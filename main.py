@@ -210,7 +210,10 @@ def setup_bot():
     from src.nadobro.handlers.brief_commands import cmd_market_news, cmd_morning_brief, cmd_night_howl
     from src.nadobro.handlers.messages import handle_message
     from src.nadobro.handlers.callbacks import handle_callback
-    from src.nadobro.handlers.update_serialization import with_user_serialized
+    from src.nadobro.handlers.update_serialization import (
+        with_callback_ack,
+        with_user_serialized,
+    )
 
     async def _private_chat_only(update: Update, context):
         chat = update.effective_chat
@@ -220,9 +223,15 @@ def setup_bot():
     async def _language_middleware(update: Update, context):
         user = update.effective_user
         if user:
+            from src.nadobro.core.async_utils import run_blocking_db
             from src.nadobro.i18n import _ACTIVE_LANG, normalize_lang
             from src.nadobro.users.user_service import get_user
-            existing = get_user(user.id)
+            # Runs on EVERY update, ahead of every handler. ``get_user`` serves a
+            # 10s in-process cache but falls through to a synchronous psycopg2
+            # round-trip — on the event loop that stalls every other user's tick
+            # and tap. Hand the miss to the DB pool. (The contextvar is still set
+            # here, in the handler's own context, so localization is unaffected.)
+            existing = await run_blocking_db(get_user, user.id)
             if existing is not None and getattr(existing, "language", None):
                 # Respect the user's stored choice (single source of truth).
                 lang = normalize_lang(existing.language)
@@ -282,7 +291,10 @@ def setup_bot():
 
     app.add_handler(CommandHandler("desk", with_user_serialized(cmd_desk)))
 
-    app.add_handler(CallbackQueryHandler(with_user_serialized(handle_callback)))
+    # ``with_callback_ack`` sits OUTSIDE the serialization wrapper on purpose: the
+    # button spinner is cleared before we queue behind this user's previous
+    # action, so a tap feels instant even when the prior handler is still working.
+    app.add_handler(CallbackQueryHandler(with_callback_ack(with_user_serialized(handle_callback))))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, with_user_serialized(handle_message)))
     app.add_error_handler(_error_handler)
 

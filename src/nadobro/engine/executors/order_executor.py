@@ -49,6 +49,13 @@ class OrderExecutorConfig:
     leverage: int = 1
     position_action: PositionAction = PositionAction.OPEN
     connector_name: str = "nado"
+    # Declared crossing intent, for an order priced THROUGH the book that stays a
+    # limit order. ``execution_strategy`` cannot express it — a plain LIMIT rests or
+    # crosses depending on its price against the book — and only the controller that
+    # chose the price knows which it meant. Read by ``_fill_was_taker`` so the
+    # recorded fill is not mislabelled maker (RG-TAKERFLAG-1). Reporting only: it
+    # changes no order parameter and is never sent to the venue.
+    crosses_book: bool = False
 
     def __post_init__(self) -> None:
         self.amount_base = _dec(self.amount_base)
@@ -184,7 +191,7 @@ class OrderExecutor(Executor):
             fee_quote=delta_fee,
             timestamp=time.time(),
         )
-        self._record_fill(fill)
+        self._record_fill(fill, order)
         self.last_fill = fill
         self._recorded_base = order.filled_base
         self._recorded_quote = order.filled_quote

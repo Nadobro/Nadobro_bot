@@ -174,7 +174,8 @@ class DCAExecutor(Executor):
         delta_fee = order.fee_quote - rung._recorded_fee
         price = (delta_quote / delta_base) if delta_base > 0 else Decimal(0)
         self._record_fill(
-            Fill(order.id, self.trading_pair, self.config.side, delta_base, price, delta_fee, time.time())
+            Fill(order.id, self.trading_pair, self.config.side, delta_base, price, delta_fee, time.time()),
+            order,
         )
         rung._recorded = order.filled_base
         rung._recorded_quote = order.filled_quote
@@ -339,7 +340,8 @@ class DCAExecutor(Executor):
         delta_fee = order.fee_quote - self._close_recorded_fee
         price = (delta_quote / delta_base) if delta_base > 0 else Decimal(0)
         self._record_fill(
-            Fill(order.id, self.trading_pair, self.close_side, delta_base, price, delta_fee, time.time())
+            Fill(order.id, self.trading_pair, self.close_side, delta_base, price, delta_fee, time.time()),
+            order,
         )
         self._close_recorded = order.filled_base
         self._close_recorded_quote = order.filled_quote

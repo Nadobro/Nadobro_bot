@@ -131,8 +131,9 @@ class GridController(Controller):
         maker_offset = max(step / Decimal(2), Decimal("0.00015"))
         # GRID-DUAL-UNIT fix: don't rebuild a fill-blind, mid-referenced hard
         # stop from sl_pct (it caused premature wick stop-outs on top of the
-        # margin-% rail). SL is the avg-entry barrier + the fee-aware session
-        # rail; the rebuild only adjusts the band bounds.
+        # margin-% rail). SL is the fee-aware %-of-margin session rail alone (the
+        # avg-entry barrier is no longer built either — DGRID-DUAL-UNIT); the
+        # rebuild only adjusts the band bounds.
         if self.SIDE is TradeType.SELL:
             return {
                 "start_price": mid * (Decimal(1) + maker_offset),

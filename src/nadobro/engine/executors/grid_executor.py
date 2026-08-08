@@ -36,6 +36,19 @@ from src.nadobro.engine.types import (
 )
 
 
+# LIMIT ORDERS ONLY (2026-08-08, product ruling). This executor never sends a naked
+# MARKET order. Entries and the ladder's paired per-level close legs REST post-only.
+# Every risk exit — the stop-out flatten, the take-profit flatten, and D-Grid's
+# profit-tier scale-out — is a MARKETABLE LIMIT: a bounded limit priced through the
+# touch, so it crosses and fills like a taker but can never execute worse than its
+# limit. An exit that may not fill is not an exit; an exit with no price bound is
+# not one either.
+#
+# How far through the touch an exit prices. Wide enough to cross a normal book,
+# bounded so a thin or gapped book cannot fill it at an arbitrary price.
+_EXIT_CROSS_BP = Decimal("30")
+
+
 class GridLevelState(Enum):
     NOT_ACTIVE = "NOT_ACTIVE"
     OPEN_ORDER_PLACED = "OPEN_ORDER_PLACED"
@@ -62,6 +75,15 @@ class GridLevel:
     _close_recorded: Decimal = Decimal(0)
     _close_quote_recorded: Decimal = Decimal(0)
     _close_fee_recorded: Decimal = Decimal(0)
+    # Base of this level's inventory closed by an order that is NOT its own close
+    # leg — a profit-tier booking or the stop-out flatten. GRID-CLOSE-WATERMARK:
+    # this used to be added into ``_close_recorded``, which ``_ingest`` assigns
+    # ABSOLUTELY as the close ORDER's cumulative-fill watermark. Mixing a counter
+    # into a watermark made ``_ingest`` subtract externally-closed base from the
+    # close order's real fills: the fill was under-counted or dropped, its price
+    # was divided by a shrunken delta, and the executor held phantom inventory
+    # that permanently blocked D-Grid's next phase spawn.
+    _close_booked_base: Decimal = Decimal(0)
     filled_base: Decimal = Decimal(0)
     filled_quote: Decimal = Decimal(0)
 
@@ -176,6 +198,11 @@ class GridExecutor(Executor):
         self.orders_placed = 0
         self.orders_filled = 0
         self.orders_cancelled = 0
+        # Accumulators for an external reduce-only close (a profit tier), mirroring
+        # the per-level ones so a multi-price fill is ingested as exact deltas.
+        self._book_recorded_base = Decimal(0)
+        self._book_recorded_quote = Decimal(0)
+        self._book_recorded_fee = Decimal(0)
 
     @property
     def open_side(self) -> TradeType:
@@ -205,7 +232,10 @@ class GridExecutor(Executor):
         self.orders_placed += 1
 
     async def _place_close(self, level: GridLevel) -> None:
-        await self._place_close_remaining(level, level.filled_base - level._close_recorded)
+        await self._place_close_remaining(
+            level,
+            level.filled_base - level._close_recorded - level._close_booked_base,
+        )
 
     async def _place_close_remaining(self, level: GridLevel, base_amount: Decimal) -> None:
         if base_amount <= 0:
@@ -245,7 +275,8 @@ class GridExecutor(Executor):
         # Use the marginal price of this *chunk*, not the running VWAP.
         price = (delta_quote / delta_base) if delta_base > 0 else Decimal(0)
         self._record_fill(
-            Fill(order.id, self.trading_pair, side, delta_base, price, delta_fee, time.time())
+            Fill(order.id, self.trading_pair, side, delta_base, price, delta_fee, time.time()),
+            order,
         )
         if opening:
             level._open_recorded = order.filled_base
@@ -389,74 +420,194 @@ class GridExecutor(Executor):
         # Place the re-priced opens now (subject to the usual suppress/bounds).
         await self._maybe_place_opens()
 
-    async def reduce_position(self, amount_base: object) -> Decimal:
-        """Reduce the net held inventory by up to ``amount_base`` with a single
-        reduce-only MARKET, keeping the executor's OWN accounting consistent.
+    def _exit_cross_price(self, mid: Decimal) -> Optional[Decimal]:
+        """A limit price far enough THROUGH the touch to cross, and no further.
 
-        DGRID-BOOK-RACE fix: dgrid tiered profit-booking used to fire a naked
-        ``adapter.place_order(... reduce_only ...)`` straight at the venue,
-        bypassing this executor. The booked reduction was then invisible here, so
-        the resting per-level close legs still tried to close the full
-        ``filled_base`` (rejected by reduce_only, but leaving levels stuck in
-        CLOSE_ORDER_PLACED) and the shared inventory net drifted from the venue.
-        Routing the reduction through here records the fill in the shared
-        inventory AND advances per-level close accounting (cancelling a fully
-        booked level's resting close leg) so the two views stay in sync. Returns
-        the base actually reduced.
+        LIMIT ORDERS ONLY: an exit must act, so it is priced aggressively; but it is
+        still a limit, so a gapped or thin book cannot fill it at an arbitrary
+        price the way a naked MARKET order can. ``None`` when there is no usable
+        mid — the caller then has nothing safe to price against.
         """
-        amount = _dec(amount_base)
-        if amount <= 0 or self.is_terminated:
+        if mid is None or mid <= 0:
+            return None
+        slip = _EXIT_CROSS_BP / Decimal(10000)
+        if self.close_side is TradeType.SELL:
+            return mid * (Decimal(1) - slip)     # sell down through the bid
+        return mid * (Decimal(1) + slip)         # buy up through the ask
+
+    def _unclosed_base(self) -> Decimal:
+        held = sum(
+            (lv.filled_base - lv._close_recorded - lv._close_booked_base
+             for lv in self.levels),
+            Decimal(0),
+        )
+        return max(Decimal(0), held)
+
+    async def _ingest_book(self, order: NadoOrder, *, crossed: bool = False) -> Decimal:
+        """Book the fill of an external reduce-only close (a profit tier).
+
+        Mirrors :meth:`_ingest` — marginal price for the chunk, fee delta passed
+        through — but against this executor's booking accumulators rather than a
+        level's, and it advances per-level close accounting by the SAME delta so
+        ``_net_base`` and the resting close legs stay consistent with the venue.
+        Returns the base newly closed.
+        """
+        delta_base = _dec(getattr(order, "filled_base", 0) or 0) - self._book_recorded_base
+        if delta_base <= 0:
             return Decimal(0)
-        held = sum((lv.filled_base - lv._close_recorded for lv in self.levels), Decimal(0))
-        held = max(Decimal(0), held)
-        reduce = min(amount, held)
+        delta_quote = _dec(getattr(order, "filled_quote", 0) or 0) - self._book_recorded_quote
+        delta_fee = _dec(getattr(order, "fee_quote", 0) or 0) - self._book_recorded_fee
+        self._book_recorded_base += delta_base
+        self._book_recorded_quote += delta_quote
+        self._book_recorded_fee += delta_fee
+        price = (delta_quote / delta_base) if delta_base > 0 else Decimal(0)
+        self._record_fill(
+            Fill(order.id, self.trading_pair, self.close_side, delta_base, price,
+                 delta_fee, time.time()),
+            order,
+            crossed=crossed or None,
+        )
+        await self._advance_close_accounting(delta_base)
+        return delta_base
+
+    async def reduce_position(
+        self, amount_base: object, mid: Optional[Decimal] = None,
+    ) -> Decimal:
+        """Close up to ``amount_base`` of held inventory by CROSSING, and return
+        the base actually reduced.
+
+        TAKER RISK EXITS (2026-08-08, product ruling). This is D-Grid's profit-tier
+        scale-out — a risk exit, and every risk exit crosses now. A brief maker
+        experiment rested it post-only and chased the touch; that produced the
+        whole class of defects this replaced: a tier chasing a reversing mid until
+        it booked a LOSS, a slice stranded below one lot, an order orphaned on the
+        flat branch with nobody left to drive it, and a partial fill colliding with
+        the level close watermark. An exit that may not fill is not an exit.
+        Entries and the ladder's paired per-level close legs stay post-only —
+        those have no deadline and earn the spread.
+
+        Synchronous: a reduce-only MARKET either fills now or comes back unfilled,
+        and only what actually FILLED is booked. Booking the request regardless
+        would inject a phantom close at price 0 into inventory and wrongly advance
+        per-level accounting.
+
+        DGRID-BOOK-RACE fix (kept): the reduction is routed THROUGH this executor
+        rather than fired at the adapter behind its back, so the fill lands in the
+        shared inventory AND advances per-level close accounting — its resting
+        close legs and the controller's net view cannot drift apart.
+        """
+        if self.is_terminated:
+            return Decimal(0)
+        amount = _dec(amount_base)
+        if amount <= 0:
+            return Decimal(0)
+        reduce = min(amount, self._unclosed_base())
         if reduce <= 0:
             return Decimal(0)
-        order = await self._guard(
-            lambda: self.adapter.place_order(
-                self.trading_pair, self.close_side, OrderType.MARKET,
-                reduce, None, self.config.leverage, True,
-            ),
-            label="grid_book_reduce",
-        )
+        # No min-notional guard: a crossing order is not subject to the venue's
+        # RESTING minimum, which is exactly why crossing is the right tool for an
+        # exit that would otherwise be too small to place at all.
+        if mid is None:
+            mid = await self._guard(
+                lambda: self.adapter.mid_price(self.trading_pair), label="grid_book_mid",
+            )
+        # NOT via _guard: it terminates the executor FAILED after its retries, and
+        # _terminate cancels nothing — so a transient venue error on a DISCRETIONARY
+        # profit tier used to kill the ladder and strand every resting order on the
+        # venue with no executor driving them. A tier is best-effort; the stop-out
+        # flatten is the path that may terminate.
+        try:
+            order = await self.adapter.place_order(
+                self.trading_pair, self.close_side, OrderType.LIMIT,
+                reduce, self._exit_cross_price(_dec(mid or 0)),
+                self.config.leverage, True,
+            )
+        except Exception as exc:  # noqa: BLE001 - booking is best-effort, retry next tick
+            logger.warning("grid %s: profit-tier book failed (retry next tick): %s",
+                           self.id, exc)
+            return Decimal(0)
         if order is None:
             return Decimal(0)
-        filled = _dec(getattr(order, "filled_base", 0) or 0)
-        if filled <= 0:
-            # Reduce-only MARKET came back unfilled (no liquidity / already flat
-            # / venue reject — the adapter reconciles a genuine zero fill to
-            # filled_base=0). Booking `reduce` regardless would inject a phantom
-            # close at price 0 into inventory and wrongly advance per-level
-            # accounting. Record nothing and let the next tick retry.
-            return Decimal(0)
-        price = order.filled_quote / filled
-        # Keep the shared inventory net consistent with the venue.
-        self._record_fill(
-            Fill(order.id, self.trading_pair, self.close_side, filled, price, order.fee_quote, time.time())
-        )
-        # Advance per-level close accounting so resting close legs don't try to
-        # re-close the booked amount; cancel & complete fully booked levels.
+        self._book_recorded_base = Decimal(0)
+        self._book_recorded_quote = Decimal(0)
+        self._book_recorded_fee = Decimal(0)
+        self.orders_placed += 1
+        booked = await self._ingest_book(order, crossed=True)
+        if booked > 0:
+            self.orders_filled += 1
+        return booked
+
+    async def _maybe_complete_level(self, lv: GridLevel) -> bool:
+        """Complete a level whose inventory is fully closed, cancelling any close
+        leg still resting for base that is already gone.
+
+        Needed because a level can be closed by TWO orders — its own close leg and
+        an external booking (profit tier / stop-out flatten) — and neither alone
+        reports "FILLED" for the whole level. Without this, a level closed half by
+        a tier and half by a partial close-leg fill stays CLOSE_ORDER_PLACED with
+        an oversized order still on the book: reduce-only stops it over-closing,
+        but it is a stale order against inventory the executor no longer holds.
+        """
+        if lv._close_recorded + lv._close_booked_base < lv.filled_base:
+            return False
+        # BOTH legs. A level can be completed while its OPEN order is still resting
+        # and only partially filled — an external close books the filled part, which
+        # is all this level "holds". Clearing only the close leg left the entry live
+        # on the venue, and with recycle_levels (D-Grid's default) the recycled slot
+        # DISCARDS the id and places a second entry at the same price: two live
+        # orders on one rung, the orphan invisible to _net_base, to
+        # _cancel_all_resting and to the flat check that gates the next phase.
+        for attr, label in (("open_order_id", "grid_open_complete_cancel"),
+                            ("close_order_id", "grid_close_complete_cancel")):
+            oid = getattr(lv, attr)
+            if oid is None:
+                continue
+            cid = oid
+            try:
+                await self._guard(lambda: self.adapter.cancel_order(cid), label=label)
+                self.orders_cancelled += 1
+            except Exception as exc:  # noqa: BLE001 - cancel is best-effort
+                logger.warning("grid %s: completing level cancel failed for %s: %s",
+                               self.id, cid, exc)
+            setattr(lv, attr, None)
+        lv.state = GridLevelState.COMPLETE
+        return True
+
+    async def _advance_close_accounting(self, filled: Decimal) -> None:
+        """Attribute ``filled`` base of closing volume across the levels holding
+        inventory, so resting close legs don't try to re-close it."""
         remaining = filled
         for lv in self.levels:
             if remaining <= 0:
                 break
-            lv_held = lv.filled_base - lv._close_recorded
+            lv_held = lv.filled_base - lv._close_recorded - lv._close_booked_base
             if lv_held <= 0:
                 continue
             take = min(lv_held, remaining)
-            lv._close_recorded += take
+            lv._close_booked_base += take
             remaining -= take
-            if lv._close_recorded >= lv.filled_base and lv.state is GridLevelState.CLOSE_ORDER_PLACED:
-                if lv.close_order_id is not None:
-                    cid = lv.close_order_id
-                    try:
-                        await self._guard(lambda: self.adapter.cancel_order(cid), label="grid_book_cancel_close")
-                        self.orders_cancelled += 1
-                    except Exception as exc:  # noqa: BLE001 - cancel is best-effort
-                        logger.warning("grid %s: book-reduce close cancel failed for %s: %s", self.id, cid, exc)
-                    lv.close_order_id = None
-                lv.state = GridLevelState.COMPLETE
-        return filled
+            if await self._maybe_complete_level(lv):
+                continue
+            # Booked only PART of this level: its resting close leg is now sized for
+            # base the level no longer holds. reduce_only is an account-level flag,
+            # not per-level, so with other rungs still holding inventory the
+            # oversized leg fills in full and closes ANOTHER rung's base at this
+            # rung's price. Re-place it at what is actually left.
+            if lv.state is GridLevelState.CLOSE_ORDER_PLACED and lv.close_order_id:
+                cid = lv.close_order_id
+                try:
+                    await self._guard(lambda: self.adapter.cancel_order(cid),
+                                      label="grid_close_resize_cancel")
+                    self.orders_cancelled += 1
+                except Exception as exc:  # noqa: BLE001 - cancel is best-effort
+                    logger.warning("grid %s: close-leg resize cancel failed for %s: %s",
+                                   self.id, cid, exc)
+                    continue          # leave it be rather than double-place
+                lv.close_order_id = None
+                lv.state = GridLevelState.OPEN_ORDER_FILLED
+                await self._place_close_remaining(
+                    lv, lv.filled_base - lv._close_recorded - lv._close_booked_base,
+                )
 
     async def on_tick(self) -> None:
         if self.is_terminated:
@@ -604,11 +755,16 @@ class GridExecutor(Executor):
                 level.state = GridLevelState.COMPLETE
                 self.orders_filled += 1
                 return
+            # A tier may already have closed the rest of this level, so the level
+            # can be whole even when THIS order is only partially filled.
+            if await self._maybe_complete_level(level):
+                return
             if order.state in (OrderState.CANCELLED, OrderState.REJECTED):
                 # BUG-GR-2 fix: re-place the close leg for the remaining base
                 # if any. If the level is fully closed via partials, complete it.
                 level.close_order_id = None
-                remaining = level.filled_base - level._close_recorded
+                remaining = (level.filled_base - level._close_recorded
+                             - level._close_booked_base)
                 if remaining <= 0:
                     level.state = GridLevelState.COMPLETE
                 else:
@@ -634,7 +790,10 @@ class GridExecutor(Executor):
 
     def _net_base(self) -> Decimal:
         opened = sum((lv.filled_base for lv in self.levels), Decimal(0))
-        closed = sum((lv._close_recorded for lv in self.levels), Decimal(0))
+        closed = sum(
+            (lv._close_recorded + lv._close_booked_base for lv in self.levels),
+            Decimal(0),
+        )
         return opened - closed
 
     async def _stop_out(self, close_type: CloseType) -> None:
@@ -662,10 +821,14 @@ class GridExecutor(Executor):
                     )
         net = self._net_base()
         if not self.config.keep_position and net > 0:
+            stop_mid = await self._guard(
+                lambda: self.adapter.mid_price(self.trading_pair), label="grid_stop_mid",
+            )
+            exit_px = self._exit_cross_price(_dec(stop_mid or 0))
             flat = await self._guard(
                 lambda: self.adapter.place_order(
-                    self.trading_pair, self.close_side, OrderType.MARKET, net, None,
-                    self.config.leverage, True,
+                    self.trading_pair, self.close_side, OrderType.LIMIT, net,
+                    exit_px, self.config.leverage, True,
                 ),
                 label="grid_flatten",
             )
@@ -679,21 +842,18 @@ class GridExecutor(Executor):
                     Fill(
                         flat.id, self.trading_pair, self.close_side,
                         flat.filled_base, price, flat.fee_quote, time.time(),
-                    )
+                    ),
+                    flat,
+                    crossed=True,          # a marketable limit IS a taker fill
                 )
-                remaining_flat = flat.filled_base
-                for level in self.levels:
-                    if remaining_flat <= 0:
-                        break
-                    held = level.filled_base - level._close_recorded
-                    if held <= 0:
-                        continue
-                    take = min(held, remaining_flat)
-                    level._close_recorded += take
-                    remaining_flat -= take
-                    if level._close_recorded >= level.filled_base:
-                        level.state = GridLevelState.COMPLETE
-                        level.close_order_id = None
+                # The flatten is an EXTERNAL close like a profit tier, so it goes
+                # through the same attribution and completion rule. This used to
+                # inline a copy of both, which worked only because
+                # _cancel_all_resting() runs first — a latent dependency on call
+                # order, in duplicated arithmetic, on the path that closes a user's
+                # position. The redundant cancel _maybe_complete_level may issue for
+                # an already-cancelled leg is idempotent at the adapter.
+                await self._advance_close_accounting(flat.filled_base)
             remaining = self._net_base()
             if remaining > Decimal("1e-12"):
                 logger.warning(

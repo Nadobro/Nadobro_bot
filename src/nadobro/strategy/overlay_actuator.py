@@ -3,10 +3,20 @@ controller config, bounded so it can never exceed the user's own settings.
 
 Runs in the background for the four MM strategies (grid / rgrid / dgrid / mid);
 the normal user configures nothing. It only ever turns knobs the controllers
-already consume (directional_bias, per-side spread, order size, the net-exposure
-cap), so no controller code changes and every adjustment is inside the same
-rails the user's config already lives behind. The session SL/TP rail and a
-separate overlay-drawdown kill-switch are the backstops.
+already consume (directional_bias, per-side spread, order size, an explicit
+reduce-only flag), so no controller code changes and every adjustment is inside
+the same rails the user's config already lives behind. The session SL/TP rail and
+a separate overlay-drawdown kill-switch are the backstops.
+
+Two hard rules, both learned from bugs:
+
+* **Never encode "stop" as a zeroed limit.** ``max_net_exposure_pct = 0`` reads as
+  "cap INACTIVE" in both exposure checks, so it REMOVED the ceiling it was meant
+  to tighten. Suppression is its own flag.
+* **Never write a %-of-margin number into a price-move field.** ``Signal.sl_pct``
+  / ``tp_pct`` are % of margin; ``TripleBarrierConfig`` holds a price return from
+  avg entry. They reach the %-of-margin session rail (``rail_barriers``) and
+  nothing else.
 
 Everything here is pure and deterministic; the runtime does the I/O (candle
 fetch, persistence) and the flatten.
@@ -21,6 +31,21 @@ from src.nadobro.core.feature_flags import env_flag
 from src.nadobro.llm.signal_engine import Signal
 
 OVERLAY_STRATEGIES = ("grid", "rgrid", "dgrid", "mid")
+
+# Strategies the overlay must NEVER stand down, because the regime that triggers
+# suppression is the regime they exist to trade:
+#   * mid  — suppression fires on CHOP, which is exactly what a symmetric maker
+#            quotes. Standing it down leaves it dark for no benefit.
+#   * rgrid — Reverse Grid's whole thesis is following a move. Pausing it in a
+#            trend is backwards, and pausing it mid-position leaves the book
+#            exposed with no one managing the exit. Its risk reduction is what
+#            still applies while suppressing: no size ADD (size_factor is clamped
+#            to <= 1.0) and the regime-tightened %-of-margin session rail. It is
+#            NOT "a tightened trailing soft reset" — nothing reads such a signal;
+#            saying so once made a dead config key look like a safety mechanism.
+# Mid additionally arms the regime gate, which pauses trends/breakouts and not
+# chop. Both keep their configured net-exposure cap and their session SL/TP rails.
+NEVER_SUPPRESSED = ("mid", "rgrid")
 
 # Overlay-specific max drawdown (% of session margin). Independent of, and
 # additional to, the user's session SL — EITHER trips flatten + stand-down.
@@ -65,6 +90,7 @@ def compute_overrides(strategy: str, signal: Signal) -> Dict[str, object]:
     ``spread_factor`` 0.75..3.0 multiplier on the quoted per-side spread.
     ``directional_bias``  only for Mid (it consumes a continuous bias).
     ``suppress_new_entries``  True -> choke NEW exposure (reduce-only posture).
+        Mid instead arms the regime gate; R-Grid is exempt (see NEVER_SUPPRESSED).
     """
     strat = str(strategy or "").lower()
     # Size: add on the favoured side only on a confident trend; trim otherwise.
@@ -84,9 +110,9 @@ def compute_overrides(strategy: str, signal: Signal) -> Dict[str, object]:
         "bias": float(signal.bias),
         "confidence": float(signal.confidence),
     }
-    # Regime-adjusted barriers (% of margin), derived from the user's base SL/TP
-    # in the engine (trend widens, chop tightens). Applied to the controller's
-    # per-level barrier AND surfaced for the session rail; the 10% overlay
+    # Regime-adjusted barriers, derived from the user's base SL/TP (trend widens,
+    # chop tightens). These are % of MARGIN and go ONLY to the %-of-margin session
+    # rail via rail_barriers() — never to a price-move barrier. The 10% overlay
     # drawdown cap is the hard backstop over both.
     if signal.sl_pct is not None:
         overrides["sl_pct"] = float(signal.sl_pct)
@@ -229,39 +255,55 @@ def apply_overrides_to_configs(
         configs["directional_bias"] = float(overrides["directional_bias"])
         changed["directional_bias"] = configs["directional_bias"]
 
-    # Regime-adjusted barriers → the controller's per-level triple barrier (grid
-    # ladder). Mid + fill-anchored are rail-only, so this key is simply absent
-    # there and the session rail carries the overlay sl/tp instead (via state).
-    sl_pct = overrides.get("sl_pct")
-    tp_pct = overrides.get("tp_pct")
-    if (sl_pct is not None or tp_pct is not None) and "triple_barrier_config" in configs:
-        try:
-            from src.nadobro.engine.types import TripleBarrierConfig
-
-            sl_frac = (Decimal(str(sl_pct)) / Decimal(100)) if sl_pct else None
-            tp_frac = (Decimal(str(tp_pct)) / Decimal(100)) if tp_pct else None
-            if sl_frac or tp_frac:
-                configs["triple_barrier_config"] = TripleBarrierConfig(
-                    take_profit=tp_frac or None, stop_loss=sl_frac or None
-                )
-                changed["barriers"] = {"sl_pct": sl_pct, "tp_pct": tp_pct}
-        except Exception:  # noqa: BLE001 - barrier override is best-effort
-            pass
+    # OVERLAY-BARRIER-UNITS: the overlay does NOT touch ``triple_barrier_config``.
+    #
+    # ``Signal.sl_pct`` / ``tp_pct`` are "% of MARGIN" (llm/signal_engine.py) while
+    # ``TripleBarrierConfig.stop_loss`` / ``take_profit`` are "return fractions
+    # relative to entry" (engine/types.py) — a PRICE move, evaluated as
+    # ``avg * (1 - stop_loss)``. Dividing a %-of-margin number by 100 and storing it
+    # as a price fraction mixed the two: at leverage L the resulting barrier sat L
+    # times too far away (0.8% of margin at 49x became a 0.8% PRICE stop = ~39% of
+    # margin), and it OVERWROTE the user's own configured barrier to do it.
+    #
+    # The overlay's regime-adjusted SL/TP are %-of-margin by construction, so they
+    # go to the %-of-margin SESSION rail and nowhere else — ``rail_barriers()`` ->
+    # ``state["overlay_sl_pct"]`` / ``state["overlay_tp_pct"]``, which the runtime
+    # already applies. One number, one unit, one enforcement point.
 
     if overrides.get("suppress_new_entries"):
-        # Choke NEW exposure via the existing net-exposure cap (the inventory
-        # gate keeps the reducing side quoting), and arm the regime gate so
-        # trends/breakouts pause new opens. Both are honored by the controllers.
-        # SUPPRESS-CAP-ZERO (2026-07-30): NOT for mid — suppress fires on chop,
-        # which is exactly the regime a symmetric maker exists to quote, and
-        # both exposure checks treat a cap of 0 as "cap INACTIVE", so zeroing
-        # removed mid's exposure cap entirely instead of choking entries. Mid
-        # keeps its configured cap active and keeps quoting; its rails are the
-        # inventory cap, the regime gate (pauses trends/breakouts, not chop)
-        # and the session SL. The grid family keeps the legacy zeroing.
-        if str(strategy or "").lower() != "mid":
-            configs["max_net_exposure_pct"] = 0.0
-        configs["regime_gate_enabled"] = True
-        changed["suppress_new_entries"] = True
+        strat = str(strategy or "").lower()
+        if strat == "mid":
+            # Mid keeps its exposure cap and keeps QUOTING (suppression fires on
+            # chop, the regime a symmetric maker exists for) — but it still gets
+            # the regime gate, which pauses new opens on trends/breakouts and NOT
+            # on chop. main armed this for mid; an earlier pass on this branch
+            # replaced it with an ``overlay_defensive`` flag that nothing read, so
+            # Mid took ZERO defensive action on the two non-chop triggers
+            # (signal_engine: a higher-timeframe trend opposing the bias, and a
+            # cold candle cache) and kept quoting a full-size ladder into a
+            # flagged breakout.
+            configs["regime_gate_enabled"] = True
+            changed["regime_gate_enabled"] = True
+        elif strat in NEVER_SUPPRESSED:
+            # R-Grid: exempt outright. It is a momentum strategy that ADDS into
+            # trends, so arming a trend gate would pause it exactly where it is
+            # supposed to work (a product ruling). Its risk reduction comes from
+            # the overlay's other levers, which still apply: no size ADD while
+            # suppressing (size_factor is clamped to <= 1.0 above) and the
+            # regime-tightened %-of-margin session rail via rail_barriers().
+            pass
+        else:
+            # Reduce-only posture as an EXPLICIT flag honoured by
+            # Controller.exposure_allowed_sides, plus the regime gate.
+            #
+            # SUPPRESS-CAP-ZERO: this used to write ``max_net_exposure_pct = 0``.
+            # BOTH exposure checks read a cap of 0 as "cap INACTIVE"
+            # (controller_base.exposure_allowed_sides,
+            # market_making._projected_order_within_exposure), so "suppression"
+            # DELETED the ceiling instead of tightening it. Never encode "stop"
+            # as a zeroed limit again.
+            configs["suppress_new_entries"] = True
+            configs["regime_gate_enabled"] = True
+            changed["suppress_new_entries"] = True
 
     return changed

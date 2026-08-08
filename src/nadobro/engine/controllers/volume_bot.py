@@ -471,6 +471,7 @@ class VolumeBotController(Controller):
         execution: ExecutionStrategy = ExecutionStrategy.LIMIT_MAKER,
         position_action: PositionAction = PositionAction.OPEN,
         ref_price: Optional[Decimal] = None,
+        crosses_book: bool = False,
     ) -> tuple[bool, Optional[OrderExecutor]]:
         # MARKET carries no price (the venue fills at the touch); ``ref_price``
         # still sizes the risk request so a taker order is never submitted to
@@ -484,6 +485,10 @@ class VolumeBotController(Controller):
             price=price if execution is not ExecutionStrategy.MARKET else None,
             leverage=1,
             position_action=position_action,
+            # The vol bot's crossing legs stay LIMIT orders priced through the
+            # book, so nothing about the order says "taker" — the caller has to.
+            # Reporting only (RG-TAKERFLAG-1); it changes no order parameter.
+            crosses_book=crosses_book,
         )
         ex = OrderExecutor(
             cfg,
@@ -492,8 +497,21 @@ class VolumeBotController(Controller):
             adapter=self.adapter,
             inventory=self.inventory,
         )
+        # A risk LIMIT must never block risk REDUCTION. Without this, prod session
+        # 104 stranded spot: the venue lot-rounds a buy fill UP, so a $100 session
+        # held $101.01, and the sell's $100 cap rejected it 1.4s after the fill
+        # (see the comment at strategy/engine_runtime.py's vol risk-limits block).
+        # That was patched by padding the CAP with headroom; the exemption is the
+        # actual fix, and it is the same one R-Grid's reducing leg already uses.
+        # Safe on spot even though the adapter STRIPS reduce_only there (the venue
+        # rejects it, error_code 5000): the exit is still bounded, by never_grow
+        # plus the adapter's clamp down to the wallet balance.
+        _closing = position_action is PositionAction.CLOSE
         ok = await self.spawn_executor(
-            ex, ExecutorRequest(order_amount_quote=amount_base * sizing_price)
+            ex, ExecutorRequest(
+                order_amount_quote=amount_base * sizing_price,
+                reduce_only=_closing, position_action=position_action,
+            )
         )
         if ok and ex.order is not None:
             self.last_order_digest = ex.order.id
@@ -529,6 +547,7 @@ class VolumeBotController(Controller):
             ok, ex = await self._spawn_order(
                 TradeType.BUY, amount_base, buy_cap, kind="buy_taker",
                 execution=ExecutionStrategy.LIMIT, ref_price=ask,
+                crosses_book=True,
             )
         else:
             buy_price = self._buy_price(bid, ask)
@@ -664,6 +683,7 @@ class VolumeBotController(Controller):
             TradeType.SELL, amount, sell_cap, kind="sell_taker",
             execution=ExecutionStrategy.LIMIT,
             position_action=PositionAction.CLOSE, ref_price=bid,
+            crosses_book=True,
         )
         if ok and ex is not None:
             self.sell_id = ex.id
@@ -722,7 +742,7 @@ class VolumeBotController(Controller):
             amount = remaining_quote / px
             ok, new_ex = await self._spawn_order(
                 TradeType.BUY, amount, px, kind="buy_cross",
-                execution=ExecutionStrategy.LIMIT,
+                execution=ExecutionStrategy.LIMIT, crosses_book=True,
             )
             if ok and new_ex is not None:
                 self.buy_id = new_ex.id
@@ -750,7 +770,7 @@ class VolumeBotController(Controller):
         px = self._snap(px, tick, up=False)
         ok, new_ex = await self._spawn_order(
             TradeType.SELL, remaining, px, kind="sell_cross",
-            execution=ExecutionStrategy.LIMIT,
+            execution=ExecutionStrategy.LIMIT, crosses_book=True,
             position_action=PositionAction.CLOSE,
         )
         if ok and new_ex is not None:

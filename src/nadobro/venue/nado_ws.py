@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.nadobro.utils.env import env_float
+from src.nadobro.core.async_utils import run_blocking_sdk
 from src.nadobro.core.ipv4_egress import websocket_connect_kwargs
 from src.nadobro.venue.ws_health import mark_connected, mark_disconnected, touch
 
@@ -190,7 +191,7 @@ class NadoPortfolioWs:
             # 1) Authenticate. Only ``order_update`` requires auth; we send
             #    authenticate once up-front so it is in place before subscribe.
             if any(requires_auth for _name, requires_auth, _per_subaccount in streams):
-                auth_msg = await asyncio.to_thread(self._build_auth_message, sub)
+                auth_msg = await run_blocking_sdk(self._build_auth_message, sub)
                 if auth_msg is not None:
                     await ws.send(json.dumps(auth_msg))
 

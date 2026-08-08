@@ -39,6 +39,7 @@ class MockNadoAdapter(NadoAdapterBase):
         fail_on: Optional[List[str]] = None,
         fail_times: int = 0,
         venue_held: Optional[dict] = None,
+        fill_marketable_limits: bool = False,
     ) -> None:
         # SPOT-RECONCILE: pair -> base units the VENUE reports, independent of
         # engine inventory. None entries model an unreadable venue (fail safe).
@@ -50,6 +51,7 @@ class MockNadoAdapter(NadoAdapterBase):
         self._lot = _dec(lot)
         self._min_notional = _dec(min_notional)
         self.auto_fill_market = auto_fill_market
+        self.fill_marketable_limits = fill_marketable_limits
         self.fail_on = set(fail_on or [])
         self.fail_remaining = fail_times
         self._orders: Dict[str, NadoOrder] = {}
@@ -134,10 +136,30 @@ class MockNadoAdapter(NadoAdapterBase):
         )
         self._orders[oid] = order
         self.placed.append(order)
-        if order_type is OrderType.MARKET and self.auto_fill_market:
+        if self.auto_fill_market and self._crosses_now(order_type, side, price):
             fill_px = price if price is not None else self._current_mid()
             self._apply_fill(order, order.amount_base, _dec(fill_px), Decimal(0), partial=False)
         return copy.copy(order)
+
+    def _crosses_now(self, order_type, side, price) -> bool:
+        """Only a MARKET order fills on placement by default.
+
+        A MARKETABLE LIMIT (the engine's risk exits, priced through the touch)
+        also crosses in reality, but inferring that here from price-vs-mid also
+        catches ordinary limits that tests need to REST — a DN close at its
+        take-profit barrier, for instance. Set ``fill_marketable_limits=True`` to
+        opt a test into the realistic behaviour instead of guessing globally.
+        """
+        if order_type is OrderType.MARKET:
+            return True
+        if not self.fill_marketable_limits:
+            return False
+        if order_type is not OrderType.LIMIT or price is None:
+            return False        # LIMIT_MAKER never crosses; a priceless LIMIT rests
+        px, mid = _dec(price), self._current_mid()
+        if mid <= 0:
+            return False
+        return px >= mid if side is TradeType.BUY else px <= mid
 
     async def held_base(self, trading_pair: str):
         """AUDIT round 4: this used to return a STATIC dict entry that fills never

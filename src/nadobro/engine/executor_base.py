@@ -14,9 +14,11 @@ import uuid
 from decimal import Decimal
 from typing import Awaitable, Callable, Dict, Optional, Protocol, TypeVar
 
-from src.nadobro.engine.adapter.base import AdapterError, Fill, NadoAdapterBase
+from src.nadobro.engine.adapter.base import (
+    AdapterError, Fill, NadoAdapterBase, NadoOrder,
+)
 from src.nadobro.engine.inventory import InventoryRepository
-from src.nadobro.engine.types import CloseType, ExecutorState, TradeType
+from src.nadobro.engine.types import CloseType, ExecutorState, OrderType, TradeType
 
 T = TypeVar("T")
 
@@ -37,6 +39,8 @@ class TradeRecorder(Protocol):
         fee_quote: Decimal,
         order_id: Optional[str] = ...,
         timestamp: Optional[float] = ...,
+        *,
+        is_taker: bool = ...,
     ) -> None:
         ...
 
@@ -149,7 +153,72 @@ class Executor(abc.ABC):
             f"{label or 'adapter op'} failed after {self.MAX_ATTEMPTS} attempts: {last_exc}"
         )
 
-    def _record_fill(self, fill: Fill) -> None:
+    def _fill_was_taker(self, order: Optional[NadoOrder] = None) -> bool:
+        """Whether this fill crossed the spread.
+
+        ``DbTradeRecorder.record`` defaults ``is_taker`` to False and nothing
+        downstream ever corrected it for engine-bridged rows (nado_sync enriches
+        realized PnL and product identity, not this flag), so EVERY engine fill was
+        recorded as a maker fill. Harmless for a maker ladder; systematically wrong
+        for R-Grid and the volume bot, which cross by design — their fee analytics
+        and any ``is_taker`` filter read them as maker.
+
+        There is no venue truth to read here: the SDK's ``IndexerMatch`` model
+        carries only base/quote/fee (+ digest/order/timestamp) and has NO taker
+        field, so ``get_matches`` cannot answer it. (``venue/nado_archive`` reads a
+        ``is_taker`` key defensively off the RAW archive HTTP shape, which the
+        engine's adapter does not use.) So the flag is resolved in three tiers,
+        most authoritative first — RG-TAKERFLAG-1, self-review 2026-08-07:
+
+        1. **What the venue was ACTUALLY sent** (``order.order_type``). This is the
+           only tier that sees the adapter's EXIT-MIN-NOTIONAL escape, which
+           rewrites a sub-minimum reduce-only limit into a MARKET order AFTER the
+           executor decided (``adapter/nado.py``) — the config still says
+           LIMIT_MAKER, the wire says MARKET, and the wire is right. It also covers
+           grid's reduce-only MARKET stop-out flatten and profit-tier book-reduce,
+           whose ``GridExecutorConfig`` has no ``execution_strategy`` at all.
+        2. **A declared crossing intent** (``config.crosses_book``). Type alone
+           cannot settle this: a plain LIMIT rests or crosses depending on its price
+           against the book. The volume bot prices four legs deliberately THROUGH
+           the book while leaving them limit orders, so the controller that priced
+           them says so.
+        3. **The REQUESTED strategy**, when there is no placed order to read (a fill
+           reconstructed from a poll, or an executor that keeps no order handle).
+           This is the original behaviour and stays the conservative default.
+        """
+        cfg = getattr(self, "config", None)
+        # PositionExecutorConfig (Delta Neutral, desk) holds neither field itself —
+        # they live on a NESTED ``order_config``. Without this hop, DN's MARKET
+        # legs fell through every tier and recorded as maker on both legs of every
+        # cycle.
+        if cfg is not None and not hasattr(cfg, "execution_strategy"):
+            cfg = getattr(cfg, "order_config", cfg)
+        try:
+            from src.nadobro.engine.types import ExecutionStrategy
+
+            placed = order if order is not None else getattr(self, "order", None)
+            placed_type = getattr(placed, "order_type", None)
+            if placed_type is OrderType.MARKET:
+                return True
+            if bool(getattr(cfg, "crosses_book", False)):
+                return True
+            if placed_type is not None:
+                return False        # it really did rest as a limit order
+            return getattr(cfg, "execution_strategy", None) is ExecutionStrategy.MARKET
+        except Exception:  # noqa: BLE001  # policy: degrade-ok(unknown shape ⇒ prior behaviour)
+            return False
+
+    def _record_fill(
+        self, fill: Fill, order: Optional[NadoOrder] = None, *,
+        crossed: Optional[bool] = None,
+    ) -> None:
+        """Book a fill into inventory and bridge it to the reporting tables.
+
+        Pass ``order`` — the NadoOrder this fill came off — whenever the caller has
+        it. It is what makes ``is_taker`` reflect the order the venue actually
+        received rather than the one the config asked for; see
+        :meth:`_fill_was_taker`.
+        """
         self._fees_paid_quote += fill.fee_quote
         self._volume_quote += fill.amount_quote
         if self.inventory is not None:
@@ -180,6 +249,8 @@ class Executor(abc.ABC):
                     fill.fee_quote,
                     fill.order_id,
                     fill.timestamp,
+                    is_taker=(self._fill_was_taker(order) if crossed is None
+                              else bool(crossed)),
                 )
             except Exception:  # noqa: BLE001  # policy: degrade-ok(trade-recording is best-effort; the recorder logs its own failures — a fill must never be lost to a reporting-bridge error)
                 pass

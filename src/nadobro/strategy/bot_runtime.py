@@ -65,7 +65,7 @@ from src.nadobro.users.user_service import (
     get_user,
     run_strategy_start_preflight,
 )
-from src.nadobro.core.async_utils import run_blocking, run_blocking_sdk
+from src.nadobro.core.async_utils import run_blocking, run_blocking_db, run_blocking_sdk
 from src.nadobro.core.perf import timed_metric, record_metric
 from src.nadobro.utils.env import env_bool, env_float, env_tristate
 from src.nadobro.core.cadence import FAST_CADENCE_STRATEGIES, effective_interval_seconds
@@ -400,6 +400,20 @@ def _save_state(telegram_id: int, network: str, state: dict):
     set_bot_state(_state_key(telegram_id, network), state)
 
 
+# ``bot_state`` is an uncached KV table: every _load_state/_save_state is a live
+# psycopg2 round-trip to Supabase. A single strategy cycle does 4-8 of them, and
+# calling the sync versions from a coroutine put all of that on the event loop —
+# multiplied by every running strategy, that is a steady stream of stalls that
+# shows up as skipped APScheduler ticks and laggy taps. Coroutines must use these
+# awaitable variants instead.
+async def _load_state_async(telegram_id: int, network: str) -> dict:
+    return await run_blocking_db(_load_state, telegram_id, network)
+
+
+async def _save_state_async(telegram_id: int, network: str, state: dict) -> None:
+    await run_blocking_db(_save_state, telegram_id, network, state)
+
+
 def _engine_stop_timeout_seconds() -> float:
     raw = (os.environ.get("NADO_ENGINE_STOP_TIMEOUT_SECONDS") or "30").strip()
     try:
@@ -505,6 +519,33 @@ def _stop_engine_runtime_for_state(telegram_id: int, network: str, state: dict) 
         network=network,
         strategy=strategy,
     )
+
+
+def dgrid_flip_reason(event: dict) -> str:
+    """Human reason for a Dynamic Grid phase flip.
+
+    Must describe the DECISION, not the raw sign of drift. ``direction`` is only
+    ``sign(drift)``: a -0.001% wobble reads "down" even when the classifier ruled
+    the market RANGING and correctly returned to the neutral long grid. Reading it
+    as a verdict is what produced the reported contradiction —
+
+        "switched RGRID → GRID — downtrend detected (variance ratio 0.83) …
+         now quoting the LONG ladder"
+
+    — a wrong message about a right decision. Only call it a trend when the
+    classifier actually declared one (``trending``).
+    """
+    if str(event.get("reason") or "") == "reversal":
+        return "reversal — locked profit, flipping"
+    direction = str(event.get("direction") or "")
+    if event.get("trending"):
+        if direction == "down":
+            return "downtrend detected"
+        if direction == "up":
+            return "uptrend detected"
+    if str(event.get("to") or "").lower() == "grid":
+        return "trend stalled — back to range mode"
+    return "regime change"
 
 
 async def _notify(telegram_id: int, text: str, **fmt_kwargs):
@@ -619,7 +660,7 @@ async def _retire_legacy_vol_perp_state(telegram_id: int, network: str, state: d
     state["last_action"] = "vol_perp_retired"
     state["last_action_detail"] = "Volume Perp was retired; legacy session stopped before spot migration."
     state["last_error"] = "Volume Perp was retired; legacy session stopped and perp cleanup requested."
-    _save_state(telegram_id, network, state)
+    await _save_state_async(telegram_id, network, state)
 
     close_res = await run_blocking(close_all_positions, telegram_id, network, strategy_session_id=int(state.get("strategy_session_id") or 0) or None)
     if close_res.get("success"):
@@ -633,10 +674,10 @@ async def _retire_legacy_vol_perp_state(telegram_id: int, network: str, state: d
         return True, None
 
     error = str(close_res.get("error") or "close_all_positions failed")
-    latest = _load_state(telegram_id, network)
+    latest = await _load_state_async(telegram_id, network)
     latest["running"] = False
     latest["last_error"] = f"Legacy Volume Perp cleanup failed: {error[:220]}"
-    _save_state(telegram_id, network, latest)
+    await _save_state_async(telegram_id, network, latest)
     await _notify(
         telegram_id,
         "Volume Perp on {product}-PERP ({network}) was retired and stopped, but cleanup failed. "
@@ -1964,7 +2005,7 @@ async def _bot_loop(telegram_id: int, network: str):
     await _notify(telegram_id, "Strategy loop started on {network}.", network=network)
     try:
         while True:
-            state = _load_state(telegram_id, network)
+            state = await _load_state_async(telegram_id, network)
             if not state.get("running"):
                 break
             # Option 1: same effective cadence as the central scheduler, so the
@@ -2011,7 +2052,7 @@ async def _bot_loop(telegram_id: int, network: str):
             except Exception as cycle_error:
                 logger.error("Cycle failure for user %s: %s", telegram_id, cycle_error, exc_info=True)
                 state["last_error"] = str(cycle_error)
-                _save_state(telegram_id, network, state)
+                await _save_state_async(telegram_id, network, state)
             # Poll cadence: honor a configured interval FASTER than the base
             # runtime tick for ANY strategy (Turbo Volume writes 5s grid/dgrid
             # intervals; previously only the FAST_CADENCE set got this, so a
@@ -2169,7 +2210,7 @@ async def handle_strategy_job(payload: dict):
         while True:
             cycle_started = time.perf_counter()
             _job_stats["cycles_started"] += 1
-            state = _load_state(telegram_id, network)
+            state = await _load_state_async(telegram_id, network)
             if not state.get("running"):
                 _job_pending_payloads.pop(key, None)
                 _job_coalesce_counts.pop(key, None)
@@ -2198,7 +2239,7 @@ async def handle_strategy_job(payload: dict):
                     worker_group = strategy_worker_group(strategy)
                     state["worker_group"] = worker_group
                     state["last_dispatch_ts"] = time.time()
-                    _save_state(telegram_id, network, state)
+                    await _save_state_async(telegram_id, network, state)
                     timeout_sec = _strategy_cycle_timeout_seconds() or 180.0
                     if str(strategy).lower().strip() == "vol":
                         timeout_sec = min(timeout_sec, 45.0)
@@ -2237,22 +2278,22 @@ async def handle_strategy_job(payload: dict):
                             f"Delegated strategy cycle timed out after {timeout_sec:.0f}s; "
                             "worker may still be running"
                         )
-                        refreshed = _load_state(telegram_id, network)
+                        refreshed = await _load_state_async(telegram_id, network)
                         refreshed["worker_group"] = worker_group
                         refreshed["worker_last_heartbeat"] = time.time()
                         refreshed["last_cycle_ms"] = (time.perf_counter() - cycle_started) * 1000.0
                         refreshed["last_cycle_result"] = _cycle_result_label(ok, error_msg)
-                        _save_state(telegram_id, network, refreshed)
+                        await _save_state_async(telegram_id, network, refreshed)
                     else:
                         ok = bool(delegated.get("ok", True))
                         error_msg = delegated.get("error")
-                        refreshed = _load_state(telegram_id, network)
+                        refreshed = await _load_state_async(telegram_id, network)
                         refreshed["worker_group"] = worker_group
                         refreshed["worker_last_heartbeat"] = float(delegated.get("completed_at") or time.time())
                         refreshed["last_cycle_ms"] = float(delegated.get("elapsed_ms") or 0.0)
                         refreshed["last_cycle_result"] = _cycle_result_label(ok, error_msg)
                         refreshed["worker_pid"] = delegated.get("worker_pid")
-                        _save_state(telegram_id, network, refreshed)
+                        await _save_state_async(telegram_id, network, refreshed)
                 else:
                     timeout_sec = _strategy_cycle_timeout_seconds()
                     strategy = str(state.get("strategy") or "").lower().strip()
@@ -2281,11 +2322,11 @@ async def handle_strategy_job(payload: dict):
                             network,
                             state.get("strategy"),
                         )
-                    hb_state = _load_state(telegram_id, network)
+                    hb_state = await _load_state_async(telegram_id, network)
                     hb_state["worker_last_heartbeat"] = time.time()
                     hb_state["last_cycle_ms"] = (time.perf_counter() - cycle_started) * 1000.0
                     hb_state["last_cycle_result"] = _cycle_result_label(ok, error_msg)
-                    _save_state(telegram_id, network, hb_state)
+                    await _save_state_async(telegram_id, network, hb_state)
                 if ok:
                     _job_stats["cycles_ok"] += 1
                     try:
@@ -2295,12 +2336,12 @@ async def handle_strategy_job(payload: dict):
                     except Exception as e:
                         logger.debug("user-circuit record_success failed: %s", e)
                     if _cycle_result_label(ok, error_msg) == "ok":
-                        refreshed = _load_state(telegram_id, network)
+                        refreshed = await _load_state_async(telegram_id, network)
                         if refreshed.get("error_streak") or refreshed.get("last_error"):
                             refreshed["error_streak"] = 0
                             refreshed["last_error"] = None
                             refreshed["last_error_category"] = ""
-                            _save_state(telegram_id, network, refreshed)
+                            await _save_state_async(telegram_id, network, refreshed)
                 else:
                     _job_stats["cycles_failed"] += 1
                     try:
@@ -2361,14 +2402,14 @@ async def handle_strategy_job(payload: dict):
 
 
 async def _mark_cycle_error(telegram_id: int, network: str, error_msg: str):
-    state = _load_state(telegram_id, network)
+    state = await _load_state_async(telegram_id, network)
     if not state.get("running"):
         return
     state["last_error"] = str(error_msg)[:300]
     state["last_error_category"] = _categorize_runtime_error(error_msg)
     streak = int(state.get("error_streak") or 0) + 1
     state["error_streak"] = streak
-    _save_state(telegram_id, network, state)
+    await _save_state_async(telegram_id, network, state)
     if streak == STRATEGY_ERROR_ALERT_STREAK:
         strategy = str(state.get("strategy") or "").upper() or "STRATEGY"
         product = str(state.get("product") or "?")
@@ -2552,7 +2593,7 @@ async def _evaluate_mm_duration_rail(
         # the user once that the planned duration elapsed.
         if not state.get("mm_duration_target_notified"):
             state["mm_duration_target_notified"] = True
-            _save_state(telegram_id, network, state)
+            await _save_state_async(telegram_id, network, state)
             await _notify(
                 telegram_id,
                 "⏱️ {strategy} on {market} ({network}): planned duration "
@@ -2566,7 +2607,7 @@ async def _evaluate_mm_duration_rail(
     _finalize_session(state, stop_reason="duration_reached")
     state["running"] = False
     state["last_action"] = "mm_duration_reached"
-    _save_state(telegram_id, network, state)
+    await _save_state_async(telegram_id, network, state)
     # Stop the engine controller FIRST so its resting maker orders are cancelled
     # before we flatten — otherwise close_all_positions races the still-live
     # controller and leaves "1 open orders remain" (mirrors the SL/TP rail).
@@ -2634,10 +2675,18 @@ async def _evaluate_session_pnl_rail(
         if overlay_applies(strategy):
             ov_sl = state.get("overlay_sl_pct")
             ov_tp = state.get("overlay_tp_pct")
+            # RE-CLAMP against the user's CURRENT setting, don't just adopt.
+            # overlay_actuator.rail_barriers already enforces tighten-only SL /
+            # widen-only TP — but only at WRITE time, and these keys survive in
+            # state across cycles where the overlay bailed early (candle fetch
+            # failed, product id missing, an exception). The user's settings are
+            # re-merged into state every cycle, so a mid-run SL tighten
+            # (2.0% -> 0.5%) would otherwise lose to a stale 1.6% overlay value.
+            # The user's number is the binding contract in both directions.
             if ov_sl is not None:
-                sl_pct = float(ov_sl)
+                sl_pct = min(float(ov_sl), sl_pct) if sl_pct > 0 else float(ov_sl)
             if ov_tp is not None:
-                tp_pct = float(ov_tp)
+                tp_pct = max(float(ov_tp), tp_pct) if tp_pct > 0 else float(ov_tp)
     except Exception:  # noqa: BLE001 - fall back to the user's config barriers
         logger.debug("overlay barrier read failed", exc_info=True)
     if sl_pct <= 0 and tp_pct <= 0:
@@ -2663,7 +2712,7 @@ async def _evaluate_session_pnl_rail(
             f"Stopped because strategy session #{session_id} is no longer running; "
             "orders were cleaned up to prevent untracked fills."
         )
-        _save_state(telegram_id, network, state)
+        await _save_state_async(telegram_id, network, state)
         try:
             from src.nadobro.strategy import engine_runtime as _er_stop
             if strategy in _er_stop.ENGINE_MAPPED_STRATEGIES:
@@ -2742,7 +2791,7 @@ async def _evaluate_session_pnl_rail(
             f"Stopped by session SL: PnL ${pnl:,.2f} ({pct:.2f}% of "
             f"${float(snap.get('margin') or 0.0):,.2f} margin)."
         )
-    _save_state(telegram_id, network, state)
+    await _save_state_async(telegram_id, network, state)
 
     label = market_label or f"{product}-PERP"
     strategy_label = _strategy_display_name(strategy)
@@ -2821,7 +2870,7 @@ async def _run_cycle(
             _finalize_session(state, stop_reason="maintenance_pause")
             state["running"] = False
             state["last_error"] = "Auto-closed on maintenance pause."
-            _save_state(telegram_id, network, state)
+            await _save_state_async(telegram_id, network, state)
             close_res = await run_blocking(
                 close_delta_neutral_legs,
                 telegram_id,
@@ -2841,19 +2890,19 @@ async def _run_cycle(
                     error=close_res.get('error', 'unknown'),
                 )
         else:
-            _save_state(telegram_id, network, state)
+            await _save_state_async(telegram_id, network, state)
         return True, "maintenance_pause"
     user = await run_blocking(get_user, telegram_id)
     if not user:
         _finalize_session(state, stop_reason="user_deleted")
         state["running"] = False
-        _save_state(telegram_id, network, state)
+        await _save_state_async(telegram_id, network, state)
         return True, None
     if user.network_mode.value != network:
         _finalize_session(state, stop_reason="mode_switch")
         state["running"] = False
         state["last_error"] = f"Stopped because active mode switched to {user.network_mode.value}"
-        _save_state(telegram_id, network, state)
+        await _save_state_async(telegram_id, network, state)
         await _notify(
             telegram_id,
             "Stopped {strategy} loop on {network}: active mode changed to {new_mode}.",
@@ -2911,7 +2960,7 @@ async def _run_cycle(
         state["last_action"] = bro_action
         state["last_action_detail"] = bro_detail[:200] if bro_detail else ""
         _update_order_observability(state, result)
-        _save_state(telegram_id, network, state)
+        await _save_state_async(telegram_id, network, state)
         if prev_runs == 0 or bro_action in ("open_long", "open_short", "close", "emergency_flatten", "blocked"):
             if bro_action == "hold":
                 await _notify(
@@ -3047,7 +3096,7 @@ async def _run_cycle(
     reference_price = float(state.get("reference_price") or 0.0)
     if reference_price <= 0:
         state["reference_price"] = mid
-        _save_state(telegram_id, network, state)
+        await _save_state_async(telegram_id, network, state)
         reference_price = mid
 
     # TWAP fast-move pause (Phase 3): for the passive quoting modes, skip this
@@ -3056,7 +3105,7 @@ async def _run_cycle(
     if strategy in _TWAP_PAUSE_STRATEGIES:
         _prev_twap_paused = bool(state.get("twap_paused"))
         mm_twap_paused = _twap_should_pause(state, strategy, mid)
-        _save_state(telegram_id, network, state)
+        await _save_state_async(telegram_id, network, state)
         if mm_twap_paused and not _prev_twap_paused:
             await _notify(
                 telegram_id,
@@ -3174,27 +3223,46 @@ async def _run_cycle(
         if isinstance(result, dict):
             _telemetry.update(result.get("dgrid_metrics") or {})
             _telemetry.update(result.get("grid_metrics") or {})
-        if _telemetry:
+        # Self-heal: R-Grid used to run the D-Grid engine, so live R-Grid sessions
+        # carry dgrid_phase / dgrid_variance_ratio in bot_state from before the
+        # split. Nothing overwrites them now (the keys are only copied when
+        # present), so a stale "DGRID phase: grid (var ratio 0.97)" would sit on
+        # R-Grid's /status card forever. Drop them on the first cycle instead.
+        _stale_dgrid = [
+            _k for _k in ("dgrid_phase", "dgrid_variance_ratio", "dgrid_realized_move_bp",
+                          "dgrid_reset_threshold_bp")
+            if strategy != "dgrid" and _k in state and _k not in _telemetry
+        ]
+        if _telemetry or _stale_dgrid:
+            for _k in _stale_dgrid:
+                state.pop(_k, None)
+            # The card/order-monitor read every one of these out of state (see
+            # _bot_status_payload + formatters). Six of them were emitted by the
+            # controllers and then never copied here, so the soft-reset levels, the
+            # engaged flag, the net base and the two exposure legs rendered as
+            # 0 / False / n/a for every grid-family session.
             for _k in ("dgrid_phase", "dgrid_variance_ratio", "dgrid_realized_move_bp",
                        "dgrid_reset_threshold_bp", "grid_anchor_price", "grid_reset_side",
-                       "grid_drift_from_anchor_pct", "grid_reset_active"):
+                       "grid_drift_from_anchor_pct", "grid_reset_active",
+                       "grid_mode", "grid_reset_threshold_bp", "grid_soft_reset_engaged",
+                       "grid_reset_up_price", "grid_reset_down_price", "grid_net_base",
+                       "grid_buy_exposure_price", "grid_sell_exposure_price"):
                 if _k in _telemetry:
                     state[_k] = _telemetry[_k]
-            _save_state(telegram_id, network, state)
+            await _save_state_async(telegram_id, network, state)
         # Dynamic Grid flip: GRID<->RGRID is a directional change the user must
         # see — the old position was just closed (reduce-only) and the opposite
         # side armed. One message per flip.
         dgrid_event = result.get("dgrid_event") if isinstance(result, dict) else None
         if dgrid_event:
-            # rgrid and dgrid share DynamicGridController (see engine_runtime
-            # CONTROLLERS), so this flip fires for BOTH. Name the strategy the
-            # user actually started — an R-Grid user was being told "Dynamic
-            # GRID switched…" for a mode they never picked.
-            # Name the SIDE, not just the phase label. "downtrend detected …
-            # GRID now quoting" read as a contradiction to users (it was one —
-            # see the RGRID-FLIPFLOP fix in variance_regime), and even when
-            # correct, GRID/RGRID does not tell anyone which way the bot is now
-            # leaning.
+            # Dynamic Grid only. R-Grid used to share DynamicGridController and so
+            # inherited these flip messages for a mode that has no phases at all;
+            # it now runs its own exposure-anchored controller (engine_runtime
+            # CONTROLLER_REGISTRY) and never emits a dgrid_event.
+            #
+            # The reason describes the DECISION, not the raw sign of drift — see
+            # dgrid_flip_reason. The side is named from the phase we switch TO.
+            _to_phase = str(dgrid_event.get("to", "")).lower()
             await _notify(
                 telegram_id,
                 "🔄 {mode} switched {frm} → {to} on {product} ({network}) — "
@@ -3203,12 +3271,9 @@ async def _run_cycle(
                 mode=_STRATEGY_DISPLAY_NAMES.get(str(strategy).lower(), str(strategy).upper()),
                 frm=str(dgrid_event.get("from", "")).upper(),
                 to=str(dgrid_event.get("to", "")).upper(),
-                side=("SHORT" if str(dgrid_event.get("to", "")).lower() == "rgrid" else "LONG"),
+                side=("SHORT" if _to_phase == "rgrid" else "LONG"),
                 product=product, network=network,
-                why=("reversal — locked profit, flipping" if dgrid_event.get("reason") == "reversal"
-                     else "downtrend detected" if dgrid_event.get("direction") == "down"
-                     else "uptrend detected" if dgrid_event.get("direction") == "up"
-                     else "regime change"),
+                why=dgrid_flip_reason(dgrid_event),
                 vr=str(dgrid_event.get("variance_ratio", "")),
             )
         # Delta Neutral execution alerts: a hedge that is no longer a hedge
@@ -3371,7 +3436,7 @@ async def _run_cycle(
         _finalize_session(state, stop_reason=reason)
         state["running"] = False
         state["last_action"] = "engine_completed"
-        _save_state(telegram_id, network, state)
+        await _save_state_async(telegram_id, network, state)
         try:
             from src.nadobro.strategy import engine_runtime as _er_done
             if strategy in _er_done.ENGINE_MAPPED_STRATEGIES:
@@ -3408,7 +3473,7 @@ async def _run_cycle(
     state["last_action_detail"] = str(result.get("detail", ""))[:200]
     _merge_vol_order_counters(state, result)
     _update_order_observability(state, result)
-    _save_state(telegram_id, network, state)
+    await _save_state_async(telegram_id, network, state)
     drift_seconds = max(0.0, state["last_run_ts"] - last_run - interval) if last_run > 0 else 0.0
     if drift_seconds > 0:
         record_metric("runtime.cycle_drift_ms", drift_seconds * 1000.0)

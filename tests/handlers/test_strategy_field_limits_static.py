@@ -231,7 +231,12 @@ def test_conf_for_card_tolerates_a_missing_selection_and_a_bad_context():
     from src.nadobro.handlers.strategy_handler import _conf_for_card
     assert "product" not in _conf_for_card({"strategies": {"dn": {}}}, "dn",
                                            SimpleNamespace(user_data={}))
-    assert _conf_for_card({"strategies": {"dn": {}}}, "dn", object()) == {}
+    # A bad context still degrades to "no selection" rather than raising. The only
+    # key the overlay adds unconditionally is the effective leverage (CARD-LEV-
+    # DIVERGE) — display-only, and never a product it cannot know.
+    bad_ctx = _conf_for_card({"strategies": {"dn": {}}}, "dn", object())
+    assert "product" not in bad_ctx
+    assert set(bad_ctx) == {"leverage"}
 
 
 def test_the_dn_core_card_disclosure_is_LIVE_end_to_end(monkeypatch):
@@ -265,4 +270,7 @@ def test_every_card_conf_site_uses_the_helper():
         f"wired that way does not carry the selected product, so its "
         f"effective-size disclosure silently renders the pre-floor number."
     )
-    assert src.count("_conf_for_card(settings, strategy_id, context)") >= 7
+    # Prefix match, no closing paren: the helper grew a `network` argument for the
+    # effective-leverage overlay and a literal-with-paren guard broke on it. Match
+    # the call, not its arity.
+    assert src.count("_conf_for_card(settings, strategy_id, context") >= 7

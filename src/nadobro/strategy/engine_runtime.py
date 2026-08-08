@@ -27,6 +27,7 @@ from src.nadobro.engine.controllers.desk import DeskController
 from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
 from src.nadobro.engine.controllers.grid_trading import GridController
 from src.nadobro.engine.controllers.fill_anchored import FillAnchoredQuotingController
+from src.nadobro.engine.controllers.rgrid import RGridController
 from src.nadobro.engine.controllers.market_making import MarketMakingController
 from src.nadobro.engine.controllers.volume_bot import VolumeBotController
 from src.nadobro.engine.orchestrator import ExecutorOrchestrator
@@ -36,18 +37,24 @@ from src.nadobro.engine.risk import RiskEngine
 # quote-gate pause reasons rendered on /status and in gate notifications.
 from src.nadobro.engine.routines.regime_gate import GATE_REASON_HUMAN as GATE_REASON_HUMAN  # noqa: F401
 from src.nadobro.engine.types import RiskLimits, RiskState, TradeType, TripleBarrierConfig, _dec
+from src.nadobro.utils.env import env_float
 
 logger = logging.getLogger(__name__)
 
 # Strategy id (bot_runtime's keys) -> engine controller class.
 CONTROLLER_REGISTRY: Dict[str, type] = {
     "grid": GridController,
-    # rgrid = directional recycling ladder: long ladder in uptrends, short ladder
-    # in downtrends, multi-level, booking profit per level (user spec). That IS
-    # the DynamicGridController (same engine as D-Grid). The classic one-sided
-    # ReverseGridController is no longer the default; fill_anchored=1 opts into
-    # the trend-following taker momentum instead.
-    "rgrid": DynamicGridController,
+    # rgrid = Reverse Grid: its OWN controller and its own maker executor
+    # (engine/controllers/rgrid.py + executors/rgrid_maker_executor.py). Both legs
+    # REST post-only off the average of the buy and sell exposure prices — the bid
+    # above it, the ask below — so a break fills them without paying the spread.
+    # The one order that crosses is the armed trailing stop (MARKET, reduce-only),
+    # which has to act where a post-only order cannot rest. It does NOT switch
+    # between grid and reverse-grid phases;
+    # that switcher is D-Grid, and running rgrid on it (the pre-2026-08-06 wiring)
+    # is what produced "Reverse GRID switched RGRID → GRID … now quoting the LONG
+    # ladder" on users' R-Grid sessions.
+    "rgrid": RGridController,
     "dgrid": DynamicGridController,
     "mid": MarketMakingController,
     "dn": DeltaNeutralController,
@@ -116,9 +123,10 @@ def build_controller(
     controller_id: Optional[str] = None,
 ) -> Controller:
     cls = CONTROLLER_REGISTRY.get(strategy)
-    # Phase 4 opt-in: TreadFi-style fill-anchored quoting replaces the
-    # classic ladder for grid/rgrid when the user enables ``fill_anchored``.
-    if configs.get("controller_override") == "fill_anchored":
+    # Grid opt-in: fill-anchored maker quoting replaces the classic ladder when the
+    # user enables ``fill_anchored``. rgrid is NEVER overridden — Reverse Grid has
+    # exactly one engine, and the registry already points at it.
+    if strategy != "rgrid" and configs.get("controller_override") == "fill_anchored":
         cls = FillAnchoredQuotingController
     if cls is None:
         raise ValueError(f"no engine controller for strategy '{strategy}'")
@@ -467,18 +475,67 @@ async def _reset_mm_quotes(controller: Controller, orch: ExecutorOrchestrator) -
             setattr(controller, attr_price, None)
 
 
+def _apply_dgrid_controller_config(controller: Controller, configs: Dict[str, object]) -> None:
+    """Refresh DynamicGridController attrs that were read only at __init__.
+
+    Every one of these is a user-facing button (the Regime card: variance-ratio
+    thresholds, windows, drift, flip debounce, TP scale-out). They were captured
+    once at build time, so editing any of them mid-session changed the card and
+    nothing else until the user stopped and restarted the strategy — a silent
+    no-op on controls that look live.
+
+    The phase / confirm-streak RUNTIME state is deliberately NOT reset: clearing
+    the streak on every settings write would let a user poking at buttons defer a
+    pending flip indefinitely.
+    """
+    def _num(key: str, current: object, cast=float):
+        raw = configs.get(key)
+        if raw is None:
+            return current
+        try:
+            return cast(raw)
+        except (TypeError, ValueError):
+            return current
+
+    controller.short_window = _num("dgrid_short_window", controller.short_window, int)  # type: ignore[attr-defined]
+    controller.long_window = _num("dgrid_long_window", controller.long_window, int)  # type: ignore[attr-defined]
+    controller.trend_on_vr = _num("dgrid_trend_on_vr", controller.trend_on_vr)  # type: ignore[attr-defined]
+    controller.range_on_vr = _num("dgrid_range_on_vr", controller.range_on_vr)  # type: ignore[attr-defined]
+    controller.trend_drift_pct = _num("dgrid_trend_drift_pct", controller.trend_drift_pct)  # type: ignore[attr-defined]
+    controller.flip_confirm_ticks = _num("dgrid_flip_confirm_ticks", controller.flip_confirm_ticks, int)  # type: ignore[attr-defined]
+    controller.trail_arm_pct = _num("dgrid_trail_arm_pct", controller.trail_arm_pct)  # type: ignore[attr-defined]
+    controller.trail_giveback_pct = _num("dgrid_trail_giveback_pct", controller.trail_giveback_pct)  # type: ignore[attr-defined]
+    controller.reversal_flip_pct = _num("dgrid_reversal_flip_pct", controller.reversal_flip_pct)  # type: ignore[attr-defined]
+    controller.tp_fraction = min(1.0, max(0.0, _num("dgrid_tp_fraction", controller.tp_fraction)))  # type: ignore[attr-defined]
+    controller.signal_min_confidence = _num(  # type: ignore[attr-defined]
+        "dgrid_signal_min_confidence", controller.signal_min_confidence)
+    # Financial overlay read — refreshed every cycle so the flip debounce weighs
+    # THIS cycle's signal, not the one the controller was built with.
+    controller.signal_regime = str(configs.get("signal_regime", "") or "")  # type: ignore[attr-defined]
+    controller.signal_confidence = _num("signal_confidence", controller.signal_confidence)  # type: ignore[attr-defined]
+
+
+def _apply_rgrid_controller_config(controller: Controller, configs: Dict[str, object]) -> None:
+    """Refresh RGridController attrs read only at __init__, so a live settings edit
+    (spread, discretion, soft-reset threshold) takes effect on the next cycle.
+
+    The trail's RUNTIME state (armed flag, peak) is deliberately NOT touched: it
+    belongs to the open position, and re-arming the exit from scratch mid-run would
+    hand back profit the trail had already locked in.
+    """
+    _apply_mid_controller_config(controller, configs)
+    controller.reset_threshold_pct = _dec(configs.get("reset_threshold_pct", "0.002"))  # type: ignore[attr-defined]
+    controller.trail_enabled = bool(configs.get("trail_enabled", True))  # type: ignore[attr-defined]
+    controller.vwap_volume_fraction = _dec(configs.get("vwap_volume_fraction", "0") or "0")  # type: ignore[attr-defined]
+    # (signal_regime / signal_confidence are pushed every cycle before RUNTIME.tick,
+    # not here — they must never take part in the live-config signature.)
+
+
 def _apply_fill_anchored_controller_config(controller: Controller, configs: Dict[str, object]) -> None:
-    """Refresh FillAnchoredQuotingController attrs read only at __init__."""
+    """Refresh FillAnchoredQuotingController (grid maker) attrs read only at __init__."""
     _apply_mid_controller_config(controller, configs)
     controller.mode = str(configs.get("anchor_mode", getattr(controller, "mode", "grid"))).lower()  # type: ignore[attr-defined]
-    controller.reset_threshold_pct = _dec(  # type: ignore[attr-defined]
-        configs.get(
-            "reset_threshold_pct",
-            "0.0025" if getattr(controller, "mode", "grid") == "grid" else "0.00125",
-        )
-    )
-    controller.momentum = bool(configs.get("momentum", False))  # type: ignore[attr-defined]
-    controller.vwap_volume_fraction = _dec(configs.get("vwap_volume_fraction", "0") or "0")  # type: ignore[attr-defined]
+    controller.reset_threshold_pct = _dec(configs.get("reset_threshold_pct", "0.0025"))  # type: ignore[attr-defined]
     controller.concession_enabled = bool(configs.get("concession_enabled", False))  # type: ignore[attr-defined]
     controller.concession_escalation_ticks = max(1, int(configs.get("concession_escalation_ticks", 5) or 5))  # type: ignore[attr-defined]
     _cfrac = _dec(configs.get("concession_fraction", "0.5") or "0.5")  # type: ignore[attr-defined]
@@ -546,6 +603,12 @@ async def _apply_live_controller_update(
     controller.limits = limits
     _apply_orchestrator_risk_limits(orch, limits)
 
+    if isinstance(controller, RGridController):
+        # R-Grid rests nothing, so there are no quotes to reset — cancelling here
+        # would be a no-op that still churns the venue.
+        _apply_rgrid_controller_config(controller, configs)
+        return
+
     is_fill_anchored = (
         configs.get("controller_override") == "fill_anchored"
         or isinstance(controller, FillAnchoredQuotingController)
@@ -560,7 +623,9 @@ async def _apply_live_controller_update(
         await _reset_mm_quotes(controller, orch)
         return
 
-    if strategy in ("grid", "rgrid", "dgrid"):
+    if strategy in ("grid", "dgrid"):
+        if strategy == "dgrid":
+            _apply_dgrid_controller_config(controller, configs)
         await _apply_grid_live_config(strategy, controller, orch, configs, mid)
 
 
@@ -654,6 +719,19 @@ _LIVE_CONFIG_SIGNATURE_EXCLUDE = frozenset({
     # this helper.
     "restore_cycles_completed",
     "restore_funding_usd",
+    # FINANCIAL OVERLAY READ. ``signal_bias``/``signal_confidence`` are continuous
+    # floats recomputed from fresh candles every cycle (the in-progress 15m candle
+    # alone moves them), so including them flipped the signature on EVERY cycle —
+    # which routes into _apply_grid_live_config -> GridExecutor.recenter, i.e. a
+    # full cancel + re-place of the resting ladder every tick. That destroys queue
+    # position permanently (the ladder then only fills by adverse selection) and
+    # bypasses both throttles the controller owns: reset_threshold_bp and
+    # _DGRID_RECENTER_MIN_INTERVAL_S. It is the exact churn ``stabilize_overrides``
+    # exists to prevent. These are pushed onto the controller directly instead
+    # (see the unconditional refresh before RUNTIME.tick).
+    "signal_regime",
+    "signal_bias",
+    "signal_confidence",
 })
 
 
@@ -846,14 +924,48 @@ def map_strategy_config(
     # SL/TP honor the per-strategy fields (rgrid/dgrid store them under
     # rgrid_stop_loss_pct / rgrid_take_profit_pct), so a user's custom value
     # drives the barrier instead of the sl_pct/tp_pct default.
-    from src.nadobro.strategy.strategy_registry import effective_sl_tp_pct
+    from src.nadobro.strategy.strategy_registry import (
+        effective_sl_tp_pct, sltp_is_explicit,
+    )
     _sl_pct, _tp_pct = effective_sl_tp_pct(strategy, settings)
-    if _tp_pct <= 0:
+    # Only substitute a default when the user configured NOTHING. A key that is
+    # PRESENT and 0 is a deliberate disarm, and overriding it re-arms what they
+    # switched off — DGRID-TP-DISARM-PHANTOM: an explicit TP of 0 became 0.6, so
+    # D-Grid scaled out a third of the position at 0.2% of margin (a ~1bp move)
+    # for a user who had disarmed TP precisely to let a trend run. It also made
+    # dynamic_grid's documented "no TP set keeps the legacy tiers" branch
+    # unreachable from the mapper.
+    _sl_set, _tp_set = sltp_is_explicit(strategy, settings)
+    if _tp_pct <= 0 and not _tp_set:
         _tp_pct = _f(settings, "tp_pct", 0.6)
-    if _sl_pct <= 0:
+    if _sl_pct <= 0 and not _sl_set:
         _sl_pct = _f(settings, "sl_pct", 0.5)
-    tp = Decimal(str(_tp_pct)) / Decimal(100)
-    sl = Decimal(str(_sl_pct)) / Decimal(100)
+    # UNITS INVARIANT (CLAUDE.md): a user value is either a price-move barrier OR a
+    # %-of-margin rail — never both. ``_tp_pct`` / ``_sl_pct`` are the user's
+    # numbers and they are **% of MARGIN**: that is what the UI says, and it is what
+    # ``_evaluate_session_pnl_rail`` measures (live PnL incl. uPnL, net of fees).
+    #
+    # They therefore do NOT become an executor ``triple_barrier_config``. That
+    # barrier is a PRICE-return fraction from a single executor's avg entry
+    # (engine/types.py), which is a different quantity in two compounding ways:
+    #   * per LEVEL, not per session — with 4 levels and one filled, an 0.8% price
+    #     move is $0.20 on a $25 level while the user asked for an $0.80 stop, so
+    #     it fired ~``levels`` times early and paid taker fees to do it;
+    #   * leverage-blind — position notional is margin x leverage, so the same 0.8%
+    #     means 0.8% of margin at 1x and 39% at 49x.
+    # (Guardrail: DGRID-DUAL-UNIT-SLTP in tests/engine/test_sltp_invariants.py.)
+    #
+    # The session rail is the single enforcement point, exactly as it already is for
+    # rgrid and mid. The ladder's own per-level take-profit is unaffected: a filled
+    # BUY level is still closed by its paired SELL one step up.
+    #
+    # ``cfg["tp_pct"]`` / ``cfg["sl_pct"]`` stay PERCENTS below, because
+    # DynamicGridController._tp_tier_ladder reads tp_pct as a percent and compares
+    # the ladder against ``upnl_pct`` — also a percent. Handing it a /100 fraction
+    # made every tier 100x too small: with the shipped 1.2% TP the tiers landed at
+    # 0.004 / 0.008 / 0.012 % of margin, so D-Grid scaled out a third of the
+    # position on the first favourable tick and never let a winner run. Its
+    # controller tests pass a percent directly, so they never saw it.
 
     if strategy == "mid":
         # BIAS-TEXT-COERCION (2026-07-30): settings may carry the legacy TEXT
@@ -1139,36 +1251,152 @@ def map_strategy_config(
         }
     # grid / rgrid / dgrid family.
     #
-    # Phase 4 opt-in: fill-anchored quoting (TreadFi Grid/RGrid semantics).
-    # One bid + one ask around a fill-anchored reference instead of a static
-    # ladder; reset_threshold_pct uses TreadFi's defaults (0.25% grid /
-    # 0.125% rgrid) unless overridden.
-    # grid and rgrid both default to the MULTI-LEVEL recycling ladder (user
-    # choice, 2026-06). grid -> classic long ladder (GridController); rgrid ->
-    # dynamic directional ladder (DynamicGridController, via CONTROLLER_REGISTRY).
-    # The fill-anchored quoting (grid: single-pair maker with no-cross +
-    # soft-reset-to-mid / rgrid: trend-following taker momentum) is the opt-in
-    # via fill_anchored=1.
+    # REVERSE GRID — its own controller + taker executor (RGridController). Both
+    # legs price off the average of the buy/sell exposure prices and CROSS the
+    # spread on a break; it never switches phase (that is D-Grid), rests no
+    # ladder, and has no maker mode to opt out of.
+    if strategy == "rgrid":
+        # The threshold ARMS the trailing soft reset, and the controller refuses one
+        # that sits inside the entry band (an exit narrower than the trigger that
+        # opened the trade would arm before the break is even established). The old
+        # 0.125% default was BELOW 2 x the shipped 10bp spread, so a user who never
+        # touched the button had the soft reset silently disabled. Default to the
+        # registry's 0.2%, never below 2 x spread, so it is always armable.
+        _spread_pct = float(spread_frac * Decimal(100)) if spread_frac > 0 else 0.1
+        _reset_pct = _f(
+            settings, "rgrid_reset_threshold_pct",
+            _f(settings, "grid_reset_threshold_pct",
+               _f(settings, "reset_threshold_pct", max(0.2, 2.0 * _spread_pct))),
+        )
+        _band = spread_frac if spread_frac > 0 else Decimal("0.001")
+        # STEP vs STOP BUDGET. R-Grid crosses the spread on both legs, and the
+        # session stop is a % of MARGIN judged net of fees — so leverage buys size
+        # but not stop budget. At $100/49x/4 levels the $1,225 step costs $1.05 per
+        # round trip against a $0.80 stop: the session stopped out on the FIRST
+        # entry+exit whichever way price went. Cap the step so at least ~3 round
+        # trips fit inside the stop. Only ever shrinks it, and is skipped when the
+        # user disarmed their stop (no budget to size against).
+        from src.nadobro.quant.mm_quote_math import DEFAULT_MIN_ORDER_NOTIONAL_USD
+        from src.nadobro.quant.rgrid_sizing import (
+            TAKER_ROUND_TRIP_RATE, resolve_step_quote,
+        )
+        from src.nadobro.strategy.strategy_registry import (
+            effective_sl_tp_pct,
+            session_margin_usd,
+        )
+
+        _rg_sl_pct = max(0.0, effective_sl_tp_pct("rgrid", settings)[0])
+        # The budget must use the margin the RAIL measures against, NOT the
+        # deployment basis ``notional`` above. They resolve in opposite order
+        # (rail: notional_usd first; deployment: cycle_notional_usd first), so a
+        # user with a larger cycle size was sizing the cap against a budget 2.5x
+        # what the rail would enforce.
+        _rg_margin = session_margin_usd(settings) or notional
+        _step_plan = resolve_step_quote(
+            deployed_quote=deployed,
+            levels=levels,
+            chunk_quote=_chunk_dec,
+            stop_budget_usd=_rg_margin * _rg_sl_pct / 100.0,
+            min_step_usd=DEFAULT_MIN_ORDER_NOTIONAL_USD,
+            # R-Grid's own exit triggers a band away, so the cap must bound a full
+            # band of adverse move on the PYRAMID, not just its fees — otherwise
+            # the session rail always fires before the exit can trigger.
+            band_frac=_band,
+        )
+        # Derive the exposure ceiling from the same budget the step cap uses.
+        _rg_budget = _dec(str(_rg_margin * _rg_sl_pct / 100.0))
+        _rg_exposure_pct = _f(settings, "max_net_exposure_pct", 30.0)
+        if _rg_budget > 0 and deployed > 0:
+            _rg_move = _band + _dec(str(TAKER_ROUND_TRIP_RATE))
+            if _rg_move > 0:
+                _afford = _rg_budget / _rg_move          # USD of exposure
+                _rg_exposure_pct = min(
+                    _rg_exposure_pct,
+                    float(_afford / _dec(str(deployed)) * Decimal(100)),
+                )
+        if _step_plan.capped:
+            logger.info(
+                "rgrid step capped by the stop budget: %s -> %s (stop $%.2f, round "
+                "trip $%.2f, ~%.1f trips fit)%s",
+                _step_plan.uncapped, _step_plan.step, float(_step_plan.stop_budget_usd),
+                float(_step_plan.round_trip_cost), float(_step_plan.round_trips_in_budget),
+                " [FLOORED at the venue minimum — the stop is too tight for any "
+                "placeable size]" if _step_plan.floored else "",
+            )
+        return {
+            "trading_pair": product,
+            # Kept so /status, the live-reconfig router and the overlay keep
+            # recognising this as the exposure-anchored family.
+            "controller_override": "fill_anchored",
+            "anchor_mode": "rgrid",
+            # Maker on both legs, post-only. Kept as an explicit key so a config
+            # dump shows the execution model rather than implying it.
+            "passive_only": True,
+            "trail_enabled": True,     # the documented soft reset
+            "reset_threshold_pct": Decimal(str(_reset_pct)) / Decimal(100),
+            # The trigger offset from the exposure average, per leg.
+            "spread_bid_pct": _band,
+            "spread_ask_pct": _band,
+            # ONE resting quote of this size per break: deployed/levels, shrunk by
+            # a POV chunk and by the stop budget (see resolve_step_quote above).
+            # Never grown by either. The step is priced against the TAKER round
+            # trip even though both legs are makers — a deliberately conservative
+            # bound, and the one order that does cross (the trailing stop) is
+            # therefore already inside the budget.
+            "order_amount_quote": _step_plan.step,
+            # The risk-bound the overlay may not exceed (see _maybe_apply_overlay).
+            "step_capped_quote": _step_plan.step,
+            # Surfaced so /status and the config card can explain a step that is
+            # smaller than margin x leverage / levels.
+            "step_uncapped_quote": _step_plan.uncapped,
+            "step_capped_by_stop": bool(_step_plan.capped),
+            "step_below_venue_minimum": bool(_step_plan.floored),
+            "ladder_levels": 1,        # no resting ladder
+            "min_quote_lifetime_s": _min_quote_lifetime_s(strategy, settings),
+            "price_distance_tolerance": (spread_frac / Decimal(2)) or Decimal("0.0005"),
+            "leverage": int(eff_lev),
+            # Exposure-price window. Spec: "a rolling VWAP over the most recent
+            # portion of filled volume (e.g. last 12% of quantity when discretion is
+            # 0.06)" — the window is discretion on EACH side, so the volume fraction
+            # is 2x the knob. Clamped to the whole retained window.
+            "vwap_volume_fraction": min(
+                1.0, max(0.0, _f(settings, "rgrid_discretion", 0.0)) * 2.0
+            ),
+            **_quote_defense_defaults(settings, deployed, auto_spread=spread_frac <= 0),
+            # THE CEILING THE STEP CAP CANNOT REACH — after the defaults on
+            # purpose, so this wins the dict literal.
+            # R-Grid has no break counter: it adds one step per break until the
+            # NET-EXPOSURE CAP stops it, and that cap is step-INDEPENDENT. A bound
+            # written as ``levels * step`` therefore models a pyramid the strategy
+            # never stops at: at $100/50x the modelled $400 is really $1,500 (15
+            # steps), where ONE crossing exit costs 81% of a 0.8% stop and a single
+            # band of adverse move costs 3.5x it. Shrinking the step cannot fix
+            # that — it just takes more breaks to reach the same ceiling. So bound
+            # the CAP: hold only the exposure that a band of adverse move plus the
+            # round trip can afford out of the stop budget. min() with the user's
+            # setting, so this only ever tightens.
+            "max_net_exposure_pct": _rg_exposure_pct,
+            # The regime gate would pause momentum exactly when it must act. OFF
+            # unless the user (or the overlay's suppress posture) re-arms it; the
+            # net-exposure cap, the trailing soft reset and the session SL/TP rails
+            # are the backstops.
+            **({"regime_gate_enabled": 0.0} if "regime_gate_enabled" not in settings else {}),
+        }
+    #
+    # GRID's fill-anchored maker mode (FillAnchoredQuotingController) — opt-in via
+    # fill_anchored=1. Default for grid is the classic multi-level recycling ladder.
     _fa_default = 0.0
-    if strategy in ("grid", "rgrid") and bool(_f(settings, "fill_anchored", _fa_default)):
+    if strategy == "grid" and bool(_f(settings, "fill_anchored", _fa_default)):
         from src.nadobro.quant.mm_quote_math import _resolve_directional_bias_value
 
-        default_reset = 0.25 if strategy == "grid" else 0.125
-        # The UI writes the reset threshold under per-strategy keys
-        # (grid_reset_threshold_pct / rgrid_reset_threshold_pct), but the
-        # fill-anchored controller reads ``reset_threshold_pct``. Read the UI
-        # keys here so the "Reset Threshold" button actually drives the soft
-        # reset — previously a silent no-op: the controller always fell back to
-        # the hardcoded default because nothing translated the key. Percent →
+        default_reset = 0.25
+        # The UI writes the reset threshold under ``grid_reset_threshold_pct`` but
+        # the controller reads ``reset_threshold_pct``; translate here so the
+        # "Reset Threshold" button actually drives the soft reset. Percent →
         # fraction. (Also fixes live edits: _apply_fill_anchored_controller_config
         # refreshes from this same mapped value each cycle.)
-        if strategy == "rgrid":
-            _reset_pct = _f(settings, "rgrid_reset_threshold_pct",
-                            _f(settings, "grid_reset_threshold_pct",
-                               _f(settings, "reset_threshold_pct", default_reset)))
-        else:
-            _reset_pct = _f(settings, "grid_reset_threshold_pct",
-                            _f(settings, "reset_threshold_pct", default_reset))
+        _reset_pct = _f(settings, "grid_reset_threshold_pct",
+                        _f(settings, "reset_threshold_pct", default_reset))
         return {
             "trading_pair": product,
             "controller_override": "fill_anchored",
@@ -1190,15 +1418,9 @@ def map_strategy_config(
             # sizing it has always had.
             # rgrid fires ONE taker of this size per break, so its step stays
             # deployed/levels. A POV chunk may only make that step SMALLER:
-            # the $1000 throughput floor is capped at the deployed budget, so
-            # an unclamped chunk turned a $25 step into the entire $100 budget
-            # — one break at 3.3x the net-exposure cap, and 4x the taker fee.
-            "order_amount_quote": (
-                min(_chunk_dec or Decimal(str(deployed)), Decimal(str(deployed)) / Decimal(levels))
-                if strategy == "rgrid"
-                else (_chunk_dec or Decimal(str(deployed)))
-            ),
-            "ladder_levels": 1 if strategy == "rgrid" else levels,
+            # the $1000 throughput floor is capped at the deployed budget.
+            "order_amount_quote": _chunk_dec or Decimal(str(deployed)),
+            "ladder_levels": levels,
             # Step by the quoted spread, so level i sits at the anchor ± (i+1)
             # spreads — the same geometry as the classic grid ladder.
             "ladder_step_bp": (spread_frac if spread_frac > 0 else Decimal("0.001")) * Decimal(10000),
@@ -1206,43 +1428,25 @@ def map_strategy_config(
             "min_quote_lifetime_s": _min_quote_lifetime_s(strategy, settings),
             "price_distance_tolerance": (spread_frac / Decimal(2)) or Decimal("0.0005"),
             "leverage": int(eff_lev),
-            # rgrid → taker-momentum (buy the break up / sell the break down).
-            # grid stays maker (no-cross spread capture).
-            "momentum": strategy == "rgrid",
-            # Exposure-price VWAP window from the user's discretion knob (now
-            # live; previously a dead input). Only meaningful for rgrid.
-            "vwap_volume_fraction": (
-                _f(settings, "rgrid_discretion", 0.0) if strategy == "rgrid" else 0.0
-            ),
-            # Grid two-step stall escalation: after the soft-reset maker leg
-            # stalls for N ticks, a bounded reduce-only taker concession flattens
-            # part of the one-sided exposure before the SL rail. Grid only
-            # (rgrid is momentum-driven, no soft reset).
-            # Directional bias. Grid's registry carries a directional_bias
-            # setting that nothing read — the fill-anchored controller now
-            # applies the same skew Mid does, so honour it (and the overlay's
-            # signal, which lands on this same key). rgrid is momentum-driven
-            # and ignores it. NOTE: unlike Mid, grid's net-exposure cap is NOT
-            # scaled up by |bias| — the lean works inside the cap the user
-            # already has, so enabling this cannot raise anyone's exposure.
-            "directional_bias": (
-                _resolve_directional_bias_value(settings.get("directional_bias"))
-                if strategy == "grid" else 0.0
-            ),
-            "concession_enabled": strategy == "grid",
+            "momentum": False,          # grid is a maker book (no-cross capture)
+            # Directional bias. Grid's registry carries a directional_bias setting
+            # that nothing read — the fill-anchored controller applies the same skew
+            # Mid does, so honour it (and the overlay's signal, which lands on this
+            # same key). NOTE: unlike Mid, grid's net-exposure cap is NOT scaled up
+            # by |bias| — the lean works inside the cap the user already has, so
+            # enabling this cannot raise anyone's exposure.
+            "directional_bias": _resolve_directional_bias_value(settings.get("directional_bias")),
+            # Two-step stall escalation: after the soft-reset maker leg stalls for N
+            # ticks, a bounded reduce-only taker concession flattens part of the
+            # one-sided exposure before the SL rail.
+            "concession_enabled": True,
             "concession_escalation_ticks": int(max(1.0, _f(settings, "grid_concession_ticks", 5.0))),
             "concession_fraction": _f(settings, "grid_concession_fraction", 0.5),
             **_quote_defense_defaults(settings, deployed, auto_spread=spread_frac <= 0),
-            # Keep the regime gate OFF: rgrid is a trend strategy (the gate would
-            # pause momentum exactly when it must act), and grid is the
-            # GRID-IN-TRENDS default (quote in every regime; inventory cap +
-            # soft-reset + session SL/TP rail are the backstops). Both honor an
-            # explicit user override (regime_gate_enabled=1 re-arms it).
-            **(
-                {"regime_gate_enabled": 0.0}
-                if (strategy == "rgrid" or (strategy == "grid" and "regime_gate_enabled" not in settings))
-                else {}
-            ),
+            # GRID-IN-TRENDS default: quote in every regime (inventory cap +
+            # soft-reset + session SL/TP rail are the backstops). An explicit
+            # regime_gate_enabled=1 re-arms the gate.
+            **({"regime_gate_enabled": 0.0} if "regime_gate_enabled" not in settings else {}),
         }
     #
     # NO_ORDERS_AUDIT-FIX-R4: spread_bp is now interpreted as the per-level
@@ -1253,10 +1457,6 @@ def map_strategy_config(
     #                         span = (levels - 1) * spread_frac
     #                         start = mid * (1 - span)  (lo)
     #                         end   = mid               (hi)  — all buys ≤ mid
-    #
-    #   * rgrid (SELL, short): N levels stepping UP from mid.
-    #                         start = mid                    (lo)
-    #                         end   = mid * (1 + span)       (hi)  — all sells ≥ mid
     #
     #   * dgrid: side is chosen dynamically per tick. We DON'T fix the band
     #     here; instead we pass ``step_pct`` and ``levels_count`` so the
@@ -1279,10 +1479,12 @@ def map_strategy_config(
     # user's sl_pct. That stop is referenced to the run/rebuild mid and ignores
     # how much of the grid has actually filled, so it fires on a brief wick to
     # mid*(1-sl) even when little is at risk — a premature stop-out on top of the
-    # session margin-% rail. SL is now governed consistently by (a) the executor
-    # avg-entry barrier (triple_barrier_config.stop_loss, fill-aware) and (b) the
-    # fee-aware session rail. limit_price stays available as an explicit
-    # catastrophic stop but is no longer auto-set from sl.
+    # session margin-% rail. SL is now governed by the fee-aware %-of-margin
+    # session rail ALONE — the executor avg-entry barrier this comment used to
+    # name second is no longer constructed for the ladder either (DGRID-DUAL-UNIT,
+    # 2026-08-06: one user number must be a price barrier OR a margin rail, never
+    # both). limit_price stays available as an explicit catastrophic stop but is
+    # no longer auto-set from sl.
     # POST-ONLY-CROSS fix: the boundary level nearest mid must be a strict maker,
     # or a post-only LIMIT_MAKER placed AT mid crosses the book and the venue
     # rejects it (error_code 2008 — seen on every rgrid SELL and, once grids
@@ -1290,14 +1492,12 @@ def map_strategy_config(
     # least half a grid step (floored at 1.5 bp) onto the maker side: buys
     # strictly below mid, sells strictly above.
     maker_offset = max(spread_frac / Decimal(2), Decimal("0.00015"))
-    if strategy == "rgrid":
-        start_price = mid * (Decimal(1) + maker_offset)
-        end_price = mid * (Decimal(1) + maker_offset + span)
-        limit_price = Decimal(0)
-    else:  # grid OR dgrid-as-long-default; dgrid recomputes at on_tick
-        start_price = mid * (Decimal(1) - maker_offset - span)
-        end_price = mid * (Decimal(1) - maker_offset)
-        limit_price = Decimal(0)
+    # Only grid and dgrid reach here (rgrid returned above with its
+    # exposure-anchored config): a long band stepping DOWN from mid. dgrid
+    # recomputes the side-correct band against a fresh mid at on_tick.
+    start_price = mid * (Decimal(1) - maker_offset - span)
+    end_price = mid * (Decimal(1) - maker_offset)
+    limit_price = Decimal(0)
 
     cfg: Dict[str, object] = {
         "trading_pair": product,
@@ -1310,24 +1510,26 @@ def map_strategy_config(
         "min_spread_between_orders": spread_frac,
         "max_open_orders": levels,
         "leverage": int(eff_lev),
-        # Continuous laddering for the whole GridExecutor family (classic grid &
-        # rgrid when fill_anchored=0, and D-Grid): re-arm round-tripped levels so
+        # Continuous laddering for the whole GridExecutor family (classic grid
+        # and D-Grid): re-arm round-tripped levels so
         # the ladder keeps working its band instead of draining to COMPLETE and
         # terminating. Bounded by the net-exposure cap + session rails. (Default
         # grid/rgrid run the fill-anchored controller, which already re-quotes
         # every tick; Mid is the market-making controller, likewise continuous —
         # this flag only affects the multi-level ladder executor.)
         "recycle_levels": True,
-        "triple_barrier_config": TripleBarrierConfig(
-            take_profit=tp or None, stop_loss=sl or None
-        ),
+        # No ``triple_barrier_config``: the user's SL/TP are %-of-margin session
+        # rails, never also a per-level price barrier (see the UNITS INVARIANT note
+        # above). GridExecutorConfig defaults it to None and every read is guarded.
         # NO_ORDERS_AUDIT-FIX-R4: extra knobs consumed by DynamicGridController
         # so it can rebuild the side-correct band on the fly. Ignored by
-        # GridController / ReverseGridController.
+        # GridController / ShortLadderController.
         "step_pct": spread_frac,
         "levels_count": levels,
-        "tp_pct": tp,
-        "sl_pct": sl,
+        # PERCENT of margin (not the price fraction above) — this is what
+        # DynamicGridController's tiered scale-out measures uPnL against.
+        "tp_pct": float(_tp_pct),
+        "sl_pct": float(_sl_pct),
         # Regime gate + inventory cap + ATR auto-step (2026-06 upgrade).
         # margin_quote = DEPLOYED notional so the net-exposure cap scales with
         # leverage instead of choking a leveraged ladder at 30% of collateral.
@@ -1341,30 +1543,22 @@ def map_strategy_config(
     # ``client.get_candlesticks(...)``; setting ``"candle_provider": None``
     # here makes the contract explicit and lets the cycle driver inject the
     # real provider on first start.
-    if strategy in ("dgrid", "rgrid"):
-        # Both run the SAME dynamic directional-ladder engine (DynamicGridController:
-        # long ladder in uptrends, short in downtrends), but with DIFFERENT default
-        # tuning so the two products stay distinct:
-        #   * rgrid = PURE trend-direction ladder — reacts sooner and flips faster
-        #     (lower VR/drift thresholds, shorter windows, 1-tick flip confirm,
-        #     earlier trailing-reversal), so it spends less time in the neutral
-        #     mean-reversion grid and tracks the trend direction aggressively.
-        #   * dgrid = VOLATILITY-BALANCED switcher — steadier thresholds and slower
-        #     flips, so it mean-reverts (long grid) in ranges and only goes
-        #     directional on a clearer volatility-regime signal.
-        # Any explicit user setting still overrides these per-strategy defaults.
-        _rg = strategy == "rgrid"
+    if strategy == "dgrid":
+        # D-Grid is the phase SWITCHER: a volatility-balanced classifier that
+        # mean-reverts with a long ladder in ranges and flips to a short ladder on
+        # a clear directional signal. R-Grid used to share this engine, which is
+        # why R-Grid users were told "switched RGRID → GRID"; it now runs its own
+        # exposure-anchored controller and never reaches this branch.
         cfg["candle_provider"] = None
         # (recycle_levels is set for the whole GridExecutor family above.)
-        cfg["dgrid_short_window"] = int(max(2, _f(settings, "dgrid_short_window_points", 3 if _rg else 4)))
-        cfg["dgrid_long_window"] = int(max(4, _f(settings, "dgrid_long_window_points", 8 if _rg else 12)))
-        cfg["dgrid_trend_on_vr"] = _f(settings, "dgrid_trend_on_variance_ratio", 1.10 if _rg else 1.25)
-        cfg["dgrid_range_on_vr"] = _f(settings, "dgrid_range_on_variance_ratio", 1.05 if _rg else 1.15)
+        cfg["dgrid_short_window"] = int(max(2, _f(settings, "dgrid_short_window_points", 4)))
+        cfg["dgrid_long_window"] = int(max(4, _f(settings, "dgrid_long_window_points", 12)))
+        cfg["dgrid_trend_on_vr"] = _f(settings, "dgrid_trend_on_variance_ratio", 1.25)
+        cfg["dgrid_range_on_vr"] = _f(settings, "dgrid_range_on_variance_ratio", 1.15)
         # Sustained-drift trend filter: flip the grid direction on a slow one-way
         # grind the variance ratio misses (a steady decline keeps VR<1 yet bleeds
-        # a long grid). Percent over the long window; 0 disables. rgrid catches it
-        # earlier (0.15%) so it turns with the trend sooner.
-        cfg["dgrid_trend_drift_pct"] = _f(settings, "dgrid_trend_drift_pct", 0.15 if _rg else 0.30)
+        # a long grid). Percent over the long window; 0 disables.
+        cfg["dgrid_trend_drift_pct"] = _f(settings, "dgrid_trend_drift_pct", 0.30)
         # Tiered profit-booking: scale out reduce-only as the run's uPnL climbs
         # past these tiers, closing dgrid_tp_fraction each time. The tiers are
         # ANCHORED to the user's TP in the controller (top tier == tp_pct), so
@@ -1375,18 +1569,27 @@ def map_strategy_config(
         # The user's allocated MARGIN (= notional), so the controller measures
         # the tier % against the SAME basis as the session TP rail — NOT the
         # deployed notional (margin x leverage) that margin_quote carries.
-        cfg["tp_margin_basis"] = Decimal(str(notional))
-        # Confirm-ticks debounce a flip. rgrid flips on the first confirmed change
-        # (trend follower); dgrid waits an extra tick to avoid whipsaw.
-        cfg["dgrid_flip_confirm_ticks"] = int(max(1, _f(settings, "dgrid_flip_confirm_ticks", 1 if _rg else 2)))
+        # The tier ladder is anchored to the user's TP, so its denominator MUST be
+        # the margin the session rail measures against — not the deployment basis
+        # ``notional``, which resolves cycle-first while the rail resolves
+        # notional-first. With cycle_notional_usd=250 and notional_usd=100 the
+        # tiers demanded $1/$2/$3 of uPnL while the rail took profit at $1.20 (the
+        # ladder dead above rung one); with cycle 50 they fired at half the user's
+        # TP. Same hazard the R-Grid step cap already fixed above.
+        from src.nadobro.strategy.strategy_registry import (
+            session_margin_usd as _rail_margin_usd,
+        )
+
+        cfg["tp_margin_basis"] = Decimal(str(_rail_margin_usd(settings) or notional))
+        # Confirm-ticks debounce a flip: wait an extra tick to avoid whipsaw.
+        cfg["dgrid_flip_confirm_ticks"] = int(max(1, _f(settings, "dgrid_flip_confirm_ticks", 2)))
         # Trend-capture redesign (2026-06): as a run goes in profit, ratchet a
         # trailing take-profit so a reversal still closes green, and flip
         # long<->short on a confirmed price reversal from the run's extreme
         # (faster than waiting for the variance classifier to cross). Percents.
-        # rgrid arms sooner and flips on a smaller reversal (it chases the trend).
-        cfg["dgrid_trail_arm_pct"] = _f(settings, "dgrid_trail_arm_pct", 0.5 if _rg else 1.0)
+        cfg["dgrid_trail_arm_pct"] = _f(settings, "dgrid_trail_arm_pct", 1.0)
         cfg["dgrid_trail_giveback_pct"] = _f(settings, "dgrid_trail_giveback_pct", 0.5)
-        cfg["dgrid_reversal_flip_pct"] = _f(settings, "dgrid_reversal_flip_pct", 0.3 if _rg else 0.4)
+        cfg["dgrid_reversal_flip_pct"] = _f(settings, "dgrid_reversal_flip_pct", 0.4)
         # Reset re-center drives an IN-PLACE re-quote of the resting ladder
         # (GridExecutor.recenter) — no flatten, no realized loss — so it can
         # follow price closely without bleeding fees. Pass the user's explicit
@@ -1395,11 +1598,13 @@ def map_strategy_config(
         # price as it trends instead of going stale ("placed a few orders and
         # stopped"). 50bp was too coarse — BTC rarely drifts that far inside one
         # 30-60s tick, so it almost never re-centered.
-        _reset_key = "rgrid_reset_threshold_pct" if strategy == "rgrid" else "grid_reset_threshold_pct"
         cfg["dgrid_reset_threshold_bp"] = _f(
             settings, "dgrid_reset_threshold_bp",
-            _f(settings, _reset_key, 0.0) * 100.0,
+            _f(settings, "grid_reset_threshold_pct", 0.0) * 100.0,
         )
+        # Financial overlay: below this confidence its read is not worth an extra
+        # confirm tick on a flip (see DynamicGridController._required_confirm_ticks).
+        cfg["dgrid_signal_min_confidence"] = _f(settings, "dgrid_signal_min_confidence", 0.45)
         # Dynamic Grid's own min/max per-side spread bounds drive the auto-spread
         # clamp (previously dead — _quote_defense_defaults hardcoded the band).
         _dg_floor = Decimal(str(max(0.0, _f(settings, "dgrid_min_spread_bp", 2.0)))) / Decimal(10000)
@@ -1410,8 +1615,8 @@ def map_strategy_config(
     # GRID in-place re-center: honor the user's reset threshold so the classic
     # long ladder follows price ("reset and continue") instead of going stale.
     # Drives GridExecutor.recenter (no flatten); the controller floors it above
-    # the band. (rgrid now runs DynamicGridController — its re-center is wired
-    # via dgrid_reset_threshold_bp in the block above.)
+    # the band. (rgrid never reaches here — it runs the exposure-anchored
+    # controller, where the same knob arms its trailing soft reset.)
     if strategy == "grid":
         # Re-center ON by default: pass the user's explicit reset through, else 0
         # so the controller uses its band-width auto-follow (50bp was too coarse —
@@ -1483,9 +1688,13 @@ def map_risk_limits(
     # budget, and from levels=3 up the deep ask rungs were rejected every tick
     # with `risk:max_open_executors` — a permanent 2:1 long-skewed book that
     # accumulates inventory in a downtrend with half the depth to unwind it.
-    # Mid ladders unconditionally; grid/rgrid only on the fill-anchored path.
+    # Mid ladders unconditionally; GRID only on its fill-anchored path. rgrid is
+    # excluded on purpose: it rests exactly one quote per side (ladder_levels=1)
+    # and its own toggle was removed, so an fill_anchored=1 left behind in a
+    # user's bot_state from that removed button would otherwise still double
+    # R-Grid's executor budget for a book that never uses it.
     _laddered = strategy == "mid" or (
-        strategy in ("grid", "rgrid") and bool(_f(settings, "fill_anchored", 0.0))
+        strategy == "grid" and bool(_f(settings, "fill_anchored", 0.0))
     )
     _executor_budget = (2 * levels + 2) if _laddered else (levels + 2)
     return RiskLimits(
@@ -1746,7 +1955,16 @@ _OVERLAY_FUNDING_TTL = 300.0
 _OVERLAY_FUNDING_CACHE: Dict[tuple, tuple[float, Optional[float]]] = {}
 # Persist the overlay signal only when the APPLIED action changed, plus a
 # heartbeat so Night HOWL still sees a quiet-but-alive overlay.
-_OVERLAY_PERSIST_HEARTBEAT = 600.0
+#
+# The heartbeat doubles as the sampling floor for signal grading
+# (``llm/signal_scorer.py``): every row written here becomes one labeled example
+# per horizon, so a quiet regime still produces evidence instead of a gap.
+# 10 minutes is denser than the shortest graded horizon (15m), which is
+# deliberate — but it also means consecutive rows share most of their forward
+# window, so grades are strongly autocorrelated and the effective sample size is
+# well below the row count. ``quant/scoring.MIN_SAMPLES_FOR_TRUST`` is the floor
+# for acting on a metric; treat it as a lower bound, not a guarantee.
+_OVERLAY_PERSIST_HEARTBEAT = env_float("NADO_OVERLAY_PERSIST_HEARTBEAT_SECONDS", 600.0)
 
 
 async def _maybe_apply_overlay(
@@ -1844,6 +2062,15 @@ async def _maybe_apply_overlay(
             base_sl_pct=(base_sl if base_sl > 0 else 0.5),
             base_tp_pct=(base_tp if base_tp > 0 else 1.0),
         )
+        # ADVISORY TIER (NanoGPT / DMind). Read-through cache: a HIT shades the
+        # deterministic signal in the risk-REDUCING direction only; a MISS returns
+        # it untouched and refreshes in the background, so a cycle never waits on
+        # inference. Disabled or unconfigured ⇒ no change at all.
+        from src.nadobro.llm.signal_advisor import advise as _advise
+
+        signal, advisor_verdict = await _advise(
+            signal, features, network=network, product=product
+        )
         overrides = compute_overrides(strategy, signal)
         # USER-BIAS-WINS (2026-07-30): Mid's directional_bias is a user-facing
         # Long/Short/Neutral control, but the overlay stamped the AI signal's
@@ -1869,6 +2096,20 @@ async def _maybe_apply_overlay(
         applied_changed = applied != prev_applied
         state["overlay_applied"] = applied
         changed = apply_overrides_to_configs(strategy, configs, overrides)
+        # Hand the signal's READ (not just its effects) to the controllers that can
+        # use it: D-Grid weighs it when deciding whether to flip phase, R-Grid and
+        # the cards surface it so a decision can be explained after the fact.
+        configs["signal_regime"] = str(signal.regime)
+        configs["signal_bias"] = float(signal.bias)
+        configs["signal_confidence"] = float(signal.confidence)
+        if advisor_verdict is not None:
+            state["overlay_advisor"] = {
+                "provider": advisor_verdict.get("provider"),
+                "agree": bool(advisor_verdict.get("agree", True)),
+                "confidence_delta": float(advisor_verdict.get("confidence_delta") or 0.0),
+            }
+        else:
+            state.pop("overlay_advisor", None)
 
         # OVERLAY-SIZE-VS-RISK-CAP (2026-07-30): the overlay's size_factor can
         # scale order_amount_quote up to 1.25x, but ``limits`` were mapped from
@@ -1883,6 +2124,20 @@ async def _maybe_apply_overlay(
         if _cap is not None and _oaq is not None and Decimal(str(_oaq)) > _cap:
             configs["order_amount_quote"] = _cap
             changed["order_amount_quote"] = str(_cap)
+        # R-GRID STEP CAP is a RISK bound, not a preference: the step was sized so
+        # one taker round trip stays inside the session stop budget. The overlay's
+        # size_factor (up to 1.25x) is applied AFTER that and is otherwise only
+        # clamped back to max_single_order_quote, which sits far above the capped
+        # step — so a confident signal quietly turned a "33% of the stop per round
+        # trip" budget into ~41%. The overlay may shrink the step, never grow it
+        # past what the stop can absorb. (Audit 2026-08-06.)
+        if strategy == "rgrid":
+            _step_cap = configs.get("step_capped_quote")
+            if _step_cap is not None and _oaq is not None:
+                _now = Decimal(str(configs.get("order_amount_quote")))
+                if _now > Decimal(str(_step_cap)):
+                    configs["order_amount_quote"] = Decimal(str(_step_cap))
+                    changed["order_amount_quote"] = str(_step_cap)
 
         # Surface the regime-adjusted barriers to the session SL/TP rail (which
         # reads state, not configs). Persisted with state at end of cycle, so
@@ -2449,6 +2704,22 @@ async def _run_engine_cycle_locked(
                     "engine live config updated user=%s network=%s strategy=%s",
                     telegram_id, network, strategy,
                 )
+
+    # Overlay read -> controller, every cycle and OUTSIDE the live-config path.
+    # D-Grid weighs it when deciding a flip and R-Grid surfaces it on /status, but
+    # neither may cost a venue round trip: this is a pure attribute write, whereas
+    # letting it flip the config signature re-quotes the whole ladder (see
+    # _LIVE_CONFIG_SIGNATURE_EXCLUDE).
+    try:
+        _sig_ctrl = RUNTIME._controllers.get((telegram_id, network, strategy))  # noqa: SLF001
+        if _sig_ctrl is not None and hasattr(_sig_ctrl, "signal_regime"):
+            _sig_ctrl.signal_regime = str(configs.get("signal_regime", "") or "")
+            try:
+                _sig_ctrl.signal_confidence = float(configs.get("signal_confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                _sig_ctrl.signal_confidence = 0.0
+    except Exception:  # noqa: BLE001  # policy: degrade-ok(advisory read; the tick must run)
+        logger.debug("overlay signal push failed", exc_info=True)
 
     await RUNTIME.tick(telegram_id, network, strategy)
     # Regime-gate transition: surfaced exactly once per QUOTE<->PAUSE flip so

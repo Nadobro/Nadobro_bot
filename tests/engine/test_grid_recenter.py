@@ -14,7 +14,7 @@ from decimal import Decimal
 from tests.engine._mock_nado import MockNadoAdapter
 
 from src.nadobro.engine.controllers.grid_trading import GridController
-from src.nadobro.engine.controllers.reverse_grid import ReverseGridController
+from src.nadobro.engine.controllers.short_ladder import ShortLadderController
 from src.nadobro.engine.executors.grid_executor import (
     GridExecutor,
     GridExecutorConfig,
@@ -147,7 +147,7 @@ def test_grid_controller_recenters_in_place_and_reports_telemetry():
     async def body():
         adapter = MockNadoAdapter(mid=Decimal("100"), auto_fill_market=False)
         orch = ExecutorOrchestrator()
-        c = ReverseGridController(
+        c = ShortLadderController(
             user_id=1, orchestrator=orch, adapter=adapter, inventory=InventoryRepository(),
             configs=_ctrl_cfg(reset_threshold_bp=200.0), controller_id="RG",
         )

@@ -1,8 +1,8 @@
 """News connectors for the Morning Brief / multi-source news intelligence layer.
 
 Each connector exposes a synchronous `fetch(limit: int = 10) -> list[NewsItem]`
-that never raises — failures return `[]`. The aggregator wraps these in
-`asyncio.to_thread` for parallel fan-out.
+that never raises — failures return `[]`. The aggregator runs these on the
+background thread pool (`core.async_utils.run_blocking_bg`) for parallel fan-out.
 """
 
 from __future__ import annotations

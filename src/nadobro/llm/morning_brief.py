@@ -244,7 +244,14 @@ async def render_morning_brief(
     try:
         from src.nadobro.llm.bro_llm import chat_json
 
-        parsed, _provider = await asyncio.to_thread(chat_json, messages, None, None)
+        # Background pool, not asyncio.to_thread: the implicit default executor is
+        # only cpu_count+4 (=5) threads on the production VM and is shared with
+        # the engine's gateway IO. A minutes-long brief call parked there starved
+        # strategy ticks and Telegram taps. (Lazy import: llm/ has no
+        # module-level edge to core/ — tests/lint/test_architecture_layers.py.)
+        from src.nadobro.core.async_utils import run_blocking_bg
+
+        parsed, _provider = await run_blocking_bg(chat_json, messages, None, None)
     except Exception as exc:
         logger.warning("morning brief LLM call failed: %s", exc)
 

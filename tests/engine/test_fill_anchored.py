@@ -1,14 +1,16 @@
-"""Fill-anchored quoting controller (Phase 4 — TreadFi Grid/RGrid semantics).
+"""Fill-anchored quoting controller — Grid's single-pair maker mode.
 
-Pins the four behaviors that define the mode:
-1. The reference price re-anchors to the LAST FILL (grid mode).
-2. The no-cross invariant: never buy above the last sell / sell below the
-   last buy — every round trip must capture spread.
+Pins the behaviours that define it:
+1. The reference price re-anchors to the LAST FILL.
+2. The no-cross invariant: never buy above the last sell / sell below the last
+   buy — every round trip must capture spread.
 3. Soft reset: when mid drifts past reset_threshold_pct from the reference,
-   quotes re-anchor to mid (no flatten, no restart).
-4. RGrid mode references the exposure VWAP of recent fills.
-Plus the engine_runtime opt-in mapping (controller_override + TreadFi
-default reset thresholds).
+   quotes re-anchor to mid (no flatten, no restart), and only the BEHIND leg
+   drops its no-cross clamp.
+4. Stall escalation: a bounded reduce-only taker concession before the SL rail.
+
+Reverse Grid lives in tests/engine/test_rgrid_controller.py — it is a different
+strategy with its own controller and taker executor.
 """
 from __future__ import annotations
 
@@ -117,150 +119,20 @@ def test_soft_reset_reanchors_to_mid_beyond_threshold():
     asyncio.run(body())
 
 
-def test_rgrid_mode_uses_exposure_vwap():
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(101), auto_fill_market=False)
-        orch, c = _controller(adapter, mode="rgrid")
-        await orch.spawn_controller(c)
-        c._fills.append((Decimal(100), Decimal(1)))
-        c._fills.append((Decimal(102), Decimal(1)))
-        assert c.anchor_state()["exposure_vwap"] == Decimal(101)
-        await orch.tick_controller(c.id)
-        bid, ask = _quotes(adapter)
-        assert bid == Decimal(101) * (1 - SPREAD)
-        assert ask == Decimal(101) * (1 + SPREAD)
-        # rgrid follows the trend: NO no-cross clamping. In grid mode a
-        # last_buy at 150 would force the ask up to >=150.15 (a requote);
-        # rgrid leaves the vwap-anchored ask resting untouched.
-        c._last_buy_px = Decimal(150)
-        await orch.tick_controller(c.id)
-        _, ask2 = _quotes(adapter)
-        assert ask2 == Decimal(101) * (1 + SPREAD)
-        assert all(
-            o.price < Decimal(150) for o in adapter.placed if o.side is TradeType.SELL
-        ), "no clamped requote may appear in rgrid mode"
-
-    asyncio.run(body())
-
-
 def _takers(adapter, side=None):
     out = [o for o in adapter.placed if o.order_type is OrderType.MARKET]
     return [o for o in out if side is None or o.side is side]
 
 
-def test_momentum_waits_for_directional_break():
-    """rgrid taker-momentum does NOT enter on start — it waits for price to break
-    the exposure band from the anchor (fixes the 'immediately enters short')."""
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={"momentum": True})
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)   # mid == anchor → no break
-        assert adapter.placed == []
-
-    asyncio.run(body())
-
-
-def test_momentum_buys_the_break_up():
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={"momentum": True})
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)           # anchor = 100
-        adapter.set_mid(Decimal("101"))             # > 100*(1+0.001) = 100.1
-        await orch.tick_controller(c.id)
-        assert len(_takers(adapter, TradeType.BUY)) == 1
-        assert _takers(adapter, TradeType.SELL) == []
-
-    asyncio.run(body())
-
-
-def test_momentum_sells_the_break_down():
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={"momentum": True})
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)
-        adapter.set_mid(Decimal("99"))              # < 100*(1-0.001) = 99.9
-        await orch.tick_controller(c.id)
-        assert len(_takers(adapter, TradeType.SELL)) == 1
-        assert _takers(adapter, TradeType.BUY) == []
-
-    asyncio.run(body())
-
-
-def test_momentum_adds_into_an_uptrend():
-    """As price keeps pumping past the re-anchored exposure band, momentum adds
-    MORE longs — and never shorts into the pump."""
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={"momentum": True})
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)               # anchor 100
-        for px in ("101", "104", "108", "113"):
-            adapter.set_mid(Decimal(px))
-            await orch.tick_controller(c.id)           # may fire a taker
-            await orch.tick_controller(c.id)           # absorb the fill into the VWAP
-        assert len(_takers(adapter, TradeType.BUY)) >= 2, "adds longs as price pumps"
-        assert _takers(adapter, TradeType.SELL) == [], "never shorts into a pump"
-
-    asyncio.run(body())
-
-
-def test_discretion_windows_exposure_vwap():
-    """vwap_volume_fraction (rgrid_discretion) VWAPs only the most-recent fraction
-    of fill volume — a tighter, more reactive exposure price."""
-    adapter = MockNadoAdapter(mid=Decimal(100))
-    _, c = _controller(adapter, mode="rgrid",
-                       extra={"momentum": True, "vwap_volume_fraction": Decimal("0.5")})
-    for px in (100, 100, 110, 120):
-        c._fills.append((Decimal(px), Decimal(1)))
-    # Last 50% of volume (2 of 4 units): (120 + 110) / 2 = 115.
-    assert c._exposure_vwap() == Decimal("115")
-    # Whole window: (100 + 100 + 110 + 120) / 4 = 107.5.
-    c.vwap_volume_fraction = Decimal(0)
-    assert c._exposure_vwap() == Decimal("107.5")
-
-
-def test_rgrid_defaults_to_directional_ladder_momentum_is_optin():
-    from src.nadobro.strategy.engine_runtime import map_strategy_config
-    # rgrid now DEFAULTS to the dynamic directional recycling ladder
-    # (DynamicGridController: long ladder in uptrends, short ladder in downtrends,
-    # booking profit per level) — user choice. It is NOT the fill-anchored maker.
-    cfg = map_strategy_config(
-        "rgrid", {"notional_usd": 100.0, "levels": 2}, Decimal(100), product=PAIR,
-    )
-    assert "controller_override" not in cfg
-    assert cfg.get("candle_provider", "MISSING") is None  # routed to the dynamic engine
-    assert cfg["recycle_levels"] is True
-    # Trend-following taker MOMENTUM is now the fill_anchored=1 opt-in.
-    mom = map_strategy_config(
-        "rgrid", {"notional_usd": 100.0, "levels": 2, "rgrid_discretion": 0.1, "fill_anchored": 1},
-        Decimal(100), product=PAIR,
-    )
-    assert mom["controller_override"] == "fill_anchored"
-    assert mom["momentum"] is True
-    assert mom["vwap_volume_fraction"] == 0.1
-    # grid DEFAULTS to the classic MULTI-LEVEL recycling ladder (not fill-anchored).
-    g = map_strategy_config("grid", {"notional_usd": 100.0, "levels": 2}, Decimal(100), product=PAIR)
-    assert "controller_override" not in g
-    assert "start_price" in g and g["recycle_levels"] is True
-    # grid can opt INTO the fill-anchored maker via fill_anchored=1.
-    g_fa = map_strategy_config(
-        "grid", {"notional_usd": 100.0, "levels": 2, "fill_anchored": 1}, Decimal(100), product=PAIR
-    )
-    assert g_fa["controller_override"] == "fill_anchored" and g_fa["momentum"] is False
-
-
-def test_exposure_vwap_is_isolated_per_controller_and_user():
-    """A different user's/run's controller never bleeds into this run's exposure
-    VWAP — fills are sourced only from my_executors (scoped to this
+def test_fill_window_is_isolated_per_controller_and_user():
+    """A different user's/run's controller never bleeds into this run's fill
+    window — fills are sourced only from my_executors (scoped to this
     controller_id), so two controllers in the same process stay separate."""
     async def body():
         adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
         orch = ExecutorOrchestrator()
         base = {
-            "trading_pair": PAIR, "anchor_mode": "rgrid",
+            "trading_pair": PAIR, "anchor_mode": "grid",
             "spread_bid_pct": SPREAD, "spread_ask_pct": SPREAD,
             "order_amount_quote": Decimal(10), "price_distance_tolerance": Decimal("0.0001"),
         }
@@ -284,29 +156,30 @@ def test_exposure_vwap_is_isolated_per_controller_and_user():
         await orch.tick_controller(b.id)   # B must NOT see A's fills
         assert len(a._fills) >= 1
         assert len(b._fills) == 0
-        assert b._exposure_vwap() is None
+        assert b._reference is None
 
     asyncio.run(body())
 
 
-def test_seed_from_session_history_scopes_vwap_to_the_run():
-    """The runtime seeds the exposure VWAP from THIS session's own recorded fills
+def test_seed_from_session_history_scopes_the_reference_to_the_run():
+    """The runtime seeds the fill window from THIS session's own recorded fills
     (get_session_recent_fills, scoped by strategy_session_id + user_id), so the
-    anchor is per-session and survives a rebuild. No seed → empty (fresh run)."""
+    reference is per-session and survives a rebuild. No seed → empty (fresh run)."""
     adapter = MockNadoAdapter(mid=Decimal(100))
     seed = [  # newest-first, exactly as get_session_recent_fills returns
         {"price": 120, "size": 1, "side": "long"},
         {"price": 110, "size": 1, "side": "short"},
         {"price": 100, "size": 1, "side": "long"},
     ]
-    _, c = _controller(adapter, mode="rgrid", extra={"momentum": True, "seed_fills": seed})
-    assert c._exposure_vwap() == Decimal(110)          # (100+110+120)/3
+    _, c = _controller(adapter, extra={"seed_fills": seed})
+    assert len(c._fills) == 3
+    assert c._reference == Decimal(120)                 # newest fill
     assert c._reference == Decimal(120)                # newest fill = anchor
     assert c._last_buy_px == Decimal(120)              # most recent long
     assert c._last_sell_px == Decimal(110)             # the short
-    # A fresh session (no seed) starts blank → waits for a directional break.
-    _, c2 = _controller(adapter, mode="rgrid", extra={"momentum": True})
-    assert c2._exposure_vwap() is None
+    # A fresh session (no seed) starts blank → quotes around mid on the first tick.
+    _, c2 = _controller(adapter)
+    assert not c2._fills and c2._reference is None
 
 
 def test_grid_soft_reset_concedes_only_the_behind_leg():
@@ -431,7 +304,11 @@ def test_runtime_opt_in_maps_override_and_treadfi_defaults():
         Decimal(100), product=PAIR,
     )
     assert rgrid_cfg["anchor_mode"] == "rgrid"
-    assert rgrid_cfg["reset_threshold_pct"] == Decimal("0.00125")  # TreadFi 0.125%
+    # rgrid's default arms the trailing soft reset: 0.2%, floored at 2 x spread so
+    # the controller's "target inside the entry band" guard can never silently
+    # disable it (see test_fill_anchored_reset_threshold_reads_ui_keys).
+    assert rgrid_cfg["reset_threshold_pct"] == Decimal("0.002")
+    assert rgrid_cfg["reset_threshold_pct"] >= rgrid_cfg["spread_ask_pct"] * 2
 
     # Opting OUT (fill_anchored=0) gives the classic ladder mapping.
     ladder_cfg = map_strategy_config(
@@ -441,194 +318,3 @@ def test_runtime_opt_in_maps_override_and_treadfi_defaults():
     assert "start_price" in ladder_cfg
 
 
-# ==========================================================================
-# RGrid take-profit — the "TP reset threshold", wired 2026-08-03
-# ==========================================================================
-# ``reset_threshold_pct`` was entirely DEAD on the momentum path: on_tick hands
-# off to _tick_momentum and returns before any reset logic runs, so the user's
-# RGrid setting changed nothing. It cannot mean grid's soft reset here — grid
-# re-anchors on DRIFT, but in momentum a drift IS the entry signal. It is the
-# profit target: momentum adds into a move and had no way to bank it.
-def test_momentum_take_profit_banks_a_winning_long():
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={
-            "momentum": True, "reset_threshold_pct": Decimal("0.01"),   # 1%
-        })
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)                 # anchor 100
-        adapter.set_mid(Decimal("101"))                  # break up -> buy
-        await orch.tick_controller(c.id)
-        await orch.tick_controller(c.id)                 # absorb the fill
-        assert len(_takers(adapter, TradeType.BUY)) == 1
-        opens = len(adapter.placed)
-        adapter.set_mid(Decimal("103"))                  # ~2% above entry > 1%
-        await orch.tick_controller(c.id)
-        assert len(adapter.placed) > opens, "take-profit never fired"
-        assert _takers(adapter, TradeType.SELL), "a winning long must be SOLD to bank it"
-
-    asyncio.run(body())
-
-
-def test_momentum_take_profit_is_disabled_when_the_target_sits_inside_the_band():
-    """A target narrower than the entry band would close the position before the
-    break that opened it is even established — a trend follower turned scalper.
-    rgrid's shipped 0.125% default is narrower than its 0.1% band, so this guard
-    is what stops the default config from self-destructing."""
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={
-            "momentum": True, "reset_threshold_pct": Decimal("0.00125"),  # < 2x band
-        })
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)
-        adapter.set_mid(Decimal("101"))
-        await orch.tick_controller(c.id)
-        await orch.tick_controller(c.id)
-        buys = len(_takers(adapter, TradeType.BUY))
-        adapter.set_mid(Decimal("101.5"))
-        await orch.tick_controller(c.id)
-        assert _takers(adapter, TradeType.SELL) == [], "closed inside its own entry band"
-        assert len(_takers(adapter, TradeType.BUY)) >= buys
-
-    asyncio.run(body())
-
-
-def test_momentum_take_profit_never_fires_on_a_loser():
-    """Excursion-gated: it banks a FAVOURABLE move only. Asserted directly on
-    the decision function — going through on_tick would let a legitimate
-    reversal ENTRY masquerade as a take-profit and make the test vacuous."""
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={
-            "momentum": True, "reset_threshold_pct": Decimal("0.01"),
-        })
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)
-        adapter.set_mid(Decimal("101"))                  # break up -> long
-        await orch.tick_controller(c.id)
-        await orch.tick_controller(c.id)                 # absorb the fill
-        assert c._net_base() > 0, "expected a long position to test against"
-        c._pending_taker_id = None                       # clear the in-flight guard
-
-        assert await c._maybe_take_profit(Decimal("99")) == "none", \
-            "fired on a 2% LOSS"
-        assert await c._maybe_take_profit(Decimal("101")) == "none", \
-            "fired below the 1% target"
-        assert await c._maybe_take_profit(Decimal("103")) == "fired", \
-            "did not fire on a 2% winner"
-
-    asyncio.run(body())
-
-
-def test_take_profit_threshold_is_off_when_disarmed():
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={
-            "momentum": True, "reset_threshold_pct": Decimal(0),
-        })
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)
-        adapter.set_mid(Decimal("101"))
-        await orch.tick_controller(c.id)
-        await orch.tick_controller(c.id)
-        adapter.set_mid(Decimal("120"))                  # 19% winner
-        await orch.tick_controller(c.id)
-        assert _takers(adapter, TradeType.SELL) == [], "disarmed threshold still closed"
-
-    asyncio.run(body())
-
-
-# ==========================================================================
-# AUDIT-F8 / F9 — exit fills must not pollute the exposure anchor
-# ==========================================================================
-def test_exit_fills_are_excluded_from_the_exposure_window():
-    """AUDIT-F9. _fills is the price at which the book took ON risk. A
-    reduce-only exit is risk REMOVAL at whatever the market offered; folding it
-    back in dragged the VWAP toward the exit price."""
-    async def body():
-        from src.nadobro.engine.types import PositionAction
-
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={
-            "momentum": True, "reset_threshold_pct": Decimal("0.01"),
-        })
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)
-        adapter.set_mid(Decimal("101"))
-        await orch.tick_controller(c.id)
-        await orch.tick_controller(c.id)                 # entry absorbed
-        entries = list(c._fills)
-        assert entries, "the entry fill should be in the exposure window"
-
-        adapter.set_mid(Decimal("103"))
-        await orch.tick_controller(c.id)                 # take-profit fires
-        await orch.tick_controller(c.id)                 # close settles
-        closes = [e for e in c.my_executors(active_only=False)
-                  if getattr(getattr(e, "config", None), "position_action", None)
-                  is PositionAction.CLOSE]
-        assert closes, "expected a reduce-only close to have been placed"
-        assert all(px != Decimal("103") for px, _ in c._fills), \
-            "the exit price entered the exposure window"
-
-    asyncio.run(body())
-
-
-def test_flat_after_banking_re_arms_instead_of_re_entering_at_the_exit():
-    """AUDIT-F9, second half. Even with exits excluded, the window still held
-    the OLD entries — whose VWAP sits far below the post-run mid, enough on its
-    own to breach the band and re-buy within a tick of the sale. Two taker legs
-    for zero directional edge, repeating every cycle."""
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={
-            "momentum": True, "reset_threshold_pct": Decimal("0.01"),
-        })
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)
-        adapter.set_mid(Decimal("101"))
-        await orch.tick_controller(c.id)
-        await orch.tick_controller(c.id)
-        adapter.set_mid(Decimal("103"))
-        await orch.tick_controller(c.id)                 # bank it
-        await orch.tick_controller(c.id)                 # settle -> flat
-        assert c._net_base() == 0, "expected to be flat after the take-profit"
-        buys_before = len(_takers(adapter, TradeType.BUY))
-        await orch.tick_controller(c.id)                 # the re-arm tick
-        assert len(_takers(adapter, TradeType.BUY)) == buys_before, \
-            "re-entered immediately at the price it just sold"
-        # And the anchor is the fresh mid, so a REAL break still triggers.
-        adapter.set_mid(Decimal("105"))
-        await orch.tick_controller(c.id)
-        assert len(_takers(adapter, TradeType.BUY)) > buys_before, \
-            "re-arm left the strategy unable to enter a genuine break"
-
-    asyncio.run(body())
-
-
-def test_a_refused_take_profit_does_not_fall_through_into_the_add_branch():
-    """AUDIT-F8: treating 'could not close' as 'no signal' let the same tick
-    pile MORE risk onto a position we had just failed to reduce."""
-    async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
-        orch, c = _controller(adapter, mode="rgrid", extra={
-            "momentum": True, "reset_threshold_pct": Decimal("0.01"),
-        })
-        await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)
-        adapter.set_mid(Decimal("101"))
-        await orch.tick_controller(c.id)
-        await orch.tick_controller(c.id)
-        assert c._net_base() > 0
-        placed_before = len(adapter.placed)
-
-        async def _refuse(*a, **k):
-            return False
-        c.spawn_executor = _refuse                        # type: ignore[method-assign]
-        c._pending_taker_id = None
-        adapter.set_mid(Decimal("103"))                   # TP wants to fire
-        await orch.tick_controller(c.id)
-        assert len(adapter.placed) == placed_before, "an order escaped a refused close"
-        assert await c._maybe_take_profit(Decimal("103")) == "failed"
-
-    asyncio.run(body())

@@ -1,8 +1,8 @@
 """News aggregator — fans out across all configured news connectors in parallel.
 
-Each connector's `fetch()` is wrapped via `asyncio.to_thread` for parallel
-execution. Results are deduplicated and grouped by category. A module-level
-TTL cache mirrors the `_chat_history` pattern in knowledge_service.
+Each connector's `fetch()` runs on the background thread pool (`run_blocking_bg`)
+for parallel execution. Results are deduplicated and grouped by category. A
+module-level TTL cache mirrors the `_chat_history` pattern in knowledge_service.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
+from src.nadobro.core.async_utils import run_blocking_bg
 from src.nadobro.connectors.news import NewsItem
 from src.nadobro.connectors.news import (
     ap_rss,
@@ -86,7 +87,7 @@ def _dedupe(items: list[NewsItem]) -> list[NewsItem]:
 
 async def _safe_fetch(fetcher: Callable[[int], list[NewsItem]], limit: int) -> list[NewsItem]:
     try:
-        return await asyncio.to_thread(fetcher, limit)
+        return await run_blocking_bg(fetcher, limit)
     except Exception as exc:
         logger.debug("news connector %s raised: %s", getattr(fetcher, "__module__", "?"), exc)
         return []

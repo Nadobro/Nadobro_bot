@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 
 _price_cache = {}
 _PRICE_CACHE_TTL = env_int("NADO_PRICE_CACHE_TTL_SECONDS", 10)
+# Sized book depth. Shorter TTL than the price cache because depth is the input
+# to imbalance/adverse-selection reads, where a 10s-old ladder is worse than no
+# ladder — but long enough to collapse a burst of per-user structure reads on
+# the same product into one query. Process-local by design: a Redis round-trip
+# costs more than it saves at this TTL.
+_liquidity_cache: dict = {}
+_LIQUIDITY_CACHE_TTL = env_float("NADO_LIQUIDITY_CACHE_TTL_SECONDS", 2.0)
 _ALL_PRODUCTS_CACHE = {}
 # Product list is static metadata — align with catalog hourly refresh.
 _ALL_PRODUCTS_TTL = env_int("NADO_ALL_PRODUCTS_CACHE_TTL_SECONDS", 3600)
@@ -176,7 +183,7 @@ from src.nadobro.core.http_session import SESSION as _rest_session  # noqa: E402
 # This isolates wedge-prone background polling from latency-critical paths
 # (order execution, WS auth, Telegram-reply DB reads) that also fan work out to
 # the default executor — a poll storm can no longer starve them.
-from src.nadobro.core.async_utils import run_blocking_sdk  # noqa: E402
+from src.nadobro.core.async_utils import run_blocking_exec, run_blocking_sdk  # noqa: E402
 
 
 def _install_session_timeout(session, timeout) -> bool:
@@ -691,6 +698,78 @@ class NadoClient:
             logger.error(f"REST get_market_price failed: {e}")
 
         return {"bid": 0, "ask": 0, "mid": 0}
+
+    def get_market_liquidity(self, product_id: int, depth: int = 10) -> dict:
+        """Sized order-book depth for a product.
+
+        Returns ``{"bids": [[price, size], ...], "asks": [...], "timestamp": t}``
+        with prices/sizes decoded from x18 and levels ordered best-first (bids
+        descending, asks ascending). Returns empty sides on any failure — depth
+        is an enrichment, and every consumer must stay fail-open without it.
+
+        ``get_market_price`` (top-of-book only) remains the hot path for mids
+        and is deliberately untouched: this query carries the full ladder and is
+        meant for the structure/microstructure read at its own cadence, not for
+        every tick of every strategy.
+        """
+        depth = max(1, int(depth))
+        cache_key = f"{self.network}:{product_id}:{depth}"
+        with _caches_lock:
+            cached = _liquidity_cache.get(cache_key)
+        if cached and (time.time() - cached["ts"] < _LIQUIDITY_CACHE_TTL):
+            return cached["data"]
+
+        if not self._initialized or not self.client:
+            if self.private_key is not None or self.address or self.main_address:
+                self.initialize()
+            if not self._initialized or not self.client:
+                return {"bids": [], "asks": [], "timestamp": 0.0}
+
+        from src.nadobro.venue.nado_weights import query_weight
+        if not self._gateway_allowed(weight=query_weight("market_liquidity")):
+            logger.debug(
+                "get_market_liquidity throttled by gateway budget product_id=%s",
+                product_id,
+            )
+            return {"bids": [], "asks": [], "timestamp": 0.0}
+
+        try:
+            from nado_protocol.utils.math import from_x18
+
+            data = self.client.market.get_market_liquidity(int(product_id), depth)
+
+            def _levels(raw) -> list:
+                # The SDK models a level as a 2-element list of x18 strings:
+                # ``[price_x18, size_x18]``. Tolerate objects too so a future
+                # SDK shape change degrades to empty rather than raising.
+                out = []
+                for lvl in raw or []:
+                    try:
+                        if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                            price = float(from_x18(int(lvl[0])))
+                            size = float(from_x18(int(lvl[1])))
+                        else:
+                            price = float(from_x18(int(getattr(lvl, "price_x18", 0) or 0)))
+                            size = float(from_x18(int(getattr(lvl, "amount_x18", 0) or 0)))
+                    except (TypeError, ValueError):
+                        continue
+                    if price > 0 and size > 0:
+                        out.append([price, size])
+                return out
+
+            bids = sorted(_levels(getattr(data, "bids", None)), key=lambda r: -r[0])
+            asks = sorted(_levels(getattr(data, "asks", None)), key=lambda r: r[0])
+            result = {"bids": bids, "asks": asks, "timestamp": time.time()}
+            if bids or asks:
+                with _caches_lock:
+                    _liquidity_cache[cache_key] = {"data": result, "ts": time.time()}
+            return result
+        except Exception as e:
+            logger.warning(
+                "SDK get_market_liquidity failed product_id=%s depth=%s: %s",
+                product_id, depth, _format_sdk_error(e),
+            )
+            return {"bids": [], "asks": [], "timestamp": 0.0}
 
     def get_candlesticks(self, product_id: int, timeframe: str = "1h", limit: int = 200, max_time: int | None = None) -> list[dict]:
         """Fetch OHLCV candles from the Nado indexer through the official SDK.
@@ -1420,7 +1499,7 @@ class NadoClient:
                 productIds=[int(product_id)],
                 digests=clean_digests,
             )
-            response = await asyncio.to_thread(
+            response = await run_blocking_exec(
                 self._dispatch_execute, cancel_params, "cancel_orders"
             )
             # BUG-CANCEL-1: detect a transient ip_query_only downgrade in the
@@ -1428,7 +1507,7 @@ class NadoClient:
             # reporting a successful batch cancel and leaving orders live.
             if self._result_is_ip_query_only(response) and _retry_count < 1:
                 try:
-                    check = await asyncio.to_thread(self.verify_linked_signer, self.address)
+                    check = await run_blocking_exec(self.verify_linked_signer, self.address)
                 except Exception as ve:  # pragma: no cover
                     logger.warning("verify_linked_signer during cancel_orders retry check failed: %s", ve)
                     check = {"verified": False}
@@ -1538,7 +1617,7 @@ class NadoClient:
                 productIds=[int(product_id)],
                 digests=clean_digests,
             )
-            response = await asyncio.to_thread(trigger_client.cancel_trigger_orders, params)
+            response = await run_blocking_exec(trigger_client.cancel_trigger_orders, params)
             return {
                 "success": True,
                 "cancelled": len(clean_digests),

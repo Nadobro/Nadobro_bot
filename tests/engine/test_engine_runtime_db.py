@@ -53,7 +53,11 @@ def test_runtime_drives_grid_and_persists_fill_and_executor():
         from src.nadobro.trading.engine_persistence import DbExecutorStore, DbInventoryRepository
         from src.nadobro.strategy.engine_runtime import EngineRuntime
 
-        adapter = MockNadoAdapter(mid=Decimal(100))   # venue double
+        # LIMIT ORDERS ONLY: the stop-out flatten is a MARKETABLE limit now, not a
+        # MARKET order, so the venue double has to model a crossing limit or the
+        # flatten never fills, the executor stays active for retry, and runtime.stop
+        # leaves the controller running.
+        adapter = MockNadoAdapter(mid=Decimal(100), fill_marketable_limits=True)
         inventory = DbInventoryRepository()            # REAL Postgres
         store = DbExecutorStore()                      # REAL Postgres
         runtime = EngineRuntime(executor_store=store)

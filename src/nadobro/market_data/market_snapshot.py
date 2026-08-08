@@ -7,11 +7,12 @@ When Nado lists them, we add the rows.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+from src.nadobro.core.async_utils import run_blocking_bg
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +166,10 @@ async def gather_snapshot(network: str = "mainnet", *, ttl_seconds: int = _DEFAU
     if cached and (now - cached[0]) < ttl_seconds:
         return cached[1]
 
-    payload = await asyncio.to_thread(_gather_sync, network)
+    # _gather_sync walks every perp product (one gateway stats call each) plus
+    # CMC and Fear&Greed — minutes of blocking IO in the worst case. Keep it on
+    # the background pool so it can never queue ahead of a click-path render.
+    payload = await run_blocking_bg(_gather_sync, network)
     _SNAPSHOT_CACHE[network] = (now, payload)
     return payload
 

@@ -162,7 +162,8 @@ class TWAPExecutor(Executor):
         delta_fee = order.fee_quote - self._current_recorded_fee
         price = (delta_quote / delta_base) if delta_base > 0 else Decimal(0)
         self._record_fill(
-            Fill(order.id, self.trading_pair, self.config.side, delta_base, price, delta_fee, time.time())
+            Fill(order.id, self.trading_pair, self.config.side, delta_base, price, delta_fee, time.time()),
+            order,
         )
         self._current_recorded = order.filled_base
         self._current_recorded_quote = order.filled_quote

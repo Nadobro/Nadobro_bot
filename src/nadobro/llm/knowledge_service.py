@@ -13,6 +13,22 @@ from src.nadobro.i18n import get_active_language, LANGUAGE_LABELS
 
 logger = logging.getLogger(__name__)
 
+
+def _llm_thread(func, *args, **kwargs):
+    """Await blocking LLM / stream-queue work on the dedicated LLM thread pool.
+
+    Never ``loop.run_in_executor(None, ...)``: that is the event loop's implicit
+    default executor — five threads on the 1-CPU production VM, shared with the
+    engine's gateway IO. A streaming answer parks one of those threads per
+    chunk-queue wait for the whole generation, which is how AI chat and strategy
+    ticks starved each other (2026-08 latency incident). Lazy import: llm/ has no
+    module-level edge to core/ (tests/lint/test_architecture_layers.py).
+    """
+    from src.nadobro.core.async_utils import run_blocking_llm
+
+    return run_blocking_llm(func, *args, **kwargs)
+
+
 _knowledge_base = None
 _knowledge_sections = None
 _xai_client = None
@@ -1838,8 +1854,7 @@ async def stream_nado_answer(question: str, telegram_id: int = None, user_name: 
         primary = _pick_primary_provider(question)
         try:
             full_answer = ""
-            import asyncio, queue, threading
-            loop = asyncio.get_event_loop()
+            import queue, threading
             chunk_queue = queue.Queue()
 
             def _run_casual(p=primary):
@@ -1855,7 +1870,7 @@ async def stream_nado_answer(question: str, telegram_id: int = None, user_name: 
 
             while True:
                 try:
-                    item = await loop.run_in_executor(None, lambda: chunk_queue.get(timeout=15))
+                    item = await _llm_thread(chunk_queue.get, timeout=15)
                 except Exception:
                     break
                 if item is None:
@@ -1945,17 +1960,14 @@ async def stream_nado_answer(question: str, telegram_id: int = None, user_name: 
             used_sources = ["https://x.com"]
         gathered_context = "[X/TWITTER RESULTS]"
     else:
-        import asyncio
-        loop = asyncio.get_event_loop()
-
         primary = _pick_primary_provider(question)
         if _should_skip_router(question):
             gathered_context = _search_knowledge_sections(question, top_k=5)
             used_sources = _pick_sources_for_question(question, context_text=gathered_context)
         else:
             try:
-                gathered_context, used_sources = await loop.run_in_executor(
-                    None, _run_agent_pipeline, question, primary, user_network
+                gathered_context, used_sources = await _llm_thread(
+                    _run_agent_pipeline, question, primary, user_network
                 )
             except Exception as e:
                 logger.warning(f"Agent pipeline failed: {e}")
@@ -1996,8 +2008,7 @@ async def stream_nado_answer(question: str, telegram_id: int = None, user_name: 
         if (p == "xai" and xai_client) or (p == "openai" and openai_client)
     ]
 
-    import asyncio, queue, threading
-    loop = asyncio.get_event_loop()
+    import queue, threading
 
     for provider in providers:
         try:
@@ -2017,7 +2028,7 @@ async def stream_nado_answer(question: str, telegram_id: int = None, user_name: 
             full_answer = ""
             while True:
                 try:
-                    item = await loop.run_in_executor(None, lambda: chunk_queue.get(timeout=30))
+                    item = await _llm_thread(chunk_queue.get, timeout=30)
                 except Exception:
                     break
                 if item is None:
@@ -2105,8 +2116,6 @@ async def answer_nado_question(question: str, telegram_id: int = None, user_name
         system = CASUAL_SYSTEM_PROMPT.format(current_date=current_date, user_name=display_name, language_instruction=lang_instruction)
         primary = _pick_primary_provider(question)
         try:
-            import asyncio
-            loop = asyncio.get_event_loop()
 
             def _call_casual(p=primary):
                 client = _get_xai_client() if p == "xai" else _get_openai_client()
@@ -2119,7 +2128,7 @@ async def answer_nado_question(question: str, telegram_id: int = None, user_name
                 )
                 return resp.choices[0].message.content.strip()
 
-            answer = await loop.run_in_executor(None, _call_casual)
+            answer = await _llm_thread(_call_casual)
             if answer and telegram_id:
                 _add_to_chat_history(telegram_id, "assistant", answer)
             return answer
@@ -2193,17 +2202,14 @@ async def answer_nado_question(question: str, telegram_id: int = None, user_name
             used_sources = ["https://x.com"]
         gathered_context = "[X/TWITTER RESULTS]"
     else:
-        import asyncio
-        loop = asyncio.get_event_loop()
-
         primary = _pick_primary_provider(question)
         if _should_skip_router(question):
             gathered_context = _search_knowledge_sections(question, top_k=5)
             used_sources = _pick_sources_for_question(question, context_text=gathered_context)
         else:
             try:
-                gathered_context, used_sources = await loop.run_in_executor(
-                    None, _run_agent_pipeline, question, primary, user_network
+                gathered_context, used_sources = await _llm_thread(
+                    _run_agent_pipeline, question, primary, user_network
                 )
             except Exception as e:
                 logger.warning(f"Agent pipeline failed: {e}")
@@ -2235,8 +2241,6 @@ async def answer_nado_question(question: str, telegram_id: int = None, user_name
     )
 
     try:
-        import asyncio
-        loop = asyncio.get_event_loop()
         primary = _pick_primary_provider(question)
         if use_x_prompt:
             primary = "xai"
@@ -2279,7 +2283,7 @@ async def answer_nado_question(question: str, telegram_id: int = None, user_name
                         raise RuntimeError(f"{p.upper()} returned empty response")
                     return content.strip()
 
-                answer = await loop.run_in_executor(None, _call)
+                answer = await _llm_thread(_call)
                 used_provider = provider
                 break
             except Exception as provider_error:

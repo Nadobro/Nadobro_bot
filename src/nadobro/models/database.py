@@ -2048,6 +2048,113 @@ def get_overlay_signals(user_id: int, network: str, since=None, limit: int = 500
         return []
 
 
+def insert_signal_outcome(data: dict) -> Optional[int]:
+    """Persist one graded outcome for an overlay signal at one horizon.
+
+    Idempotent by ``(signal_id, horizon)`` — a re-run of the scorer over the same
+    window is a no-op and returns ``None`` rather than duplicating the row. Like
+    ``insert_overlay_signal`` this filters against an explicit column allowlist,
+    so a new column means editing the migration, ``db.py``'s startup DDL, AND
+    this list.
+    """
+    cols = [
+        "signal_id", "user_id", "network", "strategy", "product_id",
+        "product_name", "ts_signal", "mid_at_signal", "bias", "regime",
+        "confidence", "horizon", "fwd_return", "excursion_up",
+        "excursion_down", "directional_hit", "bars_used",
+    ]
+    # ``directional_hit`` is deliberately nullable (a neutral call cannot be
+    # right or wrong), so filter on presence, not truthiness.
+    payload = {k: v for k, v in data.items() if k in cols and v is not None}
+    col_names = list(payload.keys())
+    if not col_names:
+        return None
+    vals = [payload[c] for c in col_names]
+    query = pgsql.SQL(
+        "INSERT INTO signal_outcomes ({}) VALUES ({}) "
+        "ON CONFLICT (signal_id, horizon) DO NOTHING RETURNING id"
+    ).format(
+        pgsql.SQL(", ").join(pgsql.Identifier(c) for c in col_names),
+        pgsql.SQL(", ").join(pgsql.Placeholder() * len(col_names)),
+    )
+    row = execute_returning(query, vals)
+    return row["id"] if row else None
+
+
+def get_ungraded_signals(
+    horizon: str,
+    *,
+    ready_before,
+    not_older_than,
+    limit: int = 500,
+) -> list:
+    """Overlay signals old enough for ``horizon`` to be knowable but not yet graded.
+
+    ``ready_before`` is ``now - horizon`` (the outcome exists) and
+    ``not_older_than`` bounds the backlog so a long outage doesn't make the
+    scorer chew through months of history on one pass. Oldest first, so repeated
+    runs drain the queue in order. ``[]`` on any error — grading is best-effort
+    and must never break the scheduler.
+    """
+    try:
+        return query_all(
+            "SELECT s.id, s.user_id, s.network, s.strategy, s.product_id, "
+            "s.product_name, s.ts, s.bias, s.regime, s.confidence "
+            "FROM overlay_signals s "
+            "LEFT JOIN signal_outcomes o "
+            "  ON o.signal_id = s.id AND o.horizon = %s "
+            "WHERE o.id IS NULL AND s.ts <= %s AND s.ts >= %s "
+            "ORDER BY s.ts ASC LIMIT %s",
+            (str(horizon), ready_before, not_older_than, int(limit)),
+        ) or []
+    except Exception:
+        return []
+
+
+def get_signal_outcomes(
+    *,
+    user_id: Optional[int] = None,
+    network: Optional[str] = None,
+    horizon: Optional[str] = None,
+    since=None,
+    limit: int = 5000,
+) -> list:
+    """Graded signal outcomes for metrics (newest first).
+
+    Every filter is optional: the ``/structure`` card reads one user's slice,
+    while the nightly weight fit reads across users to get a sample large enough
+    to be worth anything. ``[]`` on any error.
+    """
+    try:
+        clauses: list = []
+        params: list = []
+        if user_id is not None:
+            clauses.append("user_id = %s")
+            params.append(int(user_id))
+        if network is not None:
+            clauses.append("network = %s")
+            params.append(str(network))
+        if horizon is not None:
+            clauses.append("horizon = %s")
+            params.append(str(horizon))
+        if since is not None:
+            clauses.append("ts_signal >= %s")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        params.append(int(limit))
+        return query_all(
+            "SELECT signal_id, user_id, network, strategy, product_id, "
+            "product_name, ts_signal, mid_at_signal, bias, regime, confidence, "
+            "horizon, fwd_return, excursion_up, excursion_down, "
+            "directional_hit, bars_used "
+            f"FROM signal_outcomes {where}"
+            "ORDER BY ts_signal DESC LIMIT %s",
+            tuple(params),
+        ) or []
+    except Exception:
+        return []
+
+
 def insert_fill_sync(data: dict) -> Optional[int]:
     cols = ["trade_id", "network", "user_id", "subaccount_hex", "order_digest", "product_id", "placed_at_ts"]
     filtered = {k: v for k, v in data.items() if k in cols and v is not None}

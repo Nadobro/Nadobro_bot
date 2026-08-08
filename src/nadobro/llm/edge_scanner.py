@@ -363,25 +363,30 @@ def get_edges_context() -> str:
     return "\n".join(lines)
 
 
+# Scans and KB indexing are long, blocking, and purely background: they belong on
+# the background pool, never on the loop's implicit default executor (five threads
+# on the 1-CPU production VM, shared with the engine's gateway IO). Lazy import:
+# llm/ has no module-level edge to core/ (tests/lint/test_architecture_layers.py).
+def _bg_thread(func, *args, **kwargs):
+    from src.nadobro.core.async_utils import run_blocking_bg
+
+    return run_blocking_bg(func, *args, **kwargs)
+
+
 async def async_scan_edges():
     """Async wrapper for the scheduler."""
-    import asyncio
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, scan_edges)
+    await _bg_thread(scan_edges)
 
 
 async def async_initial_scan():
     """Run initial scan + KB indexing on bot startup."""
-    import asyncio
-    loop = asyncio.get_event_loop()
-
     # Index knowledge base into Pinecone
     try:
         from src.nadobro.llm.vector_store import index_knowledge_base, is_available
         if is_available():
-            await loop.run_in_executor(None, index_knowledge_base)
+            await _bg_thread(index_knowledge_base)
     except Exception:
         logger.debug("KB indexing skipped", exc_info=True)
 
     # Run initial edge scan
-    await loop.run_in_executor(None, scan_edges)
+    await _bg_thread(scan_edges)

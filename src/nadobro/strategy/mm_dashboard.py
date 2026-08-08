@@ -628,7 +628,11 @@ def render_status_lines(snapshot: dict) -> list[str]:
         ),
         f"Spread: {snapshot['spread_bp']:.1f} bp / Ref: {snapshot['reference_price']:,.4f}",
     ]
-    if snapshot.get("dgrid_phase"):
+    # Dynamic Grid ONLY. R-Grid used to run the D-Grid engine, so R-Grid cards
+    # showed a "DGRID phase" line for a strategy that has no phases; a stale
+    # dgrid_phase can also survive in bot_state from before that split, so gate on
+    # the strategy rather than on the key being present.
+    if str(snapshot.get("strategy_id") or "").lower() == "dgrid" and snapshot.get("dgrid_phase"):
         var = snapshot.get("dgrid_variance_ratio")
         lines.append(
             f"DGRID phase: {snapshot['dgrid_phase']}"

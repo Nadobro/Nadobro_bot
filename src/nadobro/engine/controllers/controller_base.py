@@ -295,9 +295,9 @@ class Controller(abc.ABC):
             margin_quote = Decimal(str(margin))
             mid_d = Decimal(str(mid))
         except Exception:  # policy: degrade-ok(cap unset/malformed; cap inactive)
-            return allowed
+            return self._apply_entry_suppression(allowed, trading_pair, mid)
         if cap_frac <= 0 or margin_quote <= 0 or mid_d <= 0:
-            return allowed
+            return self._apply_entry_suppression(allowed, trading_pair, mid)
         net_quote = self.inventory.get(self.user_id, trading_pair, self.id).net_amount_base * mid_d
         cap_quote = margin_quote * cap_frac
         resume_quote = cap_quote * Decimal(str(self.cfg("exposure_resume_frac", "0.7")))
@@ -313,6 +313,39 @@ class Controller(abc.ABC):
                 allowed["buy"] = False   # long over cap: only reduce
             else:
                 allowed["sell"] = False  # short over cap: only reduce
+        return self._apply_entry_suppression(allowed, trading_pair, mid)
+
+    def _apply_entry_suppression(
+        self, allowed: Dict[str, bool], trading_pair: str, mid: object
+    ) -> Dict[str, bool]:
+        """Honour an explicit ``suppress_new_entries`` posture: reduce-only.
+
+        The financial overlay used to express suppression by writing
+        ``max_net_exposure_pct = 0``. That is the OPPOSITE of suppression — a cap
+        of 0 short-circuits both this check and
+        ``_projected_order_within_exposure`` as "cap INACTIVE", so the strategy
+        lost its net-exposure ceiling at exactly the moment the overlay wanted to
+        choke it. A resting ladder survived that (its own budget bounds it); a
+        taker strategy that adds a fresh step per break did not, and the regime
+        gate only pauses on TRENDS, so in chop it pyramided with no ceiling at
+        all. Suppression is now its own flag and can never disable the cap.
+        """
+        from decimal import Decimal
+
+        if not self.cfg("suppress_new_entries"):
+            return allowed
+        net_base = Decimal(0)
+        if self.inventory is not None:
+            try:
+                net_base = Decimal(
+                    str(self.inventory.get(self.user_id, trading_pair, self.id).net_amount_base)
+                )
+            except Exception:  # noqa: BLE001  # policy: degrade-ok(flat book ⇒ both sides denied)
+                net_base = Decimal(0)
+        # Reduce-only: permit exactly the side that shrinks |net|. A flat book has
+        # nothing to reduce, so both sides close.
+        allowed["buy"] = allowed["buy"] and net_base < 0
+        allowed["sell"] = allowed["sell"] and net_base > 0
         return allowed
 
     # -- lifecycle hooks --------------------------------------------------

@@ -419,13 +419,13 @@ def _rgrid_configs(candle_provider):
 def test_reverse_grid_arms_in_both_trends():
     # rgrid trades trends (up AND down) — the gate is off for it, so it arms in
     # every regime rather than sitting out.
-    from src.nadobro.engine.controllers.reverse_grid import ReverseGridController
+    from src.nadobro.engine.controllers.short_ladder import ShortLadderController
 
     async def body():
         for step, label in ((-0.4, "downtrend"), (0.4, "uptrend")):
             adapter = MockNadoAdapter(mid=Decimal("100"), auto_fill_market=False)
             orch = ExecutorOrchestrator()
-            c = ReverseGridController(
+            c = ShortLadderController(
                 user_id=1, orchestrator=orch, adapter=adapter, inventory=InventoryRepository(),
                 configs=_rgrid_configs(lambda _p, s=step: trending_candles(step=s)),
                 controller_id=f"RG{step}",
@@ -442,12 +442,12 @@ def test_map_strategy_config_disables_gate_for_rgrid():
 
     from src.nadobro.strategy.engine_runtime import map_strategy_config
 
-    # rgrid now runs the dynamic directional-ladder engine (DynamicGridController),
-    # which never pauses on trend/breakout (on_tick calls evaluate_quote_gate with
-    # pause_on_trend=False, pause_on_breakout=False) — so it is inherently not gated
-    # out of trends. Assert it routed to that engine, not the old short-ladder flag.
+    # rgrid is a TREND strategy: the regime gate would pause it exactly when it
+    # must act, so the gate ships OFF (its backstops are the inventory cap, the
+    # trailing soft reset, and the session SL/TP rails).
     rg = map_strategy_config("rgrid", {"notional_usd": 100.0}, _D("100"), product="BTC-PERP")
-    assert rg.get("candle_provider", "MISSING") is None and rg.get("recycle_levels") is True
+    assert rg["controller_override"] == "fill_anchored"
+    assert float(rg.get("regime_gate_enabled", 1.0)) == 0.0
     # GRID-IN-TRENDS (user directive 2026-06-21): plain grid now defaults the gate
     # OFF too (it was silently never quoting in trends/expansions). The inventory
     # cap + recenter + session SL/TP rails are the backstops.

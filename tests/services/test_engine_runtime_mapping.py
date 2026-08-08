@@ -40,9 +40,10 @@ def test_map_grid_config_centers_band_and_sets_barriers():
     # fee-aware session rail. limit_price stays available as an explicit
     # catastrophic stop but defaults to 0 (disabled).
     assert cfg["limit_price"] == Decimal("0")
-    tb = cfg["triple_barrier_config"]
-    assert isinstance(tb, TripleBarrierConfig)
-    assert tb.take_profit == Decimal("0.006") and tb.stop_loss == Decimal("0.005")
+    # UNITS INVARIANT: the user's %-of-margin SL/TP are the session rail's, not a
+    # per-level avg-entry price barrier. They reach the controller as percents.
+    assert "triple_barrier_config" not in cfg
+    assert float(cfg["tp_pct"]) == 0.6 and float(cfg["sl_pct"]) == 0.5
 
 
 def test_map_dn_config_defaults():
@@ -76,25 +77,36 @@ def test_map_dn_clamps_hold_and_sets_cycles():
     assert cfg["cycle_gap_seconds"] == 45
 
 
-def test_map_rgrid_band_is_above_mid_and_stop_in_barrier():
-    # rgrid now defaults to fill-anchored trend-follow; this pins the CLASSIC
-    # one-sided ladder, which is opt-out via fill_anchored=0.
-    cfg = er.map_strategy_config(
-        "rgrid", {"notional_usd": 100.0, "spread_bp": 10.0, "levels": 4, "sl_pct": 0.8,
-                  "fill_anchored": 0},
-        Decimal(100), product="BTC-USDC",
-    )
-    # A short grid's sell band steps UP from mid. POST-ONLY-CROSS fix: the nearest
-    # sell is offset STRICTLY above mid (was == mid, which crossed the book and
-    # the venue rejected with error_code 2008).
-    assert cfg["start_price"] > Decimal("100")
-    assert cfg["end_price"] > cfg["start_price"]
-    # GRID-DUAL-UNIT fix (f391f3c): no mid-anchored hard limit_price stop; the
-    # short's SL lives in the fill-aware barrier (avg-entry + sl_pct).
-    assert cfg["limit_price"] == Decimal("0")
-    tb = cfg["triple_barrier_config"]
-    assert isinstance(tb, TripleBarrierConfig)
-    assert tb.stop_loss == Decimal("0.008")  # 0.8% from avg entry, above for a short
+def test_map_rgrid_is_exposure_anchored_with_no_static_band():
+    """Reverse Grid is its own market-making engine, not a one-sided ladder.
+
+    There is no static band to place: both legs are derived each tick from the
+    average of the buy/sell exposure prices. ``fill_anchored`` is not a choice
+    here — setting it to 0 must NOT hand R-Grid to another engine (that wiring
+    routed R-Grid to the D-Grid phase switcher, which is what produced
+    "switched RGRID → GRID" on R-Grid sessions).
+    """
+    from src.nadobro.strategy.strategy_registry import effective_sl_tp_pct
+
+    for settings in (
+        {"notional_usd": 100.0, "spread_bp": 10.0, "levels": 4, "sl_pct": 0.8},
+        {"notional_usd": 100.0, "spread_bp": 10.0, "levels": 4, "sl_pct": 0.8,
+         "fill_anchored": 0},
+    ):
+        cfg = er.map_strategy_config("rgrid", settings, Decimal(100), product="BTC-USDC")
+        assert cfg["controller_override"] == "fill_anchored"
+        assert cfg["anchor_mode"] == "rgrid"
+        assert cfg["passive_only"] is True, "every MM strategy rests post-only limits"
+        # No static ladder geometry, and no phase-switcher knobs.
+        for dead in ("start_price", "end_price", "dgrid_trend_on_vr", "dgrid_flip_confirm_ticks"):
+            assert dead not in cfg, dead
+        # SL/TP are the %-of-margin SESSION rails (live PnL incl. uPnL, net of
+        # fees), exactly as the spec describes them — never ALSO a price-move
+        # barrier on the same user number (CLAUDE.md units invariant).
+        assert "triple_barrier_config" not in cfg
+        assert effective_sl_tp_pct(
+            "rgrid", {"rgrid_stop_loss_pct": 2.0, "rgrid_take_profit_pct": 5.0}
+        ) == (2.0, 5.0)
 
 
 def test_map_mid_config():
@@ -216,17 +228,29 @@ def test_fill_anchored_reset_threshold_reads_ui_keys():
         Decimal(100), product="BTC-USDC",
     )
     assert rgrid["reset_threshold_pct"] == Decimal("1.5") / Decimal(100)
-    # Unset → per-mode default preserved (grid 0.25% / rgrid 0.125%).
+    # Unset → per-mode default. grid keeps 0.25%. rgrid's threshold ARMS its
+    # trailing soft reset and the controller refuses one that sits inside the entry
+    # band, so its default is 0.2% but never below 2 x spread — the old flat 0.125%
+    # was under 2 x the shipped 10bp spread and silently disabled the soft reset
+    # for anyone who never touched the button.
     grid_def = er.map_strategy_config(
         "grid", {"notional_usd": 100.0, "levels": 4, "fill_anchored": 1},
         Decimal(100), product="BTC-USDC",
     )
     assert grid_def["reset_threshold_pct"] == Decimal("0.25") / Decimal(100)
     rgrid_def = er.map_strategy_config(
-        "rgrid", {"notional_usd": 100.0, "levels": 4, "fill_anchored": 1},
+        "rgrid", {"notional_usd": 100.0, "levels": 4, "rgrid_spread_bp": 10.0},
         Decimal(100), product="BTC-USDC",
     )
-    assert rgrid_def["reset_threshold_pct"] == Decimal("0.125") / Decimal(100)
+    assert rgrid_def["reset_threshold_pct"] == Decimal("0.2") / Decimal(100)
+    assert rgrid_def["reset_threshold_pct"] >= rgrid_def["spread_ask_pct"] * 2
+    # A wide spread lifts the default with it, so the trail stays armable.
+    rgrid_wide = er.map_strategy_config(
+        "rgrid", {"notional_usd": 100.0, "levels": 4, "rgrid_spread_bp": 30.0},
+        Decimal(100), product="BTC-USDC",
+    )
+    assert rgrid_wide["reset_threshold_pct"] == Decimal("0.6") / Decimal(100)
+    assert rgrid_wide["reset_threshold_pct"] >= rgrid_wide["spread_ask_pct"] * 2
 
 
 def test_dgrid_continuous_quoting_wiring():
@@ -249,12 +273,9 @@ def test_dgrid_continuous_quoting_wiring():
     assert dg2["dgrid_reset_threshold_bp"] == 80.0
 
 
-def test_grid_rgrid_default_to_recycling_ladders():
-    """grid & rgrid both DEFAULT to multi-level recycling ladders now (user
-    choice). grid -> classic long ladder; rgrid -> dynamic directional ladder
-    (DynamicGridController: long in uptrends, short in downtrends), so its cfg
-    carries the dgrid candle_provider + regime knobs. The fill-anchored quoting
-    (grid maker / rgrid momentum taker) is the fill_anchored=1 opt-in."""
+def test_grid_defaults_to_a_recycling_ladder_rgrid_never_does():
+    """grid DEFAULTS to the multi-level recycling ladder and opts into
+    fill-anchored quoting; rgrid IS the exposure-anchored engine, always."""
     g_def = er.map_strategy_config(
         "grid", {"notional_usd": 100.0, "levels": 3}, Decimal(58000), product="BTC-USDC",
     )
@@ -262,40 +283,35 @@ def test_grid_rgrid_default_to_recycling_ladders():
     # Classic long ladder, NOT the dynamic engine: no dgrid regime knobs.
     assert "dgrid_trend_on_vr" not in g_def
 
+    g_fa = er.map_strategy_config(
+        "grid", {"notional_usd": 100.0, "levels": 3, "fill_anchored": 1},
+        Decimal(58000), product="BTC-USDC",
+    )
+    assert g_fa["controller_override"] == "fill_anchored" and g_fa["momentum"] is False
+
     r_def = er.map_strategy_config(
         "rgrid", {"notional_usd": 100.0, "levels": 3}, Decimal(58000), product="BTC-USDC",
     )
-    assert r_def.get("recycle_levels") is True and "controller_override" not in r_def
-    # Routed to the dynamic directional-ladder engine (same as dgrid): carries the
-    # regime classifier knobs that the classic grid ladder does not.
-    assert "dgrid_trend_on_vr" in r_def
-
-    # fill_anchored=1 opts rgrid into trend-following taker momentum.
-    r_mom = er.map_strategy_config(
-        "rgrid", {"notional_usd": 100.0, "levels": 3, "fill_anchored": 1},
-        Decimal(58000), product="BTC-USDC",
-    )
-    assert r_mom["controller_override"] == "fill_anchored" and r_mom["momentum"] is True
+    assert r_def["controller_override"] == "fill_anchored" and r_def["passive_only"] is True
+    assert "recycle_levels" not in r_def, "no resting ladder to recycle"
 
 
-def test_rgrid_is_trend_aggressive_dgrid_is_balanced():
-    """rgrid and dgrid share DynamicGridController but get DIFFERENT default
-    tuning: rgrid reacts/flips faster (pure trend-direction ladder), dgrid is the
-    steadier volatility-balanced switcher. Explicit user settings still override."""
+def test_only_dgrid_gets_the_phase_switcher_knobs():
+    """D-Grid is the phase switcher. R-Grid must carry NONE of its knobs — it has
+    no phases to switch between, and sharing the engine is what made R-Grid
+    sessions announce "switched RGRID → GRID … now quoting the LONG ladder"."""
     rg = er.map_strategy_config("rgrid", {"notional_usd": 100.0}, Decimal(58000), product="BTC-USDC")
     dg = er.map_strategy_config("dgrid", {"notional_usd": 100.0}, Decimal(58000), product="BTC-USDC")
-    # rgrid detects trend sooner and flips faster than dgrid.
-    assert rg["dgrid_trend_on_vr"] < dg["dgrid_trend_on_vr"]
-    assert rg["dgrid_trend_drift_pct"] < dg["dgrid_trend_drift_pct"]
-    assert rg["dgrid_flip_confirm_ticks"] < dg["dgrid_flip_confirm_ticks"]
-    assert rg["dgrid_short_window"] < dg["dgrid_short_window"]
-    assert rg["dgrid_reversal_flip_pct"] < dg["dgrid_reversal_flip_pct"]
-    # An explicit user value overrides the per-strategy default.
+    for knob in ("dgrid_trend_on_vr", "dgrid_trend_drift_pct", "dgrid_flip_confirm_ticks",
+                 "dgrid_short_window", "dgrid_reversal_flip_pct", "dgrid_range_on_vr"):
+        assert knob in dg, knob
+        assert knob not in rg, knob
+    # A dgrid_* setting left over on an R-Grid config cannot resurrect the switcher.
     rg_ov = er.map_strategy_config(
         "rgrid", {"notional_usd": 100.0, "dgrid_trend_on_variance_ratio": 1.40},
         Decimal(58000), product="BTC-USDC",
     )
-    assert rg_ov["dgrid_trend_on_vr"] == 1.40
+    assert "dgrid_trend_on_vr" not in rg_ov
 
 
 def test_map_vol_config_is_spot():
@@ -559,22 +575,14 @@ def test_spread_is_per_strategy_user_set():
 
     mid = Decimal("100")
 
-    # rgrid honors rgrid_spread_bp (20bp), not the generic spread_bp (5). It now
-    # defaults to the dynamic directional ladder, where the spread is the ladder
-    # STEP (min_spread_between_orders).
+    # rgrid honors rgrid_spread_bp (20bp), not the generic spread_bp (5). The
+    # spread IS the trigger offset from the exposure average on each leg.
     rg = map_strategy_config(
         "rgrid", {"notional_usd": 100.0, "spread_bp": 5.0, "rgrid_spread_bp": 20.0, "levels": 2},
         mid, product="BTC-PERP",
     )
-    assert rg["min_spread_between_orders"] == Decimal("20.0") / Decimal(10000)
-    # Opting into momentum (fill_anchored=1) flows the spread to the per-side band.
-    rg_mom = map_strategy_config(
-        "rgrid",
-        {"notional_usd": 100.0, "spread_bp": 5.0, "rgrid_spread_bp": 20.0, "levels": 2,
-         "fill_anchored": 1},
-        mid, product="BTC-PERP",
-    )
-    assert rg_mom["spread_ask_pct"] == Decimal("20.0") / Decimal(10000)
+    assert rg["spread_ask_pct"] == Decimal("20.0") / Decimal(10000)
+    assert rg["spread_bid_pct"] == Decimal("20.0") / Decimal(10000)
 
     # dgrid honors dgrid_spread_bp (15bp), not the default 8.
     dg = map_strategy_config(
@@ -686,16 +694,18 @@ def test_sl_tp_is_per_strategy_user_set():
     assert effective_sl_tp_pct("grid", {"sl_pct": 3.0, "tp_pct": 9.0,
                                         "rgrid_stop_loss_pct": 99.0}) == (3.0, 9.0)  # grid ignores rgrid_*
 
-    # barrier honors the dgrid SL/TP the user set (10% / 50%).
+    # The user's dgrid SL/TP (10% / 50%) reach the controller as PERCENTS of
+    # margin — the unit the tiered scale-out and the session rail both use. They
+    # are NOT also copied onto a per-level price barrier (units invariant).
     cfg = map_strategy_config(
         "dgrid",
         {"notional_usd": 100.0, "levels": 4, "rgrid_stop_loss_pct": 10.0,
          "rgrid_take_profit_pct": 50.0, "sl_pct": 0.8, "tp_pct": 1.2},
         Decimal("100"), product="BTC-PERP",
     )
-    tb = cfg["triple_barrier_config"]
-    assert tb.stop_loss == Decimal("10.0") / Decimal(100)
-    assert tb.take_profit == Decimal("50.0") / Decimal(100)
+    assert float(cfg["sl_pct"]) == 10.0
+    assert float(cfg["tp_pct"]) == 50.0
+    assert "triple_barrier_config" not in cfg
 
 
 def test_should_build_controller_truth_table():
@@ -1045,19 +1055,16 @@ def test_mid_resurrects_the_levels_input_without_changing_deployment():
     assert one["ladder_levels"] == 1
 
 
-def test_rgrid_momentum_is_excluded_from_the_ladder():
-    """rgrid fires ONE taker per break rather than resting a ladder. Handing it
-    the full side deployment would multiply its step size by ``levels``."""
-    settings = {"notional_usd": 1000.0, "levels": 4, "fill_anchored": 1}
-    rg = er.map_strategy_config("rgrid", settings, Decimal("1000"), product="BTC-PERP", leverage=1)
-    assert rg["momentum"] is True
-    assert rg["ladder_levels"] == 1, "rgrid must not ladder"
-    assert rg["order_amount_quote"] == Decimal("250"), "per-step taker size changed"
-
-    gr = er.map_strategy_config("grid", settings, Decimal("1000"), product="BTC-PERP", leverage=1)
-    assert gr["momentum"] is False
-    assert gr["ladder_levels"] == 4
-    assert gr["order_amount_quote"] == Decimal("1000")
+def test_rgrid_rests_one_quote_per_side_not_a_ladder():
+    """R-Grid quotes exactly two prices (anchor +- spread), so handing it the
+    multi-level ladder would multiply its deployed size by ``levels`` while it only
+    ever rests one quote per side."""
+    rg = er.map_strategy_config(
+        "rgrid", {"notional_usd": 100.0, "levels": 4}, Decimal(58000), product="BTC-USDC",
+    )
+    assert rg["ladder_levels"] == 1
+    assert "ladder_step_bp" not in rg and "ladder_curve" not in rg
+    assert rg["passive_only"] is True
 
 
 def test_min_quote_lifetime_tracks_the_actual_cadence():

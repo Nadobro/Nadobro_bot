@@ -21,11 +21,10 @@ Fixes applied (search for AUDIT-FIX in this file):
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, Optional, Sequence
 
 from src.nadobro.utils.env import env_float
@@ -49,6 +48,47 @@ from src.nadobro.venue.nado_client import NadoClient
 from src.nadobro.quant.margin import compute_isolated_margin
 
 logger = logging.getLogger(__name__)
+
+
+# --- thread-pool routing ----------------------------------------------------
+# Every blocking call below used to go through ``asyncio.to_thread``, i.e. the
+# event loop's IMPLICIT default executor — ``min(32, cpu_count + 4)`` workers,
+# which is FIVE on the production 1-CPU Fly VM. The engine is the heaviest
+# blocking-IO consumer in the process (a grid tick issues open-orders, positions,
+# balance, candles, depth and N placements, each a gateway call with a ~12s read
+# timeout), and it shared those five threads with venue/nado_sync's per-user
+# snapshot writes and market_data's snapshot gather. Saturation showed up in
+# production as 45s strategy cycles, APScheduler "maximum number of running
+# instances reached", and an 84s p-max on Telegram taps.
+#
+# Route the work to the purpose-built pools instead (see core/async_utils):
+# ``_exec`` for placements/cancels, ``_sdk`` for gateway READS, ``_db`` for
+# psycopg2. Execution keeps its own pool so a portfolio-poll storm can never
+# queue in front of an order or a cancel — that isolation previously came from
+# execution sitting on the default executor while polling used the SDK pool,
+# which quietly stopped working when the VM went to 1 CPU. Imports are
+# function-local on purpose: engine/ has no module-level edge to core/
+# (tests/lint/test_architecture_layers.py) and lazy imports are exempt there.
+def _exec(func, *args, **kwargs):
+    """Await an order placement / cancel on the dedicated execution pool."""
+    from src.nadobro.core.async_utils import run_blocking_exec
+
+    return run_blocking_exec(func, *args, **kwargs)
+
+
+def _sdk(func, *args, **kwargs):
+    """Await a blocking SDK/gateway READ on the dedicated SDK thread pool."""
+    from src.nadobro.core.async_utils import run_blocking_sdk
+
+    return run_blocking_sdk(func, *args, **kwargs)
+
+
+def _db(func, *args, **kwargs):
+    """Await a blocking psycopg2 call on the dedicated DB thread pool."""
+    from src.nadobro.core.async_utils import run_blocking_db
+
+    return run_blocking_db(func, *args, **kwargs)
+
 
 # --- venue response field maps (confirm via scripts/capture_nado_shapes.py) --
 _DIGEST_KEYS = ("digest", "order_digest", "order_id", "id")
@@ -427,7 +467,7 @@ class NadoAdapter(NadoAdapterBase):
         )
         try:
             if order_type is OrderType.MARKET:
-                resp = await asyncio.to_thread(
+                resp = await _exec(
                     self._client.place_market_order, meta.product_id, amount, is_buy,
                     isolated_only=isolated_only, isolated_margin=isolated_margin,
                     reduce_only=reduce_only, never_grow=never_grow, client_id=tag,
@@ -435,7 +475,7 @@ class NadoAdapter(NadoAdapterBase):
             else:
                 if price is None:
                     raise AdapterError("limit order requires a price")
-                resp = await asyncio.to_thread(
+                resp = await _exec(
                     self._client.place_limit_order, meta.product_id, amount, float(price), is_buy,
                     isolated_only=isolated_only, isolated_margin=isolated_margin,
                     post_only=order_type is OrderType.LIMIT_MAKER, reduce_only=reduce_only,
@@ -468,7 +508,7 @@ class NadoAdapter(NadoAdapterBase):
         # loop). Best-effort: a link failure must never fail a placed order.
         if self._on_place is not None:
             try:
-                await asyncio.to_thread(self._on_place, order.id)
+                await _db(self._on_place, order.id)
             except Exception:  # noqa: BLE001 - placement link is best-effort
                 logger.debug("on_place link failed for %s", order.id, exc_info=True)
         ref = _OrderRef(
@@ -589,7 +629,7 @@ class NadoAdapter(NadoAdapterBase):
 
     async def _verify_no_longer_open(self, product_id: int, order_id: str) -> bool:
         try:
-            open_orders = await asyncio.to_thread(self._client.get_open_orders, product_id, True)
+            open_orders = await _sdk(self._client.get_open_orders, product_id, True)
         except Exception:  # noqa: BLE001
             return False
         return self._find_open(open_orders, order_id) is None
@@ -638,7 +678,7 @@ class NadoAdapter(NadoAdapterBase):
         hit = self._open_orders_snap.get(pid)
         if hit is not None and (now - hit[0]) < _OPEN_ORDERS_SNAP_TTL_S:
             return hit[1]
-        orders = await asyncio.to_thread(self._client.get_open_orders, pid, True)
+        orders = await _sdk(self._client.get_open_orders, pid, True)
         orders = list(orders or [])
         self._open_orders_snap[pid] = (now, orders)
         return orders
@@ -693,7 +733,7 @@ class NadoAdapter(NadoAdapterBase):
     async def _reconcile_order(self, order_id: str) -> Optional[_OrderRef]:
         for pair, meta in self._products.items():
             try:
-                open_orders = await asyncio.to_thread(
+                open_orders = await _sdk(
                     self._client.get_open_orders, meta.product_id, True,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -790,7 +830,7 @@ class NadoAdapter(NadoAdapterBase):
     async def order_book(self, trading_pair: str) -> OrderBookSnapshot:
         meta = self._meta(trading_pair)
         try:
-            data = await asyncio.to_thread(self._client.get_market_price, meta.product_id)
+            data = await _sdk(self._client.get_market_price, meta.product_id)
         except Exception as exc:  # noqa: BLE001
             raise AdapterError(f"order_book failed: {exc}") from exc
         data = data or {}
@@ -818,12 +858,43 @@ class NadoAdapter(NadoAdapterBase):
     ) -> list:
         meta = self._meta(trading_pair)
         try:
-            data = await asyncio.to_thread(
+            data = await _sdk(
                 self._client.get_candlesticks, meta.product_id, timeframe, limit
             )
         except Exception as exc:  # noqa: BLE001
             raise AdapterError(f"candles failed: {exc}") from exc
         return list(data or [])
+
+    async def depth_book(
+        self, trading_pair: str, depth: int = 10
+    ) -> OrderBookSnapshot:
+        meta = self._meta(trading_pair)
+        try:
+            data = await _sdk(
+                self._client.get_market_liquidity, meta.product_id, depth
+            )
+        except Exception as exc:  # noqa: BLE001  # policy: degrade-ok(depth is an enrichment; callers stay fail-open)
+            logger.debug("depth_book failed %s: %s", trading_pair, exc)
+            data = None
+        data = data or {}
+
+        def _levels(rows) -> list:
+            out = []
+            for row in rows or []:
+                try:
+                    price, amount = Decimal(str(row[0])), Decimal(str(row[1]))
+                except (IndexError, TypeError, ValueError, InvalidOperation):
+                    continue
+                if price > 0 and amount > 0:
+                    out.append(OrderBookLevel(price, amount))
+            return out
+
+        return OrderBookSnapshot(
+            trading_pair=trading_pair,
+            bids=_levels(data.get("bids")),
+            asks=_levels(data.get("asks")),
+            timestamp=float(data.get("timestamp") or time.time()),
+        )
 
     async def held_base(self, trading_pair: str) -> Optional[Decimal]:
         """Venue truth for how much of ``trading_pair`` the account holds.
@@ -837,7 +908,7 @@ class NadoAdapter(NadoAdapterBase):
         meta = self._meta(trading_pair)
         try:
             if bool(meta.is_perp):
-                rows = await asyncio.to_thread(self._client.get_all_positions)
+                rows = await _sdk(self._client.get_all_positions)
                 for row in (rows or []):
                     if not isinstance(row, dict):
                         continue
@@ -871,7 +942,7 @@ class NadoAdapter(NadoAdapterBase):
             # stale map lacking this product read as Decimal(0) and the clamp then
             # REFUSED a legitimate exit. Audit round 3. Cost is bounded: this runs
             # once per close, not per tick.
-            data = await asyncio.to_thread(lambda: self._client.get_balance(force=True))
+            data = await _sdk(self._client.get_balance, force=True)
             # get_balance does NOT raise on failure: a gateway-budget throttle or a
             # total SDK+REST failure both return {"exists": False, "balances": {}}.
             # Treating that as "flat" broke the documented None-on-failure contract
@@ -909,7 +980,7 @@ class NadoAdapter(NadoAdapterBase):
     async def funding_rate(self, trading_pair: str) -> Optional[Decimal]:
         meta = self._meta(trading_pair)
         try:
-            data = await asyncio.to_thread(self._client.get_funding_rate, meta.product_id)
+            data = await _sdk(self._client.get_funding_rate, meta.product_id)
         except Exception as exc:  # noqa: BLE001
             raise AdapterError(f"funding_rate failed: {exc}") from exc
         if data is None:

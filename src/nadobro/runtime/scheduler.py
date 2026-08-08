@@ -398,6 +398,23 @@ async def tick_night_howl():
         logger.error("Night HOWL ticker failed: %s", e)
 
 
+async def tick_signal_scorer():
+    """Grade overlay signals whose horizon has elapsed.
+
+    Read-only against the venue and write-only against ``signal_outcomes`` — it
+    places no orders and touches no strategy state, so it is safe to run on a
+    short interval. Anything it cannot grade this pass stays ungraded and is
+    retried next run."""
+    try:
+        from src.nadobro.llm.signal_scorer import grade_pending
+
+        result = await run_blocking(grade_pending)
+        if result.get("graded"):
+            logger.info("signal scorer graded %s outcomes", result["graded"])
+    except Exception as e:
+        logger.error("Signal scorer ticker failed: %s", e)
+
+
 async def poll_lowiqpts_relay():
     global _bot_app
     if not _bot_app:
@@ -829,6 +846,10 @@ async def initial_ai_setup():
 
 _EDGE_SCAN_SECONDS = env_int("EDGE_SCAN_INTERVAL_SECONDS", 1800)
 _NEWS_WARMUP_MINUTES = env_int("NEWS_WARMUP_MINUTES", 12)
+# Signal grading. The shortest horizon is 15m, so a 5-minute cadence keeps the
+# ledger close to live without re-querying candles that haven't moved. Set to 0
+# to disable grading entirely.
+_SIGNAL_SCORER_SECONDS = env_int("SIGNAL_SCORER_INTERVAL_SECONDS", 300)
 
 
 async def tick_news_warmup() -> None:
@@ -921,6 +942,13 @@ def start_scheduler():
         tick_night_howl, "cron", minute=0, id="night_howl_hourly",
         replace_existing=True, **_LONG_TICK,
     )
+    # Grade elapsed overlay signals. Read-only against the venue; no trading
+    # side effects, so it is safe on a short interval.
+    if _SIGNAL_SCORER_SECONDS > 0:
+        scheduler.add_job(
+            tick_signal_scorer, "interval", seconds=_SIGNAL_SCORER_SECONDS,
+            id="signal_scorer", replace_existing=True, **_LONG_TICK,
+        )
     scheduler.add_job(
         poll_lowiqpts_relay, "interval", seconds=relay_poll_seconds,
         id="lowiqpts_relay_poll", replace_existing=True, **_SHORT_TICK,

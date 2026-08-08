@@ -997,6 +997,43 @@ def init_db():
             conn.commit()
             logger.info("overlay_signals table verified/created")
 
+        # --- signal_outcomes (migrations/0019_signal_outcomes.sql) ---
+        # Grading ledger: what actually happened after each overlay signal.
+        # One row per (signal, horizon) — horizons complete at different times.
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signal_outcomes (
+                    id                 BIGSERIAL PRIMARY KEY,
+                    signal_id          BIGINT NOT NULL REFERENCES overlay_signals (id) ON DELETE CASCADE,
+                    user_id            BIGINT NOT NULL,
+                    network            TEXT NOT NULL,
+                    strategy           TEXT,
+                    product_id         INTEGER,
+                    product_name       TEXT,
+                    ts_signal          TIMESTAMPTZ NOT NULL,
+                    mid_at_signal      DOUBLE PRECISION,
+                    bias               DOUBLE PRECISION,
+                    regime             TEXT,
+                    confidence         DOUBLE PRECISION,
+                    horizon            TEXT NOT NULL,
+                    fwd_return         DOUBLE PRECISION,
+                    excursion_up       DOUBLE PRECISION,
+                    excursion_down     DOUBLE PRECISION,
+                    directional_hit    BOOLEAN,
+                    bars_used          INTEGER,
+                    graded_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (signal_id, horizon)
+                );
+                CREATE INDEX IF NOT EXISTS idx_signal_outcomes_user
+                    ON signal_outcomes (user_id, network, ts_signal DESC);
+                CREATE INDEX IF NOT EXISTS idx_signal_outcomes_horizon
+                    ON signal_outcomes (horizon, ts_signal DESC);
+                CREATE INDEX IF NOT EXISTS idx_signal_outcomes_regime
+                    ON signal_outcomes (regime, horizon) WHERE regime IS NOT NULL;
+            """)
+            conn.commit()
+            logger.info("signal_outcomes table verified/created")
+
         # --- Engine v2 tables (migrations/0007_engine_v2_tables.sql) ---
         with conn.cursor() as cur:
             cur.execute("""

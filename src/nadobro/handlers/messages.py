@@ -109,7 +109,7 @@ from src.nadobro.handlers.intent_handlers import (
     handle_trade_intent_message,
 )
 from src.nadobro.handlers.intent_parser import parse_interaction_intent
-from src.nadobro.core.async_utils import run_blocking, run_blocking_sdk
+from src.nadobro.core.async_utils import run_blocking, run_blocking_db, run_blocking_sdk
 from src.nadobro.core.perf import timed_metric, log_slow, increment_counter
 
 logger = logging.getLogger(__name__)
@@ -411,7 +411,10 @@ async def handle_message(update: Update, context: CallbackContext):
         username = update.effective_user.username
         text = update.message.text.strip()
 
-        get_or_create_user(telegram_id, username)
+        # Always two psycopg2 round-trips (SELECT + last_active UPDATE) with no
+        # cache in front of them. On the event loop that blocked every other
+        # user's strategy tick and tap for the duration — hand it to the DB pool.
+        await run_blocking_db(get_or_create_user, telegram_id, username)
 
         with language_context(get_user_language(telegram_id)):
             return await _handle_message_inner(update, context, telegram_id, username, text, started)

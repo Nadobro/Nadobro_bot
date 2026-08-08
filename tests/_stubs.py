@@ -9,7 +9,11 @@ def install_test_stubs() -> None:
     telegram_ext = sys.modules.get("telegram.ext") or types.ModuleType("telegram.ext")
     telegram_error = sys.modules.get("telegram.error") or types.ModuleType("telegram.error")
 
-    if hasattr(telegram_error, "BadRequest") and hasattr(telegram_mod, "InlineKeyboardButton"):
+    if (
+        hasattr(telegram_error, "BadRequest")
+        and hasattr(telegram_error, "TelegramError")
+        and hasattr(telegram_mod, "InlineKeyboardButton")
+    ):
         sys.modules["telegram"] = telegram_mod
         sys.modules["telegram.constants"] = telegram_constants
         sys.modules["telegram.ext"] = telegram_ext
@@ -60,12 +64,22 @@ def install_test_stubs() -> None:
                 self.command = command
                 self.description = description
 
-        class _BadRequest(Exception):
+        # Mirror PTB's hierarchy: BadRequest is a TelegramError, so handlers that
+        # catch the base class also catch the specific one.
+        class _TelegramError(Exception):
+            pass
+
+        class _BadRequest(_TelegramError):
             pass
 
         telegram_constants.ParseMode = _ParseMode
         telegram_constants.ChatAction = _ChatAction
         telegram_ext.CallbackContext = _CallbackContext
+
+        class _ContextTypes:
+            DEFAULT_TYPE = _CallbackContext
+
+        telegram_ext.ContextTypes = _ContextTypes
         telegram_mod.Update = _Update
         telegram_mod.InlineKeyboardButton = _InlineKeyboardButton
         telegram_mod.InlineKeyboardMarkup = _InlineKeyboardMarkup
@@ -74,6 +88,7 @@ def install_test_stubs() -> None:
         telegram_mod.ReplyKeyboardRemove = _ReplyKeyboardRemove
         telegram_mod.BotCommand = _BotCommand
         telegram_mod.WebAppInfo = _WebAppInfo
+        telegram_error.TelegramError = _TelegramError
         telegram_error.BadRequest = _BadRequest
 
         sys.modules["telegram"] = telegram_mod

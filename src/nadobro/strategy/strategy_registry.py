@@ -43,6 +43,31 @@ MARKET_MAKING_STRATEGIES: tuple[str, ...] = (
 _RGRID_SLTP_STRATEGIES: tuple[str, ...] = (STRATEGY_RGRID, STRATEGY_DGRID)
 
 
+# The margin the session SL/TP percentage is measured against. MUST stay in the
+# same key order as ``trading/live_session._resolve_margin`` — that function is
+# what actually enforces the rail, so anything sizing itself against "the stop
+# budget" has to agree with it. Note this is NOT the deployment basis:
+# ``map_strategy_config`` resolves ``cycle_notional_usd`` FIRST when deciding how
+# much to deploy, which is the opposite order. Mixing the two let R-Grid's step
+# cap size itself against a budget 2.5x larger than the rail would ever honour
+# (audit 2026-08-06). ``tests/engine/test_sltp_invariants.py`` pins the agreement.
+_SESSION_MARGIN_KEYS: tuple[str, ...] = (
+    "notional_usd", "cycle_notional_usd", "fixed_margin_usd", "session_margin_usd",
+)
+
+
+def session_margin_usd(conf: Mapping) -> float:
+    """Allocated margin the user's SL/TP % is measured against (0 when unset)."""
+    for key in _SESSION_MARGIN_KEYS:
+        try:
+            value = float(conf.get(key) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0.0
+
+
 def effective_sl_tp_pct(strategy: str, conf: Mapping) -> tuple[float, float]:
     """Return ``(sl_pct, tp_pct)`` honoring the per-strategy SL/TP fields.
 
@@ -63,6 +88,25 @@ def effective_sl_tp_pct(strategy: str, conf: Mapping) -> tuple[float, float]:
         tp = conf.get("tp_pct") if tp is None else tp
         return _f(sl), _f(tp)
     return _f(conf.get("sl_pct")), _f(conf.get("tp_pct"))
+
+
+def sltp_is_explicit(strategy: str, conf: Mapping) -> tuple[bool, bool]:
+    """``(sl_set, tp_set)`` — whether the user's own key is PRESENT for this
+    strategy, even when its value is 0.
+
+    ``effective_sl_tp_pct`` already returns 0.0 for a deliberately disarmed stop,
+    but a caller cannot tell that apart from "never configured" and so may
+    substitute a default, re-arming what the user switched off. That is exactly
+    what DGRID-TP-DISARM-PHANTOM was: an explicit ``rgrid_take_profit_pct = 0``
+    became 0.6, arming a tier ladder at [0.2, 0.4, 0.6]% of margin while the rail
+    stayed disarmed. Key order mirrors ``effective_sl_tp_pct`` exactly.
+    """
+    s = str(strategy or "").lower()
+    if s in _RGRID_SLTP_STRATEGIES:
+        sl_set = conf.get("rgrid_stop_loss_pct") is not None or conf.get("sl_pct") is not None
+        tp_set = conf.get("rgrid_take_profit_pct") is not None or conf.get("tp_pct") is not None
+        return sl_set, tp_set
+    return conf.get("sl_pct") is not None, conf.get("tp_pct") is not None
 
 STRATEGY_ALIASES: Mapping[str, str] = {
     "mm": STRATEGY_GRID,

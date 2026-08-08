@@ -267,3 +267,92 @@ def test_funding_flag_fires_with_held_long_position(monkeypatch):
 
     risks = captured.get("risks_json") or []
     assert any("Funding" in r and "paying" in r for r in risks)
+
+
+# ==========================================================================
+# Overlay read must not churn live orders (audit 2026-08-06, HIGH)
+# ==========================================================================
+# The overlay's regime read is handed to the controllers so D-Grid can weigh it
+# on a flip and R-Grid can surface it. It is written into the mapped config —
+# and the mapped config is hashed into the LIVE-CONFIG SIGNATURE, whose only job
+# is to decide when to re-quote a live controller. `signal_bias`/
+# `signal_confidence` are continuous floats recomputed from fresh candles every
+# cycle, so including them re-placed the entire resting ladder every tick:
+# permanent loss of queue position, and both of D-Grid's re-center throttles
+# (reset_threshold_bp, _DGRID_RECENTER_MIN_INTERVAL_S) bypassed.
+def test_signal_read_never_flips_the_live_config_signature():
+    from src.nadobro.strategy.engine_runtime import _live_config_signature
+
+    base = {"trading_pair": "BTC-PERP", "spread_bid_pct": "0.001", "step_pct": "0.0008"}
+    quiet = dict(base, signal_regime="trend_up", signal_bias=0.6104, signal_confidence=0.5512)
+    wobble = dict(base, signal_regime="trend_up", signal_bias=0.6109, signal_confidence=0.5518)
+    assert _live_config_signature(quiet) == _live_config_signature(wobble), (
+        "a 4th-decimal signal wobble re-quotes every live ladder"
+    )
+    # Even a full regime flip must not, on its own, re-place the book — the
+    # controllers read it directly and act on it in their own tick.
+    flipped = dict(base, signal_regime="trend_down", signal_bias=-0.7, signal_confidence=0.9)
+    assert _live_config_signature(quiet) == _live_config_signature(flipped)
+    # A REAL parameter change still must.
+    assert _live_config_signature(quiet) != _live_config_signature(
+        dict(quiet, spread_bid_pct="0.002")
+    )
+
+
+def test_a_real_config_change_still_re_quotes():
+    """Guard the other direction: the exclusion must not blanket-disable the
+    live-reconfig path."""
+    from src.nadobro.strategy.engine_runtime import _live_config_signature
+
+    base = {"trading_pair": "BTC-PERP", "order_amount_quote": "100"}
+    for key, changed in (
+        ("order_amount_quote", "250"),
+        ("trading_pair", "ETH-PERP"),
+        ("reset_threshold_pct", "0.01"),
+    ):
+        assert _live_config_signature(base) != _live_config_signature(dict(base, **{key: changed}))
+
+
+def test_every_overlay_steered_controller_can_receive_the_signal_push():
+    """The push before RUNTIME.tick is guarded by `hasattr(ctrl, "signal_regime")`.
+    If a controller renames or drops those attributes the push silently no-ops and
+    D-Grid's flip weighting dies with no error — pin the contract instead."""
+    from decimal import Decimal
+
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
+    from src.nadobro.engine.controllers.rgrid import RGridController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+
+    for cls in (DynamicGridController, RGridController):
+        c = cls(
+            user_id=1, orchestrator=ExecutorOrchestrator(),
+            adapter=MockNadoAdapter(mid=Decimal(100)), inventory=InventoryRepository(),
+            configs={"trading_pair": "BTC-PERP"}, controller_id="X",
+        )
+        assert hasattr(c, "signal_regime"), cls.__name__
+        assert hasattr(c, "signal_confidence"), cls.__name__
+        # The push writes plain attributes; nothing may reject the assignment.
+        c.signal_regime = "trend_down"
+        c.signal_confidence = 0.9
+        assert c.signal_regime == "trend_down" and c.signal_confidence == 0.9
+
+
+def test_the_runtime_pushes_the_signal_before_ticking_not_via_live_config():
+    """Structural guard. Routing the read through the live-config path is what
+    re-quoted every ladder each cycle; it must stay a direct attribute write that
+    happens BEFORE the tick (so the controller acts on THIS cycle's signal)."""
+    import inspect
+
+    from src.nadobro.strategy import engine_runtime as er
+
+    source = inspect.getsource(er._run_engine_cycle_locked)
+    push = source.index("_sig_ctrl.signal_regime =")
+    tick = source.index("await RUNTIME.tick(")
+    assert push < tick, "the signal must reach the controller before it ticks"
+    # And the live-reconfig helpers must not ASSIGN it (that is the churn path).
+    # Substring-match would trip on the explanatory comment, so match the write.
+    assert "signal_regime =" not in inspect.getsource(er._apply_rgrid_controller_config)
+    assert "signal_regime =" not in inspect.getsource(er._apply_fill_anchored_controller_config)

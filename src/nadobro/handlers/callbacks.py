@@ -85,7 +85,12 @@ from src.nadobro.config import (
     list_volume_spot_product_names,
     normalize_volume_spot_symbol,
 )
-from src.nadobro.core.async_utils import run_blocking, run_blocking_sdk, run_blocking_sdk_capped
+from src.nadobro.core.async_utils import (
+    fire_and_forget,
+    run_blocking,
+    run_blocking_sdk,
+    run_blocking_sdk_capped,
+)
 from src.nadobro.core.perf import timed_metric, log_slow
 from src.nadobro.trading.trading_readiness import check_trading_readiness
 
@@ -171,6 +176,14 @@ async def _edit_loc(query, text, parse_mode=None, reply_markup=None, **fmt):
         raise
 
 
+async def _send_typing(query) -> None:
+    """Best-effort typing indicator. Cosmetic — never block a tap on it."""
+    try:
+        await query.message.chat.send_action(ChatAction.TYPING)
+    except Exception as exc:  # noqa: BLE001 - purely cosmetic
+        logger.debug("send_action(TYPING) failed: %s", exc)
+
+
 async def handle_callback(update: Update, context: CallbackContext):
     started = time.perf_counter()
     query = update.callback_query
@@ -197,15 +210,15 @@ async def _handle_callback_inner(update, context, query, data, telegram_id, star
     _seq_chat = getattr(getattr(query, "message", None), "chat_id", None) or int(telegram_id)
     _CB_SEQ[int(_seq_chat)] = _CB_SEQ.get(int(_seq_chat), 0) + 1
     try:
-        try:
-            # LOWIQPTS cancel needs a targeted answer (e.g. show_alert) when nothing is pending.
-            if data != "points:cancel":
-                await query.answer()
-        except BadRequest as e:
-            # Callback queries expire quickly; ignore stale answers and continue.
-            if "Query is too old" not in str(e) and "query id is invalid" not in str(e):
-                raise
-        await query.message.chat.send_action(ChatAction.TYPING)
+        # PERF: the callback query is already answered by ``with_callback_ack``
+        # BEFORE the per-user serialization lock (main.py wires it outside
+        # ``with_user_serialized``), so the spinner clears immediately and this
+        # handler doesn't pay a Telegram round-trip before doing real work.
+        # ``points:cancel`` is excluded there and answers itself with show_alert.
+        #
+        # The typing indicator is cosmetic and costs another round-trip: fire it
+        # and move on. Awaiting it added ~1 RTT to every single tap.
+        fire_and_forget(_send_typing(query))
 
         if data.startswith("onb:"):
             await _handle_onb_new(query, data, telegram_id, context)

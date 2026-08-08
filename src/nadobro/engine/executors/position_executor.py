@@ -129,7 +129,8 @@ class PositionExecutor(Executor):
                 price,
                 delta_fee,
                 time.time(),
-            )
+            ),
+            order,
         )
         self._e_base, self._e_quote, self._e_fee = (
             order.filled_base,
@@ -155,7 +156,8 @@ class PositionExecutor(Executor):
                 price,
                 delta_fee,
                 time.time(),
-            )
+            ),
+            order,
         )
         self._x_base, self._x_quote, self._x_fee = (
             order.filled_base,

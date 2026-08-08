@@ -167,6 +167,22 @@ class NadoAdapterBase(abc.ABC):
     async def funding_rate(self, trading_pair: str) -> Optional[Decimal]:
         raise NotImplementedError
 
+    async def depth_book(
+        self, trading_pair: str, depth: int = 10
+    ) -> OrderBookSnapshot:
+        """Sized order book — levels carry real ``amount``, unlike ``order_book``.
+
+        ``order_book`` is the top-of-book hot path behind every ``mid_price``
+        call and returns levels with zero size; loading it with the full ladder
+        would put a heavier query on the most-called method in the engine. This
+        is the separate, lower-cadence read for structure and microstructure
+        work (imbalance, liquidity-at-price, adverse-selection defense).
+
+        Implementations must degrade to an empty snapshot rather than raise:
+        depth is an enrichment and no consumer may hard-depend on it.
+        """
+        raise NotImplementedError
+
     async def held_base(self, trading_pair: str) -> Optional[Decimal]:
         """Base units of ``trading_pair`` the account ACTUALLY holds, per the
         VENUE — the spot balance for a spot product, the signed position size for

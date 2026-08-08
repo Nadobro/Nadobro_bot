@@ -110,9 +110,62 @@ _LOWIQPTS_ORPHAN_REPLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A pending points refresh lives for up to LOWIQPTS_PENDING_TTL_SECONDS (30min
+# default). The relay used to claim EVERY free-text message inside that window,
+# which is above the trade parsers in handlers/messages.py — so a user who typed
+# "Short 0.3 ETH 49x" while a refresh was pending had their trade forwarded to
+# LOWIQPTS ("Data error: Текст должен быть JSON массивом/объектом или JSONL")
+# instead of opening a position. The relay now only claims text SHAPED like an
+# answer to what LOWIQPTS actually asks for: a bare number (or a list of them),
+# yes/no, a wallet, or one of the option labels it just offered. Everything else
+# falls through to the normal handler chain.
+_LOWIQPTS_ANSWER_RE = re.compile(
+    r"""^\s*(?:
+          \d+(?:[.,]\d+)?(?:\s*[,;/]\s*\d+(?:[.,]\d+)?)*   # 0 | 0.5 | 0,1,2
+        | 0x[a-fA-F0-9]{40}                                # wallet paste
+        | y|n|yes|no|ok|okay|none|skip|nope|yep|yeah        # confirmations
+        | да|нет|ага                                       # LOWIQPTS is RU-facing
+    )\s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+# Belt-and-braces veto: trading vocabulary is never a points answer, even if it
+# somehow matched the shape above. Mirrors desk_parser.TRADE_VERBS (duplicated
+# rather than imported: users/ must not depend on trading/ for a regex).
+_LOWIQPTS_TRADE_VETO_RE = re.compile(
+    r"\b(long|short|buy|sell|close|market|limit|leverage|twap|dca|"
+    r"accumulate|acquire|purchase|grab|ape|scale|perp|flip|hedge)\b",
+    re.IGNORECASE,
+)
+
 
 def looks_like_orphan_lowiqpts_reply(text: str) -> bool:
     return bool(_LOWIQPTS_ORPHAN_REPLY_RE.match(text or ""))
+
+
+def text_is_lowiqpts_answer(text: str, req: Optional[dict] = None) -> bool:
+    """Is this free text plausibly an answer to a pending LOWIQPTS prompt?
+
+    Gate for ``relay_user_reply_to_lowiqpts``: a pending points refresh must not
+    swallow trade instructions, questions, or chat. Option labels offered by the
+    relay itself always pass (they can be arbitrary text); everything else has to
+    look like a number / confirmation / wallet and carry no trading vocabulary.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+
+    # The relay just offered these exact labels — tapping-by-typing must work
+    # regardless of what the label says.
+    options = (req or {}).get("relay_options")
+    if isinstance(options, list):
+        normalized = cleaned.casefold()
+        for option in options:
+            if str(option or "").strip().casefold() == normalized:
+                return True
+
+    if _LOWIQPTS_TRADE_VETO_RE.search(cleaned):
+        return False
+    return bool(_LOWIQPTS_ANSWER_RE.match(cleaned))
 
 
 def _pending_maps(bot_data: dict) -> tuple[list[dict], dict[str, list[dict]]]:
@@ -776,6 +829,17 @@ async def relay_user_reply_to_lowiqpts(context, chat_id: int, text: str) -> dict
         _drop_relay_cursor(context.application.bot_data, session_id)
         await _persist_relay_state(context.application.bot_data)
         return {"ok": True, "handled": True, "cancelled": True}
+
+    # The user typed something that is not an answer to LOWIQPTS (a trade, a
+    # question, chat). Decline the message so the normal handler chain — trade
+    # parsers, desk, AI — gets it. The pending request stays open; the relay is
+    # still free to prompt again, and the user's next number/yes still lands.
+    if not text_is_lowiqpts_answer(cleaned, req):
+        logger.info(
+            "LOWIQPTS relay declined free text (not an answer shape): req_id=%s chat=%d",
+            req.get("req_id"), chat_id,
+        )
+        return {"ok": False, "handled": False}
 
     session_id = str(req.get("relay_session_id", "")).strip()
     if not session_id:

@@ -655,7 +655,7 @@ async def _handle_strategy(query, data, context, telegram_id):
         if strategy_id not in supported:
             return
         network, settings = get_user_settings(telegram_id)
-        conf = _conf_for_card(settings, strategy_id, context)
+        conf = _conf_for_card(settings, strategy_id, context, network)
         context.user_data.pop(f"strategy_config_section:{strategy_id}", None)
         await _edit_loc(query, 
             _strategy_config_menu_text(strategy_id, conf, network),
@@ -671,7 +671,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             return
         context.user_data[f"strategy_config_section:{strategy_id}"] = section
         network, settings = get_user_settings(telegram_id)
-        conf = _conf_for_card(settings, strategy_id, context)
+        conf = _conf_for_card(settings, strategy_id, context, network)
         await _edit_loc(
             query,
             _strategy_config_section_text(strategy_id, conf, network, section),
@@ -710,7 +710,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 _replace_mm_preset(cfg, strategy_id, "turbo", turbo_cfg)
 
             network, settings = update_user_settings(telegram_id, _mutate_turbo)
-            conf = _conf_for_card(settings, strategy_id, context)
+            conf = _conf_for_card(settings, strategy_id, context, network)
             section = "setup"
             context.user_data[f"strategy_config_section:{strategy_id}"] = section
             margin_t = float(conf.get("notional_usd", 100.0) or 0.0)
@@ -745,11 +745,13 @@ async def _handle_strategy(query, data, context, telegram_id):
                 _replace_mm_preset(cfg, strategy_id, "standard")
 
             network, settings = update_user_settings(telegram_id, _mutate_std)
-            conf = _conf_for_card(settings, strategy_id, context)
+            conf = _conf_for_card(settings, strategy_id, context, network)
             section = "setup"
             context.user_data[f"strategy_config_section:{strategy_id}"] = section
             # Confirmation note so Standard is no longer a silent no-op: it clears
-            # the Tiny override and returns to the default leverage (margin × 3x).
+            # the Tiny override and returns to the leverage the run will resolve
+            # (the pair max for grid/rgrid/dgrid, else the user's default) — read
+            # through _mm_effective_leverage so the number shown is the engine's.
             margin_std = float(conf.get("notional_usd", 100.0) or 0.0)
             deployed_std = margin_std * _mm_effective_leverage(conf)
             std_note = (
@@ -822,7 +824,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             )
 
         network, settings = update_user_settings(telegram_id, _mutate_tiny)
-        conf = _conf_for_card(settings, strategy_id, context)
+        conf = _conf_for_card(settings, strategy_id, context, network)
         section = "setup"
         context.user_data[f"strategy_config_section:{strategy_id}"] = section
         notional_after = collateral * float(target_lev)
@@ -864,8 +866,10 @@ async def _handle_strategy(query, data, context, telegram_id):
             "dgrid_spread_bp", "dgrid_min_spread_bp", "dgrid_max_spread_bp",
             "dgrid_short_window_points", "dgrid_long_window_points",
             "auto_close_on_maintenance", "is_long_bias",
-            # R-Grid trend-follow toggle (1 = fill-anchored taker-momentum, the
-            # default for rgrid; 0 = classic one-sided ladder).
+            # GRID quoting mode (1 = fill-anchored maker with no-cross + soft reset,
+            # 0 = classic static ladder). Ignored for rgrid: Reverse Grid has one
+            # engine, and letting this route it elsewhere is what made R-Grid
+            # sessions announce D-Grid phase flips.
             "fill_anchored",
             # Mid Mode accepts directional_bias as a continuous float in [-1, +1].
             "directional_bias",
@@ -986,7 +990,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 sync_cycle_notional_with_margin(strategies, strategy_id)
 
         network, settings = update_user_settings(telegram_id, _mutate)
-        conf = _conf_for_card(settings, strategy_id, context)
+        conf = _conf_for_card(settings, strategy_id, context, network)
         section = context.user_data.get(f"strategy_config_section:{strategy_id}") or _strategy_section_for_field(strategy_id, field)
         context.user_data[f"strategy_config_section:{strategy_id}"] = section
         await _edit_loc(query, 
@@ -1034,7 +1038,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 cfg[field] = raw_value
 
         network, settings = update_user_settings(telegram_id, _mutate)
-        conf = _conf_for_card(settings, strategy_id, context)
+        conf = _conf_for_card(settings, strategy_id, context, network)
         section = context.user_data.get(f"strategy_config_section:{strategy_id}") or _strategy_section_for_field(strategy_id, field)
         context.user_data[f"strategy_config_section:{strategy_id}"] = section
         await _edit_loc(query, 
@@ -1507,10 +1511,10 @@ def _strategy_config_sections(strategy: str) -> list[tuple[str, str]]:
     if strategy == "grid":
         return [("setup", "⚙️ Core"), ("execution", "📐 Spread"), ("risk", "🛡 Risk")]
     if strategy == "rgrid":
-        # The "reset" section id is kept (callbacks and pending-input routing
-        # use it); only the LABEL changes — on the momentum path the threshold
-        # is a take-profit, not a re-anchor.
-        return [("setup", "⚙️ Core"), ("risk", "🛡 Risk"), ("reset", "🎯 Take Profit")]
+        # The "reset" section id is kept (callbacks and pending-input routing use
+        # it). The threshold ARMS the trailing soft reset: once price has drifted
+        # favourably by it, the exit leg follows the trend instead of banking.
+        return [("setup", "⚙️ Core"), ("risk", "🛡 Risk"), ("reset", "🎯 Soft Reset")]
     if strategy == "dgrid":
         return [("setup", "⚙️ Core"), ("regime", "⚡ Regime"), ("risk", "🛡 Risk")]
     if strategy == "mid":
@@ -1591,11 +1595,156 @@ def _strategy_config_menu_kb(strategy: str):
 
 
 def _mm_effective_leverage(conf: dict) -> float:
-    """Display-side mirror of engine_runtime._effective_leverage: an explicit
-    mm_leverage_override wins, else the MM default (3x). Used so the card shows
-    the SAME leverage the engine will deploy."""
-    override = float(conf.get("mm_leverage_override", 0) or 0)
-    return override if override >= 1 else 3.0
+    """The leverage the ENGINE will deploy at — resolved by the engine's own
+    helper rather than mirrored, so the card cannot drift from it.
+
+    This used to be a hand-written "override wins, else 3x" copy, and it was
+    wrong in both directions (CARD-LEV-DIVERGE, self-review 2026-08-07). The
+    engine resolves ``mm_leverage_override`` -> session ``leverage`` -> 1x, and
+    for grid/rgrid/dgrid the start path sets that session ``leverage`` to the
+    PAIR MAX. On BTC (50x) the card therefore priced every size at 3x: it showed
+    a $75 step where the engine deployed $306.98, and — because the step cap is
+    computed from the same number — it reported "not capped" on a run the engine
+    was capping. The whole stop-headroom warning was blind to the real size.
+
+    ``_conf_for_card`` injects ``leverage`` with the value the start path will
+    resolve, so a card rendered BEFORE the run agrees with the run.
+    """
+    from src.nadobro.strategy.engine_runtime import _effective_leverage
+
+    return _effective_leverage(conf, 1.0)
+
+
+def _start_leverage_for_card(
+    settings: dict, strategy_id: str, product: str | None, network: str | None,
+) -> float:
+    """The session leverage the START path will hand the engine.
+
+    Mirrors the resolution in the ``preview`` branch (the value that becomes
+    ``state["leverage"]``, which is what ``_effective_leverage`` reads): vol is
+    always 1x, dn is clamped to 5x, grid/rgrid/dgrid deploy at the PAIR MAX, and
+    everything else takes the user's ``default_leverage``. Kept next to
+    ``_mm_effective_leverage`` so the two stay in step.
+
+    Cache-first: ``get_product_max_leverage`` reads the product catalog, the same
+    synchronous call the start branch already makes on a tap, and any failure
+    degrades to ``default_leverage`` rather than blocking the card.
+    """
+    if strategy_id == "vol":
+        return 1.0
+    try:
+        default_lev = float(settings.get("default_leverage", 3) or 3)
+    except (TypeError, ValueError):
+        default_lev = 3.0
+    if strategy_id == "dn":
+        return max(1.0, min(default_lev, 5.0))
+    if strategy_id in ("grid", "rgrid", "dgrid") and product:
+        try:
+            from src.nadobro.config import get_product_max_leverage as _gpml
+
+            return max(1.0, float(_gpml(str(product), network=network)))
+        except Exception:  # noqa: BLE001  # policy: degrade-ok(card falls back to the user default)
+            return max(1.0, default_lev)
+    return max(1.0, default_lev)
+
+
+def rgrid_step_plan(conf: dict, sl_pct_val: float):
+    """The per-break size R-Grid will actually trade, and why.
+
+    Uses the SAME pure math the engine mapping uses
+    (:mod:`src.nadobro.quant.rgrid_sizing`), so the card can never quote a size
+    the strategy does not place. Lazy import: handlers/ has no module-level edge
+    to quant/ (tests/lint/test_architecture_layers.py).
+    """
+    from src.nadobro.quant.mm_quote_math import DEFAULT_MIN_ORDER_NOTIONAL_USD
+    from src.nadobro.quant.rgrid_sizing import resolve_step_quote
+    from src.nadobro.strategy.strategy_registry import session_margin_usd
+
+    # TWO different bases, on purpose — mixing them is what the 2026-08-06 audit
+    # caught. Deployment is cycle-first (what the engine actually trades); the stop
+    # budget is notional-first (what the session rail measures its % against).
+    deploy_margin = _effective_margin_usd(conf)
+    rail_margin = session_margin_usd(conf) or deploy_margin
+    levels = max(1, int(float(conf.get("levels", 4) or 4)))
+    # The same band engine_runtime derives (spread_bp -> fraction, 10bp default),
+    # so the card's cap matches the engine's on the price bound too.
+    _band_bp = float(conf.get("rgrid_spread_bp", conf.get("spread_bp", 10.0)) or 10.0)
+    return rail_margin, resolve_step_quote(
+        deployed_quote=deploy_margin * _mm_effective_leverage(conf),
+        levels=levels,
+        stop_budget_usd=rail_margin * max(0.0, sl_pct_val) / 100.0,
+        min_step_usd=DEFAULT_MIN_ORDER_NOTIONAL_USD,
+        band_frac=(_band_bp / 10000.0) if _band_bp > 0 else 0.001,
+    )
+
+
+def rgrid_stop_headroom(conf: dict, sl_pct_val: float) -> dict:
+    """How much room the session stop leaves R-Grid to trade, AFTER the step cap.
+
+    SL/TP are % of MARGIN and the rail judges live PnL NET of fees, so the real
+    question is not "is 1% a sensible stop" but "how many round trips fit inside 1%
+    of my margin before the stop fires on costs alone". The engine caps the step so
+    at least ~3 do; this reports the resulting numbers and flags the one case the
+    cap cannot fix.
+
+    Costed at the TAKER round trip on purpose. R-Grid rests post-only quotes, so its
+    real cost is lower — pricing the bound conservatively means the displayed
+    headroom is a floor, never an overstatement.
+    """
+    margin, plan = rgrid_step_plan(conf, sl_pct_val)
+    budget = float(plan.stop_budget_usd)
+    fee = float(plan.round_trip_cost)
+    return {
+        "margin": margin,
+        "budget_usd": budget,
+        "step_usd": float(plan.step),
+        "uncapped_step_usd": float(plan.uncapped),
+        "round_trip_usd": fee,
+        "ratio": (fee / budget) if budget > 0 else 0.0,
+        "round_trips": (budget / fee) if fee > 0 else float("inf"),
+        "capped": bool(plan.capped),
+        "floored": bool(plan.floored),
+    }
+
+
+def _rgrid_step_cap_note(conf: dict, sl_pct_val: float) -> str:
+    """Explain a step that is smaller than margin x leverage / levels, or warn when
+    even the venue-minimum step cannot fit inside the stop."""
+    room = rgrid_stop_headroom(conf, sl_pct_val)
+    if room["budget_usd"] <= 0:
+        return (
+            "\n\n⚠️ PnL stop disarmed — the step is NOT capped against a stop "
+            "budget; only the net\\-exposure cap and take profit remain\\."
+        )
+    step = escape_md(f"${room['step_usd']:,.0f}")
+    fee = escape_md(f"${room['round_trip_usd']:,.2f}")
+    budget = escape_md(f"${room['budget_usd']:,.2f}")
+    if room["floored"]:
+        # The budget wanted a step SMALLER than the venue accepts, so the cap could
+        # not finish the job. How bad that is depends on what is actually left.
+        if room["ratio"] >= 1.0:
+            return (
+                f"\n\n🚨 *Stop too tight to trade\\.* The smallest step the venue "
+                f"accepts \\({step}\\) costs {fee} per round trip — more than "
+                f"your whole {budget} stop budget, so the session stops out on fees "
+                "alone whichever way price goes\\. Raise the PnL stop or add margin\\."
+            )
+        trips = escape_md(f"{room['round_trips']:.1f}")
+        return (
+            f"\n\n⚠️ *Thin\\.* The step is already at the venue minimum \\({step}\\) "
+            f"so it cannot be capped further: {fee} per round trip leaves only about "
+            f"{trips} inside your {budget} stop budget\\. Raise the PnL stop or add "
+            "margin for more room\\."
+        )
+    if room["capped"]:
+        uncapped = escape_md(f"${room['uncapped_step_usd']:,.0f}")
+        trips = escape_md(f"{room['round_trips']:.0f}")
+        return (
+            f"\n\n🛡 Step capped to *{step}* per break \\(from {uncapped}\\) so your "
+            f"stop budget covers about {trips} round trips\\. Raise the PnL "
+            "stop or lower leverage to trade larger steps\\."
+        )
+    return ""
 
 
 def _mm_sizing_line(conf: dict) -> str:
@@ -1685,7 +1834,9 @@ def _ladder_line(conf: dict) -> str:
     )
 
 
-def _conf_for_card(settings: dict, strategy_id: str, context) -> dict:
+def _conf_for_card(
+    settings: dict, strategy_id: str, context, network: str | None = None,
+) -> dict:
     """The strategy's stored config PLUS the product the user has selected.
 
     ``settings["strategies"][sid]`` has no "product" key — the chosen asset lives
@@ -1702,6 +1853,16 @@ def _conf_for_card(settings: dict, strategy_id: str, context) -> dict:
         sel = None
     if sel:
         conf.setdefault("product", str(sel).upper())
+    # ...and the leverage the run will actually deploy at. The stored per-strategy
+    # config has no ``leverage`` key — the session value is resolved at START from
+    # the pair max — so every size the card renders (step, deployed notional, the
+    # stop-budget cap and its four warning tiers) was computed at a hardcoded 3x
+    # while the engine ran at up to 50x. setdefault, so a stored value or an
+    # explicit mm_leverage_override still wins, exactly as in the engine.
+    conf.setdefault(
+        "leverage",
+        _start_leverage_for_card(settings, strategy_id, conf.get("product"), network),
+    )
     return conf
 
 
@@ -1830,13 +1991,31 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
 
     if strategy == "rgrid":
         if section == "risk":
-            pnl_sl = f"{float(conf.get('rgrid_stop_loss_pct', sl_pct)):.2f}%"
+            _sl_val = float(conf.get("rgrid_stop_loss_pct", sl_pct) or 0.0)
+            pnl_sl = f"{_sl_val:.2f}%"
             pnl_tp = f"{float(conf.get('rgrid_take_profit_pct', tp_pct)):.2f}%"
+            _room = rgrid_stop_headroom(conf, _sl_val)
+            _budget_txt = escape_md(f"${_room['budget_usd']:,.2f}")
+            _margin_txt = escape_md(f"${_room['margin']:,.0f}")
+            _rt_txt = escape_md(f"${_room['round_trip_usd']:,.2f}")
+            _step_txt = escape_md(f"${_room['step_usd']:,.0f}")
+            _budget_line = (
+                f"Stop budget: *{_budget_txt}* "
+                f"\\({escape_md(pnl_sl)} of {_margin_txt} margin\\)\n"
+                f"Step: *{_step_txt}* per break \\| Round trip \\(worst case\\): *{_rt_txt}*\n"
+                if _room["budget_usd"] > 0 else ""
+            )
             return (
                 "⚙️ *Reverse GRID · Risk*\n\n"
                 f"PnL stop: *{escape_md(pnl_sl)}* \\| "
-                f"PnL take profit: *{escape_md(pnl_tp)}*\n\n"
-                "Set when the strategy should cut or lock gains based on realized/open PnL, not raw market drift\\."
+                f"PnL take profit: *{escape_md(pnl_tp)}*\n"
+                f"{_budget_line}\n"
+                "Both are % of MARGIN, measured on live PnL \\(realized \\+ open\\) "
+                "NET of fees — not raw market drift\\. R\\-Grid rests post\\-only "
+                "limit orders, so it earns the spread rather than paying it; only the "
+                "trailing stop crosses\\. The size per break is capped so even a "
+                "worst\\-case crossing round trip fits inside that budget\\."
+                f"{_rgrid_step_cap_note(conf, _sl_val)}"
             )
         if section == "reset":
             _tp_pct_val = float(conf.get("rgrid_reset_threshold_pct", 0.2) or 0.2)
@@ -1856,19 +2035,23 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
                 f"at a {escape_md(f'{_band_bp:.1f} bp')} band \\(2× the entry band\\)\\."
                 if _inactive else ""
             )
-            # RGrid runs taker-momentum, where this threshold is a TAKE-PROFIT,
-            # not a re-anchor: on_tick hands off to the momentum path, so grid's
-            # soft reset never runs here. Re-anchoring on drift would suppress
-            # the very break the strategy exists to trade. rgrid_reset_timeout_
-            # seconds is NOT displayed — no controller reads it.
+            # This threshold ARMS the soft reset — it is not a re-anchor (grid's
+            # meaning) and no longer an immediate take-profit. Re-anchoring the
+            # ENTRY on drift would suppress the very break the strategy exists to
+            # trade; banking at the threshold would stop it following the trend.
+            # rgrid_reset_timeout_seconds is NOT displayed — no controller reads it.
             return (
-                "⚙️ *Reverse GRID · Take Profit*\n\n"
-                f"Take profit: *{escape_md(reset_threshold)}* favourable move{_tp_note}\n"
+                "⚙️ *Reverse GRID · Soft Reset*\n\n"
+                f"Arms after: *{escape_md(reset_threshold)}* favourable move{_tp_note}\n"
                 f"Discretion: *{escape_md(discretion)}* \\(exposure VWAP window\\)\n\n"
-                "RGrid adds INTO a trend and banks the position once it has run "
-                "this far from the exposure price, then re\\-arms\\. Range 0\\.1–10%\\. "
-                "Set it clear of the entry band or a position closes before the "
-                "break that opened it is established\\."
+                "R\\-Grid adds INTO a trend\\. Once the move has gone this far your "
+                "way *and* you are in profit, the exit starts FOLLOWING the trend — "
+                "one spread behind the best price, instead of sitting at your entry, "
+                "so the run keeps going and the profit is locked\\. A pullback that "
+                "stops short of it is booked by the resting limit; once price comes "
+                "back THROUGH it the stop crosses and closes the whole position\\. "
+                "Range 0\\.1–10%\\. Set it clear of the entry band or the exit would "
+                "arm before the move that opened the position is established\\."
             )
         levels = str(int(conf.get("levels", 4)))
         rgrid_spread = f"{float(conf.get('rgrid_spread_bp', spread_bp)):.1f} bp"
@@ -1879,7 +2062,13 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             f"Levels: *{escape_md(levels)}* \\| Spread: *{escape_md(rgrid_spread)}*\n"
             f"POV: *{escape_md(pov_label)}*\n"
             f"{_mm_sizing_line(conf)}\n\n"
-            "Set the basic breakout loop here\\. *Position size \\= margin × leverage*\\."
+            "Both legs rest as *post\\-only limit orders* one spread either side of "
+            "the *average of your buy and sell exposure prices* — the buy ABOVE it, "
+            "the sell BELOW\\. Each becomes fillable once price has travelled past "
+            "it, so you buy into strength and sell into weakness without ever paying "
+            "the spread\\. Profits in trends, waits in chop — the mirror of GRID\\. "
+            "The trailing stop is the one order that crosses\\. "
+            "*Position size \\= margin × leverage*\\."
         )
 
     if strategy == "dgrid":
@@ -2308,10 +2497,11 @@ def _strategy_config_section_kb(strategy: str, section: str):
                     InlineKeyboardButton("60s", callback_data="strategy:set:rgrid:interval_seconds:60"),
                     InlineKeyboardButton("120s", callback_data="strategy:set:rgrid:interval_seconds:120"),
                 ],
-                [
-                    InlineKeyboardButton("🌊 Momentum (taker)", callback_data="strategy:set:rgrid:fill_anchored:1"),
-                    InlineKeyboardButton("📊 Directional ladder (default)", callback_data="strategy:set:rgrid:fill_anchored:0"),
-                ],
+                # No mode toggle: Reverse Grid has exactly one engine (both legs
+                # quote off the average of the buy/sell exposure prices and take
+                # the break). The old "Directional ladder" option routed R-Grid to
+                # the D-Grid phase switcher, which is why R-Grid sessions reported
+                # "switched RGRID → GRID" — pick D-Grid if you want a switcher.
                 [
                     InlineKeyboardButton("Discretion 0.06", callback_data="strategy:set:rgrid:rgrid_discretion:0.06"),
                     InlineKeyboardButton("0.12", callback_data="strategy:set:rgrid:rgrid_discretion:0.12"),

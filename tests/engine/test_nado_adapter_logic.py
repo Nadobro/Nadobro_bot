@@ -669,3 +669,68 @@ def test_a_present_zero_balance_IS_flat():
         c = _BalanceClient({1: 0.0})
         assert await NadoAdapter(c, _SPOT).held_base("S") == Decimal(0)
     asyncio.run(body())
+
+
+# --- sized depth ------------------------------------------------------------
+# ``order_book`` is the top-of-book hot path behind every ``mid_price`` call and
+# deliberately carries no sizes. ``depth_book`` is the separate, lower-cadence
+# read that structure/microstructure work needs.
+
+class _DepthClient(_FakeClient):
+    def __init__(self, book=None, raises=False):
+        super().__init__()
+        self._book = book
+        self._raises = raises
+        self.calls = []
+
+    def get_market_liquidity(self, product_id, depth):
+        self.calls.append((product_id, depth))
+        if self._raises:
+            raise RuntimeError("engine unavailable")
+        return self._book
+
+
+def test_depth_book_carries_real_sizes():
+    async def body():
+        client = _DepthClient({
+            "bids": [[99.0, 2.5], [98.0, 4.0]],
+            "asks": [[101.0, 1.5]],
+            "timestamp": 123.0,
+        })
+        book = await NadoAdapter(client, META).depth_book(PAIR, depth=5)
+        assert [(l.price, l.amount) for l in book.bids] == [
+            (Decimal("99.0"), Decimal("2.5")), (Decimal("98.0"), Decimal("4.0")),
+        ]
+        assert [(l.price, l.amount) for l in book.asks] == [(Decimal("101.0"), Decimal("1.5"))]
+        assert client.calls == [(2, 5)]
+    asyncio.run(body())
+
+
+def test_order_book_stays_top_of_book_only():
+    """The hot path must not start paying for the full ladder."""
+    async def body():
+        client = _DepthClient({"bids": [[99.0, 2.5]], "asks": [[101.0, 1.5]]})
+        book = await NadoAdapter(client, META).order_book(PAIR)
+        assert len(book.bids) == 1 and book.bids[0].amount == Decimal(0)
+        assert client.calls == [], "order_book must not query market liquidity"
+    asyncio.run(body())
+
+
+def test_depth_book_degrades_to_empty_rather_than_raising():
+    """Depth is an enrichment — a venue blip must not break a controller tick."""
+    async def body():
+        book = await NadoAdapter(_DepthClient(raises=True), META).depth_book(PAIR)
+        assert book.bids == [] and book.asks == []
+    asyncio.run(body())
+
+
+def test_depth_book_drops_unusable_levels():
+    async def body():
+        client = _DepthClient({
+            "bids": [[99.0, 2.5], [0, 1.0], [98.0, 0], ["junk", 1.0], [97.0]],
+            "asks": None,
+        })
+        book = await NadoAdapter(client, META).depth_book(PAIR)
+        assert [l.price for l in book.bids] == [Decimal("99.0")]
+        assert book.asks == []
+    asyncio.run(body())
