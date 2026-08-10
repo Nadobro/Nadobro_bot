@@ -1656,8 +1656,10 @@ def rgrid_step_plan(conf: dict, sl_pct_val: float):
     the strategy does not place. Lazy import: handlers/ has no module-level edge
     to quant/ (tests/lint/test_architecture_layers.py).
     """
+    from decimal import Decimal
+
     from src.nadobro.quant.mm_quote_math import DEFAULT_MIN_ORDER_NOTIONAL_USD
-    from src.nadobro.quant.rgrid_sizing import resolve_step_quote
+    from src.nadobro.quant.rgrid_sizing import resolve_step_quote, step_band_frac
     from src.nadobro.strategy.strategy_registry import session_margin_usd
 
     # TWO different bases, on purpose — mixing them is what the 2026-08-06 audit
@@ -1669,12 +1671,24 @@ def rgrid_step_plan(conf: dict, sl_pct_val: float):
     # The same band engine_runtime derives (spread_bp -> fraction, 10bp default),
     # so the card's cap matches the engine's on the price bound too.
     _band_bp = float(conf.get("rgrid_spread_bp", conf.get("spread_bp", 10.0)) or 10.0)
+    _band = Decimal(str((_band_bp / 10000.0) if _band_bp > 0 else 0.001))
+    # The PRICE bound must use the distance to R-Grid's own exit, not the entry
+    # band — the same `exit_band_frac` the engine mapping passes. This is what the
+    # docstring's "can never quote a size the strategy does not place" promise
+    # rests on: with the raw band the card quoted $319.77 where the engine placed
+    # $215.89, and suppressed the "stop too tight" warning exactly when it applied.
+    # Reset mirrors the mapper's own default, max(0.2%, 2 x spread).
+    _reset_pct = float(conf.get(
+        "rgrid_reset_threshold_pct",
+        conf.get("grid_reset_threshold_pct",
+                 conf.get("reset_threshold_pct", max(0.2, 2.0 * float(_band) * 100))),
+    ) or 0.0)
     return rail_margin, resolve_step_quote(
         deployed_quote=deploy_margin * _mm_effective_leverage(conf),
         levels=levels,
         stop_budget_usd=rail_margin * max(0.0, sl_pct_val) / 100.0,
         min_step_usd=DEFAULT_MIN_ORDER_NOTIONAL_USD,
-        band_frac=(_band_bp / 10000.0) if _band_bp > 0 else 0.001,
+        band_frac=step_band_frac(_band, Decimal(str(_reset_pct)) / Decimal(100)),
     )
 
 

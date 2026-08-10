@@ -416,10 +416,12 @@ curve — the curve changes where size sits, not how much there is.
 
 Three things this changed that the tests did not initially catch, all fixed:
 
-- **rgrid is excluded.** It fires one taker per break rather than resting a
-  ladder, and it sizes that taker from `order_amount_quote` — the new per-side
+- **rgrid is excluded.** It rests ONE post-only quote per break rather than a
+  ladder, and it sizes that quote from `order_amount_quote` — the new per-side
   meaning would have multiplied its step size by `levels`. It keeps
-  `deployed / levels` and `ladder_levels = 1`.
+  `deployed / levels` and `ladder_levels = 1`. (This said "fires one taker per
+  break" until 2026-08-10; R-Grid has been maker-first since `a9a4d2a` — only its
+  risk exits cross, as bounded marketable limits.)
 - **Grid's stall-escalation concession** compares stuck exposure against "one
   quote's notional". That now divides by the level count, or the safety valve
   would have needed `levels`× more stuck exposure before firing.

@@ -281,9 +281,12 @@ def test_rgrid_risk_card_explains_the_cap_and_its_failure_modes():
         return _strategy_config_section_text("rgrid", base, "mainnet", "risk")
 
     # Capped: informational, tells the user what it cost them. Needs a stop big
-    # enough that the PYRAMID's bound still lands above the venue minimum — at
-    # 4 levels that is a budget over ~$1.05, i.e. an SL above ~1.05% of $100.
-    capped = _card(rgrid_stop_loss_pct=2.0)
+    # enough that the PYRAMID's bound still lands above the venue minimum. The
+    # adverse move the budget must cover is now the distance to R-Grid's OWN exit
+    # plus the bounded crossing print (68.6bp, vs 18.6bp when only fees and the
+    # entry band were counted), so at 4 levels that threshold is a budget over
+    # ~$2.74 — an SL above ~2.74% of $100, where it used to be ~1.05%.
+    capped = _card(rgrid_stop_loss_pct=3.0)
     assert "Step capped to" in capped and "round trips" in capped
     # Floored but workable: thin, not broken.
     thin = _card(rgrid_stop_loss_pct=0.8)
@@ -313,3 +316,32 @@ def test_rgrid_stop_headroom_counts_round_trips_against_the_margin_budget():
     # step leaves barely one, and the card says so instead of claiming three.
     assert round(room["uncapped_step_usd"] * 10 * 0.00086, 2) == 4.30
     assert room["floored"] is True and room["round_trips"] < 3.0
+
+
+def test_the_card_prices_the_step_against_rgrids_own_exit_not_the_entry_band():
+    """SLTP-F5. rgrid_step_plan's docstring promises the card "can never quote a
+    size the strategy does not place". The engine's price bound moved to the EXIT
+    distance (arm + band); with the raw entry band the card quoted $319.77 where
+    the engine placed $215.89 and suppressed the "stop too tight" warning exactly
+    when it applied."""
+    from decimal import Decimal
+
+    from src.nadobro.handlers.strategy_handler import rgrid_step_plan
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    for conf, sl in (
+        ({"notional_usd": 250, "leverage": 20, "levels": 3, "rgrid_spread_bp": 10.0}, 1.0),
+        ({"notional_usd": 100, "leverage": 5, "levels": 2, "rgrid_spread_bp": 10.0,
+          "rgrid_reset_threshold_pct": 1.0}, 2.0),
+        ({"notional_usd": 1000, "leverage": 4, "levels": 4, "rgrid_spread_bp": 10.0}, 5.0),
+    ):
+        conf = dict(conf, rgrid_stop_loss_pct=sl)
+        _, plan = rgrid_step_plan(conf, sl)
+        cfg = map_strategy_config(
+            "rgrid", conf, Decimal(2000),
+            product="ETH-PERP", leverage=int(conf["leverage"]),
+        )
+        assert plan.step == Decimal(str(cfg["order_amount_quote"])), (
+            f"card quotes ${plan.step} where the engine places "
+            f"${cfg['order_amount_quote']} for {conf}"
+        )

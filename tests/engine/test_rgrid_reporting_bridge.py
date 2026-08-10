@@ -116,7 +116,10 @@ def test_the_trailing_exit_reaches_the_bridge_too():
         entries = len(rec.rows)
         assert entries >= 1
 
-        await _walk(orch, c, adapter, ["108", "107"])   # arm, then the exit rests+fills
+        # Arm at +1%, then come back THROUGH the trailed level. The give-back is
+        # the arm threshold (108 x 0.99 = 106.92), not one entry band, so the
+        # retrace has to be a real one — 107 no longer breaches it.
+        await _walk(orch, c, adapter, ["108", "106.5"])
 
         assert len(rec.rows) > entries, "the reducing leg never reached the bridge"
         assert rec.rows[-1]["side"] is TradeType.SELL

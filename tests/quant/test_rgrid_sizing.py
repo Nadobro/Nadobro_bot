@@ -161,3 +161,57 @@ def test_after_capping_the_stop_always_covers_at_least_one_round_trip(leverage, 
         min_step_usd=100,
     )
     assert plan.round_trip_cost < plan.stop_budget_usd or plan.floored
+
+
+# ==========================================================================
+# Exit geometry — the three distances, and the ordering between them
+# ==========================================================================
+def test_the_three_distances_are_ordered_so_the_trail_always_goes_first():
+    """R-Grid's exposure-band exit fires at ``avg_entry x (1 - exit_band)`` and is
+    LOSS-ONLY by construction; the trail is the only exit that can book a gain,
+    because it ratchets with the favourable extreme. So the band exit MUST sit
+    strictly beyond the point at which the trail arms, or the loss-only exit wins
+    every race and the strategy can never ride a trend.
+
+    Shipped, all three distances were the entry band and the arm was 2x the band
+    exit, i.e. exactly inverted.
+    """
+    from src.nadobro.quant.rgrid_sizing import (
+        arm_pct, exit_band_frac, trail_giveback_frac,
+    )
+
+    for band_bp in (1, 5, 10, 20, 50, 100, 250):
+        band = Decimal(band_bp) / Decimal(10000)
+        for reset in ("0", "0.001", "0.002", "0.01", "0.05"):
+            arm = arm_pct(band, reset)
+            assert exit_band_frac(band, reset) > arm, (
+                f"band={band_bp}bp reset={reset}: the loss-only exit is inside the "
+                f"arm point, so the trail can never engage"
+            )
+            # Give-back == arm puts the stop at breakeven the instant it arms.
+            assert trail_giveback_frac(band, reset) == arm
+            # And the arm always clears the round-trip cost.
+            assert arm >= TAKER_ROUND_TRIP_RATE
+
+
+def test_the_geometry_never_collapses_on_degenerate_input():
+    """Unset / zero / malformed distances must not produce a zero-width exit — a
+    stop at the entry price would fire on the first tick."""
+    from src.nadobro.quant.rgrid_sizing import arm_pct, exit_band_frac
+
+    for band in (0, None, "", "nonsense", -1, Decimal(0)):
+        assert arm_pct(band) >= TAKER_ROUND_TRIP_RATE
+        assert exit_band_frac(band) >= TAKER_ROUND_TRIP_RATE
+
+
+def test_a_wider_user_spread_widens_the_exit_monotonically():
+    """The user's spread knob must move the geometry in one direction only — a
+    non-monotone response would make the strategy behave unpredictably as the
+    overlay scales the spread live."""
+    from src.nadobro.quant.rgrid_sizing import exit_band_frac
+
+    prev = Decimal(-1)
+    for band_bp in (1, 5, 10, 20, 50, 100):
+        cur = exit_band_frac(Decimal(band_bp) / Decimal(10000), "0.002")
+        assert cur >= prev
+        prev = cur

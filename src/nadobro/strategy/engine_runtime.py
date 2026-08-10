@@ -1278,7 +1278,7 @@ def map_strategy_config(
         # user disarmed their stop (no budget to size against).
         from src.nadobro.quant.mm_quote_math import DEFAULT_MIN_ORDER_NOTIONAL_USD
         from src.nadobro.quant.rgrid_sizing import (
-            TAKER_ROUND_TRIP_RATE, resolve_step_quote,
+            exit_band_frac, exit_cost_frac, resolve_step_quote, step_band_frac,
         )
         from src.nadobro.strategy.strategy_registry import (
             effective_sl_tp_pct,
@@ -1292,27 +1292,80 @@ def map_strategy_config(
         # user with a larger cycle size was sizing the cap against a budget 2.5x
         # what the rail would enforce.
         _rg_margin = session_margin_usd(settings) or notional
+        # THE ADVERSE MOVE THE BUDGET MUST COVER is the distance to R-Grid's own
+        # exit, and that is NOT the entry band — the controller derives it as
+        # arm + band (``exit_band_frac``), ~3x the band at the shipped settings.
+        # Sizing against one band while the controller waits for three is the
+        # failure this argument exists to prevent, just with the wrong number: the
+        # session rail fires first and the strategy never exits on its own terms.
+        # Same source of truth as RGridController._exit_band().
+        _rg_exit_move = exit_band_frac(_band, Decimal(str(_reset_pct)) / Decimal(100))
+        # Everything a full pyramid can realise reaching that exit: the trigger
+        # distance, the round trip, AND the bounded crossing print (the exit is
+        # priced through the touch so it actually fills). Sizing against fees alone
+        # left up to 1.8x the stop on the table at the shipped defaults.
+        _rg_exit_cost = exit_cost_frac(_band, Decimal(str(_reset_pct)) / Decimal(100))
         _step_plan = resolve_step_quote(
             deployed_quote=deployed,
             levels=levels,
             chunk_quote=_chunk_dec,
             stop_budget_usd=_rg_margin * _rg_sl_pct / 100.0,
             min_step_usd=DEFAULT_MIN_ORDER_NOTIONAL_USD,
-            # R-Grid's own exit triggers a band away, so the cap must bound a full
-            # band of adverse move on the PYRAMID, not just its fees — otherwise
-            # the session rail always fires before the exit can trigger.
-            band_frac=_band,
+            band_frac=step_band_frac(_band, Decimal(str(_reset_pct)) / Decimal(100)),
         )
         # Derive the exposure ceiling from the same budget the step cap uses.
         _rg_budget = _dec(str(_rg_margin * _rg_sl_pct / 100.0))
-        _rg_exposure_pct = _f(settings, "max_net_exposure_pct", 30.0)
+        # THE PYRAMID HAS TO FIT INSIDE ITS OWN CEILING.
+        #
+        # ``margin_quote`` for this family is the DEPLOYED notional (margin x
+        # leverage), the step is ``deployed / levels``, and a full pyramid is
+        # therefore 100% of it. The shared MM default of 30% admitted 1.0-1.4
+        # steps at every realistic configuration — so R-Grid took its entry and
+        # then had every single add refused by _projected_order_within_exposure.
+        # It could not pyramid at all, which is the whole strategy. The default is
+        # the plan the user actually configured (levels x step == deployed); an
+        # explicit user setting still wins, and the stop-budget ceiling below still
+        # only ever tightens it.
+        #
+        # The 100% default is only safe BECAUSE the stop-budget ceiling below
+        # tightens it. With the rail DISARMED there is no budget, nothing
+        # tightens, and the full pyramid would run with no stop at all — 3.3x the
+        # old exposure and no rail behind it. A disarmed stop is a reason to hold
+        # the conservative ceiling, not to lift it.
+        _rg_default_pct = 100.0 if _rg_budget > 0 else 30.0
+        _rg_exposure_pct = _f(settings, "max_net_exposure_pct", _rg_default_pct)
+        # Largest adverse move the reachable pyramid can take and still leave the
+        # strategy's own exit inside the budget. Handed to the controller as a
+        # CEILING on its exit distance, because two things widen that distance
+        # after this point and neither re-derives the ceiling: the overlay scales
+        # spread_ask_pct live (0.75-3.0x, `overlay_actuator`), and the user's Reset
+        # knob feeds arm_pct — at Reset 10% the derived exit is 1010bp, which no
+        # realistic stop can afford. Without the ceiling the session rail fires
+        # first and the strategy never exits on its own terms.
+        _rg_exit_cap = Decimal(0)
         if _rg_budget > 0 and deployed > 0:
-            _rg_move = _band + _dec(str(TAKER_ROUND_TRIP_RATE))
+            _rg_move = _rg_exit_cost
             if _rg_move > 0:
                 _afford = _rg_budget / _rg_move          # USD of exposure
                 _rg_exposure_pct = min(
                     _rg_exposure_pct,
                     float(_afford / _dec(str(deployed)) * Decimal(100)),
+                )
+            # Exposure actually reachable, including the floor the controller
+            # applies (`market_making._projected_order_within_exposure` never lets
+            # the cap fall below one step, or the strategy could not place its
+            # first order at all).
+            _rg_step = _dec(str(_step_plan.step))
+            _rg_reach = max(
+                _rg_step,
+                min(_dec(str(deployed)) * _dec(str(_rg_exposure_pct)) / Decimal(100),
+                    _rg_step * Decimal(max(1, int(levels)))),
+            )
+            if _rg_reach > 0:
+                _rg_exit_cap = max(
+                    Decimal(0),
+                    _rg_budget / _rg_reach
+                    - (_rg_exit_cost - _rg_exit_move),   # fees + crossing print
                 )
         if _step_plan.capped:
             logger.info(
@@ -1346,6 +1399,11 @@ def map_strategy_config(
             "order_amount_quote": _step_plan.step,
             # The risk-bound the overlay may not exceed (see _maybe_apply_overlay).
             "step_capped_quote": _step_plan.step,
+            # Ceiling on the controller's own exit distance, so a live-scaled
+            # spread or a large Reset threshold cannot push the exit past the
+            # point where the session rail would fire first. 0 = no budget to
+            # size against (disarmed stop), so no ceiling.
+            "exit_band_cap": _rg_exit_cap,
             # Surfaced so /status and the config card can explain a step that is
             # smaller than margin x leverage / levels.
             "step_uncapped_quote": _step_plan.uncapped,
@@ -2833,7 +2891,19 @@ async def _run_engine_cycle_locked(
             if hasattr(controller, "reset_threshold_bp"):
                 engine_diag["reset_bp"] = round(
                     float(getattr(controller, "reset_threshold_bp", 0.0) or 0.0), 1)
-            _anchor = getattr(controller, "_grid_anchor_mid", None)
+            # ``_grid_anchor_mid`` is DynamicGrid's name for it. R-Grid keeps its
+            # own on ``_last_anchor``/``_anchor``, so this printed anchor=n/a for
+            # rgrid — and the anchor is the ONE number that explains a dark
+            # R-Grid, because its triggers are anchor x (1 -+ band). A session
+            # reported as "no orders, just skipping" (2026-08-09) showed
+            # active=0 mid=1916.75 anchor=n/a for exactly that reason; the anchor
+            # was frozen on its seed and printing it would have said so at once.
+            _anchor = next(
+                (getattr(controller, attr, None)
+                 for attr in ("_grid_anchor_mid", "_last_anchor", "_anchor")
+                 if getattr(controller, attr, None) is not None),
+                None,
+            )
             if _anchor is not None:
                 engine_diag["anchor"] = str(_anchor)
             logger.debug(
