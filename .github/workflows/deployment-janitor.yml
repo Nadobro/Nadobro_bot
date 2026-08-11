@@ -1,0 +1,149 @@
+name: Deployment Janitor
+
+# Fly.io's GitHub App (fly-io[bot]) opens a `production` deployment when a deploy
+# starts and is supposed to close it when the deploy finishes. It frequently does
+# not. On 2026-08-11 EIGHT deployments were still sitting in `in_progress`, the
+# oldest from 2026-03-02, including two duplicate pairs on the same commit — so
+# GitHub showed production as perpetually deploying and the Environments panel
+# could not be trusted.
+#
+# The callback that never fires is Fly's and lives outside this repository (there
+# is no deploy workflow here and no FLY_API_TOKEN — deploys are driven entirely
+# from Fly's side). So this CANNOT fix the cause. It closes the abandoned records
+# instead, so they stop accumulating and the panel stays readable.
+#
+# SAFETY. A real Fly deploy of this app takes ~2 minutes end to end (measured on
+# deployment 5744903712: in_progress 13:42:58 -> success 13:45:07). The 2-hour
+# floor below is therefore a ~60x margin — it can only ever touch a deploy that
+# is long dead, never one still running. `inactive` is also the state GitHub
+# itself applies to superseded deployments, and it is reversible: posting a later
+# status supersedes it.
+#
+# If a hung record turns out to represent a deploy that DID succeed, mark it so
+# explicitly rather than relying on this job:
+#   gh api -X POST repos/<owner>/<repo>/deployments/<id>/statuses -f state=success
+
+on:
+  schedule:
+    # Every 6 hours, offset off the hour to avoid the top-of-hour scheduling rush.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report what would be closed without changing anything"
+        type: boolean
+        default: false
+      stale_after_hours:
+        description: "Hours a deployment may sit non-terminal before it is closed"
+        type: string
+        default: "2"
+
+# Deployment statuses only. Nothing here reads or writes code.
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: deployment-janitor
+  cancel-in-progress: false
+
+jobs:
+  close-stale-deployments:
+    name: Close stale deployments
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close deployments stuck in a non-terminal state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          STALE_AFTER_HOURS: ${{ inputs.stale_after_hours || '2' }}
+        run: |
+          set -euo pipefail
+
+          # Refuse a threshold that could race a live deploy, however this job
+          # was invoked. A manual dispatch is not a reason to close a deployment
+          # that may still be running.
+          if ! [[ "$STALE_AFTER_HOURS" =~ ^[0-9]+$ ]] || [ "$STALE_AFTER_HOURS" -lt 1 ]; then
+            echo "::error::stale_after_hours must be a whole number of hours >= 1 (got '$STALE_AFTER_HOURS')"
+            exit 1
+          fi
+
+          cutoff_ts=$(date -u -d "$STALE_AFTER_HOURS hours ago" +%s)
+          echo "Closing deployments left non-terminal since before $(date -u -d "@$cutoff_ts" --iso-8601=seconds) (dry_run=$DRY_RUN)"
+
+          scanned=0
+          stale=0
+          closed=0
+          summary=""
+
+          # `--paginate` walks the whole history; this repo has a few hundred at
+          # most, and the job runs four times a day.
+          while read -r id created_at; do
+            [ -n "$id" ] || continue
+            scanned=$((scanned + 1))
+
+            # The LATEST status decides. A deployment with no statuses at all was
+            # opened and abandoned outright, which is the same failure.
+            latest=$(gh api "repos/$REPO/deployments/$id/statuses" \
+                       --jq '.[0] | "\(.state) \(.created_at)"' 2>/dev/null || true)
+            if [ -z "$latest" ] || [ "$latest" = "null null" ]; then
+              state="none"
+              state_at="$created_at"
+            else
+              state="${latest%% *}"
+              state_at="${latest##* }"
+            fi
+
+            case "$state" in
+              in_progress|pending|queued|none) ;;
+              *) continue ;;
+            esac
+
+            state_ts=$(date -u -d "$state_at" +%s)
+            if [ "$state_ts" -ge "$cutoff_ts" ]; then
+              echo "  skip  id=$id state=$state at=$state_at (still within the window — may be live)"
+              continue
+            fi
+
+            stale=$((stale + 1))
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "  DRY   id=$id state=$state at=$state_at -> would close"
+              summary="${summary}| \`$id\` | $state | $state_at | would close |"$'\n'
+              continue
+            fi
+
+            if gh api -X POST "repos/$REPO/deployments/$id/statuses" \
+                 -f state=inactive \
+                 -f description="Closed by Deployment Janitor: left $state since $state_at with no terminal status." \
+                 --jq '.state' >/dev/null; then
+              closed=$((closed + 1))
+              echo "  close id=$id state=$state at=$state_at -> inactive"
+              summary="${summary}| \`$id\` | $state | $state_at | closed |"$'\n'
+            else
+              # One bad record must not abort the sweep.
+              echo "::warning::could not close deployment $id"
+              summary="${summary}| \`$id\` | $state | $state_at | FAILED |"$'\n'
+            fi
+          done < <(gh api --paginate "repos/$REPO/deployments" --jq '.[] | "\(.id) \(.created_at)"')
+
+          {
+            echo "### Deployment janitor"
+            echo
+            echo "Scanned **$scanned** deployments; **$stale** were stale; **$closed** closed."
+            if [ -n "$summary" ]; then
+              echo
+              echo "| deployment | stuck state | since | action |"
+              echo "|---|---|---|---|"
+              printf '%s' "$summary"
+            fi
+            if [ "$stale" -gt 0 ]; then
+              echo
+              echo "These were opened by Fly.io's GitHub App and never given a terminal"
+              echo "status. This job only ever marks them inactive — it cannot know"
+              echo "whether the deploy behind one actually finished. If any did succeed,"
+              echo "record that yourself; the command is in the header of this workflow."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "scanned=$scanned stale=$stale closed=$closed"
