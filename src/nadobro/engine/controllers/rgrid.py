@@ -34,6 +34,33 @@ residual with no exit while the entry leg kept adding), was cancelled outright
 whenever the trail armed above it, and left a stub on a partial fill. An exit that
 may not fill is not an exit.
 
+R-GRID IS A PYRAMIDING TREND FOLLOWER. It takes the side the move is going, ADDS
+to that side for as long as the move extends, and flips when the move turns. Four
+things had to be true for that to work, and none of them were:
+
+* **The reference must track the market.** While FLAT with an empty window the
+  anchor is not exposure at all — it is only what the next break is measured from
+  — so it rides a leash behind mid (``_track_flat_anchor``). Frozen on the first
+  tick's mid, it made every break relative to whenever the user pressed start.
+* **The add must march, not converge.** In a position the add leg is quoted off
+  the LAST FILL on that side (``_add_reference``), so each add costs one fresh
+  band of trend extension. Off the exposure VWAP — an average — the spacing decays
+  toward zero and the pyramid stalls behind its own cost basis.
+* **The pyramid must fit its own ceiling.** ``levels x step == deployed``, so the
+  net-exposure cap has to admit 100% of the deployed notional. At the shared MM
+  default of 30% exactly one step fitted and every add was refused.
+* **The profit-taking exit must get its chance first.** The exposure-band exit
+  fires at ``avg_entry x (1 - band)`` and is LOSS-ONLY by construction; only the
+  trail can book a gain. So the trail arms strictly inside the band exit
+  (``_exit_band`` > ``_arm_pct``), and its give-back equals the arm, which puts
+  the stop at breakeven the moment it engages. Shipped, those were the other way
+  round and the loss-only exit always won.
+
+Measured end to end on the repo's cost-aware backtester through the real mapped
+config: the shipped geometry returned **-85.27** across five trending regimes,
+this one **+487.19**, and the churn that produced the loss (35-47 fills per trend)
+collapsed to 5-6 — it now rides instead of round-tripping.
+
 Safety, in layers:
 
 * **Session SL / TP** — % of margin on live PnL including uPnL, judged net of
@@ -41,9 +68,10 @@ Safety, in layers:
   controller never second-guesses it, and never applies the same user number as a
   price barrier too (the units invariant).
 * **Soft reset** — once price has moved favourably by ``reset_threshold_pct`` AND
-  the position is in profit, the exit level starts FOLLOWING the trend: it trails
-  the best price by one spread instead of sitting at the anchor, so the run keeps
-  going and the profit is locked. It fires by CROSSING, like every exit here.
+  the position is in profit, the exit starts FOLLOWING the trend: it trails the
+  best price by one give-back (``_trail_giveback``, == the arm threshold) instead
+  of sitting at the anchor, so the run keeps going and the profit is locked. It
+  fires by CROSSING, like every exit here.
 * **Reversal recalibration** — an exit always closes the WHOLE position in one
   order, so a turn books all of it at once rather than a step per tick while the
   move runs. Once flat the window clears and the next move picks the side.
@@ -76,23 +104,41 @@ from src.nadobro.engine.executors.rgrid_maker_executor import (
     build_trail_stop,
 )
 from src.nadobro.engine.risk import ExecutorRequest
-from src.nadobro.engine.types import PositionAction, TradeType, _dec
+from src.nadobro.engine.types import TradeType, _dec
+from src.nadobro.quant.rgrid_sizing import (
+    EXIT_CROSS_RATE,
+    arm_pct,
+    exit_band_frac,
+    trail_giveback_frac,
+)
 
 logger = logging.getLogger(__name__)
 
 # Retained fills per leg. Large enough that a volume-fraction window has history.
 _FILL_HISTORY = 200
-# Absolute floor on the soft-reset arm: a "profit" smaller than the round-trip
-# round-trip cost is not profit. Kept at the TAKER round trip (8.6bp) as a
-# deliberately conservative floor: R-Grid rests maker quotes, so its real cost is
-# lower and this only ever makes the arm harder to reach, never easier.
-_MIN_ARM_PCT = Decimal("0.00086")
+# The soft-reset arm floor (a "profit" smaller than the round-trip cost is not
+# profit) now lives with the rest of the exit geometry in quant.rgrid_sizing, as
+# TAKER_ROUND_TRIP_RATE — it was the same 8.6bp written out twice, and the step
+# cap has to agree with the controller about these distances or the session rail
+# fires before the strategy's own exit can.
 # How far through the touch a crossing exit prices. Wide enough to cross a normal
-# book, bounded so a gapped book cannot fill it at an arbitrary price.
-_EXIT_CROSS_BP = Decimal("30")
+# book, bounded so a gapped book cannot fill it at an arbitrary price. Shared with
+# the step cap (quant.rgrid_sizing.EXIT_CROSS_RATE) — it is realised cost on the way
+# out, so the stop budget has to be sized against it too, not just against fees.
+_EXIT_CROSS_BP = EXIT_CROSS_RATE * Decimal(10000)
 # After this many consecutive refused exits, stop pretending a retry-only posture
 # is safe and say so loudly (the rail still owns the hard stop).
 _MAX_CONSECUTIVE_EXIT_FAILURES = 5
+# Ticks a crossing exit may sit unfilled before it is cancelled and re-priced. The
+# executor has no timeout of its own for a plain LIMIT, so without this a gapped
+# book or a partial fill freezes the controller indefinitely (see _reap_stale_stop).
+_STOP_STALE_TICKS = 3
+# How far the FLAT-book anchor may lag mid, in bands. The lag is the whole point —
+# it is what makes a break a break — but it has to be bounded or the reference goes
+# stale (see _track_flat_anchor). One band is degenerate: it parks the trigger
+# exactly ON mid, where it is never strictly postable. Two leaves a full band of
+# working room, so a resting entry sits ~one band from the touch and follows price.
+_FLAT_ANCHOR_MAX_BANDS = Decimal(2)
 
 BUY, SELL = "buy", "sell"
 
@@ -114,6 +160,10 @@ class RGridController(MarketMakingController):
         # rather than an instant one-sided entry.
         self._anchor: Optional[Decimal] = None
         self._last_anchor: Optional[Decimal] = None
+        # The levels actually worked last tick, so /status reports what the engine
+        # is doing rather than re-deriving it from the anchor and the entry band.
+        self._last_add_ref: Optional[Decimal] = None
+        self._last_exit_band: Optional[Decimal] = None
         # Last mid seen, so grid_metrics() can report drift from the anchor without
         # an extra venue read (the /status card renders it every refresh).
         self._last_mid: Optional[Decimal] = None
@@ -124,6 +174,7 @@ class RGridController(MarketMakingController):
         self._resting_price: Dict[TradeType, Decimal] = {}
         # The armed trailing stop is the one order that crosses; never stack two.
         self._stop_id: Optional[str] = None
+        self._stop_age = 0
         # Exposure-price window as a fraction of each leg's recent fill VOLUME.
         # 0 ⇒ VWAP over the whole retained window.
         self.vwap_volume_fraction = _dec(self.cfg("vwap_volume_fraction", "0") or "0")
@@ -131,6 +182,9 @@ class RGridController(MarketMakingController):
         self.reset_threshold_pct = _dec(self.cfg("reset_threshold_pct", "0.002"))
         self.trail_enabled = bool(self.cfg("trail_enabled", True))
         self._trail_peak: Optional[Decimal] = None
+        # First mid observed while holding THIS position — the arm basis when the
+        # seeded window cannot be trusted (see _track_trail).
+        self._trail_origin: Optional[Decimal] = None
         self._trail_armed = False
         # Overlay telemetry only — the actuator has already applied its effect to
         # size/spread/exposure in the mapped config before this controller sees it.
@@ -280,6 +334,39 @@ class RGridController(MarketMakingController):
     def _has_fills(self) -> bool:
         return any(self._leg_fills[leg] for leg in (BUY, SELL))
 
+    def _track_flat_anchor(self, mid: Decimal) -> None:
+        """Keep the FLAT, fill-less reference on a leash behind mid.
+
+        While the window is empty the anchor is not exposure at all — it is purely
+        the reference the next break is measured from, and nothing else writes it.
+        It was therefore pinned to the mid of the FIRST tick for the entire
+        session: ``_reset_exposure_window`` is the only other writer and it is
+        gated on ``_has_fills()``, which is False precisely here. So every break
+        was measured against wherever price happened to sit when the user pressed
+        start, and once price left that level R-Grid was inert for the rest of the
+        run — it rested ONE entry at the seeded trigger, price walked away from it,
+        and because the anchor moves only on a FILL there was no way back.
+        Reproduced at 72 ticks / 82bp of range: one order placed, zero fills, the
+        anchor still on its seed and the bid stranded 72bp under the market.
+
+        The leash fixes that without dissolving the break. Re-seeding to mid every
+        tick would be the opposite failure — the band could never be breached and
+        nothing would ever rest — so the anchor keeps its lag and is only dragged
+        along once mid pulls more than ``_FLAT_ANCHOR_MAX_BANDS`` away, in either
+        direction. Inside the leash it does not move, so a fresh break still has to
+        travel a full band. A fill hands the anchor back to the exposure VWAP and
+        this stops applying; only the flat, empty-window state is affected.
+        """
+        if self._anchor is None or mid <= 0:
+            return
+        lag = self._band() * max(
+            _dec(self.cfg("flat_anchor_lag_bands", _FLAT_ANCHOR_MAX_BANDS)),
+            Decimal(1),
+        )
+        clamped = min(max(self._anchor, mid * (Decimal(1) - lag)), mid * (Decimal(1) + lag))
+        if clamped != self._anchor:
+            self._anchor = clamped
+
     # -- resting-quote plumbing ----------------------------------------------
 
     def _net_base(self) -> Decimal:
@@ -322,8 +409,81 @@ class RGridController(MarketMakingController):
         return breakeven if (breakeven is not None and breakeven > 0) else None
 
     def _band(self) -> Decimal:
-        """Trigger offset from the anchor — the user's spread, fee-floored."""
+        """ENTRY trigger offset from the reference — the user's spread, fee-floored."""
         return max(self.spread_ask_pct, self.spread_floor_half_pct)
+
+    def _arm_pct(self) -> Decimal:
+        """Favourable excursion at which the trailing exit engages."""
+        return arm_pct(self._band(), self.reset_threshold_pct)
+
+    def _exit_band(self) -> Decimal:
+        """How far from the average entry the exposure-band exit fires.
+
+        Kept SEPARATE from the entry band. When the two were one number the stop
+        stood exactly as far from the position as the break that opened it, so the
+        same pullback that qualifies as an entry signal also stopped the position
+        out — and, because the exit fires at ``avg_entry x (1 - band)``, it could
+        only ever book a LOSS of one band. Traced on the backtester: a +3.14%
+        uptrend with ordinary 12bp pullbacks produced 29 fills and -$12.10 realised,
+        the whole trend handed back one band at a time.
+
+        DERIVED (``quant.rgrid_sizing.exit_band_frac``), not tuned, and shared with
+        the step-sizing cap so both bound the same adverse move. ``exit_band_mult``
+        may only WIDEN it past the derived floor — narrowing it below the arm point
+        would restore the pathology by letting the loss-only exit outrun the
+        profit-taking one again.
+        """
+        band = self._band()
+        derived = max(exit_band_frac(band, self.reset_threshold_pct),
+                      band * _dec(self.cfg("exit_band_mult", "0") or "0"))
+        # CEILING (``exit_band_cap``, from the mapper's stop budget). The derived
+        # distance is the one the strategy WANTS; this is the one the stop can
+        # AFFORD, and two paths push the two apart after the budget was sized:
+        # the overlay scales spread_ask_pct live by up to 3x, and the user's Reset
+        # knob feeds arm_pct (Reset 10% derives a 1010bp exit). Past the ceiling
+        # the session rail fires before the strategy's own exit and every close
+        # becomes a rail flatten — the exact pathology this geometry exists to
+        # remove. Never narrower than the entry band: an exit inside the trigger
+        # that opened the position would fire on the noise that entered it.
+        cap = _dec(self.cfg("exit_band_cap", "0") or "0")
+        if cap > 0:
+            return max(min(derived, cap), band)
+        return derived
+
+    def _add_reference(self, net: Decimal, anchor: Decimal) -> Decimal:
+        """The price the ENTRY/ADD leg is quoted around.
+
+        While FLAT this is the leashed anchor — the break reference.
+
+        While a position is OPEN it is the LAST FILL on the position's own side,
+        because that is what makes the pyramid march. Quoting the add off the
+        exposure VWAP stalls it: a VWAP is an average, so each successive add moves
+        it less than the one before and the add level converges while price runs on.
+        Traced on the backtester, one leg's adds came at 2005.20, 2007.20, 2008.21,
+        2008.88, 2009.38 — steps of 10.0, 5.0, 3.3 and 2.5bp, decaying to nothing.
+        Off the last fill each add instead requires one fresh band of trend
+        extension, so the level follows price for as long as the move lasts.
+
+        The exit keeps using the exposure anchor, so this cannot move any stop.
+        ``add_ref_mode="anchor"`` restores the old reference if an operator needs it.
+        """
+        if net == 0:
+            return anchor
+        if str(self.cfg("add_ref_mode", "last_fill") or "last_fill").lower() == "anchor":
+            return anchor
+        leg = BUY if net > 0 else SELL
+        # Only a LIVE fill may price the add — the same evidence rule the crossing
+        # exit uses (:meth:`_band_exit_trustworthy`). ``seed_fills`` restores the
+        # whole SESSION's prints on a rebuild, exits included, so the newest entry
+        # in a seeded window is not necessarily this position's last add. Pricing
+        # off one that sits well below mid would rest an add far under the market —
+        # exactly the stale-order class this change exists to remove — and it would
+        # fill by adding to a long into a collapse. Until this leg fills in THIS
+        # process the anchor is the honest reference.
+        if leg not in self._live_fill_legs:
+            return anchor
+        fills = self._leg_fills[leg]
+        return fills[-1][0] if fills else anchor
 
     def _quantize_quote(self, amount_base: Decimal, price: Decimal) -> Optional[Decimal]:
         """Round a quote DOWN to the venue lot, and decline it below the venue
@@ -386,10 +546,30 @@ class RGridController(MarketMakingController):
         if not allowed or price <= 0 or amount_base <= 0:
             await self._cancel_leg(side)
             return
-        # Never send a post-only order that would cross: the venue rejects it
+        # Never SEND a post-only order that would cross: the venue rejects it
         # (error_code 2008) and R-Grid must not cross to force a fill.
+        #
+        # But do not PULL one that is already resting AT THIS TARGET. Post-only
+        # binds at placement; an order on the book is unaffected by the rule. A bid
+        # becomes "unpostable" exactly when mid reaches it — the moment it is about
+        # to be hit — so cancelling there withdrew the entry at the one instant it
+        # could have filled, and R-Grid only got in when a venue fill beat the next
+        # tick (~8-10s in prod).
+        #
+        # The distinction is REQUIRED, not cosmetic. Holding unconditionally leaks:
+        # if the position is flattened out-of-band — the session SL/TP rail, a
+        # liquidation, a manual close, none of which run _fire_trail_stop and its
+        # two-leg cancel — the next tick is flat, re-anchors to mid, computes an
+        # unpostable target, and would leave the DEAD position's add leg resting.
+        # That order can re-open exposure the rail just closed. So a resting quote
+        # survives only while it is still the quote we want; once the target has
+        # moved off it, it is somebody else's order and it goes.
         if not self._is_postable(side, price, mid):
-            await self._cancel_leg(side)
+            resting_px = self._resting_price.get(side)
+            if ex_id is None or resting_px is None or not self._price_is_close(
+                resting_px, price
+            ):
+                await self._cancel_leg(side)
             return
         # Exposure: include the order we are about to rest, not just filled
         # inventory. Reducing quotes are always admitted by this check.
@@ -439,12 +619,48 @@ class RGridController(MarketMakingController):
 
     def _stop_in_flight(self) -> bool:
         if self._stop_id is None:
+            self._stop_age = 0
             return False
         ex = self.orchestrator.get(self._stop_id)
         if ex is None or ex.is_terminated:
             self._stop_id = None
+            self._stop_age = 0
             return False
         return True
+
+    async def _reap_stale_stop(self) -> bool:
+        """Cancel a crossing exit that has stopped working, so it can be re-fired
+        at the CURRENT mid. Returns True if the caller should stand down this tick.
+
+        The exit is a bounded marketable limit (``_EXIT_CROSS_BP`` through the
+        touch), and ``OrderExecutor`` neither times out nor re-prices a plain
+        LIMIT — it terminates only on FILLED / CANCELLED / REJECTED. So on a gapped
+        or one-sided book, or after a partial (which reports PARTIALLY_FILLED and
+        is NOT terminal), the order rests unfilled and ``on_tick`` returns at the
+        in-flight guard every tick, forever: no re-price, no add, no trail update,
+        no second attempt. A position with a stranded exit and a frozen controller,
+        in exactly the fast-moving tape the exit exists for.
+
+        Ageing it out re-prices through the current mid on the next pass, which is
+        what an order that has to act must do. Re-firing is safe by construction:
+        it is reduce-only and sized off live inventory, so a partial simply leads
+        to a smaller replacement.
+        """
+        if not self._stop_in_flight():
+            return False
+        self._stop_age += 1
+        if self._stop_age <= _STOP_STALE_TICKS:
+            return True
+        stop_id, self._stop_id, self._stop_age = self._stop_id, None, 0
+        logger.warning(
+            "rgrid crossing exit has not filled in %s ticks — cancelling and "
+            "re-pricing it through the current touch rather than leaving the "
+            "position with a stranded exit (user=%s pair=%s)",
+            _STOP_STALE_TICKS, self.user_id, self.trading_pair,
+        )
+        if stop_id is not None:
+            await self.orchestrator.stop(stop_id)
+        return False
 
     async def _fire_trail_stop(
         self, net: Decimal, mid: Decimal, *, reason: str = "trailing stop",
@@ -569,8 +785,10 @@ class RGridController(MarketMakingController):
         # genuine fresh move is required.
         if net == 0 and self._has_fills():
             self._reset_exposure_window(mid)
+        elif net == 0:
+            self._track_flat_anchor(mid)
 
-        if self._stop_in_flight():
+        if await self._reap_stale_stop():
             return          # the crossing stop is working; do not re-quote over it
 
         anchor = self.exposure_anchor(mid)
@@ -581,11 +799,26 @@ class RGridController(MarketMakingController):
         self._last_anchor = anchor
         band = self._band()
 
-        # The two legs. Mirror of Grid: the BUY sits ABOVE the anchor and the SELL
-        # BELOW it, so each becomes postable only once price has travelled past it
-        # — that is the momentum. At most one is postable at a time.
-        buy_price = anchor * (Decimal(1) + band)
-        sell_price = anchor * (Decimal(1) - band)
+        # ENTRY reference and EXIT reference are deliberately separate quantities.
+        # They used to be the same number (the exposure anchor) at the same width
+        # (one band), which is what made the strategy unable to hold a trend: the
+        # stop sat exactly as far from the position as the move that opened it, so
+        # the very noise that triggers an entry also triggers the exit. See
+        # _exit_band() and _add_reference().
+        add_ref = self._add_reference(net, anchor)
+
+        # The two legs. Mirror of Grid: the BUY sits ABOVE the reference and the
+        # SELL BELOW it, so each becomes postable only once price has travelled
+        # past it — that is the momentum. At most one is postable at a time.
+        buy_price = add_ref * (Decimal(1) + band)
+        sell_price = add_ref * (Decimal(1) - band)
+        # Telemetry has to report the levels the engine is ACTUALLY working, not
+        # the ones it used to. Both moved: the add is off the last fill while a
+        # position is open, and the exit is a wider band. grid_metrics() derived
+        # both from anchor x (1 -+ band), so the /status card would have quoted the
+        # user two levels nothing was trading on.
+        self._last_add_ref = add_ref
+        self._last_exit_band = self._exit_band()
 
         # Soft reset. Once armed, the exit follows the trend.
         #
@@ -596,8 +829,16 @@ class RGridController(MarketMakingController):
         # Everything else R-Grid does still rests post-only.
         self._track_trail(mid, net)
         if self._trail_breached(mid, net) and not self._stop_in_flight():
-            if await self._fire_trail_stop(net, mid, reason="trailing stop"):
-                return
+            # A REFUSED exit must not fall through into the add branch below.
+            # _fire_trail_stop returns False when the risk engine or the kill
+            # switch declines it (reduce-only is exempt from the SIZE caps, but not
+            # from max_open_executors or the kill switch). Falling through rested a
+            # fresh ADD on the losing side, on the same tick the strategy had just
+            # failed to close it and logged "the session rail is the only stop
+            # left" — piling on risk at the worst possible moment. Stand down for
+            # this tick instead; both legs are already cancelled by _fire_trail_stop.
+            await self._fire_trail_stop(net, mid, reason="trailing stop")
+            return
 
         # THE REDUCING SIDE IS A TRIGGER, NOT A RESTING ORDER.
         #
@@ -613,11 +854,15 @@ class RGridController(MarketMakingController):
         # geometry (a bid parked above the anchor only becomes fillable once price
         # has risen past it, so the fill IS the momentum signal).
         if net != 0 and not self._stop_in_flight() and self._band_exit_trustworthy(net):
-            exit_trigger = sell_price if net > 0 else buy_price
+            exit_band = self._exit_band()
+            exit_trigger = (anchor * (Decimal(1) - exit_band) if net > 0
+                            else anchor * (Decimal(1) + exit_band))
             reached = mid <= exit_trigger if net > 0 else mid >= exit_trigger
             if reached:
-                if await self._fire_trail_stop(net, mid, reason="exposure band"):
-                    return
+                # Same standing-down rule as the trail above: a refused close is
+                # never a licence to add.
+                await self._fire_trail_stop(net, mid, reason="exposure band")
+                return
 
         # Sizing: only the ADDING leg rests, one step at a time. The reducing side
         # is the trigger above, so there is no resting exit to size.
@@ -666,7 +911,8 @@ class RGridController(MarketMakingController):
         So the crossing exit waits for one LIVE fill on the position's own side.
         Until then the anchor is only a hint, and the session rail — which reads
         venue PnL, not this window — remains the hard stop. The trailing stop is
-        deliberately NOT gated: it arms off observed price extremes, not the window.
+        gated differently: see :meth:`_track_trail`, which measures its excursion
+        from OBSERVED price on a rebuild rather than from the seeded window.
         """
         leg = BUY if net > 0 else SELL
         return leg in self._live_fill_legs
@@ -676,6 +922,7 @@ class RGridController(MarketMakingController):
         exit leg's PRICE is the mechanism, so arming only changes where it rests."""
         if net == 0:
             self._trail_peak = None
+            self._trail_origin = None
             self._trail_armed = False
             return
         if not self.trail_enabled or self.reset_threshold_pct <= 0 or mid <= 0:
@@ -683,27 +930,48 @@ class RGridController(MarketMakingController):
         long_side = net > 0
         if self._trail_peak is None:
             self._trail_peak = mid
+            self._trail_origin = mid
         elif long_side:
             self._trail_peak = max(self._trail_peak, mid)
         else:
             self._trail_peak = min(self._trail_peak, mid)
         if self._trail_armed:
             return
-        entry = self._position_entry_price() or self.exposure_anchor(mid)
+        # THE ARM BASIS MUST BE TRUSTWORTHY, and on a rebuild the window is not.
+        #
+        # ``_position_entry_price()`` is the leg window's VWAP, and ``seed_fills``
+        # restores the whole SESSION — both sides, exits included. A previous SHORT
+        # cycle's cover is a BUY, so it lands in the BUY deque and drags a later
+        # long's "entry" down. Reproduced: true entry 96.5, seeded basis 94.25, so
+        # the very first tick read a 2.4% excursion, armed instantly, and a 31bp dip
+        # crossed out of a healthy position at a loss. That is the exact "~10bp
+        # adverse + 8.6bp taker every cycle" pathology _position_entry_price was
+        # written to remove, re-entered through the seed — and it recurs on EVERY
+        # worker handoff while a position is open.
+        #
+        # This docstring used to claim the trail "arms off observed price extremes,
+        # not the window". Make that true when the window cannot be trusted: with no
+        # live fill on this leg, measure the excursion from the first mid this
+        # process observed. Conservative by construction — a rebuild deep in profit
+        # starts at zero excursion and must earn the arm again — and it keeps the
+        # trail working instead of leaving a rebuilt position to the rail alone.
+        if self._band_exit_trustworthy(net):
+            entry = self._position_entry_price() or self.exposure_anchor(mid)
+        else:
+            entry = self._trail_origin
         if entry is None or entry <= 0:
             return
         excursion = ((mid - entry) / entry) if long_side else ((entry - mid) / entry)
-        band = self._band()
         # The arm is WIDENED to clear the band and the round-trip cost, never
         # disabled: the overlay scales the spread live while the threshold is not
         # scaled, and the shipped defaults sit on the boundary, so refusing would
         # have silently removed the mechanism.
-        arm_pct = max(self.reset_threshold_pct, band * Decimal(2), _MIN_ARM_PCT)
+        arm = self._arm_pct()
         # An overlay read AGAINST the position arms early rather than pausing
         # R-Grid — but never underwater, or the trail becomes a stop that
         # front-runs the SL rail.
         opposed = self._overlay_opposes(long_side)
-        if excursion < arm_pct and not (opposed and excursion > 0):
+        if excursion < arm and not (opposed and excursion > 0):
             return
         self._trail_armed = True
         logger.info(
@@ -713,11 +981,29 @@ class RGridController(MarketMakingController):
             round(float(excursion) * 100, 3), entry, self.user_id, self.trading_pair,
         )
 
+    def _trail_giveback(self) -> Decimal:
+        """How far back from the favourable extreme the trailing exit fires.
+
+        A third quantity that used to BE the entry band. The trail is the only exit
+        that can book a PROFIT (it ratchets with the extreme, whereas the band exit
+        is loss-only), so the room it gives the position is the single number that
+        decides whether a trend is ridden or handed back. At one entry band it is
+        tighter than an ordinary pullback and the run is cut almost immediately.
+
+        Set to the ARM threshold, which is what makes it self-consistent: the moment
+        the trail arms at +arm favourable, its stop sits at ``peak x (1 - arm)`` —
+        the entry, i.e. breakeven — and ratchets into profit from there. A run can
+        no longer be given back below the point at which it was recognised.
+        """
+        floor = trail_giveback_frac(self._band(), self.reset_threshold_pct)
+        mult = _dec(self.cfg("trail_giveback_mult", "0") or "0")
+        return max(floor, self._band() * mult)
+
     def _trail_price(self, net: Decimal) -> Decimal:
-        """Where the armed exit leg rests: one band back from the best price seen.
-        Give-back is capped at one spread and it only ever ratchets forward."""
+        """Where the armed exit fires: one give-back behind the best price seen.
+        It only ever ratchets forward."""
         peak = self._trail_peak or Decimal(0)
-        band = self._band()
+        band = self._trail_giveback()
         return (
             peak * (Decimal(1) - band) if net > 0
             else peak * (Decimal(1) + band)
@@ -740,10 +1026,19 @@ class RGridController(MarketMakingController):
         shared ``grid_*`` keys the runtime already persists, plus rgrid-only ones."""
         anchor = self._last_anchor or self._anchor
         band = self._band()
+        # The ADD triggers come off the reference the add leg is actually quoted
+        # around (the last fill while in a position), not off the exposure anchor.
+        add_ref = self._last_add_ref or anchor
         up_price = down_price = 0.0
+        if add_ref and add_ref > 0:
+            up_price = float(add_ref * (Decimal(1) + band))
+            down_price = float(add_ref * (Decimal(1) - band))
+        # The exposure-band EXIT is a different, wider distance off the anchor.
+        exit_up = exit_down = 0.0
         if anchor and anchor > 0:
-            up_price = float(anchor * (Decimal(1) + band))
-            down_price = float(anchor * (Decimal(1) - band))
+            _eb = self._last_exit_band or self._exit_band()
+            exit_up = float(anchor * (Decimal(1) + _eb))
+            exit_down = float(anchor * (Decimal(1) - _eb))
         net_base = 0.0
         if self.inventory is not None:
             net_base = float(self.inventory.get(self.user_id, self.trading_pair, self.id).net_amount_base)
@@ -779,6 +1074,14 @@ class RGridController(MarketMakingController):
             "grid_reset_down_price": down_price,
             "rgrid_buy_trigger": up_price,
             "rgrid_sell_trigger": down_price,
+            # Where the position is actually given up, which is NOT the add
+            # trigger mirrored — the exit band is the wider derived distance.
+            "rgrid_exit_trigger": (
+                exit_down if net_base > 0 else exit_up if net_base < 0 else 0.0
+            ),
+            "rgrid_exit_band_bp": float(
+                (self._last_exit_band or self._exit_band()) * Decimal(10000)
+            ),
             "rgrid_trail_armed": bool(self._trail_armed),
             "rgrid_trail_peak": float(self._trail_peak) if self._trail_peak else 0.0,
             "rgrid_signal_regime": self.signal_regime,

@@ -52,6 +52,105 @@ TAKER_ROUND_TRIP_RATE = TAKER_ALL_IN_RATE * Decimal(2)                        # 
 # fit before fees alone close the session.
 DEFAULT_MAX_FEE_SHARE = Decimal("0.33")
 
+# ---------------------------------------------------------------------------
+# EXIT GEOMETRY — one source of truth for the controller AND for step sizing.
+#
+# R-Grid has three distances, and shipping them all equal to the entry band is
+# what made a trend follower lose money in trends:
+#
+#   entry band      how far a break must travel to qualify as a signal
+#   trail giveback  how far back from the favourable EXTREME the trailing exit sits
+#   exit band       how far from the average entry the exposure-band exit sits
+#
+# The trailing exit is the only one that can book a PROFIT — it ratchets with the
+# extreme. The exposure-band exit fires at ``avg_entry x (1 - band)`` and is
+# therefore LOSS-ONLY by construction. So the ordering that matters is: the trail
+# must get its chance BEFORE the loss-only exit can fire. Shipped, it was the exact
+# opposite — the trail armed at 2x the distance the band exit fired at, so on any
+# tape whose pullbacks reach one band the band exit always won and the trail was
+# unreachable. Measured on the repo's cost-aware backtester, the shipped geometry
+# returned -32.05 across five trending regimes; the geometry below returned +181.37
+# on the same tapes and the same costs.
+#
+# Both distances are DERIVED, not tuned:
+#   giveback = arm  -> the instant the trail arms at +arm favourable, its stop sits
+#                      at peak*(1-arm) ~= the entry, i.e. breakeven, and ratchets
+#                      into profit from there.
+#   exit     = arm + band  -> strictly beyond the arm point, so the profit-taking
+#                      exit always engages first, with one band of margin.
+# At the shipped 10bp band these evaluate to 2x and 3x the band, which is exactly
+# where an independent parameter sweep put the optimum.
+# ---------------------------------------------------------------------------
+
+
+def arm_pct(band_frac: object, reset_threshold_pct: object = 0) -> Decimal:
+    """Favourable excursion at which the trailing exit engages.
+
+    Floored at the taker round trip: a "profit" smaller than the cost of taking it
+    is not profit. Deliberately conservative — R-Grid rests makers, so its real
+    cost is lower and this floor only ever makes arming harder, never easier.
+    """
+    band = _as_frac(band_frac)
+    reset = _as_frac(reset_threshold_pct)
+    return max(reset, band * Decimal(2), TAKER_ROUND_TRIP_RATE)
+
+
+def trail_giveback_frac(band_frac: object, reset_threshold_pct: object = 0) -> Decimal:
+    """How far back from the favourable extreme the trailing exit fires."""
+    return arm_pct(band_frac, reset_threshold_pct)
+
+
+def exit_band_frac(band_frac: object, reset_threshold_pct: object = 0) -> Decimal:
+    """How far from the average entry the (loss-only) exposure-band exit fires.
+
+    This is also the adverse move ``max_step_for_stop_budget`` must size against:
+    the step cap exists so the strategy's OWN exit can trigger before the session
+    rail does, so the two must use the same number or the rail always wins.
+    """
+    return arm_pct(band_frac, reset_threshold_pct) + _as_frac(band_frac)
+
+
+# The crossing exit is priced THROUGH the touch so it actually fills, bounded so a
+# gapped book cannot fill it at an arbitrary price (``rgrid._EXIT_CROSS_BP``). That
+# bound is REALISED COST on the way out, so the stop budget has to carry it: sizing
+# exposure against fees alone left the exit able to print 30bp worse than the
+# modelled level, i.e. up to 1.8x the stop at the shipped defaults — "the user never
+# sees a losing trade, just a strategy that keeps stopping", from the slippage side.
+EXIT_CROSS_RATE = Decimal("0.0030")
+
+
+def exit_cost_frac(band_frac: object, reset_threshold_pct: object = 0) -> Decimal:
+    """Total adverse move a full pyramid can realise reaching its OWN exit:
+    the trigger distance, the round-trip fees, and the worst-case crossing print.
+
+    This is the number the stop budget must cover — anything smaller and the
+    session rail fires before the strategy can exit on its own terms.
+    """
+    return (exit_band_frac(band_frac, reset_threshold_pct)
+            + TAKER_ROUND_TRIP_RATE + EXIT_CROSS_RATE)
+
+
+def step_band_frac(band_frac: object, reset_threshold_pct: object = 0) -> Decimal:
+    """The ``band_frac`` to hand :func:`resolve_step_quote`.
+
+    ``max_step_for_stop_budget`` adds ``TAKER_ROUND_TRIP_RATE`` itself, so this is
+    :func:`exit_cost_frac` minus that term — everything else the move costs.
+
+    It exists so the engine mapping and the pre-start card cannot disagree. They
+    have now drifted apart twice (once on the entry band vs the exit band, once on
+    the crossing print), each time letting the card quote a size the strategy does
+    not place and swallow the "stop too tight" warning exactly when it applied.
+    One call, one number, both callers.
+    """
+    return exit_cost_frac(band_frac, reset_threshold_pct) - TAKER_ROUND_TRIP_RATE
+
+
+def _as_frac(value: object) -> Decimal:
+    try:
+        return max(Decimal(0), Decimal(str(value or 0)))
+    except Exception:  # noqa: BLE001 - an unusable distance simply does not bind
+        return Decimal(0)
+
 
 @dataclass(frozen=True)
 class StepPlan:

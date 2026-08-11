@@ -26,7 +26,7 @@ import pytest
 
 from tests.engine._mock_nado import MockNadoAdapter
 
-from src.nadobro.engine.controllers.rgrid import RGridController
+from src.nadobro.engine.controllers.rgrid import _STOP_STALE_TICKS, RGridController
 from src.nadobro.engine.executors.order_executor import OrderExecutorConfig
 from src.nadobro.engine.executors.rgrid_maker_executor import (
     LEG_ENTRY,
@@ -282,7 +282,14 @@ def test_inside_the_band_neither_leg_can_rest():
 
 def test_above_the_band_only_the_buy_leg_rests():
     """Price has risen past anchor x (1+spread), so that bid is now BELOW market —
-    a valid maker order, and the one that buys into strength on a pullback."""
+    a valid maker order, and the one that buys into strength on a pullback.
+
+    It rests NEAR the market, not at the seed. This used to assert the bid landed
+    on 100.1 — anchor x (1+spread) off the frozen session-start anchor — which is
+    89bp under a market that had just printed 101, i.e. an order price action had
+    already left behind. The flat anchor is on a leash now, so the bid trails to
+    within about one band of the touch and is something that can actually fill.
+    """
     async def body():
         adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100), auto_fill_market=False)
         orch, c = _controller(adapter)
@@ -292,7 +299,11 @@ def test_above_the_band_only_the_buy_leg_rests():
         await orch.tick_controller(c.id)
         assert len(_resting(adapter, TradeType.BUY)) == 1
         assert _resting(adapter, TradeType.SELL) == []
-        assert _resting(adapter, TradeType.BUY)[0].price == Decimal(100) * (1 + SPREAD)
+        px = _resting(adapter, TradeType.BUY)[0].price
+        assert px < Decimal("101"), "a resting bid must not cross"
+        assert px > Decimal("101") * (1 - 2 * SPREAD), (
+            f"bid {px} is stale — it should trail mid, not sit on the seeded anchor"
+        )
 
     asyncio.run(body())
 
@@ -307,7 +318,11 @@ def test_below_the_band_only_the_sell_leg_rests():
         await orch.tick_controller(c.id)
         assert len(_resting(adapter, TradeType.SELL)) == 1
         assert _resting(adapter, TradeType.BUY) == []
-        assert _resting(adapter, TradeType.SELL)[0].price == Decimal(100) * (1 - SPREAD)
+        px = _resting(adapter, TradeType.SELL)[0].price
+        assert px > Decimal("99"), "a resting ask must not cross"
+        assert px < Decimal("99") * (1 + 2 * SPREAD), (
+            f"ask {px} is stale — it should trail mid, not sit on the seeded anchor"
+        )
 
     asyncio.run(body())
 
@@ -322,6 +337,92 @@ def test_a_post_only_price_is_never_sent_on_the_crossing_side():
     assert c._is_postable(TradeType.BUY, Decimal("100.5"), mid) is False
     assert c._is_postable(TradeType.SELL, Decimal("100.5"), mid) is True
     assert c._is_postable(TradeType.SELL, Decimal("99.5"), mid) is False
+
+
+def test_a_resting_entry_is_not_withdrawn_at_the_touch():
+    """RGRID-NO-ORDERS (2026-08-09) part 2.
+
+    Post-only binds when an order is SENT, not while it sits on the book, and a
+    resting bid stops being "postable" exactly when mid reaches it — the moment it
+    is about to be hit. Cancelling there withdrew the entry at the one instant it
+    could fill, so R-Grid only ever got in when the venue's fill beat the next tick
+    (~8-10s apart in prod). The order must survive mid arriving at its price.
+    """
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100), auto_fill_market=False)
+        orch, c = _controller(adapter)
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        adapter.set_mid(Decimal("100.15"))       # break up: the bid rests
+        await orch.tick_controller(c.id)
+        resting = _resting(adapter, TradeType.BUY)
+        assert len(resting) == 1
+        bid = resting[0]
+
+        adapter.set_mid(bid.price)               # the market comes to the bid
+        await orch.tick_controller(c.id)
+        assert bid.id not in adapter.cancelled, (
+            "the entry was cancelled at the exact price it would have filled"
+        )
+        assert not bid.state.is_terminal
+
+    asyncio.run(body())
+
+
+def test_the_flat_anchor_is_not_frozen_at_the_session_start_mid():
+    """RGRID-NO-ORDERS (2026-08-09) part 1 — the reported "no orders, just skipping".
+
+    While flat with an empty window nothing but the seed writes ``_anchor``
+    (``_reset_exposure_window`` is gated on ``_has_fills()``), so every break was
+    measured against wherever price sat when the user pressed start. Once price
+    left that level R-Grid rested one entry at the seeded trigger, price walked
+    away, and — the anchor only moving on a FILL — there was no way back: inert for
+    the rest of the session.
+
+    Live repro before the fix: 72 ticks over 82bp of range produced ONE order,
+    zero fills, the anchor still on its seed and the bid stranded 72bp under the
+    market. The anchor must track mid while flat.
+    """
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100), auto_fill_market=False)
+        orch, c = _controller(adapter)
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)                  # seed := 100
+        assert c.exposure_anchor() == Decimal(100)
+
+        px = Decimal(100)
+        for _ in range(40):                               # a steady 6bp-per-tick trend
+            px *= Decimal("1.0006")
+            adapter.set_mid(px)
+            await orch.tick_controller(c.id)
+
+        assert c._net_base() != 0 or _resting(adapter, TradeType.BUY), (
+            "R-Grid sat out an 82bp trend entirely"
+        )
+        anchor = c.exposure_anchor(px)
+        assert anchor > Decimal(100), "the anchor never left its seed"
+        # Never further from the market than the leash allows.
+        assert anchor > px * (1 - 3 * SPREAD), f"anchor {anchor} went stale vs mid {px}"
+
+    asyncio.run(body())
+
+
+def test_a_break_still_needs_a_real_move_after_the_leash():
+    """The leash must not dissolve the break. Re-seeding to mid every tick would be
+    the opposite failure — the band could never be breached and nothing would ever
+    rest — so inside the leash the anchor does not move at all."""
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100), auto_fill_market=False)
+        orch, c = _controller(adapter)
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        for px in ("100.05", "99.95", "100.02", "99.98"):   # all inside the band
+            adapter.set_mid(Decimal(px))
+            await orch.tick_controller(c.id)
+        assert adapter.placed == [], "quoted without a break"
+        assert c.exposure_anchor() == Decimal(100), "the anchor drifted inside the band"
+
+    asyncio.run(body())
 
 
 def test_no_fills_waits_at_the_seeded_mid():
@@ -423,9 +524,13 @@ def test_the_armed_soft_reset_moves_the_exit_leg_up_with_the_trend():
         assert c._trail_breached(Decimal("108"), Decimal(1)) is False
         assert [o for o in adapter.placed if o.order_type is OrderType.LIMIT] == []
 
-        # Price comes back THROUGH the trailed level (108 x 0.999 = 107.892) — the
-        # one place a post-only ask cannot sit. The stop crosses.
-        adapter.set_mid(Decimal("107"))
+        # The give-back is the ARM threshold, not the entry band: arming at +1%
+        # puts the stop at 108 x (1 - 0.01) = 106.92, which is breakeven-ish on a
+        # position opened at 100 and ratchets up from there. It used to be one
+        # entry band (107.892) -- tighter than an ordinary pullback, so the run was
+        # cut almost immediately.
+        assert c._trail_price(Decimal(1)) == Decimal("106.92")
+        adapter.set_mid(Decimal("106.9"))        # back THROUGH the trailed level
         await orch.tick_controller(c.id)
         stops = [o for o in adapter.placed if o.order_type is OrderType.LIMIT]
         assert len(stops) == 1, "the trailing stop never crossed"
@@ -447,8 +552,8 @@ def test_the_trail_only_crosses_once_and_cancels_the_resting_legs_first():
         c.inventory.apply_fill(1, PAIR, c.id, TradeType.BUY, Decimal(1), Decimal(100), Decimal(0))
         _seed_leg(c, "buy", 100)
         adapter.set_mid(Decimal("108"))
-        await orch.tick_controller(c.id)          # arms
-        adapter.set_mid(Decimal("107"))
+        await orch.tick_controller(c.id)          # arms; trail sits at 106.92
+        adapter.set_mid(Decimal("106.9"))
         await orch.tick_controller(c.id)          # crosses
         assert c._resting == {}, "a resting leg survived alongside the stop"
         stops = [o for o in adapter.placed if o.order_type is OrderType.LIMIT]
@@ -687,5 +792,492 @@ def test_a_refused_exit_is_counted_and_escalated_not_retried_in_silence():
         del c.spawn_executor
         assert await c._fire_trail_stop(Decimal(3), Decimal(99)) is True
         assert c._exit_failures == 0
+
+    asyncio.run(body())
+
+
+# ==========================================================================
+# 9. Trend following — R-Grid's actual mandate
+#
+# "As the market is trending, rgrid follows the asset price and buys or sells in
+#  the direction of the price. If the asset price is dumping, it shorts and adds
+#  more shorts as the price dumps more. If the price switches and starts pumping,
+#  rgrid switches to Long and adds more Longs as the price continues to increase."
+#
+# Four separate defects made that impossible. Each has a guardrail here; each was
+# verified to FAIL with its own fix reverted. Measured end to end on the repo's
+# cost-aware backtester through the real mapped config, the shipped geometry
+# returned -85.27 across five trending regimes and the fixed one +487.19.
+# ==========================================================================
+def test_the_add_leg_marches_with_the_trend_instead_of_converging():
+    """RGRID-STALE-ADD. The add used to be quoted off the exposure VWAP, which is
+    an AVERAGE: each successive add moves it less than the one before, so the add
+    level converges while price runs on. Traced on the backtester, one leg's adds
+    came at 2005.20, 2007.20, 2008.21, 2008.88, 2009.38 — steps of 10.0, 5.0, 3.3
+    and 2.5bp, decaying to nothing. Off the LAST FILL each add instead needs one
+    fresh band of trend extension, so the spacing cannot decay.
+    """
+    adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100))
+    _, c = _controller(adapter)
+    # A pyramid whose fills are one band apart, as a trend produces.
+    for px in (100, 100.1, 100.2, 100.3):
+        _seed_leg(c, "buy", px)
+    anchor = c.exposure_anchor(Decimal("100.3"))
+
+    ref = c._add_reference(Decimal(1), anchor)
+    assert ref == Decimal("100.3"), "the add must key off the most recent fill"
+    # The averaging reference lags the newest fill, and the gap only widens.
+    assert anchor < Decimal("100.3")
+
+    # Spacing is constant, not decaying: every add needs a full band of extension.
+    step_bp = (ref * (1 + SPREAD) / Decimal("100.3") - 1) * Decimal(10000)
+    assert abs(step_bp - Decimal(10)) < Decimal("0.01")
+
+
+def test_the_short_side_pyramids_as_price_dumps():
+    """The mirror: a dumping market must keep ADDING shorts, each one band lower."""
+    adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100))
+    _, c = _controller(adapter)
+    for px in (100, 99.9, 99.8):
+        _seed_leg(c, "sell", px)
+    ref = c._add_reference(Decimal(-1), c.exposure_anchor(Decimal("99.8")))
+    assert ref == Decimal("99.8")
+    # The next short rests one band BELOW the last one — further into the dump.
+    assert ref * (1 - SPREAD) < Decimal("99.8")
+
+
+def test_the_profit_taking_exit_engages_before_the_loss_only_one():
+    """RGRID-EXIT-RACE, the dominant money bug.
+
+    The exposure-band exit fires at ``avg_entry x (1 - band)`` and is therefore
+    LOSS-ONLY by construction — it can never book a gain. The trailing stop is the
+    only exit that can, because it ratchets with the favourable extreme. Shipped,
+    the trail armed at 2x the distance the band exit fired at, so on any tape whose
+    pullbacks reach one band the loss-only exit ALWAYS won the race and the trail
+    was unreachable: a +3.14% uptrend booked -$12.10 realised over 29 fills.
+
+    The invariant: the band exit must sit strictly BEYOND the arm point.
+    """
+    adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100))
+    for spread in ("0.0005", "0.001", "0.002", "0.005"):
+        _, c = _controller(adapter, extra={
+            "spread_bid_pct": Decimal(spread), "spread_ask_pct": Decimal(spread),
+        })
+        assert c._exit_band() > c._arm_pct(), (
+            f"at spread {spread} the loss-only exit still outruns the trail"
+        )
+        # And the give-back puts the armed stop at breakeven, never below it.
+        assert c._trail_giveback() == c._arm_pct()
+
+
+def test_an_armed_trail_protects_breakeven_not_a_loss():
+    """Give-back == arm means that at the instant the trail arms at +arm
+    favourable, its stop sits at peak x (1-arm) — the entry. A recognised winner
+    can never be handed back as a loss. At one entry band the stop sat well inside
+    the move and cut it immediately."""
+    adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100))
+    _, c = _controller(adapter, extra={"reset_threshold_pct": Decimal("0.01")})
+    entry = Decimal(100)
+    peak = entry * (Decimal(1) + c._arm_pct())      # exactly the arm point
+    c._trail_peak = peak
+    c._trail_armed = True
+    stop = c._trail_price(Decimal(1))
+    assert stop <= entry
+    assert stop > entry * Decimal("0.99"), "the give-back overshot breakeven"
+
+
+def test_the_step_cap_bounds_the_move_to_rgrids_own_exit():
+    """RGRID-RAIL-RACE. The step cap exists so the strategy's OWN exit can fire
+    before the session rail does, and it sizes against the adverse move to that
+    exit. That move is the EXIT band (arm + band), not the entry band — sizing
+    against one band while the controller waits for three hands the decision back
+    to the rail. Controller and sizer must read the same number."""
+    from src.nadobro.quant.rgrid_sizing import exit_band_frac
+
+    adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100))
+    for spread, reset in (("0.001", "0.002"), ("0.002", "0.004"), ("0.0005", "0.002")):
+        _, c = _controller(adapter, extra={
+            "spread_bid_pct": Decimal(spread), "spread_ask_pct": Decimal(spread),
+            "reset_threshold_pct": Decimal(reset),
+        })
+        assert c._exit_band() == exit_band_frac(Decimal(spread), Decimal(reset))
+
+
+def test_the_configured_pyramid_fits_inside_its_own_exposure_ceiling():
+    """RGRID-NO-PYRAMID. ``margin_quote`` for this family is the DEPLOYED notional
+    and the step is deployed/levels, so a full pyramid is 100% of it. The shared MM
+    default of 30% admitted 1.0-1.4 steps: R-Grid took its entry and then had every
+    add refused by _projected_order_within_exposure. It could not pyramid at all,
+    which is the entire strategy.
+    """
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    for margin, lev, levels in ((100, 5, 2), (1000, 4, 4), (250, 20, 3), (500, 3, 2)):
+        cfg = map_strategy_config(
+            "rgrid",
+            {"notional_usd": margin, "leverage": lev, "levels": levels,
+             "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 5.0},
+            Decimal(2000), product="ETH-PERP", leverage=lev,
+        )
+        step = Decimal(str(cfg["order_amount_quote"]))
+        cap = (Decimal(str(cfg["margin_quote"]))
+               * Decimal(str(cfg["max_net_exposure_pct"])) / Decimal(100))
+        rungs = max(cap, step) / step
+        assert rungs >= Decimal(levels) - Decimal("0.01"), (
+            f"margin={margin} lev={lev} levels={levels}: only {rungs:.2f} of "
+            f"{levels} planned rungs fit — the pyramid cannot be built"
+        )
+
+
+def test_a_resting_entry_does_not_outlive_the_position_it_belonged_to():
+    """RGRID-STALE-LEG — found in the pre-push self-audit, and introduced by the
+    fix immediately above it.
+
+    Holding an unpostable resting quote is right when the market has merely come
+    to it. It is WRONG once the target has moved off it. The position can be
+    flattened out-of-band — the session SL/TP rail, a liquidation, a manual close —
+    none of which run _fire_trail_stop and its two-leg cancel. The next tick is
+    flat, re-anchors to mid, computes an unpostable target, and an unconditional
+    hold would leave the dead position's add leg resting where it can RE-OPEN
+    exposure the rail just closed.
+    """
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter)
+        await orch.spawn_controller(c)
+        c.inventory.apply_fill(1, PAIR, c.id, TradeType.BUY, Decimal(1),
+                               Decimal(100), Decimal(0))
+        _seed_leg(c, "buy", 100)
+
+        adapter.set_mid(Decimal("100.3"))
+        await orch.tick_controller(c.id)
+        resting = _resting(adapter, TradeType.BUY)
+        assert len(resting) == 1, "expected the add leg to rest"
+        add_leg = resting[0]
+
+        # The rail closes the book without going through _fire_trail_stop.
+        c.inventory.apply_fill(1, PAIR, c.id, TradeType.SELL, Decimal(1),
+                               Decimal("100.3"), Decimal(0))
+        assert c._net_base() == 0
+        adapter.set_mid(Decimal("100.1"))
+        await orch.tick_controller(c.id)
+
+        assert add_leg.state.is_terminal, (
+            "the dead position's add leg is still working — it can re-open "
+            "exposure the rail just closed"
+        )
+        assert c._resting.get(TradeType.BUY) is None
+
+    asyncio.run(body())
+
+
+def test_a_rebuilt_controller_will_not_price_its_add_off_a_seeded_fill():
+    """The add reference obeys the same live-fill evidence rule as the crossing
+    exit. ``seed_fills`` restores the whole SESSION's prints, exits included, so
+    the newest BUY in a seeded window need not be this position's last add —
+    pricing off one below mid would rest an add far under the market and fill it
+    by adding to a long into a collapse."""
+    adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100))
+    _, c = _controller(adapter, extra={
+        # newest-first, as get_session_recent_fills returns them
+        "seed_fills": [{"price": "92", "size": "1", "side": "buy"},
+                       {"price": "95", "size": "1", "side": "sell"}],
+    })
+    anchor = c.exposure_anchor(Decimal(100))
+    # Seeded only: the anchor, not the seeded 92 print.
+    assert c._add_reference(Decimal(1), anchor) == anchor
+    assert c._add_reference(Decimal(1), anchor) != Decimal(92)
+
+    # A live fill on this leg is the evidence that unlocks it.
+    _seed_leg(c, "buy", 101)
+    assert c._add_reference(Decimal(1), c.exposure_anchor(Decimal(100))) == Decimal(101)
+
+
+def test_the_strategy_exit_still_fires_before_the_session_rail():
+    """The safety ordering the step cap exists to guarantee, re-proved after the
+    exit was widened and the exposure ceiling raised to 100% of deployed.
+
+    R-Grid must be able to exit on its OWN terms; if a full pyramid taking the
+    adverse move to its band exit already costs more than the stop budget, the
+    session rail always fires first and the user "never sees a losing trade, just
+    a strategy that keeps stopping". Both the raised cap and the widened exit push
+    against this, so it is checked at the tight-SL / high-leverage corners where
+    the stop-budget ceiling has to bind.
+    """
+    from src.nadobro.quant.rgrid_sizing import TAKER_ROUND_TRIP_RATE, exit_band_frac
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    for margin, lev, levels, sl in ((100, 5, 2, 2.0), (1000, 4, 4, 5.0),
+                                    (250, 20, 3, 1.0), (100, 20, 4, 0.5),
+                                    (500, 10, 4, 3.0)):
+        cfg = map_strategy_config(
+            "rgrid",
+            {"notional_usd": margin, "leverage": lev, "levels": levels,
+             "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": sl},
+            Decimal(2000), product="ETH-PERP", leverage=lev,
+        )
+        step = Decimal(str(cfg["order_amount_quote"]))
+        deployed = Decimal(str(cfg["margin_quote"]))
+        cap_quote = deployed * Decimal(str(cfg["max_net_exposure_pct"])) / Decimal(100)
+        reachable = min(max(cap_quote, step), step * Decimal(levels))
+        move = exit_band_frac(Decimal(str(cfg["spread_ask_pct"])),
+                              Decimal(str(cfg["reset_threshold_pct"])))
+        loss_at_own_exit = reachable * (move + TAKER_ROUND_TRIP_RATE)
+        stop_budget = Decimal(str(margin)) * Decimal(str(sl)) / Decimal(100)
+        assert loss_at_own_exit <= stop_budget, (
+            f"margin={margin} lev={lev} levels={levels} SL={sl}%: a full pyramid "
+            f"loses ${loss_at_own_exit:.2f} reaching R-Grid's own exit against a "
+            f"${stop_budget:.2f} stop — the session rail fires first"
+        )
+
+
+def test_status_reports_the_levels_the_engine_is_actually_working():
+    """Telemetry must not re-derive levels the engine no longer uses. Both moved
+    in this change: the ADD trigger is off the last fill while a position is open,
+    and the EXIT is a wider derived band off the anchor. grid_metrics() computed
+    both as anchor x (1 -+ entry band), so the /status card would have quoted the
+    user two levels nothing was trading on."""
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter)
+        await orch.spawn_controller(c)
+        c.inventory.apply_fill(1, PAIR, c.id, TradeType.BUY, Decimal(3),
+                               Decimal("100.27"), Decimal(0))
+        # A real pyramid: the VWAP anchor lags the newest add, which is the whole
+        # reason the two references have to be reported separately.
+        for px in ("100.0", "100.3", "100.5"):
+            _seed_leg(c, "buy", Decimal(px))
+        adapter.set_mid(Decimal("100.8"))
+        await orch.tick_controller(c.id)
+
+        m = c.grid_metrics()
+        anchor = Decimal(str(m["grid_anchor_price"]))
+        assert anchor < Decimal("100.5"), "the VWAP must lag the newest add here"
+        # The add trigger tracks the LAST FILL, not the anchor.
+        assert m["rgrid_buy_trigger"] == pytest.approx(
+            float(Decimal("100.5") * (1 + SPREAD))
+        )
+        assert m["rgrid_buy_trigger"] != pytest.approx(float(anchor * (1 + SPREAD)))
+        # The exit is the wider derived band, off the anchor, and below a long.
+        assert m["rgrid_exit_band_bp"] == pytest.approx(float(c._exit_band() * 10000))
+        assert m["rgrid_exit_trigger"] == pytest.approx(
+            float(anchor * (1 - c._exit_band()))
+        )
+        assert m["rgrid_exit_trigger"] < float(anchor)
+
+    asyncio.run(body())
+
+
+# ==========================================================================
+# 10. Findings from the pre-push SL/TP trace — the exit must stay affordable
+# ==========================================================================
+def test_the_exit_distance_is_capped_at_what_the_stop_can_afford():
+    """SLTP-F1 / SLTP-F3. The mapper sizes the exposure ceiling against the exit
+    distance, but TWO paths widen that distance afterwards and neither re-derives
+    the ceiling:
+
+      * the financial overlay scales ``spread_ask_pct`` LIVE by 0.75-3.0x
+        (overlay_actuator; rgrid is in OVERLAY_STRATEGIES), and _band() reads it;
+      * ``arm_pct`` is floored on the user's Reset threshold, whose card button
+        goes to 10% — deriving a 1010bp exit that no realistic stop can cover.
+
+    Past the affordable distance the session rail fires first and every close
+    becomes a rail flatten, which is the pathology this geometry exists to remove.
+    """
+    adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100))
+    cap = Decimal("0.00314")
+
+    # Overlay scaling cannot push the exit past the ceiling.
+    for factor in ("1.5", "2.0", "3.0"):
+        _, c = _controller(adapter, extra={
+            "spread_bid_pct": SPREAD * Decimal(factor),
+            "spread_ask_pct": SPREAD * Decimal(factor),
+            "reset_threshold_pct": Decimal("0.002"),
+            "exit_band_cap": cap,
+        })
+        assert c._exit_band() <= cap, f"overlay x{factor} escaped the ceiling"
+        assert c._exit_band() >= c._band(), "the exit fell inside the entry trigger"
+
+    # Nor can a large Reset threshold.
+    _, c = _controller(adapter, extra={
+        "reset_threshold_pct": Decimal("0.10"), "exit_band_cap": cap,
+    })
+    assert c._exit_band() <= cap
+
+    # And with no ceiling configured the derived distance is untouched.
+    _, c = _controller(adapter, extra={"reset_threshold_pct": Decimal("0.002")})
+    assert c._exit_band() == Decimal("0.003")
+
+
+def test_a_disarmed_stop_does_not_unlock_the_full_pyramid():
+    """SLTP-F4. The 100% exposure default is only safe because the stop-budget
+    ceiling tightens it. With the rail disarmed there is no budget, nothing
+    tightens, and the full pyramid would run with no stop behind it at all."""
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    armed, disarmed = (
+        map_strategy_config(
+            "rgrid",
+            {"notional_usd": 100, "leverage": 20, "levels": 4,
+             "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": sl},
+            Decimal(2000), product="ETH-PERP", leverage=20,
+        )
+        for sl in (2.0, 0.0)
+    )
+    assert float(disarmed["max_net_exposure_pct"]) <= 30.0, (
+        "a disarmed stop lifted the exposure ceiling instead of holding it"
+    )
+    assert float(armed["max_net_exposure_pct"]) <= 100.0
+    # No budget to size against means no exit ceiling either.
+    assert Decimal(str(disarmed["exit_band_cap"])) == 0
+
+
+# ==========================================================================
+# 11. Findings from the pre-push strategy audit
+# ==========================================================================
+def test_a_rebuilt_controller_will_not_arm_the_trail_off_a_seeded_cost_basis():
+    """AUDIT-F1 (critical). ``_position_entry_price()`` is the leg window's VWAP,
+    and ``seed_fills`` restores the whole SESSION — both sides, exits included. A
+    previous SHORT cycle's cover is a BUY, so it lands in the BUY deque and drags a
+    later long's "entry" down.
+
+    Reproduced before the fix: true entry 96.5, seeded basis 94.25, so tick 1 read
+    a 2.4% excursion, armed the trail instantly, and a 31bp dip crossed out of a
+    healthy position at a loss — on EVERY worker handoff while a position is open.
+    With no live fill the excursion is measured from observed price instead, which
+    is what the docstring always claimed the trail did.
+    """
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal("96.5"),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter, extra={
+            "reset_threshold_pct": Decimal("0.002"), "trail_enabled": True,
+            # newest-first: long @96.5, and cycle 1's short @100 covered @92.
+            "seed_fills": [{"price": "96.5", "size": "2", "side": "buy"},
+                           {"price": "92", "size": "2", "side": "buy"},
+                           {"price": "100", "size": "2", "side": "sell"}],
+        })
+        await orch.spawn_controller(c)
+        c.inventory.apply_fill(1, PAIR, c.id, TradeType.BUY, Decimal(2),
+                               Decimal("96.5"), Decimal(0))
+        # The polluted basis is still there — we simply must not arm off it.
+        assert c._position_entry_price() < Decimal("96.5")
+
+        adapter.set_mid(Decimal("96.5"))
+        await orch.tick_controller(c.id)
+        assert c._trail_armed is False, "armed off a seeded cost basis"
+        assert c._trail_origin == Decimal("96.5")
+
+        adapter.set_mid(Decimal("96.2"))          # a 31bp dip
+        await orch.tick_controller(c.id)
+        assert _crossings(adapter) == [], "a 31bp dip dumped a healthy position"
+
+    asyncio.run(body())
+
+
+def test_a_refused_exit_never_falls_through_into_an_add():
+    """AUDIT-F3. ``_fire_trail_stop`` returns False when the risk engine or the
+    kill switch declines the close (reduce-only is exempt from the SIZE caps, but
+    not from max_open_executors or the kill switch). The tick used to fall through
+    to the sizing branch and rest a fresh ADD on the losing side — on the very tick
+    it had just failed to close and logged "the session rail is the only stop
+    left". A refused close is never a licence to add."""
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter, extra={
+            "reset_threshold_pct": Decimal("0.002"), "trail_enabled": True,
+        })
+        await orch.spawn_controller(c)
+        c.inventory.apply_fill(1, PAIR, c.id, TradeType.BUY, Decimal(1),
+                               Decimal(100), Decimal(0))
+        _seed_leg(c, "buy", 100)
+
+        async def _refuse(*_a, **_k):
+            return False
+        c.spawn_executor = _refuse                    # type: ignore[assignment]
+
+        adapter.set_mid(Decimal("108"))               # arms the trail
+        await orch.tick_controller(c.id)
+        adapter.set_mid(Decimal("104"))               # breaches it; the close is refused
+        await orch.tick_controller(c.id)
+
+        assert c._exit_failures >= 1, "the refusal was not recorded"
+        assert _resting(adapter, TradeType.BUY) == [], (
+            "an ADD was rested on the losing side after the close was refused"
+        )
+
+    asyncio.run(body())
+
+
+def test_the_stop_budget_covers_the_crossing_print_not_just_the_fees():
+    """AUDIT-F4. The exit is priced THROUGH the touch so it actually fills, bounded
+    at _EXIT_CROSS_BP. That bound is realised cost on the way out, so the exposure
+    ceiling has to carry it; sized against fees alone the exit could print 30bp
+    worse than the modelled level — up to 1.8x the stop at shipped defaults."""
+    from src.nadobro.quant.rgrid_sizing import exit_cost_frac
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    for margin, lev, levels, sl in ((100, 20, 4, 0.8), (100, 5, 2, 2.0),
+                                    (1000, 4, 4, 5.0), (250, 20, 3, 1.0)):
+        cfg = map_strategy_config(
+            "rgrid",
+            {"notional_usd": margin, "leverage": lev, "levels": levels,
+             "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": sl},
+            Decimal(2000), product="ETH-PERP", leverage=lev,
+        )
+        step = Decimal(str(cfg["order_amount_quote"]))
+        cap = (Decimal(str(cfg["margin_quote"]))
+               * Decimal(str(cfg["max_net_exposure_pct"])) / Decimal(100))
+        reachable = min(max(cap, step), step * Decimal(levels))
+        worst = reachable * exit_cost_frac(
+            Decimal(str(cfg["spread_ask_pct"])),
+            Decimal(str(cfg["reset_threshold_pct"])),
+        )
+        budget = Decimal(str(margin)) * Decimal(str(sl)) / Decimal(100)
+        assert worst <= budget, (
+            f"margin={margin} lev={lev} SL={sl}%: worst-case ${worst:.2f} at the "
+            f"strategy's own exit exceeds the ${budget:.2f} stop"
+        )
+
+
+def test_an_unfilled_crossing_exit_is_repriced_not_left_stranded():
+    """AUDIT-F2. The crossing exit is a bounded marketable limit, and OrderExecutor
+    neither times out nor re-prices a plain LIMIT — it terminates only on FILLED /
+    CANCELLED / REJECTED, and a partial reports PARTIALLY_FILLED (not terminal).
+    So on a gapped or one-sided book the exit rested unfilled and on_tick returned
+    at the in-flight guard EVERY tick, forever: no re-price, no second attempt, a
+    position with a stranded exit and a frozen controller — in exactly the fast
+    tape the exit exists for."""
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=False, mid=Decimal(100),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter, extra={
+            "reset_threshold_pct": Decimal("0.002"), "trail_enabled": True,
+        })
+        await orch.spawn_controller(c)
+        c.inventory.apply_fill(1, PAIR, c.id, TradeType.BUY, Decimal(1),
+                               Decimal(100), Decimal(0))
+        _seed_leg(c, "buy", 100)
+
+        adapter.set_mid(Decimal("108"))
+        await orch.tick_controller(c.id)               # arms
+        adapter.set_mid(Decimal("104"))
+        await orch.tick_controller(c.id)               # crosses; the book never fills it
+        first = _crossings(adapter)
+        assert len(first) == 1, "expected the exit to have crossed"
+        assert c._stop_id is not None
+
+        # It sits unfilled. After the stale window it must be re-priced, not held.
+        for _ in range(_ST := 6):
+            adapter.set_mid(Decimal("103"))
+            await orch.tick_controller(c.id)
+        assert len(_crossings(adapter)) > 1, (
+            "the exit was never re-priced — the controller froze with a stranded order"
+        )
+        # And the replacement chases the market rather than repeating a dead price.
+        assert _crossings(adapter)[-1].price < first[0].price
 
     asyncio.run(body())
