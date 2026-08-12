@@ -41,10 +41,27 @@ def test_a_verdict_can_only_shade_conviction_down_when_it_disagrees():
     assert any("disagrees" in r for r in out.risks)
 
 
-def test_agreement_may_nudge_confidence_but_is_hard_clamped():
+def test_agreement_can_never_raise_conviction():
+    """``confidence`` feeds overlay_actuator's ``size_factor`` and therefore real
+    order notional. This tier is documented as risk-reducing-only, so a positive
+    delta must be discarded rather than clamped-and-applied."""
     out = sa._apply(_signal(), {"agree": True, "confidence_delta": 99.0, "provider": "nanogpt"})
-    assert out.confidence == pytest.approx(0.7 + sa._MAX_CONFIDENCE_DELTA)
+    assert out.confidence == pytest.approx(0.7), "agreement must not raise confidence"
     assert out.scale == 0.8, "agreement must not change size appetite"
+
+
+def test_a_negative_delta_still_lands_on_agreement():
+    """Risk-reducing-only must not become a no-op tier: the down-shade still applies."""
+    out = sa._apply(_signal(), {"agree": True, "confidence_delta": -0.1, "provider": "nanogpt"})
+    assert out.confidence == pytest.approx(0.6)
+
+
+def test_the_recorded_verdict_keeps_the_models_raw_signed_opinion():
+    """``_parse_verdict`` stays signed for the audit trail / signal_scorer even
+    though ``_apply`` drops the positive half."""
+    verdict = sa._parse_verdict('{"agree": true, "confidence_delta": 0.9}')
+    assert verdict is not None
+    assert verdict["confidence_delta"] == pytest.approx(sa._MAX_CONFIDENCE_DELTA)
 
 
 def test_a_disagreement_on_an_unconfident_read_closes_the_entry():

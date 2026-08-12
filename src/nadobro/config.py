@@ -15,7 +15,9 @@ NANOGPT_MODEL = os.environ.get("NANOGPT_MODEL", "chatgpt-4o-latest")
 DMIND_API_KEY = os.environ.get("DMIND_API_KEY")
 DMIND_BASE_URL = os.environ.get("DMIND_BASE_URL", "https://api.dmind.ai")
 DMIND_MODEL = os.environ.get("DMIND_MODEL", "dmind-finance")
-# n8n: also accepts n8n_Server_URL, n8n_authorization, n8n_MCP_Access_Token (see workflow_service).
+# n8n: also accepts n8n_Server_URL, n8n_authorization, n8n_MCP_Access_Token
+# (resolved in connectors/provider_config.py). Only feeds provider-status display
+# now — the prompt-to-workflow builder that deployed to n8n was removed.
 N8N_BASE_URL = os.environ.get("N8N_BASE_URL", "").rstrip("/")
 N8N_API_KEY = os.environ.get("N8N_API_KEY", "")
 N8N_WEBHOOK_SECRET = os.environ.get("N8N_WEBHOOK_SECRET", "")

@@ -135,7 +135,8 @@ def test_pending_stop_cannot_be_restarted_over_open_copy_exposure():
     user = type("User", (), {"linked_signer_address": "0xsigner"})()
     trader = {"id": 9, "wallet_address": "0xleader", "label": "leader", "active": True, "owner_user_id": 4242}
     pending = {"id": 7, "trader_id": 9, "stop_requested": True, "active": True}
-    with patch.object(copy_service, "get_user", return_value=user), \
+    with patch.object(copy_service, "is_trading_paused", return_value=False), \
+         patch.object(copy_service, "get_user", return_value=user), \
          patch.object(copy_service, "get_copy_trader", return_value=trader), \
          patch.object(copy_service, "get_user_active_mirrors_v2", return_value=[pending]), \
          patch.object(copy_service, "create_copy_mirror_v2") as create:
@@ -283,6 +284,7 @@ def test_open_loop_aborts_when_the_mirror_was_stopped_mid_sync():
 
         stopped_live = dict(mirror, stop_requested=True)
         with patch.object(copy_service, "run_blocking", side_effect=_inline), \
+             patch.object(copy_service, "is_trading_paused", return_value=False), \
              patch.object(copy_service, "get_open_copy_positions", return_value=[]), \
              patch.object(copy_service, "get_user_nado_client", return_value=None), \
              patch.object(copy_service, "set_mirror_unrealized"), \
@@ -334,6 +336,7 @@ def test_stop_landing_during_the_open_unwinds_the_just_opened_position():
         follower.get_market_price.return_value = {"mid": 100.0}
 
         with patch.object(copy_service, "run_blocking", side_effect=_inline), \
+             patch.object(copy_service, "is_trading_paused", return_value=False), \
              patch.object(copy_service, "get_open_copy_positions", return_value=[]), \
              patch.object(copy_service, "get_user_nado_client", return_value=follower), \
              patch.object(copy_service, "_archive_reads_unreliable", return_value=False), \
@@ -402,6 +405,7 @@ def test_network_switch_does_not_stop_a_network_scoped_mirror():
             return fn(*args, **kwargs)
 
         with patch.object(copy_service, "run_blocking", side_effect=_inline), \
+             patch.object(copy_service, "is_trading_paused", return_value=False), \
              patch.object(copy_service, "get_open_copy_positions", return_value=[]), \
              patch.object(copy_service, "get_user_nado_client", return_value=None) as client, \
              patch.object(copy_service, "set_mirror_unrealized"), \
@@ -414,3 +418,131 @@ def test_network_switch_does_not_stop_a_network_scoped_mirror():
         flatten.assert_not_called()
 
     asyncio.run(_case())
+
+
+# ==========================================================================
+# Global admin pause must cover EVERY copy arming path (audit COPY-PAUSE-*).
+#
+# Strategies stand down mid-flight (bot_runtime._run_cycle -> maintenance_pause).
+# Copy had three uncovered arming paths; these pin all of them, plus the
+# deliberate asymmetry that CLOSING stays alive while paused.
+# ==========================================================================
+def test_start_copy_blocked_by_global_pause():
+    """COPY-PAUSE-START"""
+    with patch.object(copy_service, "is_trading_paused", return_value=True), \
+         patch.object(copy_service, "get_user") as user_spy, \
+         patch.object(copy_service, "create_copy_mirror_v2") as create:
+        ok, msg = copy_service.start_copy(4242, 9, margin_per_trade=100.0)
+
+    assert not ok
+    assert "paused" in msg.lower()
+    create.assert_not_called()
+    user_spy.assert_not_called()
+
+
+def test_resume_copy_blocked_by_global_pause():
+    """COPY-PAUSE-RESUME — the post-redeploy restart path.
+
+    boot_stand_down_mirrors pauses every mirror and hands the user a
+    "▶ Resume" button, so this is the ONLY way copy restarts after a deploy.
+    A pause that does not cover it is a kill switch with a bypass button.
+    """
+    paused_mirror = {"id": 7, "user_id": 4242, "active": True, "paused": True}
+    with patch.object(copy_service, "get_copy_mirror", return_value=paused_mirror), \
+         patch.object(copy_service, "is_trading_paused", return_value=True), \
+         patch.object(copy_service, "resume_copy_mirror") as resume:
+        ok, msg = copy_service.resume_copy(4242, 7)
+
+    assert not ok
+    assert "paused" in msg.lower()
+    resume.assert_not_called()
+
+
+def test_resume_copy_still_works_when_not_paused():
+    """The gate must not brick the normal resume path."""
+    paused_mirror = {"id": 7, "user_id": 4242, "active": True, "paused": True}
+    with patch.object(copy_service, "get_copy_mirror", return_value=paused_mirror), \
+         patch.object(copy_service, "is_trading_paused", return_value=False), \
+         patch.object(copy_service, "resume_copy_mirror") as resume:
+        ok, msg = copy_service.resume_copy(4242, 7)
+
+    assert ok
+    assert "resumed" in msg.lower()
+    resume.assert_called_once_with(7)
+
+
+def test_poller_does_not_open_new_positions_while_globally_paused():
+    """COPY-PAUSE-POLLER — needs no user action, so it is the widest gap.
+
+    The pre-open liveness re-read caught stop/pause on the MIRROR but not the
+    global switch, so an active mirror kept opening while every strategy was
+    suspended.
+    """
+    mirror = {
+        "id": 7, "user_id": 4242, "active": True, "network": "mainnet",
+        "trader_id": 9, "margin_per_trade": 100.0, "max_leverage": 5.0,
+        "total_allocated_usd": 500.0,
+    }
+    leader = {1: {"side": "LONG", "entry_price": 100.0, "size": 1.0, "leverage": 2.0}}
+
+    with patch.object(copy_service, "get_copy_mirror", return_value=mirror), \
+         patch.object(copy_service, "get_open_copy_positions", return_value=[]), \
+         patch.object(copy_service, "_execute_maker_open") as maker, \
+         patch.object(copy_service, "execute_market_order") as taker, \
+         patch.object(copy_service, "_notify_user", new_callable=AsyncMock):
+        asyncio.run(
+            copy_service._sync_mirror_positions(mirror, leader, opens_blocked=True)
+        )
+
+    maker.assert_not_called()
+    taker.assert_not_called()
+
+
+def test_pause_gate_is_read_off_the_event_loop():
+    """asyncio discipline: is_trading_paused is an uncached bot_state read, so it
+    must be reached through run_blocking, never inline in a coroutine body. A sync
+    call here would starve the loop and make APScheduler skip jobs."""
+    seen = {}
+
+    async def _fake_run_blocking(fn, *a, **kw):
+        seen["fn"] = getattr(fn, "__name__", str(fn))
+        return False
+
+    with patch.object(copy_service, "run_blocking", side_effect=_fake_run_blocking):
+        blocked = asyncio.run(copy_service._global_pause_blocks_opens())
+
+    assert blocked is False
+    assert seen["fn"] == "is_trading_paused"
+
+
+def test_pause_gate_fails_closed_when_the_switch_cannot_be_read():
+    """An unreadable kill switch must block opens, not wave them through:
+    skipping an open is safe (next poll retries); trading through a pause is not."""
+    async def _boom(fn, *a, **kw):
+        raise RuntimeError("bot_state unreachable")
+
+    with patch.object(copy_service, "run_blocking", side_effect=_boom):
+        assert asyncio.run(copy_service._global_pause_blocks_opens()) is True
+
+
+def test_poller_resolves_the_pause_once_and_passes_it_to_every_mirror():
+    """The flag must actually reach _sync_mirror_positions — a default-False
+    parameter nobody sets would be a silent bypass."""
+    mirrors = [
+        {"id": 7, "user_id": 1, "trader_id": 9, "network": "mainnet", "wallet_address": "0xa"},
+        {"id": 8, "user_id": 2, "trader_id": 9, "network": "mainnet", "wallet_address": "0xa"},
+    ]
+    calls = []
+
+    async def _sync(mirror, leader_map, *, opens_blocked=False, leader_trusted=True):
+        calls.append((mirror["id"], opens_blocked))
+
+    with patch.object(copy_service, "run_blocking", new_callable=AsyncMock) as rb, \
+         patch.object(copy_service, "_global_pause_blocks_opens", return_value=True), \
+         patch.object(copy_service, "_sync_mirror_positions", side_effect=_sync):
+        rb.side_effect = lambda fn, *a, **kw: (
+            mirrors if fn is copy_service.get_all_active_mirrors_v2 else {}
+        )
+        asyncio.run(copy_service._poll_all_mirrors())
+
+    assert sorted(calls) == [(7, True), (8, True)]

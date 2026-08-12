@@ -258,23 +258,6 @@ def status_kb(is_running: bool = False, strategy_label: str | None = None):
     return InlineKeyboardMarkup(rows)
 
 
-def portfolio_kb(has_positions: bool = False):
-    rows = [
-        [
-            InlineKeyboardButton("📌 Open Positions", callback_data="pos:view"),
-            InlineKeyboardButton("📜 Trade History", callback_data="portfolio:history"),
-        ],
-        [
-            InlineKeyboardButton("📊 Performance", callback_data="portfolio:performance"),
-            InlineKeyboardButton("📊 Refresh portfolio", callback_data="portfolio:refresh"),
-        ],
-    ]
-    if has_positions:
-        rows.append([InlineKeyboardButton("❌ Close All Positions", callback_data="pos:close_all")])
-    rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:main")])
-    return InlineKeyboardMarkup(rows)
-
-
 def referral_kb(has_code: bool = False, **_compat):
     """Inline keyboard for the Referral Deck.
 
@@ -293,23 +276,6 @@ def referral_kb(has_code: bool = False, **_compat):
         InlineKeyboardButton("🔗 Refresh referrals", callback_data="refer:view"),
         InlineKeyboardButton("🏠 Home", callback_data="nav:main"),
     ])
-    return InlineKeyboardMarkup(rows)
-
-
-def portfolio_history_kb(page: int = 0, has_more: bool = False):
-    rows = []
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("◀ Prev", callback_data=f"portfolio:history:{page - 1}"))
-    if has_more:
-        nav_row.append(InlineKeyboardButton("Next ▶", callback_data=f"portfolio:history:{page + 1}"))
-    if nav_row:
-        rows.append(nav_row)
-    rows.append([
-        InlineKeyboardButton("📁 Back to Portfolio", callback_data="portfolio:view"),
-        InlineKeyboardButton("📊 View Performance", callback_data="portfolio:performance"),
-    ])
-    rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -423,12 +389,6 @@ def trade_card_cb(session_id: str, action: str, value: str = "") -> str:
     if value:
         return f"card:trade:{session_id}:{action}:{value}"
     return f"card:trade:{session_id}:{action}"
-
-
-def trade_card_start_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Trade", callback_data="card:trade:start")],
-    ])
 
 
 def trade_card_direction_kb(session_id: str):
@@ -561,10 +521,12 @@ def trade_card_text_input_kb(session_id: str):
 
 
 def trade_card_confirm_kb(session_id: str):
+    # No "Auto-close at…" row: it collected a time, echoed it on the card, and
+    # then dropped it — nothing ever parsed the text or armed a close, so the
+    # button promised an exit the bot would not take. Removed with the unarmed
+    # DB time-limit watcher (2026-08). Engine strategies keep their own
+    # triple-barrier time limit.
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⏱ Auto-close at…", callback_data=trade_card_cb(session_id, "time_limit")),
-        ],
         [
             InlineKeyboardButton("❌ Cancel", callback_data=trade_card_cb(session_id, "cancel")),
             InlineKeyboardButton("✅ Confirm Trade", callback_data=trade_card_cb(session_id, "confirm")),

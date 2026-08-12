@@ -465,3 +465,214 @@ def test_the_dgrid_tier_denominator_is_the_margin_the_rail_measures():
             f"tier basis {basis} != rail margin {rail} for {conf} — the scale-out "
             f"and the stop measure the same percent against different dollars"
         )
+
+
+# ==========================================================================
+# Self-review audit 2026-08-12 — [VERIFIED] findings, recorded not fixed
+# ==========================================================================
+# Strict xfails per the triage protocol. These came out of the audit fan-out on
+# the signal-advisor / copy-pause branch. None is fixed here: each changes live
+# order sizing or live stop behaviour for real sessions, which is a product call.
+# When one is fixed, strict mode turns the XPASS into a failure — delete the
+# marker in the same PR as the fix.
+
+@pytest.mark.xfail(strict=True, reason="ADVISOR-SIZE-SIGN: confidence is a magnitude "
+                                      "multiplier on a SIGNED scale, so LOWERING it "
+                                      "weakens a trim instead of deepening it")
+def test_lowering_advisor_confidence_never_increases_the_overlay_size_factor():
+    """ADVISOR-SIZE-SIGN — pre-existing, on the risk-REDUCING path.
+
+    ``signal_advisor`` promises "Nothing here can raise size". But
+    ``overlay_actuator`` computes ``size_factor = 1 + 0.25 * scale * confidence``
+    where ``scale`` carries the DIRECTION. So when the engine wants to reduce
+    (``scale < 0``), lowering confidence moves the factor back toward 1.0 — a
+    SHALLOWER cut, i.e. MORE notional. The tier increases risk precisely when it
+    is trying to reduce it.
+
+    This is the disagree / negative-delta path, which the 2026-08 conviction clamp
+    did not touch: ``min(confidence, signal.confidence)`` already discarded
+    positive deltas there. Bounded by the 0.05 dead-band in ``stabilize_overrides``
+    and by the downstream ``max_single_order_quote`` clamp.
+
+    Invariant that should hold: a LOWER advisory confidence never yields a larger
+    ``size_factor``. Fix: derive size from ``abs(scale)`` so confidence is an
+    unambiguous risk dial, or floor the factor at its pre-advisor value.
+    """
+    from src.nadobro.llm.signal_advisor import _apply
+    from src.nadobro.llm.signal_engine import Signal
+    from src.nadobro.strategy.overlay_actuator import compute_overrides
+
+    # Engine reads a downtrend and wants to TRIM: bias < 0 => scale < 0.
+    base = Signal(bias=-0.8, regime="trend_down", entry_ok=True, scale=-0.48,
+                  confidence=0.60)
+    shaded = _apply(base, {"agree": False, "confidence_delta": -0.15,
+                           "provider": "test"})
+    assert shaded.confidence < base.confidence, "precondition: confidence dropped"
+
+    before = float(compute_overrides("grid", base)["size_factor"])
+    after = float(compute_overrides("grid", shaded)["size_factor"])
+    assert after <= before, (
+        f"lowering confidence raised size_factor {before:.4f} -> {after:.4f}"
+    )
+
+
+# ── Moved out, deliberately ─────────────────────────────────────────────────
+# Two guardrails from the 2026-08-12 audit are BEHAVIOURAL — they drive the real
+# _maybe_apply_overlay and _evaluate_session_pnl_rail — so they transitively import
+# models.database and need psycopg2. This file is run by .github/workflows/
+# self-review.yml with `pip install pytest` and NOTHING else, on purpose: the
+# invariants must stay runnable with zero project dependencies. Guarding them with
+# importorskip would silently skip them in the very job meant to enforce them, so
+# they live next to the harnesses they use instead:
+#
+#   GRID-TOTALQUOTE-UNCAPPED / DGRID-TOTALQUOTE-UNCAPPED (FIXED)
+#     -> tests/services/test_overlay_wiring.py
+#        test_no_overlay_scaled_size_key_can_exceed_the_risk_cap[grid|dgrid]
+#   OVERLAY-DISARMED-BARRIER-ARMS (FIXED)
+#     -> tests/services/test_session_safety_rails.py
+#        test_a_disarmed_user_barrier_is_never_armed_by_a_stale_overlay_value
+#
+# Both run in the full pytest job. Keep this pointer in step with them.
+
+
+@pytest.mark.xfail(strict=True, reason="RGRID-EXITBAND-INVERT: exit_band_cap is "
+                                      "derived from the UNSCALED band while "
+                                      "spread_ask_pct is overlay-scaled up to 3x")
+def test_rgrid_band_exit_always_sits_outside_the_trail_arm_point():
+    """RGRID-EXITBAND-INVERT — [VERIFIED], recorded not fixed.
+
+    rgrid's own docstring states the invariant that makes it profitable: the band
+    exit fires at ``avg_entry x (1 - band)`` and is LOSS-ONLY by construction, so
+    the trail must arm strictly INSIDE it (``_exit_band() > _arm_pct()``). Shipped
+    the other way round, "the loss-only exit always won" — the configuration that
+    measured -85.27 on the backtester.
+
+    ``exit_band_cap`` is computed once in ``map_strategy_config`` from the UNSCALED
+    band, but ``spread_ask_pct`` is scaled live by the overlay (up to 3x) and
+    pushed onto the controller. ``_exit_band()`` is ceilinged by that stale cap
+    while ``_arm_pct()`` is not, so they invert. Audit measured:
+
+        overlay x1.0: band=10.0bp arm=20.0bp exit_band=30.0bp  ok
+        overlay x1.5: band=15.0bp arm=30.0bp exit_band=30.0bp  INVERTED
+        overlay x3.0: band=30.0bp arm=60.0bp exit_band=30.0bp  INVERTED
+
+    1.5x needs a 15m ATR around 1.67% of price — and the overlay only widens the
+    spread BECAUSE the tape is volatile, so this arms itself exactly when the
+    noise is largest.
+
+    NOT fixed here deliberately. Every candidate fix moves live exit geometry:
+    raising ``_exit_band`` past the cap reintroduces the rail-flatten pathology the
+    cap exists to prevent, and clamping ``_arm_pct``/``_trail_giveback`` under the
+    cap changes the 1.0x geometry that commit #222 measured at +487 across five
+    trending regimes. That is a tuning change, and this repo's rule is that a
+    tuning change must be proven on the cost-aware backtester first — the checked-in
+    reference CSV resamples to 11 bars, which cannot prove it. Needs real trending
+    data before the fix lands.
+    """
+    from src.nadobro.engine.controllers.rgrid import RGridController
+
+    ctrl = object.__new__(RGridController)
+    ctrl.spread_ask_pct = Decimal("0.0015")        # overlay-scaled 1.5x from 10bp
+    ctrl.spread_floor_half_pct = Decimal("0.00015")
+    ctrl.reset_threshold_pct = Decimal("0.002")
+    ctrl._cfg = {"exit_band_cap": "0.003", "exit_band_mult": "0"}
+    ctrl.cfg = lambda key, default=None: ctrl._cfg.get(key, default)
+
+    assert ctrl._exit_band() > ctrl._arm_pct(), (
+        f"band exit {ctrl._exit_band()} is inside the trail arm {ctrl._arm_pct()}: "
+        "only the loss-only exit can ever fire"
+    )
+
+
+@pytest.mark.xfail(strict=True, reason="DGRID-REVERSAL-FLIPFLOP: _maybe_reversal_flip "
+                                      "runs BEFORE the classifier and never consults "
+                                      "its hysteresis / directional release")
+def test_dgrid_reversal_flip_respects_the_classifier_hysteresis():
+    """DGRID-REVERSAL-FLIPFLOP — [VERIFIED], recorded not fixed.
+
+    ``variance_regime`` carries hysteresis and a directional release added
+    specifically to stop side-flapping ("six flips in forty minutes … paid a round
+    trip to end up on the wrong side of the move it had just identified").
+    ``_maybe_reversal_flip`` runs BEFORE that classifier and reads neither
+    ``last_direction`` nor ``last_is_trend``, so it can arm a counter-trend ladder
+    inside a declared trend. Audit reproduced on a steady uptrend at shipped
+    defaults (trail_arm_pct=1.0, reversal_flip_pct=0.4, flip_confirm_ticks=2):
+
+        t1 +1.2%  phase=grid  armed=True
+        t3 -0.5%  phase=rgrid  <-- SHORT ladder armed inside a 1.46-VR uptrend
+        t5        phase=grid   <-- classifier flips it straight back
+
+    A 0.5% retrace arms sell entries that rest ABOVE mid and fill into the
+    continuing rally; ~60s later the classifier reverses and flattens them. Cost
+    per event: two reduce-only exits crossing 30bp through the touch plus the
+    adverse move, repeated on every 0.4% retrace in a trend — and the user gets two
+    contradictory notifications a minute apart.
+
+    Structural pin (the behavioural repro needs a full tape + orchestrator): the
+    reversal path must consult the classifier's directional state before changing
+    side. Fix: require classifier agreement, or flatten-and-hold instead of
+    flipping.
+    """
+    import inspect
+
+    from src.nadobro.engine.controllers import dynamic_grid
+
+    src = inspect.getsource(dynamic_grid.DynamicGridController._maybe_reversal_flip)
+    assert ("last_direction" in src) or ("last_is_trend" in src), (
+        "_maybe_reversal_flip changes side without consulting the classifier's "
+        "hysteresis, so it can arm a counter-trend ladder inside a declared trend"
+    )
+
+
+@pytest.mark.parametrize("strategy", ["grid", "dgrid"])
+@pytest.mark.parametrize("spread_bp", [0.0, 0.1, 2.0, 3.0])
+def test_a_grid_level_round_trip_can_never_complete_at_a_loss(strategy, spread_bp):
+    """DGRID-FEE-FLOOR — FIXED.
+
+    Each level's close leg sits exactly one step from its open leg, so a completed
+    level earns ``step`` GROSS while paying a resting round trip: 1.5bp maker per
+    side plus the 1bp builder routing policy locks on to both legs = 5bp. The
+    mapper floored the step only when it was ZERO, so any positive value passed
+    through raw — and the UI shipped a "Spread 2bp" preset button (plus a 3bp Turbo
+    preset) with a settable range down to 0.1bp. Every completed level at those
+    settings was a guaranteed net loss: the bot paid to trade.
+    ``dgrid_min_spread_bp`` looked like the floor but only reaches
+    ``spread_floor_half_pct``, which this path never reads.
+
+    The invariant is "no level can complete at a LOSS", i.e. step >= fee round
+    trip. Break-even is the boundary; how far ABOVE it a level should sit is a
+    profit target and therefore a tuning decision for the operator, not something
+    this floor should invent. ``dgrid_min_spread_bp`` still raises the floor when
+    the user sets it higher.
+    """
+    from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
+
+    cfg = map_strategy_config(
+        strategy, {"dgrid_spread_bp": spread_bp, "spread_bp": spread_bp},
+        MID, product=PRODUCT,
+    )
+    step = Decimal(str(cfg.get("step_pct") or cfg.get("min_spread_between_orders") or 0))
+    assert step >= MAKER_ROUND_TRIP_RATE, (
+        f"{strategy} level round trip {step * 10000:.2f}bp is under the "
+        f"{MAKER_ROUND_TRIP_RATE * 10000:.2f}bp fee round trip — every completed "
+        "level loses money"
+    )
+
+
+def test_a_user_spread_above_the_fee_floor_is_left_alone():
+    """The floor must not flatten a deliberate wider spread into itself."""
+    cfg = map_strategy_config("dgrid", {"dgrid_spread_bp": 25.0}, MID, product=PRODUCT)
+    step = Decimal(str(cfg.get("step_pct") or cfg.get("min_spread_between_orders") or 0))
+    assert step == Decimal("0.0025"), f"25bp spread was altered to {step}"
+
+
+def test_dgrid_min_spread_bp_now_raises_the_step_floor():
+    """``dgrid_min_spread_bp`` had its own button and card row but only reached
+    ``spread_floor_half_pct``, which the manual-step path never read — a dead
+    input. It must now bind when it is above the fee floor."""
+    cfg = map_strategy_config(
+        "dgrid", {"dgrid_spread_bp": 1.0, "dgrid_min_spread_bp": 12.0},
+        MID, product=PRODUCT,
+    )
+    step = Decimal(str(cfg.get("step_pct") or cfg.get("min_spread_between_orders") or 0))
+    assert step == Decimal("0.0012"), f"dgrid_min_spread_bp ignored (step={step})"

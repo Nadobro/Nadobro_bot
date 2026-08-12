@@ -406,14 +406,6 @@ async def run_bot():
     # NADO_AUTO_RESTORE_STRATEGIES=1 only for supervised environments.
     auto_restore = env_bool("NADO_AUTO_RESTORE_STRATEGIES", False)
     restore_running_bots(enabled=auto_restore)
-    try:
-        from src.nadobro.core.feature_flags import time_limit_enabled
-        from src.nadobro.strategy.time_limit_watcher import time_limit_tick
-
-        if time_limit_enabled():
-            asyncio.create_task(time_limit_tick())
-    except Exception as e:
-        logger.warning("Could not schedule startup time-limit catch-up: %s", e)
 
     portfolio_history_enabled = env_bool("NADO_PORTFOLIO_HISTORY", True)
     if portfolio_history_enabled:

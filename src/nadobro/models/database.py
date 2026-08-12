@@ -1896,108 +1896,6 @@ def get_running_strategy_sessions(user_id: int, network: str | None = None) -> l
 
 
 # ---------------------------------------------------------------------------
-# Time limits
-# ---------------------------------------------------------------------------
-
-_VALID_TIME_LIMIT_SOURCES = frozenset({"manual", "bro", "time_limit"})
-
-
-def _json_payload(value, default):
-    if value is None:
-        return json.dumps(default)
-    if isinstance(value, str):
-        return value
-    return json.dumps(value)
-
-
-def set_position_time_limit(position_id: int, ts, source: str = "manual"):
-    source = source if source in _VALID_TIME_LIMIT_SOURCES else "manual"
-    execute(
-        """UPDATE positions
-           SET time_limit = %s, time_limit_source = %s, time_limit_fired_at = NULL
-           WHERE id = %s""",
-        (ts, source, position_id),
-    )
-
-
-def set_order_time_limit(order_id: int, ts, source: str = "manual"):
-    source = source if source in _VALID_TIME_LIMIT_SOURCES else "manual"
-    execute(
-        """UPDATE open_orders
-           SET time_limit = %s, time_limit_source = %s, time_limit_fired_at = NULL, updated_at = now()
-           WHERE id = %s""",
-        (ts, source, order_id),
-    )
-
-
-def clear_position_time_limit(position_id: int):
-    execute(
-        "UPDATE positions SET time_limit = NULL, time_limit_source = NULL, time_limit_fired_at = NULL WHERE id = %s",
-        (position_id,),
-    )
-
-
-def clear_order_time_limit(order_id: int):
-    execute(
-        """UPDATE open_orders
-           SET time_limit = NULL, time_limit_source = NULL, time_limit_fired_at = NULL, updated_at = now()
-           WHERE id = %s""",
-        (order_id,),
-    )
-
-
-def fetch_due_time_limits(now_utc, network: str, limit: int = 50) -> dict:
-    """Atomically claim due position/order time limits for one network."""
-    if network not in _VALID_NETWORKS:
-        raise ValueError(f"Invalid network: {network}")
-    rows_positions = query_all(
-        """
-        WITH due AS (
-            SELECT id
-            FROM positions
-            WHERE network = %s
-              AND status = 'open'
-              AND time_limit IS NOT NULL
-              AND time_limit <= %s
-              AND time_limit_fired_at IS NULL
-            ORDER BY time_limit ASC
-            LIMIT %s
-            FOR UPDATE SKIP LOCKED
-        )
-        UPDATE positions p
-        SET time_limit_fired_at = %s
-        FROM due
-        WHERE p.id = due.id
-        RETURNING p.*
-        """,
-        (network, now_utc, limit, now_utc),
-    )
-    rows_orders = query_all(
-        """
-        WITH due AS (
-            SELECT id
-            FROM open_orders
-            WHERE network = %s
-              AND status IN ('open', 'pending', 'armed')
-              AND time_limit IS NOT NULL
-              AND time_limit <= %s
-              AND time_limit_fired_at IS NULL
-            ORDER BY time_limit ASC
-            LIMIT %s
-            FOR UPDATE SKIP LOCKED
-        )
-        UPDATE open_orders o
-        SET time_limit_fired_at = %s, updated_at = now()
-        FROM due
-        WHERE o.id = due.id
-        RETURNING o.*
-        """,
-        (network, now_utc, limit, now_utc),
-    )
-    return {"positions": rows_positions, "orders": rows_orders}
-
-
-# ---------------------------------------------------------------------------
 # Fill Sync Queue ORM
 # ---------------------------------------------------------------------------
 
@@ -2118,13 +2016,25 @@ def get_signal_outcomes(
     horizon: Optional[str] = None,
     since=None,
     limit: int = 5000,
+    across_users: bool = False,
 ) -> list:
     """Graded signal outcomes for metrics (newest first).
 
-    Every filter is optional: the ``/structure`` card reads one user's slice,
-    while the nightly weight fit reads across users to get a sample large enough
-    to be worth anything. ``[]`` on any error.
+    Two intended readers: the ``/structure`` card reads ONE user's slice, while
+    the nightly weight fit reads across users to get a sample large enough to be
+    worth anything. ``[]`` on any error.
+
+    Cross-user reads must be asked for: pass ``across_users=True``. A bare call
+    with no ``user_id`` raises rather than quietly returning every user's rows,
+    so a handler that forgets to scope the query fails closed instead of leaking.
+    ``user_id`` still wins when both are supplied — ``across_users`` only unlocks
+    the unscoped read, it does not widen a scoped one.
     """
+    if user_id is None and not across_users:
+        raise ValueError(
+            "get_signal_outcomes requires user_id, or across_users=True for the "
+            "aggregate (cross-user) read"
+        )
     try:
         clauses: list = []
         params: list = []

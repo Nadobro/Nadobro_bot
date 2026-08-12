@@ -1185,9 +1185,6 @@ def init_db():
                 ALTER TABLE positions ADD COLUMN IF NOT EXISTS close_price NUMERIC(38,18);
                 ALTER TABLE positions ADD COLUMN IF NOT EXISTS close_realized_pnl NUMERIC(38,18);
                 ALTER TABLE positions ADD COLUMN IF NOT EXISTS synced_at TIMESTAMPTZ;
-                ALTER TABLE positions ADD COLUMN IF NOT EXISTS time_limit TIMESTAMPTZ NULL;
-                ALTER TABLE positions ADD COLUMN IF NOT EXISTS time_limit_source TEXT NULL;
-                ALTER TABLE positions ADD COLUMN IF NOT EXISTS time_limit_fired_at TIMESTAMPTZ NULL;
                 -- migrations/0010_portfolio_workflow.sql: Nado summary often
                 -- omits leverage on cross/isolated rows; accept NULL to avoid
                 -- portfolio sync write failures.
@@ -1200,9 +1197,6 @@ def init_db():
                     WHERE closed_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_positions_user_status ON positions (user_id, status);
                 CREATE INDEX IF NOT EXISTS idx_positions_pair_status ON positions (pair, status);
-                CREATE INDEX IF NOT EXISTS idx_positions_time_limit_due
-                    ON positions (network, time_limit)
-                    WHERE time_limit IS NOT NULL AND time_limit_fired_at IS NULL AND status = 'open';
 
                 CREATE TABLE IF NOT EXISTS open_orders (
                     id BIGSERIAL PRIMARY KEY,
@@ -1230,21 +1224,25 @@ def init_db():
                 ALTER TABLE open_orders ADD COLUMN IF NOT EXISTS nonce BIGINT;
                 ALTER TABLE open_orders ADD COLUMN IF NOT EXISTS strategy_session_id BIGINT;
                 ALTER TABLE open_orders ADD COLUMN IF NOT EXISTS synced_at TIMESTAMPTZ;
-                ALTER TABLE open_orders ADD COLUMN IF NOT EXISTS time_limit TIMESTAMPTZ NULL;
-                ALTER TABLE open_orders ADD COLUMN IF NOT EXISTS time_limit_source TEXT NULL;
-                ALTER TABLE open_orders ADD COLUMN IF NOT EXISTS time_limit_fired_at TIMESTAMPTZ NULL;
                 CREATE UNIQUE INDEX IF NOT EXISTS open_orders_unique_digest
                     ON open_orders (user_id, network, order_digest);
                 CREATE INDEX IF NOT EXISTS idx_open_orders_user_status ON open_orders (user_id, status);
                 CREATE INDEX IF NOT EXISTS idx_open_orders_pair_status ON open_orders (pair, status);
-                CREATE INDEX IF NOT EXISTS idx_open_orders_time_limit_due
-                    ON open_orders (network, time_limit)
-                    WHERE time_limit IS NOT NULL AND time_limit_fired_at IS NULL AND status IN ('open', 'pending', 'armed');
 
                 -- Strategy Studio and conditional-order tables retired (2026-05).
                 -- Drop on boot so historic deploys converge.
                 DROP TABLE IF EXISTS conditional_orders CASCADE;
                 DROP TABLE IF EXISTS studio_sessions CASCADE;
+
+                -- DB time-limit watcher retired (2026-08). Its arming path was
+                -- never built, so positions/open_orders.time_limit* were always
+                -- NULL and these partial indexes could only ever be empty. Drop
+                -- on boot so historic deploys converge. The columns themselves
+                -- are left in place: they are guaranteed NULL, and DROP COLUMN
+                -- takes an ACCESS EXCLUSIVE lock on two actively-synced tables.
+                -- Engine strategies keep their own triple-barrier time limit.
+                DROP INDEX IF EXISTS idx_positions_time_limit_due;
+                DROP INDEX IF EXISTS idx_open_orders_time_limit_due;
 
                 CREATE TABLE IF NOT EXISTS points_snapshots (
                     id BIGSERIAL PRIMARY KEY,

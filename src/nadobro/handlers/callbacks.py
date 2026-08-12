@@ -24,7 +24,7 @@ from src.nadobro.handlers.keyboards import (
     risk_profile_kb, strategy_hub_kb, strategy_action_kb, strategy_product_picker_kb,
     onboarding_language_kb,
     referral_kb,
-    mode_kb,     home_card_kb, status_kb, portfolio_kb, portfolio_history_kb, portfolio_analytics_kb,
+    mode_kb,     home_card_kb, status_kb, portfolio_analytics_kb,
     onboarding_accept_tos_kb, getting_started_kb,
     copy_hub_kb, copy_trader_preview_kb, copy_budget_kb, copy_risk_kb,
     copy_leverage_kb, copy_confirm_kb, copy_dashboard_kb, copy_admin_menu_kb,

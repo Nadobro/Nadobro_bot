@@ -356,3 +356,171 @@ def test_the_runtime_pushes_the_signal_before_ticking_not_via_live_config():
     # Substring-match would trip on the explanatory comment, so match the write.
     assert "signal_regime =" not in inspect.getsource(er._apply_rgrid_controller_config)
     assert "signal_regime =" not in inspect.getsource(er._apply_fill_anchored_controller_config)
+
+
+# ==========================================================================
+# Advisory tier (signal_advisor) wiring — is the LLM second opinion actually
+# reachable from a live strategy cycle, and does it stay risk-reducing there?
+# ==========================================================================
+def test_the_advisor_is_reachable_from_a_live_overlay_cycle(monkeypatch):
+    """Pins the whole chain: _maybe_apply_overlay -> signal_advisor.advise ->
+    shaded signal -> configs. If any hop breaks, the LLM tier goes silently inert
+    while still reporting healthy, which is the failure mode that matters."""
+    from src.nadobro.llm import signal_advisor as sa
+
+    seen = {}
+    real_apply = sa._apply
+
+    def _spy_apply(signal, verdict):
+        seen["verdict"] = dict(verdict)
+        seen["in_confidence"] = float(signal.confidence)
+        out = real_apply(signal, verdict)
+        seen["out_confidence"] = float(out.confidence)
+        return out
+
+    monkeypatch.setattr(sa, "_apply", _spy_apply)
+    monkeypatch.setenv("NADO_SIGNAL_ADVISOR", "1")
+    sa.reset_cache()
+    # Warm cache => advise() folds the verdict in on this very cycle.
+    sa.store_verdict("mainnet", "BTC", {
+        "ok": True, "agree": False, "confidence_delta": -0.10,
+        "provider": "nanogpt", "reasons": ["thin book"], "risks": ["chop"],
+    })
+
+    cfg = {
+        "order_amount_quote": Decimal("500"),
+        "spread_bid_pct": Decimal("0.0005"),
+        "spread_ask_pct": Decimal("0.0005"),
+        "directional_bias": 0.0,
+    }
+    state = {"strategy": "mid", "strategy_session_id": 1, "sl_pct": 0.5, "tp_pct": 1.0}
+    asyncio.run(er._maybe_apply_overlay(
+        7, "mainnet", "mid", "BTC", 2, cfg, state, client=_FakeClient(), mid=131.6,
+    ))
+    sa.reset_cache()
+
+    assert seen, "signal_advisor._apply was never reached from the overlay cycle"
+    assert seen["out_confidence"] <= seen["in_confidence"], "advisor raised conviction"
+    # The applied verdict must land in state for the scorer / audit trail.
+    assert state.get("overlay_advisor"), "applied verdict not recorded on state"
+
+
+def test_the_advisor_is_a_noop_when_its_flag_is_off(monkeypatch):
+    """Operators must be able to kill the LLM tier without a deploy, and the
+    deterministic signal must still steer the strategy."""
+    from src.nadobro.llm import signal_advisor as sa
+
+    monkeypatch.setenv("NADO_SIGNAL_ADVISOR", "0")
+    sa.reset_cache()
+    sa.store_verdict("mainnet", "BTC", {
+        "ok": True, "agree": False, "confidence_delta": -0.15, "provider": "nanogpt",
+    })
+    calls = []
+    monkeypatch.setattr(sa, "_apply", lambda s, v: calls.append(1) or s)
+
+    cfg = {
+        "order_amount_quote": Decimal("500"),
+        "spread_bid_pct": Decimal("0.0005"),
+        "spread_ask_pct": Decimal("0.0005"),
+        "directional_bias": 0.0,
+    }
+    state = {"strategy": "mid", "strategy_session_id": 1}
+    asyncio.run(er._maybe_apply_overlay(
+        7, "mainnet", "mid", "BTC", 2, cfg, state, client=_FakeClient(), mid=131.6,
+    ))
+    sa.reset_cache()
+
+    assert not calls, "advisor ran with NADO_SIGNAL_ADVISOR=0"
+    # Deterministic overlay still steered the strategy.
+    assert cfg["directional_bias"] > 0.2
+
+
+def test_a_cold_advisor_cache_never_blocks_the_cycle(monkeypatch):
+    """A MISS must return the deterministic signal untouched and refresh in the
+    background — an inline LLM call here caused the 2026-08 latency incident."""
+    from src.nadobro.llm import signal_advisor as sa
+
+    monkeypatch.setenv("NADO_SIGNAL_ADVISOR", "1")
+    sa.reset_cache()
+    fetched = []
+    monkeypatch.setattr(sa, "fetch_verdict",
+                        lambda *a, **k: fetched.append(1) or {"ok": False})
+
+    cfg = {
+        "order_amount_quote": Decimal("500"),
+        "spread_bid_pct": Decimal("0.0005"),
+        "spread_ask_pct": Decimal("0.0005"),
+        "directional_bias": 0.0,
+    }
+    state = {"strategy": "mid", "strategy_session_id": 1}
+    asyncio.run(er._maybe_apply_overlay(
+        7, "mainnet", "mid", "BTC", 2, cfg, state, client=_FakeClient(), mid=131.6,
+    ))
+    sa.reset_cache()
+
+    # The cycle completed and the deterministic overlay still applied.
+    assert cfg["directional_bias"] > 0.2
+
+
+def test_the_advisor_reaches_the_finance_llm_through_nanogpt():
+    """The advisory tier must be usable with ONLY a NanoGPT key — no separate
+    DMind key required — and its provider call must go to NanoGPT."""
+    import inspect
+
+    from src.nadobro.llm import dmind_service
+
+    assert "nanogpt_is_configured" in inspect.getsource(
+        dmind_service.is_finance_expert_configured
+    ), "advisor gate must accept a NanoGPT-only deployment"
+    assert "nanogpt_chat_completion" in inspect.getsource(dmind_service)
+
+
+# ==========================================================================
+# GRID-TOTALQUOTE-UNCAPPED / DGRID-TOTALQUOTE-UNCAPPED (audit 2026-08-12, FIXED)
+#
+# Lives here, not in tests/engine/test_sltp_invariants.py, because it drives the
+# real _maybe_apply_overlay and therefore needs psycopg2 — and the invariants file
+# is run by self-review.yml with `pip install pytest` and nothing else. See the
+# pointer comment in that file.
+# ==========================================================================
+@pytest.mark.parametrize("strategy", ["grid", "dgrid"])
+def test_no_overlay_scaled_size_key_can_exceed_the_risk_cap(strategy):
+    """The post-overlay risk clamp used to cover ``order_amount_quote`` only.
+
+    Classic grid AND dgrid ship ``total_amount_quote`` and no ``order_amount_quote``,
+    and both hand the whole ladder to the risk gate as one
+    ``ExecutorRequest(order_amount_quote=cfg.total_amount_quote)`` — so a 1.25x
+    overlay size-up slipped past the clamp, ``risk.py`` refused the spawn, and the
+    session reported LIVE with zero orders while retrying every tick (measured
+    528.70 against a 500.0 cap).
+
+    dgrid was worse: ``_flip_to`` flattens the live position FIRST and then calls
+    ``_spawn_phase``, so a refused re-arm left the user's position closed and the
+    strategy never re-arming, with the overlay holding a sticky ``size_factor``.
+
+    Behavioural pin: after the overlay runs, EVERY size key it can scale is within
+    ``max_single_order_quote``. Asserted on the real ``_maybe_apply_overlay`` rather
+    than on the config's shape — a shape assertion cannot tell a fixed clamp from a
+    broken one, which is exactly how the first version of this guardrail failed.
+    """
+    cap = Decimal("500")
+    limits = type("L", (), {"max_single_order_quote": cap})()
+    configs = {
+        "total_amount_quote": cap,          # ladder strategies sit AT the cap already
+        "spread_bid_pct": Decimal("0.0005"),
+        "spread_ask_pct": Decimal("0.0005"),
+        "directional_bias": 0.0,
+    }
+    state = {"strategy": strategy, "strategy_session_id": 1}
+    asyncio.run(er._maybe_apply_overlay(
+        7, "mainnet", strategy, "BTC", 2, configs, state,
+        client=_FakeClient(), mid=131.6, limits=limits,
+    ))
+
+    for key in ("order_amount_quote", "total_amount_quote"):
+        val = configs.get(key)
+        if val is not None:
+            assert Decimal(str(val)) <= cap, (
+                f"{strategy}: {key}={val} exceeds max_single_order_quote={cap}; the "
+                "risk gate refuses the spawn and the session goes LIVE with 0 orders"
+            )

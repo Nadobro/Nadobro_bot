@@ -2148,8 +2148,13 @@ async def _nudge_async(telegram_id: int, network: str, key: str) -> None:
 async def handle_strategy_job(payload: dict):
     kind = str((payload or {}).get("kind") or "")
     if kind.startswith("time_limit"):
-        from src.nadobro.strategy.time_limit_watcher import handle_time_limit_job
-        await handle_time_limit_job(payload)
+        # The DB time-limit watcher was removed: its arming path was never built,
+        # so nothing could ever write positions.time_limit and the 60s poll could
+        # only ever find zero rows. Engine strategies keep their own triple-barrier
+        # time limit (engine/types.py, evaluated in position_executor). Kept as a
+        # drop branch so a job still in the queue across the deploy dies quietly
+        # instead of importing a deleted module.
+        logger.debug("Dropping legacy time_limit job: %s", payload)
         return
     if kind == "condition_order":
         # Conditional orders were owned by the retired Strategy Studio.
@@ -2663,7 +2668,10 @@ async def _evaluate_session_pnl_rail(
     # Honor the per-strategy SL/TP (rgrid/dgrid store them under rgrid_* keys);
     # previously this read sl_pct/tp_pct only, so a custom rgrid/dgrid SL was
     # ignored and the rail used the 0.8 default.
-    from src.nadobro.strategy.strategy_registry import effective_sl_tp_pct
+    from src.nadobro.strategy.strategy_registry import (
+        effective_sl_tp_pct,
+        sltp_is_explicit,
+    )
     sl_pct, tp_pct = effective_sl_tp_pct(strategy, state)
     # Overlay-adaptive barriers: when the financial overlay steers this strategy
     # and has written regime-adjusted SL/TP (widen in a trend, tighten in chop),
@@ -2683,9 +2691,20 @@ async def _evaluate_session_pnl_rail(
             # re-merged into state every cycle, so a mid-run SL tighten
             # (2.0% -> 0.5%) would otherwise lose to a stale 1.6% overlay value.
             # The user's number is the binding contract in both directions.
-            if ov_sl is not None:
+            #
+            # OVERLAY-DISARMED-BARRIER-ARMS (audit 2026-08-12): the `else` half of
+            # each ternary used to ADOPT the overlay value outright when the user's
+            # own number was 0 — i.e. when they deliberately DISARMED that barrier.
+            # Reachable today: the Turbo Volume preset writes tp_pct: 0.0 for mid,
+            # mid is in OVERLAY_STRATEGIES, and overlay_tp_pct persists in bot_state
+            # across degraded overlay cycles and restarts. Reproduced closing a
+            # session at +0.96% with TP explicitly off. Same class as the documented
+            # DGRID-TP-DISARM-PHANTOM, so use the same discriminator: a key that is
+            # PRESENT-AND-ZERO is a choice, not an absence.
+            _sl_set, _tp_set = sltp_is_explicit(strategy, state)
+            if ov_sl is not None and not (_sl_set and sl_pct <= 0):
                 sl_pct = min(float(ov_sl), sl_pct) if sl_pct > 0 else float(ov_sl)
-            if ov_tp is not None:
+            if ov_tp is not None and not (_tp_set and tp_pct <= 0):
                 tp_pct = max(float(ov_tp), tp_pct) if tp_pct > 0 else float(ov_tp)
     except Exception:  # noqa: BLE001 - fall back to the user's config barriers
         logger.debug("overlay barrier read failed", exc_info=True)

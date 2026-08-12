@@ -17,10 +17,6 @@ def env_flag(name: str, default: bool = False) -> bool:
     return env_bool(name, default)
 
 
-def time_limit_enabled() -> bool:
-    return env_flag("NADO_FEATURE_TIME_LIMIT", True)
-
-
 def legacy_bro_autoloop_enabled() -> bool:
     return env_flag("NADO_LEGACY_BRO_AUTOLOOP", False)
 

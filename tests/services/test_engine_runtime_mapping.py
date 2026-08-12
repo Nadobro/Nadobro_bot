@@ -13,25 +13,28 @@ def test_map_grid_config_centers_band_and_sets_barriers():
     # ladder is the opt-out escape via fill_anchored=0).
     cfg = er.map_strategy_config(
         "grid",
-        {"notional_usd": 75.0, "cycle_notional_usd": 75.0, "spread_bp": 4.0,
+        # 8bp, deliberately ABOVE the 5bp maker fee round trip: this test is about
+        # band centering, and a sub-fee step is now raised by the DGRID-FEE-FLOOR
+        # guard (see test_a_grid_level_round_trip_can_never_complete_at_a_loss).
+        {"notional_usd": 75.0, "cycle_notional_usd": 75.0, "spread_bp": 8.0,
          "levels": 2, "tp_pct": 0.6, "sl_pct": 0.5, "fill_anchored": 0},
         Decimal(100), product="BTC-USDC", leverage=3,
     )
     assert cfg["trading_pair"] == "BTC-USDC"
-    assert cfg["min_spread_between_orders"] == Decimal("0.0004")
+    assert cfg["min_spread_between_orders"] == Decimal("0.0008")
     assert cfg["max_open_orders"] == 2
     # SIZING (2026-06-21): deployed notional = margin x effective leverage, so a
     # $75 margin at 3x quotes $225 across the ladder (was margin-only $75).
     assert cfg["total_amount_quote"] == Decimal("225")
     assert cfg["leverage"] == 3
     # POST-ONLY-CROSS fix: the near-mid boundary is offset onto the maker side by
-    # max(step/2, 1.5bp). step=0.0004 -> maker_offset=0.0002; span=1*0.0004.
-    # BUY band steps DOWN from (mid - maker_offset): start=100*(1-0.0002-0.0004),
-    # end=100*(1-0.0002).
-    assert cfg["start_price"] == Decimal("99.94")
-    assert cfg["end_price"] == Decimal("99.98")
+    # max(step/2, 1.5bp). step=0.0008 -> maker_offset=0.0004; span=1*0.0008.
+    # BUY band steps DOWN from (mid - maker_offset): start=100*(1-0.0004-0.0008),
+    # end=100*(1-0.0004).
+    assert cfg["start_price"] == Decimal("99.88")
+    assert cfg["end_price"] == Decimal("99.96")
     # Knobs for DynamicGridController side-correct band rebuilds.
-    assert cfg["step_pct"] == Decimal("0.0004")
+    assert cfg["step_pct"] == Decimal("0.0008")
     assert cfg["levels_count"] == 2
     # GRID-DUAL-UNIT fix (f391f3c): limit_price is NO LONGER auto-derived from
     # sl_pct. A mid-anchored hard stop fired on a brief wick to mid*(1-sl) even
@@ -592,11 +595,29 @@ def test_spread_is_per_strategy_user_set():
     assert dg["step_pct"] == Decimal("15.0") / Decimal(10000)
 
     # grid (classic ladder, fill_anchored=0) still uses spread_bp as the step.
+    # 9bp is above the 5bp maker fee round trip, so it passes through verbatim —
+    # this assertion is about WHICH KEY grid reads, not about the floor.
     g = map_strategy_config(
+        "grid", {"notional_usd": 100.0, "spread_bp": 9.0, "levels": 2, "fill_anchored": 0},
+        mid, product="BTC-PERP",
+    )
+    assert g["min_spread_between_orders"] == Decimal("9.0") / Decimal(10000)
+
+    # DGRID-FEE-FLOOR: a sub-fee step IS raised, for every ladder strategy. A
+    # completed level earns exactly ``step`` gross against a 5bp resting round
+    # trip, so 3bp would lose money on every fill.
+    from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
+
+    g_thin = map_strategy_config(
         "grid", {"notional_usd": 100.0, "spread_bp": 3.0, "levels": 2, "fill_anchored": 0},
         mid, product="BTC-PERP",
     )
-    assert g["min_spread_between_orders"] == Decimal("3.0") / Decimal(10000)
+    assert g_thin["min_spread_between_orders"] == MAKER_ROUND_TRIP_RATE
+    dg_thin = map_strategy_config(
+        "dgrid", {"notional_usd": 100.0, "dgrid_spread_bp": 2.0, "levels": 4},
+        mid, product="BTC-PERP",
+    )
+    assert dg_thin["step_pct"] == MAKER_ROUND_TRIP_RATE
 
 
 def test_min_max_spread_bp_drive_auto_spread_bounds():

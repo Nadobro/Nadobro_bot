@@ -54,14 +54,6 @@ def n8n_auth_header() -> tuple[str, str] | None:
     return None
 
 
-def n8n_deploy_headers() -> dict[str, str]:
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    auth = n8n_auth_header()
-    if auth:
-        headers[auth[0]] = auth[1]
-    return headers
-
-
 def n8n_configured() -> bool:
     return bool(n8n_base_url() and n8n_auth_header())
 
