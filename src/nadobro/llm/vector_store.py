@@ -109,13 +109,74 @@ def is_available() -> bool:
 
 # ── Embedding helpers ────────────────────────────────────────────────
 
+# Cached embedding route: None = not yet probed, else (client, model).
+_embed_route: Optional[tuple] = None
+
+
+def _resolve_embed_route() -> Optional[tuple]:
+    """Pick the embedding route once: NanoGPT gateway first, native OpenAI second.
+
+    DIMENSION IS LOAD-BEARING. The Pinecone index is created with
+    ``EMBEDDING_DIMENSION`` (see ``_get_pinecone_index``), so a gateway model that
+    returns a different width cannot be used: it would either be rejected on
+    upsert or, worse, land beside 1536-d vectors and make every similarity score
+    meaningless. So the gateway is PROBED — one real embedding call, width
+    checked — and rejected loudly on a mismatch rather than trusted.
+
+    Probed once per process and cached, so this costs one extra call at most.
+    """
+    global _embed_route
+    if _embed_route is not None:
+        return _embed_route or None
+
+    try:
+        from src.nadobro.llm.llm_gateway import chat_client, model_for
+
+        gw = chat_client()
+        if gw is not None:
+            gw_model = model_for("embed")
+            try:
+                probe = gw.embeddings.create(model=gw_model, input=["dimension probe"])
+                width = len(probe.data[0].embedding)
+                if width == EMBEDDING_DIMENSION:
+                    logger.info(
+                        "embeddings routed through NanoGPT gateway (model=%s dim=%s)",
+                        gw_model, width,
+                    )
+                    _embed_route = (gw, gw_model)
+                    return _embed_route
+                logger.warning(
+                    "NanoGPT embed model %s returns dim=%s but the vector index is "
+                    "dim=%s — refusing to mix widths; using native OpenAI. Set "
+                    "NANOGPT_MODEL_EMBED to a %s-dimension model to route via the "
+                    "gateway.", gw_model, width, EMBEDDING_DIMENSION, EMBEDDING_DIMENSION,
+                )
+            except Exception as exc:  # noqa: BLE001 - plan may not expose embeddings
+                logger.info(
+                    "NanoGPT embeddings unavailable (%s); using native OpenAI", exc,
+                )
+    except Exception:  # noqa: BLE001 - gateway import/config issue: fall back
+        logger.debug("gateway embed probe failed", exc_info=True)
+
+    native = _get_openai_client()
+    _embed_route = (native, EMBEDDING_MODEL) if native else ()
+    return _embed_route or None
+
+
+def reset_embed_route() -> None:
+    """Test hook — drop the cached route so env changes take effect."""
+    global _embed_route
+    _embed_route = None
+
+
 def embed_text(text: str) -> Optional[list[float]]:
     """Embed a single text string. Returns None on failure."""
-    client = _get_openai_client()
-    if not client:
+    route = _resolve_embed_route()
+    if not route:
         return None
+    client, model = route
     try:
-        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=[text])
+        resp = client.embeddings.create(model=model, input=[text])
         return resp.data[0].embedding
     except Exception:
         logger.warning("Embedding failed", exc_info=True)
@@ -124,11 +185,14 @@ def embed_text(text: str) -> Optional[list[float]]:
 
 def embed_batch(texts: list[str]) -> Optional[list[list[float]]]:
     """Embed a batch of texts. Returns None on failure."""
-    client = _get_openai_client()
-    if not client or not texts:
+    if not texts:
         return None
+    route = _resolve_embed_route()
+    if not route:
+        return None
+    client, model = route
     try:
-        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+        resp = client.embeddings.create(model=model, input=texts)
         return [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
     except Exception:
         logger.warning("Batch embedding failed", exc_info=True)

@@ -1529,8 +1529,21 @@ def map_strategy_config(
     # Floor the per-level step so a near-zero spread_bp doesn't collapse the
     # grid to one price level (which then divides by zero in
     # generate_grid_levels).
-    if spread_frac <= 0:
-        spread_frac = Decimal("0.0005")  # 5 bp fallback
+    # DGRID-FEE-FLOOR (audit 2026-08-12): this used to floor ONLY a zero/negative
+    # value, so any positive step passed through raw — and a completed level earns
+    # exactly ``step`` gross while paying a maker round trip (~5 bp: 1.5 bp/side +
+    # 1 bp builder routing on both legs). The shipped "Spread 2bp" preset button
+    # and the 3 bp Turbo preset were therefore net-NEGATIVE on every completed
+    # level: the bot paid to trade. ``dgrid_min_spread_bp`` looked like the floor
+    # but only reaches ``spread_floor_half_pct``, which this manual-step path never
+    # reads. Floor at the real cost so a level cannot complete at a loss; the
+    # 5 bp constant the old fallback used was already exactly this round trip.
+    from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
+
+    _user_floor = Decimal(str(max(0.0, _f(settings, "dgrid_min_spread_bp", 0.0)))) / Decimal(10000)
+    _step_floor = max(MAKER_ROUND_TRIP_RATE, _user_floor)
+    if spread_frac < _step_floor:
+        spread_frac = _step_floor
     span = spread_frac * Decimal(max(levels - 1, 1))
 
     # GRID-DUAL-UNIT fix: do NOT derive a hard ``limit_price`` stop from the
@@ -2177,11 +2190,25 @@ async def _maybe_apply_overlay(
         # spawn ("LIVE but 0 orders", the DN/vol cap-bug class). The user's
         # deployed margin is the binding budget: clamp the per-order size back
         # to the cap rather than raising the cap.
+        #
+        # GRID-TOTALQUOTE-UNCAPPED (audit 2026-08-12): this clamp originally
+        # covered order_amount_quote only. The CLASSIC grid config ships
+        # ``total_amount_quote`` and NO ``order_amount_quote`` (see the grid branch
+        # of map_strategy_config), and GridController hands the whole ladder to the
+        # risk gate as one ExecutorRequest(order_amount_quote=cfg.total_amount_quote)
+        # — so an overlay size-up sailed past this clamp, risk.py refused the spawn,
+        # and the session reported LIVE with zero orders while retrying every tick.
+        # Measured 528.70 against a 500.0 cap. Clamp EVERY size key the overlay can
+        # scale (overlay_actuator scales exactly these two), so the fix cannot be
+        # lost again the next time a strategy picks the other key.
         _cap = getattr(limits, "max_single_order_quote", None)
+        if _cap is not None:
+            for _size_key in ("order_amount_quote", "total_amount_quote"):
+                _val = configs.get(_size_key)
+                if _val is not None and Decimal(str(_val)) > _cap:
+                    configs[_size_key] = _cap
+                    changed[_size_key] = str(_cap)
         _oaq = configs.get("order_amount_quote")
-        if _cap is not None and _oaq is not None and Decimal(str(_oaq)) > _cap:
-            configs["order_amount_quote"] = _cap
-            changed["order_amount_quote"] = str(_cap)
         # R-GRID STEP CAP is a RISK bound, not a preference: the step was sized so
         # one taker round trip stays inside the session stop budget. The overlay's
         # size_factor (up to 1.25x) is applied AFTER that and is otherwise only

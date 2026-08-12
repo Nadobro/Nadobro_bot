@@ -40,6 +40,12 @@ DEFAULT_SPOT_TAKER_FEE_RATE = Decimal("0.00033")   # 3.3 bp base (4.3 bp all-in)
 # as evidence of the fee's structure: that column is COMPUTED as
 # notional x 0.0001, so it reads 1.000 bp tautologically.)
 DEFAULT_BUILDER_FEE_RATE = Decimal("0.0001")       # 1.0 bp
+DEFAULT_MAKER_FEE_RATE = Decimal("0.00015")        # 1.5 bp (matches SimCosts.maker_fee)
+# A resting-quote round trip: post-only in, post-only out, builder routing on both
+# legs. This is the floor a grid level's step must clear — a level whose close leg
+# sits closer than this to its open leg LOSES money every time it completes, which
+# is DGRID-FEE-FLOOR (the shipped "Spread 2bp" preset was under it).
+MAKER_ROUND_TRIP_RATE = (DEFAULT_MAKER_FEE_RATE + DEFAULT_BUILDER_FEE_RATE) * Decimal(2)  # 5.0 bp
 
 # Product decision (2026-07-31): the spot volume bot sizes each cycle inside
 # this band. Enforced in the UI (buttons + custom input) and re-checked here so

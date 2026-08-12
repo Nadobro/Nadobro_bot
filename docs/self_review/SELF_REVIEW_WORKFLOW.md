@@ -124,6 +124,120 @@ alpha-brief prototype) lives in [`SCHEDULED_LOOPS.md`](SCHEDULED_LOOPS.md).
 
 ---
 
+## Open findings — self-review audit 2026-08-12
+
+Fan-out: `strategy-auditor` on grid / rgrid / mid / copy + `sltp-tracer`, run against
+the signal-advisor conviction clamp and the copy-pause branch. All `[VERIFIED]` with
+`file:line` evidence; each re-checked before landing here.
+
+**dgrid coverage:** the first dgrid auditor died on an API session limit; the re-run
+completed and its findings are folded in below. All five overlay strategies plus copy
+are now covered.
+
+### D-Grid composition — is it "grid + rgrid"?
+
+Answered, and the answer is a naming collision rather than a defect:
+
+* **Range phase IS genuine grid reuse.** `DynamicGridController` is a sibling of
+  `GridController`, not a subclass, but it imports `build_grid_config` and spawns the
+  same `GridExecutor`, so the execution core (partial-fill ingestion, close-leg
+  resize, double-cancel, watermark separation, recycle) is single-implementation. Only
+  `_rebuild_bounds_for_side` and the recenter throttle are duplicated.
+* **Trend phase is NOT the R-Grid strategy, and must not become it.** dgrid's
+  `RGRID` phase is `ReverseGridExecutor` — `GridExecutor` with `side=SELL` — with zero
+  references to `rgrid.py`, `rgrid_maker_executor.py` or `quant/rgrid_sizing.py`. That
+  is a mirrored mean-reversion ladder on the short side, exactly as
+  `variance_regime.py:67` documents (`RGRID = "rgrid"  # short reverse grid
+  (downtrend)`). It is deliberately NOT the pyramiding trend follower: R-Grid is its
+  own strategy and never the D-Grid phase switcher. **Do not "wire R-Grid into
+  dgrid"** — that would contradict a recorded product decision.
+* Consequence: none of R-Grid's four shipped defects apply. The frozen FLAT anchor
+  has no analogue (dgrid re-seeds `_grid_anchor_mid` from live mid on every spawn and
+  recenter, bounded by `ladder_recenter_threshold_bp`); the VWAP spacing decay has no
+  code path (levels are fixed geometric steps); the loss-only band exit has no code
+  path (each level's close is on the profit side by construction). Entry
+  cancel-on-touch exists but is the documented, bounded "follow price" recenter.
+
+### Guardrailed (strict xfail in `tests/engine/test_sltp_invariants.py`)
+
+| ID | Sev | Where |
+|---|---|---|
+| `ADVISOR-SIZE-SIGN` | Low | `overlay_actuator.py:98` — `size_factor = 1 + 0.25*scale*confidence`; `scale` is signed, so LOWERING confidence shallows a trim (more notional). Pre-existing, on the disagree path. |
+| `GRID-TOTALQUOTE-UNCAPPED` | **Critical** | `engine_runtime.py:2180` clamps `order_amount_quote` only; classic grid ships `total_amount_quote` and hands the whole ladder to the risk gate as one order → spawn refused → session reports LIVE with 0 orders, retrying every tick. Audit measured 528.70 vs a 500.0 cap. |
+| `OVERLAY-DISARMED-BARRIER-ARMS` | Medium | `bot_runtime.py:2691-2694` — `... if tp_pct > 0 else float(ov_tp)` ADOPTS a stale overlay barrier when the user deliberately disarmed it (0). Reachable via the Turbo Volume preset on mid (`tp_pct: 0.0`); reproduced closing a session at +0.96%. Fix: gate on `sltp_is_explicit`. |
+
+### Recorded, not yet guardrailed
+
+| ID | Sev | Where / what |
+|---|---|---|
+| `DGRID-REVERSAL-FLIPFLOP` | **High** | `dynamic_grid.py:411-415`, `:385` — `_maybe_reversal_flip` runs BEFORE the classifier and reads neither `last_direction` nor `last_is_trend`, so a 0.4% retrace arms a SHORT ladder inside a declared uptrend (sell entries rest above mid, fill into the rally) and the classifier reverses it ~60s later. Reproduced on a real controller at shipped defaults. Two contradictory user notifications a minute apart. Guardrailed. |
+| ~~`DGRID-FEE-FLOOR`~~ **FIXED** | **Med/High** | `engine_runtime.py:1532/1585` + `grid_executor.py:155` — the per-level step is floored only when ZERO, so the shipped "Spread 2bp" preset button and the 3bp Turbo preset are net-negative against a ~3bp maker+builder round trip on EVERY completed level. `dgrid_min_spread_bp` (default 2.0, own button, rendered on the card) only reaches `spread_floor_half_pct`, which the manual-step path never reads. Guardrailed. |
+| `DGRID-ORPHAN-ON-FLIP` | Medium | `grid_executor.py:785-789` + `:864` — `_cancel_all_resting` swallows cancel failures, then `_stop_out` terminates anyway; an unfilled order stays on the book with no executor to cancel it, and the opposite-side grid arms because the book reads flat. dgrid is worst-exposed since it flips sides routinely. |
+| `DGRID-ABANDONED-SIDE-REQUOTES` | Medium | `grid_executor.py:857-863` + `:710-719` — a partly-failed flatten leaves the executor active, so cancelled entries become `NOT_ACTIVE` and `_maybe_place_opens` re-places them on the side the controller just abandoned. |
+| `DGRID-MINNOTIONAL-CAP-LOST` | Medium | `engine_runtime.py:2463/2476-2492` vs `:583/602` — the min-notional level cap lives inside `if _should_build:` and is undone by the live-reconfig path, after which the venue bumps each sub-minimum level UP. On a $100-min product at dgrid defaults that is $400 placed against a $100 approved budget, with the risk engine outside the placement path. |
+| `DGRID-ADVISOR-DEBOUNCE-LOSS` | Low | `dynamic_grid.py:469/496-498` — down-shading confidence below 0.45 removes dgrid's only overlay conservatism (the extra confirming tick when the overlay contradicts the classifier). Same non-monotonicity as `ADVISOR-SIZE-SIGN`. |
+| `DGRID-TIERS-GROSS` | Low | `inventory.py:93` + `dynamic_grid.py:602-607` — profit tiers compare gross uPnL against a ladder whose top rung is the user's TP, while the rail judges the same % net of fees, so the scale-out completes before the TP is actually earned (docstring claims it "lands exactly at the user's TP"). |
+| `DGRID-DEAD-AUTOSPREAD-AND-DOCS` | Low | `engine_runtime.py:1594` computes `auto_spread = spread_frac <= 0` after `spread_frac` was already floored to 0.0005 at `:1532`, so the ATR branch at `dynamic_grid.py:215-222` is unreachable and `dgrid_min/max_spread_bp` stay dead. `docs/dynamic_grid_strategy.md:26-32` is stale on three counts; `_recenter` reports success when zero levels moved (`:560-567`); the breakout "do NOT arm" branches at `:460-462`/`:514-521` are dead because every gate PAUSE reason is neutralised. |
+| `RGRID-EXITBAND-INVERT` | **High** | `rgrid.py:448-451` + `engine_runtime.py:1345-1369` — `exit_band_cap` is derived from the UNSCALED band but `spread_ask_pct` is overlay-scaled up to 3x, inverting the `_exit_band > _arm_pct` ordering the module docstring calls essential. At >=1.5x the loss-only band exit always wins — the pathology that measured -85.27. Arms itself precisely in high vol. |
+| `MID-AUTOSPREAD-DEAD` | **High** | `market_making.py:313` gates on `gate_atr_pct > 0`, only ever set inside the regime gate, which mid ships OFF (`engine_runtime.py:1060`) — so ATR auto-spread can never fire. Compounded: mid's `min_spread_bp` default is `-10.0` → `max(0.0, -10) = 0`, so `spread_bp=0` quotes BOTH sides at mid with no fee floor, against UI copy promising "tightest fee-floored quote". |
+| ~~`COPY-LEADER-READ-FLAP`~~ **FIXED** | **High** | `copy_service.py:1329-1337` treats an absent leader position as "leader closed". `nado_client.get_all_positions` returns `[]` WITHOUT raising on total read failure (`:2121`) and on isolated-margin discovery failure (`:2133`). One flap market-closes the follower's entire copy book at 1.5% slippage and books phantom PnL. The follower side has three guards for this; the leader side has none. |
+| `GRID-LIVE-RESIZE-UNCHECKED` | High | `engine_runtime.py:576` writes the overlay-scaled `total_amount_quote` onto a running executor with no `pre_executor_check` → up to 1.25x the risk-approved notional. Same root cause as `GRID-TOTALQUOTE-UNCAPPED`. |
+| `MID-MINNOTIONAL-GROW` | Medium | `ladder.py:85` returns `max(1, ...)`, and at one level the min-notional clamp is a no-op; `nado_client.py:2901` then GROWS the sub-minimum order before signing. A 25% overlay "risk reduction" becomes a 33% over-deployment, invisible to the risk engine. |
+| `MID-SYNC-DB-IN-TICK` | Medium | `market_making.py:287,298,482` → `engine_persistence.py:100`: ~6 blocking psycopg2 reads per 8s tick inside `on_tick`. The documented APScheduler-starvation class; `test_no_blocking_calls_in_coroutines.py` misses it because the call is one indirection deep. |
+| `RGRID-STALE-INVENTORY-READD` | Medium | `rgrid.py:372` sizes off engine in-memory inventory with no venue reconcile. A portfolio-level Close All (`portfolio_handler.py:149`) does no strategy teardown, so `net` stays non-zero and the NON-reduce-only add leg keeps re-resting — re-opening exposure the user just closed. |
+| `RGRID-TRAIL-LOOSENS` | Medium | `rgrid.py:998-1010` re-derives the giveback from the LIVE band each evaluation, so an ATR rise moves an already-armed stop 40bp further away — the docstring promises it "only ever ratchets forward". |
+| `COPY-AGGREGATE-MARGIN` | Medium | `copy_service.py:1141` uses `total_allocated_usd` for the rail only, never for budget admission; the open loop has no product-count cap and the wizard sets `margin_per_trade == whole allocation` at risk >=1x. A $500 allocation against a 4-product leader commits ~$2,000. |
+| `GRID-MINNOTIONAL-CAP-LOST` | Medium | `engine_runtime.py:2483` writes the level cap into the per-cycle dict only; `configs` is re-mapped uncapped every cycle and pushed live, so venue min-notional bumps inflate deployed size. |
+| `GRID-BIAS-CHURN` | Medium | `overlay_actuator.py:254` writes `directional_bias` for grid; classic grid never reads it, but it IS in the live-config signature → full ladder cancel/re-place per bias move, bypassing both recenter throttles. Permanent queue-position loss. |
+| `GRID-MID-FAILS-OPEN` | Medium | `grid_trading.py:200` — on `mid is None` exposure defaults to `{"buy": True, "sell": True}`, skipping `_apply_entry_suppression`, so a venue hiccup removes both the exposure cap and overlay suppression. |
+| `RGRID-MINCONF-DEAD` | Low | `rgrid.py:194` reads `rgrid_signal_min_confidence`, never written by `map_strategy_config` — permanently 0.45, untunable. |
+| `ADVISOR-CONF-GATE-WITHHELD` | Low | Capping conviction keeps shaded confidence under the 0.45 gate for deterministic reads in `[0.30, 0.45)`, so rgrid's early-arm (`rgrid.py:973`) and dgrid's extra-confirm tick no longer fire — protective behaviours, withheld. Fix: gate them on the pre-advisor confidence. |
+| `RAIL-GROSS-VS-NET` | Low | `bot_runtime.py:2795` shows GROSS PnL in a stop message whose trigger is NET, so users read a stop as having fired early. |
+| `GRID-NO-FEE-FLOOR` | Low | `engine_runtime.py:1532` floors only when `spread_frac <= 0`; the UI allows `spread_bp` down to 0.1, where a round trip is a guaranteed net loss. |
+
+---
+
+## Product decision — D-Grid trend phase should pyramid (2026-08-12)
+
+The owner has decided that **dgrid's trend phase should behave like R-Grid** (add
+while the move extends, flip when it turns) rather than the current mirrored
+mean-reversion short ladder. This **supersedes** the earlier "R-Grid is its own
+strategy and never the D-Grid phase switcher" framing for the phase-switcher's
+trend leg. R-Grid remains a separately selectable strategy.
+
+This is an architecture change, not a wiring tweak, because dgrid's trend phase is
+currently `ReverseGridExecutor` (= `GridExecutor` with `side=SELL`) and shares
+nothing with `rgrid.py`. Scoped work:
+
+1. **Controller composition.** Decide between (a) dgrid delegating its trend phase
+   to an embedded `RGridController` instance, or (b) extracting R-Grid's pyramiding
+   core (anchor leash, add-off-last-fill spacing, derived arm/giveback/exit
+   geometry, step-vs-stop-budget cap) into a mixin both consume. (b) avoids two
+   controllers owning one session's inventory; (a) is faster but needs a clear
+   owner for `spawn_executor`/inventory.
+2. **Config mapping.** `map_strategy_config`'s dgrid branch must emit the R-Grid
+   keys the pyramiding core reads (`step_capped_quote`, `exit_band_cap`,
+   `reset_threshold_pct`, `exit_band_mult`) — today it emits none of them, and
+   `rgrid_signal_min_confidence` is separately dead for rgrid itself.
+3. **Blockers that must be fixed FIRST**, or the pyramiding leg inherits them:
+   `RGRID-EXITBAND-INVERT` (overlay-scaled band inverts the exit ordering — the
+   configuration that measured -85.27) and `RGRID-TRAIL-LOOSENS` (armed stop moves
+   away when the overlay widens). Both are already guardrailed.
+4. **Phase transition.** Flipping between a mean-reversion ladder and a pyramiding
+   trend follower must flatten and cancel both legs before re-arming;
+   `DGRID-REVERSAL-FLIPFLOP` (guardrailed) must be fixed first or the new trend leg
+   will be armed and unwound on every 0.4% retrace.
+5. **Reporting bridge.** Engine fills must still bridge into
+   `trades_<network>`/`strategy_sessions` for the pyramiding leg.
+6. **Proof.** Cost-aware backtest across trending AND ranging regimes before merge.
+   The checked-in reference CSV resamples to 11 bars and cannot serve; real trending
+   data is required (R-Grid's own +487 figure came from five trending regimes).
+
+Deliberately NOT started in the security-followups branch: it needs its own branch,
+its own backtest evidence, and items 3-4 landed first.
+
+---
+
 ## Anti-hallucination contract
 
 This workflow exists because a *wrong* bug report is worse than a missed one — it

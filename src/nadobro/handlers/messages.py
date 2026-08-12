@@ -34,7 +34,7 @@ from src.nadobro.handlers.keyboards import (
     trade_leverage_reply_kb, trade_size_reply_kb, trade_tpsl_kb,
     trade_tpsl_edit_kb, trade_confirm_reply_kb, SIZE_PRESETS,
     mode_kb, strategy_hub_kb, wallet_kb, positions_kb,
-    alerts_kb, settings_kb, close_product_kb, confirm_close_all_kb, portfolio_kb,
+    alerts_kb, settings_kb, close_product_kb, confirm_close_all_kb,
     bro_answer_kb, referral_kb,
 )
 from src.nadobro.users.points_ui import points_scope_kb

@@ -50,6 +50,7 @@ from src.nadobro.models.database import (
     get_bot_state,
     set_bot_state,
 )
+from src.nadobro.users.admin_service import is_trading_paused
 from src.nadobro.users.user_service import get_user, get_user_nado_client
 from src.nadobro.trading.trade_service import execute_market_order, execute_limit_order
 from src.nadobro.venue.nado_client import NadoClient
@@ -365,6 +366,15 @@ def start_copy(
     cumulative_take_profit_pct: float = 0.0,
     total_allocated_usd: float = 500.0,
 ) -> tuple[bool, str]:
+    # Global admin pause, checked FIRST and at the service layer rather than in
+    # the callback: starting a mirror arms an automated order path, so it belongs
+    # behind the same kill switch as manual trades (trade_card), typed intents
+    # (messages/intent_handlers), and strategy start (bot_runtime). Copy had
+    # THREE uncovered arming paths, all now gated: this one, ``resume_copy``,
+    # and the poller's own open/scale-up commits (which need no user action).
+    if is_trading_paused():
+        return False, "Trading is temporarily paused by admin controls."
+
     user = get_user(telegram_id)
     if not user:
         return False, "User not registered."
@@ -537,6 +547,12 @@ def resume_copy(telegram_id: int, mirror_id: int) -> tuple[bool, str]:
         return False, "Copy trading is stopping while existing positions are closed."
     if not mirror.get("paused"):
         return False, "Mirror is not paused."
+    # Resuming re-arms an automated order path exactly like start_copy, so it
+    # needs the same kill switch. This is the path that matters most: boot
+    # stand-down pauses EVERY mirror and the notification hands the user a
+    # "▶ Resume" button, so post-redeploy this is the only way copy restarts.
+    if is_trading_paused():
+        return False, "Trading is temporarily paused by admin controls."
     resume_copy_mirror(mirror_id)
     return True, "Copy trading resumed."
 
@@ -911,10 +927,32 @@ async def _poll_loop():
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
+async def _global_pause_blocks_opens() -> bool:
+    """True when this poll cycle must not commit any NEW or INCREASED position.
+
+    Read ONCE per poll cycle and threaded down, rather than at each commit point:
+    ``is_trading_paused`` is an uncached ``bot_state`` read, and the open path runs
+    per product per mirror. The cost is up to one poll interval of lag on a pause
+    that lands mid-cycle, which is acceptable for an operator kill switch (unlike
+    a user's stop, which still gets its own commit-point re-read — COPY-STOP-RACE).
+
+    Fail-CLOSED: an unreadable switch counts as paused. Skipping an open is safe
+    (the next poll retries); trading through the kill switch is not.
+    """
+    try:
+        return bool(await run_blocking(is_trading_paused))
+    except Exception:  # noqa: BLE001 - unreadable switch is treated as paused
+        logger.warning("copy opens blocked: global pause state unreadable")
+        return True
+
+
 async def _poll_all_mirrors():
     """Poll all active mirrors and process position changes."""
     synced_ids: set[int] = set()
     mirrors = await run_blocking(get_all_active_mirrors_v2)
+    # One read per cycle, applied to every mirror below. Blocks opens/scale-ups
+    # only; the stop-retry pass above and leader-close mirroring stay alive.
+    opens_blocked = await _global_pause_blocks_opens()
 
     # Group mirrors by trader+network for efficient polling
     trader_groups: dict[str, list[dict]] = {}
@@ -947,12 +985,20 @@ async def _poll_all_mirrors():
 
         try:
             leader_pos_map = await run_blocking(_load_leader_position_map, trader_id, wallet, network)
+            # COPY-LEADER-READ-FLAP: decide ONCE per trader group whether an empty
+            # read may be believed. Untrusted => mirror no closes this cycle.
+            leader_trusted = await run_blocking(
+                _leader_read_is_trustworthy, trader_id, network, leader_pos_map,
+            )
 
             # Process each mirror
             for mirror in copying_mirrors:
                 synced_ids.add(int(mirror["id"]))
                 try:
-                    await _sync_mirror_positions(mirror, leader_pos_map)
+                    await _sync_mirror_positions(
+                        mirror, leader_pos_map, opens_blocked=opens_blocked,
+                        leader_trusted=leader_trusted,
+                    )
                 except Exception as e:
                     logger.error(
                         "Copy sync failed for mirror %s user %s: %s",
@@ -984,6 +1030,45 @@ async def _poll_all_mirrors():
                 "Copy pending-only resolution failed for mirror %s: %s",
                 mirror_id, e, exc_info=True,
             )
+
+
+def _leader_snapshot_had_positions(trader_id: int, network: str) -> bool:
+    """Did the last persisted leader snapshot carry any open positions?
+
+    Fail-CLOSED for the caller's purpose: on any read/parse error return True, i.e.
+    "assume the leader had positions", so an unreadable snapshot makes the current
+    empty read UNTRUSTED rather than licensing a mass close.
+    """
+    try:
+        snap = get_latest_copy_snapshot(int(trader_id), str(network))
+        if not snap:
+            return False
+        raw = snap.get("positions") if isinstance(snap, dict) else None
+        if raw is None:
+            raw = snap.get("snapshot") if isinstance(snap, dict) else None
+        if isinstance(raw, str):
+            raw = json.loads(raw or "[]")
+        return bool(raw)
+    except Exception:  # noqa: BLE001 - unreadable basis => treat as "had positions"
+        logger.debug("leader snapshot read failed", exc_info=True)
+        return True
+
+
+def _leader_read_is_trustworthy(trader_id: int, network: str, leader_pos_map: dict) -> bool:
+    """Can ``pid not in leader_pos_map`` be believed to mean "leader closed"?
+
+    A NON-empty read is self-evidently real. An EMPTY read is only believable when
+    the archive is healthy AND the leader had nothing last time — otherwise it is
+    indistinguishable from the two silent ``[]`` failure modes in
+    ``NadoClient.get_all_positions``. The follower side already has exactly these
+    guards (``_archive_reads_unreliable``, the mass-vanish window); the leader side
+    had none, which is COPY-LEADER-READ-FLAP.
+    """
+    if leader_pos_map:
+        return True
+    if _archive_reads_unreliable(str(network)):
+        return False
+    return not _leader_snapshot_had_positions(trader_id, network)
 
 
 def _load_leader_position_map(trader_id: int, wallet: str, network: str) -> dict:
@@ -1035,6 +1120,20 @@ def _load_leader_position_map(trader_id: int, wallet: str, network: str) -> dict
             leader_pos_map[pid]["sl_price"] = sl_price
         except Exception as e:
             logger.debug("Failed to fetch orders for product %s: %s", pid, e)
+    # COPY-LEADER-READ-FLAP: never overwrite a non-empty snapshot with an EMPTY
+    # read. ``get_all_positions()`` returns [] WITHOUT raising on a total read
+    # failure and again when isolated-subaccount discovery fails, and downstream
+    # ``pid not in leader_pos_map`` is read as "the leader closed this" — so one
+    # flapped read market-flattens the follower's entire book. The persisted
+    # snapshot is the only basis for telling "leader is genuinely flat" apart from
+    # "we cannot see the leader right now", so it must survive the suspect read.
+    if not leader_pos_map and _leader_snapshot_had_positions(trader_id, network):
+        logger.warning(
+            "copy: leader %s (%s) read EMPTY but the last snapshot had positions — "
+            "keeping the snapshot and treating this read as untrusted",
+            str(wallet)[:10], network,
+        )
+        return leader_pos_map
     try:
         save_copy_snapshot(trader_id, network, json.dumps(list(leader_pos_map.values())))
     except Exception as e:
@@ -1120,8 +1219,23 @@ def _leader_max_notional(leader_pos_map: dict) -> float:
     return best
 
 
-async def _sync_mirror_positions(mirror: dict, leader_pos_map: dict):
-    """Sync a single mirror's positions with the leader's current positions."""
+async def _sync_mirror_positions(
+    mirror: dict, leader_pos_map: dict, *, opens_blocked: bool = False,
+    leader_trusted: bool = True,
+) -> None:
+    """Sync a single mirror's positions with the leader's current positions.
+
+    ``opens_blocked`` (global admin pause, resolved once per poll cycle) stops
+    NEW and INCREASED positions only. Leader-close mirroring, the SL/TP rail and
+    pending-maker resolution stay alive — the same "closing is safety" asymmetry
+    ``stop_requested`` already uses. Defaults False so a direct call (tests,
+    stop-retry path) behaves exactly as before.
+
+    ``leader_trusted`` (COPY-LEADER-READ-FLAP) is False when an EMPTY leader read
+    cannot be distinguished from a silent venue read failure. It suppresses
+    leader-CLOSE mirroring only — a genuine leader close is re-detected on the next
+    healthy poll, whereas acting on a phantom one flattens the whole book at market.
+    """
     mirror_id = mirror["id"]
     user_id = mirror["user_id"]
     network = mirror.get("network", "mainnet")
@@ -1317,7 +1431,18 @@ async def _sync_mirror_positions(mirror: dict, leader_pos_map: dict):
             return
 
     # 1. Close positions that leader has closed
-    for pid, cp in list(copy_pos_by_product.items()):
+    #
+    # COPY-LEADER-READ-FLAP: absence from leader_pos_map is only evidence of a
+    # close when the read itself is believable. An untrusted (empty, unconfirmable)
+    # read would otherwise flatten EVERY copied position at 1.5% slippage market
+    # and book phantom leader_closed PnL — then re-open the same book on the next
+    # good poll. Skip the close pass entirely; a real close is picked up next cycle.
+    if not leader_trusted:
+        logger.warning(
+            "copy: skipping leader-close mirroring for mirror %s — leader read "
+            "untrusted this cycle", mirror_id,
+        )
+    for pid, cp in ([] if not leader_trusted else list(copy_pos_by_product.items())):
         if pid not in leader_pos_map:
             # Leader closed this position — close ours too
             product_name = cp.get("product_name") or get_product_name(pid, network=network)
@@ -1420,6 +1545,7 @@ async def _sync_mirror_positions(mirror: dict, leader_pos_map: dict):
                         max_leverage=max_leverage,
                         leader_max_notional=_leader_max_notional(leader_pos_map),
                         session_id=session_id,
+                        opens_blocked=opens_blocked,
                     )
                 await run_blocking(
                     _update_tp_sl_if_changed, existing, leader_pos, user_id, network,
@@ -1510,6 +1636,16 @@ async def _sync_mirror_positions(mirror: dict, leader_pos_map: dict):
             if not live.get("active") or live.get("stop_requested") or live.get("paused"):
                 logger.info(
                     "copy opens aborted: mirror %s stopped/paused mid-sync", mirror_id
+                )
+                return
+            # GLOBAL PAUSE: strategies stand down mid-flight (bot_runtime
+            # _run_cycle -> "maintenance_pause"), so copy must too, or the admin
+            # kill switch suspends every strategy while active mirrors keep
+            # opening — which needs no user action at all.
+            if opens_blocked:
+                logger.info(
+                    "copy opens blocked: global trading pause active (mirror %s)",
+                    mirror_id,
                 )
                 return
 
@@ -2523,7 +2659,7 @@ def _partial_close_fraction(baseline_leader_size: float, new_leader_size: float)
 async def _mirror_leader_add_if_needed(
     existing_cp: dict, leader_pos: dict, user_id: int, mirror_id: int, network: str,
     *, margin_per_trade: float, max_leverage: float, leader_max_notional: float,
-    session_id=None,
+    session_id=None, opens_blocked: bool = False,
 ) -> str:
     """Mirror a leader ADDING to a position we already copy.
 
@@ -2594,6 +2730,14 @@ async def _mirror_leader_add_if_needed(
 
     # Never stack an order while a maker open on this product is unresolved.
     if (int(mirror_id), pid) in _PENDING_MAKER_OPENS:
+        return ""
+
+    # A scale-up INCREASES exposure, so the global pause blocks it exactly like a
+    # fresh open (see the open path in _sync_mirror_positions).
+    if opens_blocked:
+        logger.info(
+            "copy scale-up blocked: global trading pause active (mirror %s)", mirror_id
+        )
         return ""
 
     try:

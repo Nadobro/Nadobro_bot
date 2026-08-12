@@ -52,6 +52,15 @@ _TASK_MODEL_ENV: dict[str, tuple[str, str]] = {
     "intent": ("NANOGPT_MODEL_INTENT", "openai/gpt-5-mini"),
     "scan": ("NANOGPT_MODEL_SCAN", "anthropic/claude-sonnet-5"),
     "json": ("NANOGPT_MODEL_JSON", "openai/gpt-5-mini"),
+    # Second structured-output route. NanoGPT fronts xAI too, so a model-level
+    # failure no longer needs a DIRECT OpenAI call to recover — the retry stays
+    # inside the one gateway (one key, one bill, one rate limit). Deliberately a
+    # different vendor from "json" so a vendor-side outage is actually covered.
+    "json_fallback": ("NANOGPT_MODEL_JSON_FALLBACK", "x-ai/grok-4-fast"),
+    # Embeddings for the knowledge/vector store. NanoGPT is OpenAI-compatible, so
+    # /v1/embeddings works when the plan exposes an embedding model; vector_store
+    # probes once and falls back to native OpenAI if it does not.
+    "embed": ("NANOGPT_MODEL_EMBED", "openai/text-embedding-3-small"),
 }
 
 

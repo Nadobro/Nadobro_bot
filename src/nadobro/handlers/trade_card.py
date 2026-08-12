@@ -102,8 +102,6 @@ def _trade_step_summary(session: dict) -> str:
         lines.append(f"{_loc('TP')}: *{escape_md(str(tp))}*")
     if sl:
         lines.append(f"{_loc('SL')}: *{escape_md(str(sl))}*")
-    if session.get("time_limit_text"):
-        lines.append(f"{_loc('Auto-close')}: *{escape_md(str(session.get('time_limit_text')))}*")
     return "\n".join(lines)
 
 
@@ -162,12 +160,6 @@ def _build_trade_card_text(session: dict) -> str:
             f"{summary}\n\n"
             f"📐 *{_loc('TP/SL Settings')}*\n{tp_str} \\| {sl_str}{error_block}"
         )
-    if state == "time_limit_input":
-        return (
-            f"{header}\n\n{summary}\n\n"
-            f"{_loc('Type the auto-close time in chat')} \\(e\\.g\\. `in 6h` or `Friday 17:00 UTC`\\)\\."
-            f"{error_block}"
-        )
     return f"{header}\n\n{summary}{error_block}"
 
 
@@ -191,7 +183,7 @@ def _card_keyboard(session: dict):
         return trade_card_tpsl_kb(session_id)
     if state == "tpsl_edit":
         return trade_card_tpsl_edit_kb(session_id)
-    if state in ("size_custom_input", "tp_input", "sl_input", "time_limit_input"):
+    if state in ("size_custom_input", "tp_input", "sl_input"):
         return trade_card_text_input_kb(session_id)
     return trade_card_confirm_kb(session_id)
 
@@ -460,7 +452,6 @@ async def _execute_card_trade(query, context: CallbackContext, telegram_id: int,
             "limit_price": session.get("limit_price", session.get("price", 0)),
             "tp": session.get("tp"),
             "sl": session.get("sl"),
-            "time_limit_text": session.get("time_limit_text"),
         },
     })
 
@@ -592,8 +583,6 @@ async def handle_trade_card_callback(update: Update, context: CallbackContext, t
         _set_trade_card_session(context, session)
         await _edit_message_safely(query, _build_confirm_preview(session), trade_card_confirm_kb(session["session_id"]))
         return True
-    elif action == "time_limit":
-        session["state"] = "time_limit_input"
     elif action == "confirm":
         await _execute_card_trade(query, context, telegram_id, session)
         return True
@@ -613,7 +602,7 @@ async def handle_trade_card_text_input(update: Update, context: CallbackContext,
         return False
 
     state = session.get("state")
-    if state not in ("size_custom_input", "limit_price", "tp_input", "sl_input", "time_limit_input"):
+    if state not in ("size_custom_input", "limit_price", "tp_input", "sl_input"):
         return False
 
     try:
@@ -647,10 +636,6 @@ async def handle_trade_card_text_input(update: Update, context: CallbackContext,
     elif state == "sl_input":
         session["sl"] = value
         session["state"] = "tpsl_edit"
-    elif state == "time_limit_input":
-        session["time_limit_text"] = text
-        await _load_preview_fields(session, telegram_id)
-        session["state"] = "confirm"
 
     _set_trade_card_session(context, session)
     lang = get_active_language()

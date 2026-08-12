@@ -2930,9 +2930,21 @@ class NadoClient:
             # We ALSO pass it as ``PlaceOrderParams.id`` so it echoes back in the
             # ``order_update`` / ``fill`` subscription events for fast lookup.
             #   docs: .../api/gateway/executes/place-order (client id)
+            # The 20 is LOAD-BEARING, not a round number: the SDK builds the nonce
+            # as ``(recv_time_ms << 20) + random_int`` (nado_protocol/utils/nonce.py),
+            # so 0xFFFFF is exactly the space it leaves. Widening this mask would
+            # carry the tag into the timestamp bits and shift the order's expiry;
+            # narrowing it silently collides tags. Pinned by
+            # tests/test_nado_client_nonce_tag.py — keep them in step.
+            #
+            # Nonce unpredictability is deliberately NOT a security property here:
+            # authorization is the EIP-712 signature and replay is prevented by the
+            # venue rejecting a seen digest, so a fully deterministic tag is safe.
+            # Worst case is a self-inflicted duplicate digest on your own account
+            # (same sender/price/amount/expiration/nonce), which the venue no-ops.
             tag: Optional[int] = None
             if client_id is not None:
-                tag = int(client_id) & 0xFFFFF  # 20-bit space
+                tag = int(client_id) & 0xFFFFF  # 20-bit space — see above
                 order_nonce = gen_order_nonce(random_int=tag)
             else:
                 order_nonce = gen_order_nonce()

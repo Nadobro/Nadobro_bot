@@ -161,12 +161,6 @@ def set_bot_app(app):
     global _bot_app
     _bot_app = app
     try:
-        from src.nadobro.strategy.time_limit_watcher import set_bot_app as set_time_limit_bot_app
-
-        set_time_limit_bot_app(app)
-    except Exception:
-        pass
-    try:
         from src.nadobro.trading.desk_runtime import set_bot_app as set_desk_bot_app
 
         set_desk_bot_app(app)
@@ -896,11 +890,9 @@ def start_scheduler():
     from src.nadobro.core.feature_flags import (
         portfolio_sync_enabled,
         portfolio_sync_interval_seconds,
-        time_limit_enabled,
         vault_deposit_watch_enabled,
         vault_deposit_watch_interval_seconds,
     )
-    from src.nadobro.strategy.time_limit_watcher import time_limit_tick
 
     # Misfire / coalesce tuning. The event loop occasionally blocks for 5-20s
     # (slow callback, archive 422 retries, place_order chains) and short-tick
@@ -918,11 +910,6 @@ def start_scheduler():
         tick_price_tracker, "interval", seconds=60,
         id="price_tracker", replace_existing=True, **_SHORT_TICK,
     )
-    if time_limit_enabled():
-        scheduler.add_job(
-            time_limit_tick, "interval", seconds=60,
-            id="time_limit_watcher", replace_existing=True, **_SHORT_TICK,
-        )
     if portfolio_sync_enabled():
         from src.nadobro.venue.nado_sync import sync_active_users
 

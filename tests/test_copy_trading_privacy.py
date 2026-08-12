@@ -215,7 +215,8 @@ class CopyServicePrivacyTests(unittest.TestCase):
             "owner_user_id": 1111,
         }
         fake_user = type("U", (), {"linked_signer_address": "0xsigner", "network_mode": type("N", (), {"value": "mainnet"})()})()
-        with patch.object(copy_service, "get_user", return_value=fake_user), \
+        with patch.object(copy_service, "is_trading_paused", return_value=False), \
+             patch.object(copy_service, "get_user", return_value=fake_user), \
              patch.object(copy_service, "get_copy_trader", return_value=owned_by_a), \
              patch.object(copy_service, "count_user_active_mirrors", return_value=0), \
              patch.object(copy_service, "create_copy_mirror_v2", return_value=42) as create_spy:
@@ -223,6 +224,21 @@ class CopyServicePrivacyTests(unittest.TestCase):
 
         self.assertFalse(ok)
         create_spy.assert_not_called()
+
+    def test_start_copy_respects_the_global_admin_pause(self):
+        """Starting a mirror arms an automated order path, so it must sit behind
+        the same kill switch as manual trades, typed intents and strategy start.
+        Gate is at the service layer, so a crafted ``copy:confirm`` cannot slip
+        past it either."""
+        with patch.object(copy_service, "is_trading_paused", return_value=True), \
+             patch.object(copy_service, "get_user") as user_spy, \
+             patch.object(copy_service, "create_copy_mirror_v2") as create_spy:
+            ok, msg = copy_service.start_copy(telegram_id=2222, trader_id=9, margin_per_trade=50.0)
+
+        self.assertFalse(ok)
+        self.assertIn("paused", msg.lower())
+        create_spy.assert_not_called()
+        user_spy.assert_not_called()  # short-circuits before any other work
 
     def test_get_trader_preview_denies_private_trader_without_requester(self):
         owned = {

@@ -103,6 +103,10 @@ def _parse_verdict(text: str) -> Optional[Dict[str, Any]]:
         return None
     out: Dict[str, Any] = {"agree": bool(parsed.get("agree", True))}
     try:
+        # Range is deliberately SIGNED here while ``_apply`` clamps to [-max, 0]:
+        # the recorded verdict should show what the model actually argued (so
+        # signal_scorer can grade "wanted more conviction" verdicts), and the
+        # risk-reducing invariant is enforced at the point of application.
         out["confidence_delta"] = _clamp(
             float(parsed.get("confidence_delta", 0.0) or 0.0),
             -_MAX_CONFIDENCE_DELTA, _MAX_CONFIDENCE_DELTA,
@@ -175,16 +179,32 @@ def fetch_verdict(signal: Signal, features: Mapping[str, Any], product: str) -> 
 def _apply(signal: Signal, verdict: Mapping[str, Any]) -> Signal:
     """Fold a verdict into the signal in the RISK-REDUCING direction only.
 
-    * ``confidence_delta`` is clamped and applied, then floored at 0.
+    * ``confidence_delta`` is clamped to ``[-max, 0]`` — a positive (conviction-
+      raising) delta is discarded, never applied — then floored at 0.
     * disagreement pulls ``scale`` toward 0 (less adding) and, when the engine was
       already unconfident, clears ``entry_ok``.
     * ``reasons``/``risks`` are appended for the audit trail.
 
     Nothing here can raise size, widen a barrier, or turn an entry back ON.
     """
+    # RISK-REDUCING ONLY, and this clamp is the single enforcement point. The
+    # verdict keeps the model's raw signed delta for the audit trail, but the
+    # positive half is dropped here rather than applied: confidence feeds
+    # overlay_actuator.compute_overrides -> size_factor -> order notional, so a
+    # model that raises conviction would raise real position size. Previously the
+    # only floor was the min() on the `not agree` branch below, which left
+    # agree=True + delta=+0.15 able to add up to ~3.75% notional on grid/dgrid
+    # (and mid only when a participation chunk is active). NOT on rgrid, whose
+    # step cap already clamped the up-scale away, and NOT on the SL/TP rails,
+    # which read regime and never confidence.
+    #
+    # Caveat, audited and recorded as ADVISOR-SIZE-SIGN: confidence is a
+    # magnitude multiplier on a SIGNED scale in overlay_actuator, so on the
+    # reduce path (scale < 0) a LOWER confidence shallows the trim. This clamp
+    # fixes the add path; it does not make the tier risk-monotone.
     delta = _clamp(
         float(verdict.get("confidence_delta", 0.0) or 0.0),
-        -_MAX_CONFIDENCE_DELTA, _MAX_CONFIDENCE_DELTA,
+        -_MAX_CONFIDENCE_DELTA, 0.0,
     )
     agree = bool(verdict.get("agree", True))
     confidence = _clamp(float(signal.confidence) + delta, 0.0, 1.0)
