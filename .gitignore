@@ -77,3 +77,7 @@ relay/.fly-bootstrap.env
 # Ad-hoc local trade exports from tooling (large / user-specific)
 *_trades_*.csv
 
+
+# Cached pytest-only venv used by scripts/self_review.sh to mirror the
+# "SL/TP & config invariants" CI job (which installs pytest and nothing else).
+.self_review_ci_venv/
