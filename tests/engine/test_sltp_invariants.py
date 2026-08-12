@@ -516,127 +516,23 @@ def test_lowering_advisor_confidence_never_increases_the_overlay_size_factor():
     )
 
 
-@pytest.mark.parametrize("strategy", ["grid", "dgrid"])
-def test_no_overlay_scaled_size_key_can_exceed_the_risk_cap(strategy):
-    """GRID-TOTALQUOTE-UNCAPPED — FIXED.
-
-    The post-overlay risk clamp used to cover ``order_amount_quote`` only. Classic
-    grid ships ``total_amount_quote`` and NO ``order_amount_quote``, and
-    ``GridController`` hands the whole ladder to the risk gate as one
-    ``ExecutorRequest(order_amount_quote=cfg.total_amount_quote)`` — so a 1.25x
-    overlay size-up slipped past, ``risk.py`` refused the spawn, and the session
-    reported LIVE with zero orders while retrying every tick (measured 528.70
-    against a 500.0 cap).
-
-    dgrid (audit 2026-08-12) is the same defect but WORSE: ``_flip_to`` flattens
-    the live position FIRST and then calls ``_spawn_phase``, so a refused re-arm
-    left the user's position closed and the strategy never re-arming, retrying the
-    same refused spawn every tick while the overlay kept a sticky ``size_factor``.
-    dgrid also ships ``total_amount_quote`` only, so the old clamp was a pure no-op
-    for it. Parametrised over both strategies for that reason.
-
-    Behavioural pin: after the overlay runs, EVERY size key the overlay can scale
-    is within ``max_single_order_quote``. Asserted on the real
-    ``_maybe_apply_overlay``, not on the config's shape — a shape assertion cannot
-    tell a fixed clamp from a broken one.
-    """
-    import asyncio
-
-    from src.nadobro.strategy import engine_runtime as er
-
-    class _Uptrend:
-        def get_candlesticks(self, product_id, timeframe, limit, max_time=None):
-            return [
-                {"close": 100 + i * 0.4, "high": 100 + i * 0.4 + 1,
-                 "low": 100 + i * 0.4 - 1, "volume": 10}
-                for i in range(80)
-            ]
-
-    cap = Decimal("500")
-    limits = type("L", (), {"max_single_order_quote": cap})()
-    configs = {
-        "total_amount_quote": cap,          # classic grid: at the cap already
-        "spread_bid_pct": Decimal("0.0005"),
-        "spread_ask_pct": Decimal("0.0005"),
-        "directional_bias": 0.0,
-    }
-    state = {"strategy": strategy, "strategy_session_id": 1}
-
-    import src.nadobro.models.database as _db
-    _orig = getattr(_db, "insert_overlay_signal", None)
-    _db.insert_overlay_signal = lambda row: 1
-    try:
-        asyncio.run(er._maybe_apply_overlay(
-            7, "mainnet", strategy, "BTC", 2, configs, state,
-            client=_Uptrend(), mid=131.6, limits=limits,
-        ))
-    finally:
-        if _orig is not None:
-            _db.insert_overlay_signal = _orig
-
-    for key in ("order_amount_quote", "total_amount_quote"):
-        val = configs.get(key)
-        if val is not None:
-            assert Decimal(str(val)) <= cap, (
-                f"{key}={val} exceeds max_single_order_quote={cap}; the risk gate "
-                "will refuse the spawn and the session goes LIVE with 0 orders"
-            )
-
-
-def test_a_disarmed_user_barrier_is_never_armed_by_a_stale_overlay_value():
-    """OVERLAY-DISARMED-BARRIER-ARMS — FIXED.
-
-    ``_evaluate_session_pnl_rail`` folded the overlay barrier in as
-    ``tp_pct = max(ov_tp, tp_pct) if tp_pct > 0 else float(ov_tp)``. The ``else``
-    half ADOPTED the overlay value when the user's number was 0 — i.e. when they
-    deliberately disarmed it. Reachable: the Turbo Volume preset writes
-    ``tp_pct: 0.0`` for mid, mid is in OVERLAY_STRATEGIES, and ``overlay_tp_pct``
-    persists in bot_state across degraded overlay cycles and restarts. Audit
-    reproduced a session closing at +0.96% with TP explicitly off.
-
-    Now gated on ``sltp_is_explicit``: a PRESENT-AND-ZERO key is a choice, not an
-    absence. Behavioural pin — drives the real rail.
-    """
-    import asyncio
-    from unittest.mock import AsyncMock, patch
-
-    from src.nadobro.strategy import bot_runtime
-
-    # TP explicitly disarmed by the user; a stale overlay TP sits in state.
-    state = {
-        "sl_pct": 10.0, "tp_pct": 0.0, "strategy": "mid",
-        "strategy_session_id": 11, "running": True,
-        "overlay_tp_pct": 0.96,
-    }
-    snap = {"session_pnl": 1.0, "session_pnl_pct": 1.0,
-            "session_pnl_pct_net": 1.0, "margin": 100.0}
-    closed = {}
-
-    async def close_coro():
-        closed["called"] = True
-        return {"success": True}
-
-    sess = {"id": 11, "product_id": 2, "status": "running",
-            "started_at": None, "stopped_at": None}
-
-    async def _fake_run_blocking(fn, *a, **kw):
-        return fn(*a, **kw)
-
-    with patch.object(bot_runtime, "run_blocking", _fake_run_blocking), \
-         patch("src.nadobro.models.database.get_strategy_session_by_id", return_value=sess), \
-         patch("src.nadobro.trading.live_session.get_live_session_snapshot", return_value=snap), \
-         patch.object(bot_runtime, "_finalize_session"), \
-         patch.object(bot_runtime, "_save_state"), \
-         patch.object(bot_runtime, "_notify", new=AsyncMock()), \
-         patch.object(bot_runtime, "_strategy_display_name", return_value="MID"):
-        res = asyncio.run(bot_runtime._evaluate_session_pnl_rail(
-            42, "mainnet", state, "mid", "BTC", client=None, close_coro=close_coro,
-        ))
-
-    assert not closed.get("called"), (
-        "a stale overlay TP closed a session whose TP the user disarmed"
-    )
-    assert res is None or res[0] is not True
+# ── Moved out, deliberately ─────────────────────────────────────────────────
+# Two guardrails from the 2026-08-12 audit are BEHAVIOURAL — they drive the real
+# _maybe_apply_overlay and _evaluate_session_pnl_rail — so they transitively import
+# models.database and need psycopg2. This file is run by .github/workflows/
+# self-review.yml with `pip install pytest` and NOTHING else, on purpose: the
+# invariants must stay runnable with zero project dependencies. Guarding them with
+# importorskip would silently skip them in the very job meant to enforce them, so
+# they live next to the harnesses they use instead:
+#
+#   GRID-TOTALQUOTE-UNCAPPED / DGRID-TOTALQUOTE-UNCAPPED (FIXED)
+#     -> tests/services/test_overlay_wiring.py
+#        test_no_overlay_scaled_size_key_can_exceed_the_risk_cap[grid|dgrid]
+#   OVERLAY-DISARMED-BARRIER-ARMS (FIXED)
+#     -> tests/services/test_session_safety_rails.py
+#        test_a_disarmed_user_barrier_is_never_armed_by_a_stale_overlay_value
+#
+# Both run in the full pytest job. Keep this pointer in step with them.
 
 
 @pytest.mark.xfail(strict=True, reason="RGRID-EXITBAND-INVERT: exit_band_cap is "

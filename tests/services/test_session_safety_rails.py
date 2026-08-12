@@ -489,3 +489,78 @@ class MultiprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OverlayDisarmedBarrierTests(unittest.IsolatedAsyncioTestCase):
+    """OVERLAY-DISARMED-BARRIER-ARMS (audit 2026-08-12, FIXED).
+
+    Lives here, not in tests/engine/test_sltp_invariants.py, because it drives the
+    real rail and therefore needs psycopg2 — and the invariants file is run by
+    self-review.yml with `pip install pytest` and nothing else.
+
+    The rail folded the overlay barrier in as
+    ``tp_pct = max(ov_tp, tp_pct) if tp_pct > 0 else float(ov_tp)``. The ``else``
+    half ADOPTED the overlay value when the user's own number was 0 — i.e. when they
+    deliberately disarmed it. Reachable: the Turbo Volume preset writes
+    ``tp_pct: 0.0`` for mid, mid is in OVERLAY_STRATEGIES, and ``overlay_tp_pct``
+    persists in bot_state across degraded overlay cycles and restarts. Reproduced a
+    session closing at +0.96% with TP explicitly off. Now gated on
+    ``sltp_is_explicit``: present-and-zero is a choice, not an absence.
+    """
+
+    async def _run(self, *, sl, tp, overlay_sl=None, overlay_tp=None, snap):
+        state = {
+            "sl_pct": sl, "tp_pct": tp, "strategy": "mid",
+            "strategy_session_id": 11, "running": True,
+        }
+        if overlay_sl is not None:
+            state["overlay_sl_pct"] = overlay_sl
+        if overlay_tp is not None:
+            state["overlay_tp_pct"] = overlay_tp
+        closed = {}
+
+        async def close_coro():
+            closed["called"] = True
+            return {"success": True}
+
+        sess = {"id": 11, "product_id": 2, "status": "running",
+                "started_at": None, "stopped_at": None}
+        with patch.object(bot_runtime, "run_blocking", _fake_run_blocking), \
+             patch("src.nadobro.models.database.get_strategy_session_by_id", return_value=sess), \
+             patch("src.nadobro.trading.live_session.get_live_session_snapshot", return_value=snap), \
+             patch.object(engine_runtime.RUNTIME, "stop", new=AsyncMock()), \
+             patch.object(bot_runtime, "_finalize_session"), \
+             patch.object(bot_runtime, "_save_state"), \
+             patch.object(bot_runtime, "_notify", new=AsyncMock()), \
+             patch.object(bot_runtime, "_strategy_display_name", return_value="MID"):
+            res = await bot_runtime._evaluate_session_pnl_rail(
+                42, "mainnet", state, "mid", "BTC",
+                client=None, close_coro=close_coro,
+            )
+        return res, closed
+
+    async def test_a_disarmed_tp_is_never_armed_by_a_stale_overlay_value(self):
+        snap = {"session_pnl": 1.0, "session_pnl_pct": 1.0,
+                "session_pnl_pct_net": 1.0, "margin": 100.0}
+        res, closed = await self._run(sl=10.0, tp=0.0, overlay_tp=0.96, snap=snap)
+        self.assertFalse(
+            closed.get("called"),
+            "a stale overlay TP closed a session whose TP the user disarmed",
+        )
+        self.assertTrue(res is None or res[0] is not True)
+
+    async def test_a_disarmed_sl_is_never_armed_by_a_stale_overlay_value(self):
+        snap = {"session_pnl": -1.0, "session_pnl_pct": -1.0,
+                "session_pnl_pct_net": -1.0, "margin": 100.0}
+        res, closed = await self._run(sl=0.0, tp=50.0, overlay_sl=0.5, snap=snap)
+        self.assertFalse(closed.get("called"))
+        self.assertTrue(res is None or res[0] is not True)
+
+    async def test_the_overlay_still_TIGHTENS_an_armed_barrier(self):
+        """The fix must not make the overlay inert on barriers the user DID arm —
+        SL stays tighten-only, which is the whole point of the rail integration."""
+        snap = {"session_pnl": -0.7, "session_pnl_pct": -0.7,
+                "session_pnl_pct_net": -0.7, "margin": 100.0}
+        res, closed = await self._run(sl=2.0, tp=50.0, overlay_sl=0.5, snap=snap)
+        self.assertEqual(res, (True, None))
+        self.assertTrue(closed.get("called"))

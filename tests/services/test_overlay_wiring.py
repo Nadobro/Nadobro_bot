@@ -473,3 +473,54 @@ def test_the_advisor_reaches_the_finance_llm_through_nanogpt():
         dmind_service.is_finance_expert_configured
     ), "advisor gate must accept a NanoGPT-only deployment"
     assert "nanogpt_chat_completion" in inspect.getsource(dmind_service)
+
+
+# ==========================================================================
+# GRID-TOTALQUOTE-UNCAPPED / DGRID-TOTALQUOTE-UNCAPPED (audit 2026-08-12, FIXED)
+#
+# Lives here, not in tests/engine/test_sltp_invariants.py, because it drives the
+# real _maybe_apply_overlay and therefore needs psycopg2 — and the invariants file
+# is run by self-review.yml with `pip install pytest` and nothing else. See the
+# pointer comment in that file.
+# ==========================================================================
+@pytest.mark.parametrize("strategy", ["grid", "dgrid"])
+def test_no_overlay_scaled_size_key_can_exceed_the_risk_cap(strategy):
+    """The post-overlay risk clamp used to cover ``order_amount_quote`` only.
+
+    Classic grid AND dgrid ship ``total_amount_quote`` and no ``order_amount_quote``,
+    and both hand the whole ladder to the risk gate as one
+    ``ExecutorRequest(order_amount_quote=cfg.total_amount_quote)`` — so a 1.25x
+    overlay size-up slipped past the clamp, ``risk.py`` refused the spawn, and the
+    session reported LIVE with zero orders while retrying every tick (measured
+    528.70 against a 500.0 cap).
+
+    dgrid was worse: ``_flip_to`` flattens the live position FIRST and then calls
+    ``_spawn_phase``, so a refused re-arm left the user's position closed and the
+    strategy never re-arming, with the overlay holding a sticky ``size_factor``.
+
+    Behavioural pin: after the overlay runs, EVERY size key it can scale is within
+    ``max_single_order_quote``. Asserted on the real ``_maybe_apply_overlay`` rather
+    than on the config's shape — a shape assertion cannot tell a fixed clamp from a
+    broken one, which is exactly how the first version of this guardrail failed.
+    """
+    cap = Decimal("500")
+    limits = type("L", (), {"max_single_order_quote": cap})()
+    configs = {
+        "total_amount_quote": cap,          # ladder strategies sit AT the cap already
+        "spread_bid_pct": Decimal("0.0005"),
+        "spread_ask_pct": Decimal("0.0005"),
+        "directional_bias": 0.0,
+    }
+    state = {"strategy": strategy, "strategy_session_id": 1}
+    asyncio.run(er._maybe_apply_overlay(
+        7, "mainnet", strategy, "BTC", 2, configs, state,
+        client=_FakeClient(), mid=131.6, limits=limits,
+    ))
+
+    for key in ("order_amount_quote", "total_amount_quote"):
+        val = configs.get(key)
+        if val is not None:
+            assert Decimal(str(val)) <= cap, (
+                f"{strategy}: {key}={val} exceeds max_single_order_quote={cap}; the "
+                "risk gate refuses the spawn and the session goes LIVE with 0 orders"
+            )
