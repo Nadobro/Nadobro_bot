@@ -665,12 +665,16 @@ class NadoClient:
             return self.initialize()
         return False
 
-    def get_market_price(self, product_id: int) -> dict:
+    def get_market_price(self, product_id: int, *, cache_only: bool = False) -> dict:
         cache_key = f"{self.network}:{product_id}"
         with _caches_lock:
             cached = _price_cache.get(cache_key)
         if cached and (time.time() - cached["ts"] < _PRICE_CACHE_TTL):
             return cached["data"]
+        # Click path: serve a stale book or zeros. Never block a tap on the
+        # gateway — a cold/throttled host hangs this call for the full SDK timeout.
+        if cache_only:
+            return (cached or {}).get("data") or {"bid": 0, "ask": 0, "mid": 0}
 
         if self._initialized and self.client:
             try:
@@ -3478,12 +3482,14 @@ class NadoClient:
             }
         return rates
 
-    def get_all_funding_rates(self) -> dict:
+    def get_all_funding_rates(self, *, cache_only: bool = False) -> dict:
         cache_key = f"{self.network}:funding"
         with _caches_lock:
             cached = _FUNDING_CACHE.get(cache_key)
         if cached and (time.time() - cached["ts"] < _FUNDING_TTL):
             return cached["data"]
+        if cache_only:
+            return dict((cached or {}).get("data") or {})
         product_ids = [
             int(pid)
             for name in get_perp_products(network=self.network, client=self)
@@ -3495,8 +3501,8 @@ class NadoClient:
                 _FUNDING_CACHE[cache_key] = {"data": rates, "ts": time.time()}
         return rates
 
-    def get_funding_rate(self, product_id: int) -> Optional[dict]:
-        rates = self.get_all_funding_rates()
+    def get_funding_rate(self, product_id: int, *, cache_only: bool = False) -> Optional[dict]:
+        rates = self.get_all_funding_rates(cache_only=cache_only)
         try:
             return rates.get(int(product_id))
         except (TypeError, ValueError):

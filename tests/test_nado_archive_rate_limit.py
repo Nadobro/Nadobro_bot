@@ -77,3 +77,15 @@ def test_query_order_by_digest_stops_polling_when_rate_limited():
 
     assert result is None
     mock_post.assert_not_called()
+
+
+def test_pair_volume_cache_only_does_not_post():
+    import src.nadobro.venue.nado_archive as archive
+
+    archive._VOLUME_CACHE.clear()
+    with patch.object(archive, "_post") as mock_post:
+        assert archive.get_pair_24h_volume_usd("mainnet", 2, cache_only=True) is None
+        mock_post.assert_not_called()
+        archive._VOLUME_CACHE[("mainnet", 2)] = (0.0, 99.5)
+        assert archive.get_pair_24h_volume_usd("mainnet", 2, cache_only=True) == 99.5
+        mock_post.assert_not_called()

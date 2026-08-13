@@ -33,6 +33,15 @@ from src.nadobro.handlers.callbacks import _edit_loc  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+def _loading_kb():
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh Portfolio", callback_data="portfolio:view")],
+        [InlineKeyboardButton("🏠 Home", callback_data="nav:main")],
+    ])
+
+
 # Serve cached renders instantly; kick a background refresh when the cache
 # is older than this. The portfolio poller + WS invalidation keep actively
 # trading users well under it, so the late edit is the exception, not the rule.
@@ -313,7 +322,7 @@ async def _handle_portfolio(query, data, telegram_id):
         #   portfolio:positions:{n}       -> back-compat: both at page n
         #   portfolio:positions:pos:{n}   -> position section page n
         #   portfolio:positions:ord:{n}   -> order section page n
-        from src.nadobro.handlers.portfolio_deck import snapshot_for_user
+        from src.nadobro.handlers.portfolio_deck import render_loading
         from src.nadobro.handlers.positions_view import render_positions_view
 
         pos_page = None
@@ -344,17 +353,18 @@ async def _handle_portfolio(query, data, telegram_id):
                     lambda s: render_positions_view(s, page=page, pos_page=pos_page, ord_page=ord_page),
                 )
             return
-        snapshot = await snapshot_for_user(telegram_id)
-        text, kb = render_positions_view(
-            snapshot, page=page, pos_page=pos_page, ord_page=ord_page
+        await _edit_loc(query, render_loading(), reply_markup=_loading_kb())
+        _spawn_background_refresh(
+            query, telegram_id, f"positions:{pos_page}:{ord_page}:{page}",
+            lambda s: render_positions_view(s, page=page, pos_page=pos_page, ord_page=ord_page),
+            force=True,
         )
-        await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
     if action == "orders":
         # Legacy alias: forward to the combined Positions screen so callers
         # following older callback_data still land somewhere sensible.
-        from src.nadobro.handlers.portfolio_deck import snapshot_for_user
+        from src.nadobro.handlers.portfolio_deck import render_loading
         from src.nadobro.handlers.positions_view import render_positions_view
 
         page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
@@ -373,9 +383,12 @@ async def _handle_portfolio(query, data, telegram_id):
                     lambda s: render_positions_view(s, ord_page=page),
                 )
             return
-        snapshot = await snapshot_for_user(telegram_id)
-        text, kb = render_positions_view(snapshot, ord_page=page)
-        await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await _edit_loc(query, render_loading(), reply_markup=_loading_kb())
+        _spawn_background_refresh(
+            query, telegram_id, f"orders:{page}",
+            lambda s: render_positions_view(s, ord_page=page),
+            force=True,
+        )
         return
 
     if action == "history":
@@ -529,7 +542,6 @@ async def _handle_portfolio(query, data, telegram_id):
     from src.nadobro.handlers.portfolio_deck import (
         render_loading,
         render_portfolio_deck,
-        snapshot_for_user,
     )
 
     force_refresh = action == "refresh"
@@ -560,18 +572,13 @@ async def _handle_portfolio(query, data, telegram_id):
                     force=force_refresh,
                 )
             return
-        # Cold start (no cache yet, e.g. right after a restart): the inline
-        # sync is unavoidable once; show progress while it runs.
-        await _edit_loc(query, render_loading())
-        snapshot = await snapshot_for_user(telegram_id, force=force_refresh)
-        msg, reply_markup = render_portfolio_deck(snapshot, window=window)
-    try:
-        await _edit_loc(query,
-            msg,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.HTML,
+        # Cold start (no cache yet, e.g. right after a restart): show loading
+        # and refresh in the background. Awaiting snapshot_for_user here held
+        # the per-user lock for the full venue read storm (multi-second taps).
+        await _edit_loc(query, render_loading(), reply_markup=_loading_kb())
+        _spawn_background_refresh(
+            query, telegram_id, f"deck:{window}",
+            lambda s: render_portfolio_deck(s, window=window),
+            force=True,
         )
-    except BadRequest as e:
-        if "Message is not modified" in str(e):
-            return
-        raise
+        return

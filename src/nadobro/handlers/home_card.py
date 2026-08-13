@@ -1,4 +1,5 @@
 import logging
+import asyncio
 
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -293,17 +294,44 @@ def _view_positions_text(telegram_id: int):
 
 
 async def _view_portfolio_text(telegram_id: int):
-    from src.nadobro.handlers.portfolio_deck import render_portfolio_deck, snapshot_for_user
+    from src.nadobro.handlers.portfolio_deck import render_portfolio_deck
+    from src.nadobro.venue.nado_sync import get_cached_snapshot, mark_user_active
 
     try:
-        snapshot = await snapshot_for_user(telegram_id)
-        return render_portfolio_deck(snapshot)
+        user = get_user(telegram_id)
+        network = user.network_mode.value if user else None
+        mark_user_active(int(telegram_id))
+        cached = get_cached_snapshot(int(telegram_id), network)
+        if cached:
+            return render_portfolio_deck(cached)
+        _warm_portfolio_snapshot(telegram_id)
+        return (
+            localize_text("⏳ Loading portfolio… tap again in a sec\\.", get_active_language()),
+            home_card_kb(),
+        )
     except Exception as e:
         logger.warning("portfolio_deck_unavailable user=%s err=%s", telegram_id, e)
         return localize_text(
             "⚠️ Can't pull your portfolio right now\\. Give it a sec and tap again\\.",
             get_active_language(),
         ), home_card_kb()
+
+
+def _warm_portfolio_snapshot(telegram_id: int) -> None:
+    """Kick a venue snapshot off the tap path so the next Portfolio tap is cached."""
+
+    async def _job():
+        try:
+            from src.nadobro.handlers.portfolio_deck import snapshot_for_user
+
+            await snapshot_for_user(telegram_id)
+        except Exception as e:
+            logger.debug("portfolio snapshot warm failed user=%s: %s", telegram_id, e)
+
+    try:
+        asyncio.get_running_loop().create_task(_job())
+    except RuntimeError:
+        pass
 
 
 def _view_points_text(telegram_id: int):

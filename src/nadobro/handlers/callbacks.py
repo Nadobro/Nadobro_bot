@@ -422,6 +422,16 @@ async def _handle_nav(query, data, telegram_id, context=None):
 
     clear_pending_user_state(context, telegram_id)
 
+    # Strategy Lab hub is static copy + a keyboard. Skip the user DB hop so
+    # the tap returns even when the misc pool is busy.
+    if target == "strategy_hub":
+        await _edit_loc(query,
+            fmt_strategy_hub_intro(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=strategy_hub_kb(),
+        )
+        return
+
     user = await run_blocking(get_user, telegram_id)
     network = user.network_mode.value if user else "mainnet"
 
@@ -439,12 +449,6 @@ async def _handle_nav(query, data, telegram_id, context=None):
             raise
     elif target == "quick_start":
         await _handle_onboarding(query, "onboarding:resume", telegram_id, context)
-    elif target == "strategy_hub":
-        await _edit_loc(query,
-            fmt_strategy_hub_intro(),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=strategy_hub_kb(),
-        )
     elif target == "mode":
         user = await run_blocking(get_user, telegram_id)
         current_network = user.network_mode.value if user else "testnet"

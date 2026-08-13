@@ -737,6 +737,7 @@ def get_pair_24h_volume_usd(
     product_id: int,
     *,
     refresh: bool = False,
+    cache_only: bool = False,
 ) -> Optional[float]:
     """Return the rolling 24h USD volume for ``product_id`` from Nado archive.
 
@@ -761,6 +762,8 @@ def get_pair_24h_volume_usd(
         cached = _VOLUME_CACHE.get(key)
         if cached and (now - cached[0] < _VOLUME_CACHE_TTL_SECONDS):
             return cached[1]
+        if cache_only:
+            return cached[1] if cached else None
 
     url = archive_url_for_network(network)
     payload = {

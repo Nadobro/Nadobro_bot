@@ -308,7 +308,7 @@ def has_mode_private_key(telegram_id: int, network: str) -> bool:
     return _is_wallet_fully_linked(user)
 
 
-def ensure_active_wallet_ready(telegram_id: int) -> tuple[bool, str]:
+def ensure_active_wallet_ready(telegram_id: int, *, verify_on_chain: bool = True) -> tuple[bool, str]:
     user = get_user(telegram_id)
     if not user:
         return False, _loc("User not found. Use /start first.")
@@ -327,7 +327,9 @@ def ensure_active_wallet_ready(telegram_id: int) -> tuple[bool, str]:
                 )
     if user.salt:
         return False, "Your wallet key uses an old format. Please unlink and re-link your wallet."
-    if user.linked_signer_address and user.main_address:
+    # Tap/preview cards must not wait on get_linked_signer. Start/trade paths
+    # keep verify_on_chain=True so a mismatched 1CT key still blocks orders.
+    if verify_on_chain and user.linked_signer_address and user.main_address:
         try:
             readonly = get_user_readonly_client(telegram_id, network=user.network_mode.value)
             if readonly:
