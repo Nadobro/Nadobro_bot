@@ -460,6 +460,58 @@ def test_poll_finalizes_dead_relay_session(monkeypatch):
     assert send_mock.await_count == 1
 
 
+def test_poll_skips_persist_on_heartbeat_only(monkeypatch):
+    """Empty poll must not write bot_state every 2s (nrt→Postgres log/slot storm)."""
+    from src.nadobro.users import points_service
+
+    persist_calls = []
+
+    async def _poll_events(*, session_id, cursor):
+        return {"ok": True, "events": [], "next_cursor": None}
+
+    async def _persist(bot_data):
+        persist_calls.append(True)
+
+    monkeypatch.setattr(points_service, "relay_is_configured", lambda: True)
+    monkeypatch.setattr(points_service, "relay_poll_events", _poll_events)
+    monkeypatch.setattr(points_service, "_persist_relay_state", _persist)
+    bot_app = type("BotApp", (), {"bot_data": {
+        "lowiqpts_pending_queue": [{"relay_session_id": "sess_a", "req_id": "r1", "ts": 1.0}],
+        "lowiqpts_relay_cursor:sess_a": "11",
+    }})()
+
+    asyncio.run(points_service.poll_lowiqpts_relay_events(bot_app))
+
+    assert persist_calls == []
+    # Heartbeat still advances in-memory ts so the timeout job does not fire.
+    assert bot_app.bot_data["lowiqpts_pending_queue"][0]["ts"] > 1.0
+
+
+def test_poll_persists_when_cursor_advances(monkeypatch):
+    from src.nadobro.users import points_service
+
+    persist_calls = []
+
+    async def _poll_events(*, session_id, cursor):
+        return {"ok": True, "events": [], "next_cursor": "12"}
+
+    async def _persist(bot_data):
+        persist_calls.append(True)
+
+    monkeypatch.setattr(points_service, "relay_is_configured", lambda: True)
+    monkeypatch.setattr(points_service, "relay_poll_events", _poll_events)
+    monkeypatch.setattr(points_service, "_persist_relay_state", _persist)
+    bot_app = type("BotApp", (), {"bot_data": {
+        "lowiqpts_pending_queue": [{"relay_session_id": "sess_a", "req_id": "r1", "ts": 1.0}],
+        "lowiqpts_relay_cursor:sess_a": "11",
+    }})()
+
+    asyncio.run(points_service.poll_lowiqpts_relay_events(bot_app))
+
+    assert persist_calls == [True]
+    assert bot_app.bot_data["lowiqpts_relay_cursor:sess_a"] == "12"
+
+
 def test_parse_lowiq_points_reply_handles_markdown_volume_lines():
     from src.nadobro.users import points_service
 

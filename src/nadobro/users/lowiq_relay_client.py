@@ -8,6 +8,9 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Session start/reply waits on @lowiqpts (can take minutes). The 2s scheduler
+# poll must NOT inherit this — a hung AMS call from nrt pinned the job for
+# 210s and APScheduler skip-warned every interval (2026-08-13).
 _DEFAULT_TIMEOUT_SECONDS = env_float("LOWIQPTS_RELAY_TIMEOUT_SECONDS", 210.0)
 _DEFAULT_POLL_LIMIT = env_int("LOWIQPTS_RELAY_POLL_LIMIT", 25)
 
@@ -24,6 +27,15 @@ def relay_poll_interval_seconds() -> int:
         return max(1, int(raw))
     except (TypeError, ValueError):
         return 2
+
+
+def relay_poll_timeout_seconds() -> float:
+    """HTTP timeout for GET /events/poll — always shorter than the tick interval."""
+    interval = float(relay_poll_interval_seconds())
+    configured = env_float("LOWIQPTS_RELAY_POLL_TIMEOUT_SECONDS", 0.0)
+    if configured > 0:
+        return configured
+    return max(0.5, min(1.5, interval * 0.75))
 
 
 def relay_is_configured() -> bool:
@@ -47,12 +59,22 @@ async def _get_client() -> Optional[httpx.AsyncClient]:
     return _shared_client
 
 
-async def _request(method: str, path: str, *, json: Optional[dict[str, Any]] = None, params: Optional[dict[str, Any]] = None) -> dict:
+async def _request(
+    method: str,
+    path: str,
+    *,
+    json: Optional[dict[str, Any]] = None,
+    params: Optional[dict[str, Any]] = None,
+    timeout: Optional[float] = None,
+) -> dict:
     client = await _get_client()
     if client is None:
         return {"ok": False, "error": "relay_not_configured"}
     try:
-        response = await client.request(method, path, json=json, params=params)
+        req_kwargs: dict[str, Any] = {}
+        if timeout is not None:
+            req_kwargs["timeout"] = timeout
+        response = await client.request(method, path, json=json, params=params, **req_kwargs)
         response.raise_for_status()
         data = response.json()
         if isinstance(data, dict):
@@ -111,7 +133,12 @@ async def poll_events(*, session_id: str, cursor: Optional[str]) -> dict:
     params: dict[str, Any] = {"session_id": str(session_id), "limit": _DEFAULT_POLL_LIMIT}
     if cursor:
         params["cursor"] = str(cursor)
-    return await _request("GET", "/events/poll", params=params)
+    return await _request(
+        "GET",
+        "/events/poll",
+        params=params,
+        timeout=relay_poll_timeout_seconds(),
+    )
 
 
 async def close_session(*, session_id: str, reason: Optional[str] = None) -> dict:

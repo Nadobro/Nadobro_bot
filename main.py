@@ -8,7 +8,11 @@ import time
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
-from src.nadobro.core.log_redaction import RedactingFormatter, SensitiveDataRedactFilter
+from src.nadobro.core.log_redaction import (
+    ApschedulerOverlapFilter,
+    RedactingFormatter,
+    SensitiveDataRedactFilter,
+)
 
 
 _redact_filter = SensitiveDataRedactFilter()
@@ -23,6 +27,7 @@ logging.basicConfig(
 
 logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
 logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.scheduler").addFilter(ApschedulerOverlapFilter())
 logging.getLogger("httpx").setLevel(logging.WARNING)
 # NO_ORDERS_AUDIT-FIX-R6a: the Nado SDK logs "Initializing default {mode}
 # context" at INFO on every default-context construction (~400 ms each). With
