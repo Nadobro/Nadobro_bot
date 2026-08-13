@@ -178,6 +178,87 @@ class NadoSyncTests(unittest.IsolatedAsyncioTestCase):
 
         assert client.include_isolated_flags == [True]
 
+    async def test_ui_sync_skips_indexer_heavy_pull(self):
+        client = _Client()
+        client.match_calls = 0
+        orig_matches = client.get_matches
+        orig_funding = client.get_interest_and_funding_payments
+
+        async def _matches(*a, **k):
+            client.match_calls += 1
+            return await orig_matches(*a, **k)
+
+        async def _funding(*a, **k):
+            client.match_calls += 1
+            return await orig_funding(*a, **k)
+
+        client.get_matches = _matches
+        client.get_interest_and_funding_payments = _funding
+
+        with patch.object(
+            nado_sync, "get_user",
+            return_value=SimpleNamespace(network_mode=SimpleNamespace(value="testnet")),
+        ), patch.object(
+            nado_sync, "get_user_nado_client", return_value=client
+        ), patch.object(nado_sync, "execute"), patch.object(
+            nado_sync, "query_one", return_value=None
+        ):
+            result = await nado_sync.sync_user(42, network="testnet", reason="ui", max_age_ms=0)
+
+        assert client.match_calls == 0
+        assert result["stale"] is False
+        assert result["positions"]
+
+    async def test_ui_force_refresh_still_skips_indexer_heavy_pull(self):
+        client = _Client()
+        client.match_calls = 0
+        orig_matches = client.get_matches
+        orig_funding = client.get_interest_and_funding_payments
+
+        async def _matches(*a, **k):
+            client.match_calls += 1
+            return await orig_matches(*a, **k)
+
+        async def _funding(*a, **k):
+            client.match_calls += 1
+            return await orig_funding(*a, **k)
+
+        client.get_matches = _matches
+        client.get_interest_and_funding_payments = _funding
+
+        with patch.object(
+            nado_sync, "get_user",
+            return_value=SimpleNamespace(network_mode=SimpleNamespace(value="testnet")),
+        ), patch.object(
+            nado_sync, "get_user_nado_client", return_value=client
+        ), patch.object(nado_sync, "execute"), patch.object(
+            nado_sync, "query_one", return_value=None
+        ):
+            result = await nado_sync.sync_user(
+                42, network="testnet", reason="ui", force=True, max_age_ms=0
+            )
+
+        assert client.match_calls == 0
+        assert result["stale"] is False
+        assert result["positions"]
+
+    async def test_mark_user_active_does_not_write_inline_on_a_running_loop(self):
+        calls = []
+        scheduled = []
+
+        def _ff(coro, name=None):
+            scheduled.append(name)
+            coro.close()
+            return None
+
+        with patch.object(
+            nado_sync, "execute", side_effect=lambda *a, **k: calls.append(a)
+        ), patch("src.nadobro.core.async_utils.fire_and_forget", side_effect=_ff):
+            nado_sync.mark_user_active(7)
+
+        assert calls == []
+        assert scheduled
+
     def test_write_matches_decodes_human_size_but_keeps_x18_fields(self):
         execute_calls = []
         with patch.object(nado_sync, "query_one", return_value=None), patch.object(

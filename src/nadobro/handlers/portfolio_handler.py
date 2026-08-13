@@ -26,6 +26,7 @@ from src.nadobro.core.async_utils import run_blocking, run_blocking_sdk
 from src.nadobro.core.perf import timed_metric
 from src.nadobro.trading.trade_service import close_all_positions
 from src.nadobro.users.user_service import get_user_nado_client, get_user
+from src.nadobro.utils.env import env_float
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
@@ -33,19 +34,14 @@ from src.nadobro.handlers.callbacks import _edit_loc  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-def _loading_kb():
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh Portfolio", callback_data="portfolio:view")],
-        [InlineKeyboardButton("🏠 Home", callback_data="nav:main")],
-    ])
-
-
 # Serve cached renders instantly; kick a background refresh when the cache
 # is older than this. The portfolio poller + WS invalidation keep actively
 # trading users well under it, so the late edit is the exception, not the rule.
 _CACHE_FRESH_SECONDS = 3.0
+
+# Background venue sync ceiling. The tap already painted a real deck; this
+# only bounds how long "Refreshing…" can linger if the gateway wedges.
+_BG_SYNC_TIMEOUT_SECONDS = env_float("NADO_PORTFOLIO_BG_SYNC_TIMEOUT_SECONDS", 25.0)
 
 # One in-flight background refresh per (chat, view); a second tap while one
 # is running just re-renders the cache and rides the existing refresh.
@@ -92,24 +88,55 @@ def _spawn_background_refresh(query, telegram_id: int, view_key: str, render_fre
     if existing and not existing.done():
         return
 
+    async def _paint(snapshot) -> None:
+        if interaction_seq(int(chat)) != _BG_EXPECT_SEQ.get(key):
+            logger.debug(
+                "portfolio bg refresh dropped (user navigated) user=%s view=%s",
+                telegram_id, view_key,
+            )
+            return
+        text, kb = render_fresh(snapshot)
+        await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+    async def _fallback_snapshot():
+        from src.nadobro.handlers.portfolio_deck import empty_portfolio_snapshot
+        from src.nadobro.venue.nado_sync import get_cached_snapshot
+
+        return get_cached_snapshot(int(telegram_id)) or empty_portfolio_snapshot(telegram_id)
+
     async def _job():
         try:
             from src.nadobro.handlers.portfolio_deck import snapshot_for_user
 
-            snapshot = await snapshot_for_user(telegram_id, force=force)
-            if interaction_seq(int(chat)) != _BG_EXPECT_SEQ.get(key):
-                logger.debug(
-                    "portfolio bg refresh dropped (user navigated) user=%s view=%s",
-                    telegram_id, view_key,
-                )
-                return
-            text, kb = render_fresh(snapshot)
-            await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            snapshot = await asyncio.wait_for(
+                snapshot_for_user(telegram_id, force=force, reason="ui"),
+                timeout=_BG_SYNC_TIMEOUT_SECONDS,
+            )
+            await _paint(snapshot)
         except BadRequest as e:
             if "Message is not modified" not in str(e):
-                logger.debug("portfolio bg refresh edit failed user=%s: %s", telegram_id, e)
+                logger.warning("portfolio bg refresh edit failed user=%s: %s", telegram_id, e)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "portfolio bg refresh timed out user=%s view=%s after %.0fs",
+                telegram_id, view_key, _BG_SYNC_TIMEOUT_SECONDS,
+            )
+            try:
+                await _paint(await _fallback_snapshot())
+            except Exception:
+                logger.warning(
+                    "portfolio bg refresh fallback failed user=%s view=%s",
+                    telegram_id, view_key, exc_info=True,
+                )
         except Exception as e:
-            logger.debug("portfolio bg refresh failed user=%s view=%s: %s", telegram_id, view_key, e)
+            logger.warning("portfolio bg refresh failed user=%s view=%s: %s", telegram_id, view_key, e)
+            try:
+                await _paint(await _fallback_snapshot())
+            except Exception:
+                logger.warning(
+                    "portfolio bg refresh fallback failed user=%s view=%s",
+                    telegram_id, view_key, exc_info=True,
+                )
         finally:
             _BG_REFRESH.pop(key, None)
             _BG_EXPECT_SEQ.pop(key, None)
@@ -322,7 +349,6 @@ async def _handle_portfolio(query, data, telegram_id):
         #   portfolio:positions:{n}       -> back-compat: both at page n
         #   portfolio:positions:pos:{n}   -> position section page n
         #   portfolio:positions:ord:{n}   -> order section page n
-        from src.nadobro.handlers.portfolio_deck import render_loading
         from src.nadobro.handlers.positions_view import render_positions_view
 
         pos_page = None
@@ -353,18 +379,22 @@ async def _handle_portfolio(query, data, telegram_id):
                     lambda s: render_positions_view(s, page=page, pos_page=pos_page, ord_page=ord_page),
                 )
             return
-        await _edit_loc(query, render_loading(), reply_markup=_loading_kb())
+        from src.nadobro.handlers.portfolio_deck import empty_portfolio_snapshot
+
+        text, kb = render_positions_view(
+            empty_portfolio_snapshot(telegram_id, network),
+            page=page, pos_page=pos_page, ord_page=ord_page,
+        )
+        await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         _spawn_background_refresh(
             query, telegram_id, f"positions:{pos_page}:{ord_page}:{page}",
             lambda s: render_positions_view(s, page=page, pos_page=pos_page, ord_page=ord_page),
-            force=True,
         )
         return
 
     if action == "orders":
         # Legacy alias: forward to the combined Positions screen so callers
         # following older callback_data still land somewhere sensible.
-        from src.nadobro.handlers.portfolio_deck import render_loading
         from src.nadobro.handlers.positions_view import render_positions_view
 
         page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
@@ -383,11 +413,15 @@ async def _handle_portfolio(query, data, telegram_id):
                     lambda s: render_positions_view(s, ord_page=page),
                 )
             return
-        await _edit_loc(query, render_loading(), reply_markup=_loading_kb())
+        from src.nadobro.handlers.portfolio_deck import empty_portfolio_snapshot
+
+        text, kb = render_positions_view(
+            empty_portfolio_snapshot(telegram_id, network), ord_page=page
+        )
+        await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         _spawn_background_refresh(
             query, telegram_id, f"orders:{page}",
             lambda s: render_positions_view(s, ord_page=page),
-            force=True,
         )
         return
 
@@ -540,7 +574,7 @@ async def _handle_portfolio(query, data, telegram_id):
 
     # Default: portfolio overview (single shared 24h / 7d / 30d / All toggle).
     from src.nadobro.handlers.portfolio_deck import (
-        render_loading,
+        empty_portfolio_snapshot,
         render_portfolio_deck,
     )
 
@@ -572,13 +606,17 @@ async def _handle_portfolio(query, data, telegram_id):
                     force=force_refresh,
                 )
             return
-        # Cold start (no cache yet, e.g. right after a restart): show loading
-        # and refresh in the background. Awaiting snapshot_for_user here held
-        # the per-user lock for the full venue read storm (multi-second taps).
-        await _edit_loc(query, render_loading(), reply_markup=_loading_kb())
+        # Cold start: show a real (empty) deck immediately. "Loading…" was a
+        # dead end — the background venue+indexer sync could run for minutes
+        # and leave the user staring at two buttons.
+        msg, reply_markup = render_portfolio_deck(
+            empty_portfolio_snapshot(telegram_id, network),
+            window=window,
+            refreshing=True,
+        )
+        await _edit_loc(query, msg, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
         _spawn_background_refresh(
             query, telegram_id, f"deck:{window}",
             lambda s: render_portfolio_deck(s, window=window),
-            force=True,
         )
         return
