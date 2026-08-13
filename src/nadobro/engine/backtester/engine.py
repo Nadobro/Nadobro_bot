@@ -170,6 +170,24 @@ class BacktestEngine:
 
         last = self.candles[-1].close
         holds = self.inventory.list_for_controller(self.user_id, self.controller_id)
+        # INTEGRITY: the report's PnL/fees come from INVENTORY holds, while the sim
+        # charges fees on the ADAPTER. A gap means the report is blind to fills that
+        # actually happened, and every number below is fiction — which is exactly
+        # what the missing marketable-limit path caused (236 sim fills, one booked;
+        # 5.294 charged vs 0.025 reported). Warn loudly rather than silently
+        # reporting a clean-looking profit. Not an exception: a partially-ingested
+        # run is still informative, and raising here would break callers mid-sweep.
+        booked_fees = sum((h.cum_fees_quote for h in holds), Decimal(0))
+        leak = self.adapter.total_fees_quote - booked_fees
+        if abs(leak) > Decimal("1e-9"):
+            logger.warning(
+                "BACKTEST FEE LEAK %s: adapter charged %s but only %s reached "
+                "inventory (%s unbooked across %d sim fills) — the report is blind "
+                "to fills that happened; treat these numbers as INVALID",
+                self.strategy, self.adapter.total_fees_quote, booked_fees, leak,
+                len(self.adapter._fills),  # noqa: SLF001
+            )
+        self.fee_leak_quote = leak
         return BacktestReport(
             strategy=self.strategy,
             bars=len(self.candles),

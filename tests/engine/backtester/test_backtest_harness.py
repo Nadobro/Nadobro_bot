@@ -6,6 +6,7 @@ strategy controller actually runs end-to-end against the simulated venue.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 from decimal import Decimal
@@ -266,3 +267,70 @@ def test_the_backtest_candle_provider_has_no_look_ahead():
     served = eng._candle_provider("BTC-PERP")
     assert len(served) == 4, "provider must serve only bars 0..idx"
     assert max(d["time"] for d in served) == candles[3].ts
+
+
+def test_a_marketable_limit_crosses_now_as_a_taker():
+    """The engine's risk exits are marketable LIMITs at mid±30bp
+    (grid_executor._EXIT_CROSS_BP / _exit_cross_price), not MARKET orders. The sim
+    filled only MARKET synchronously and treated every LIMIT as purely resting, so
+    those exits filled a bar late at MAKER fees — and on the _stop_out flatten path
+    were never booked at all, because _stop_out inspects filled_base only at
+    placement and never stores the id to poll. Measured (dgrid, strong_trend_down,
+    720 bars): 236 sim fills but only ONE reached inventory; the adapter charged
+    5.294 while the report showed 0.025."""
+    from src.nadobro.engine.types import OrderType, TradeType
+
+    async def _case():
+        sim = SimNadoAdapter(costs=SimCosts(taker_fee=Decimal("0.001"),
+                                            slippage_pct=Decimal("0.0005")))
+        sim.set_candle(candles_from_prices([100.0, 100.0], interval_s=60)[1])
+        # BUY priced THROUGH the ask must cross immediately, at the touch, as taker.
+        o = await sim.place_order("BTC-PERP", TradeType.BUY, OrderType.LIMIT,
+                                  Decimal("1"), price=Decimal("103"))
+        return sim, o
+
+    sim, o = asyncio.run(_case())
+    assert sim.total_fees_quote > 0, "a marketable limit must fill on placement"
+    # Filled at the touch (mid + slippage), not at the aggressive limit price.
+    assert o.price == Decimal("103")
+    assert len(sim._fills) == 1  # noqa: SLF001
+
+
+def test_a_resting_limit_and_a_post_only_do_not_cross():
+    """Only a LIMIT through the touch takes. A passive LIMIT still rests, and
+    LIMIT_MAKER must NEVER cross — post-only binds at SEND, so live it would be
+    rejected or repriced, never filled aggressively."""
+    from src.nadobro.engine.types import OrderType, TradeType
+
+    async def _case():
+        sim = SimNadoAdapter(costs=SimCosts(taker_fee=Decimal("0.001"),
+                                            slippage_pct=Decimal("0.0005")))
+        sim.set_candle(candles_from_prices([100.0, 100.0], interval_s=60)[1])
+        passive = await sim.place_order("BTC-PERP", TradeType.BUY, OrderType.LIMIT,
+                                        Decimal("1"), price=Decimal("95"))
+        post_only = await sim.place_order("BTC-PERP", TradeType.BUY,
+                                          OrderType.LIMIT_MAKER, Decimal("1"),
+                                          price=Decimal("103"))
+        return sim, passive, post_only
+
+    sim, _passive, _post = asyncio.run(_case())
+    assert sim.total_fees_quote == 0, (
+        "neither a passive LIMIT nor a post-only may fill on placement"
+    )
+
+
+def test_the_engine_reports_a_fee_leak_when_fills_bypass_inventory():
+    """The report's PnL/fees come from inventory holds while the sim charges on the
+    adapter, so a gap means the report is BLIND to fills that happened. This is the
+    integrity check that makes the marketable-limit class of blindness impossible to
+    ship again — a clean-looking profit with a nonzero leak is fiction."""
+    from src.nadobro.engine.backtester.engine import BacktestEngine
+
+    candles = candles_from_prices([100.0 + (i % 7) * 0.3 for i in range(80)],
+                                  interval_s=60)
+    eng = BacktestEngine("grid", _grid_cfg(), candles, costs=SimCosts())
+    eng.run()
+    assert hasattr(eng, "fee_leak_quote"), "the integrity check must always run"
+    assert abs(eng.fee_leak_quote) < Decimal("1e-9"), (
+        f"fees charged by the sim did not reach inventory (leak={eng.fee_leak_quote})"
+    )

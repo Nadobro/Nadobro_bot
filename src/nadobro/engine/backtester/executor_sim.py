@@ -198,7 +198,48 @@ class SimNadoAdapter(NadoAdapterBase):
             fill_px = mid * (Decimal(1) + slip) if side is TradeType.BUY else mid * (Decimal(1) - slip)
             fee = order.amount_base * fill_px * self.costs.taker_fee
             self._record_fill(order, order.amount_base, fill_px, fee)
+        elif self._candle is not None and self._is_marketable_limit(
+            side, order_type, order.price
+        ):
+            # MARKETABLE LIMIT: a LIMIT priced THROUGH the touch crosses NOW, at
+            # the touch, as a TAKER — it does not rest.
+            #
+            # This was missing, and it silently invalidated most of the harness.
+            # The engine's risk exits are marketable LIMITs at mid +/- 30bp
+            # (grid_executor._EXIT_CROSS_BP / _exit_cross_price), not MARKET
+            # orders. Treating them as purely resting meant they filled a bar
+            # late at MAKER fees — and on the _stop_out flatten path never got
+            # booked at all, because _stop_out inspects filled_base only at
+            # placement and never stores the id to poll, so it retried forever.
+            # MEASURED (dgrid, strong_trend_down, 720 bars): 236 sim fills but
+            # only ONE reached inventory; the adapter charged 5.294 while the
+            # report showed 0.025 — a 527bp-of-margin blind spot that inverted
+            # the sign of most dgrid and rgrid results.
+            #
+            # LIMIT_MAKER is deliberately excluded: post-only binds at SEND, so a
+            # post-only order priced through the touch is rejected/repriced live,
+            # never crossed. Only OrderType.LIMIT can take.
+            mid = self._candle.close
+            slip = self.costs.slippage_pct
+            fill_px = (
+                mid * (Decimal(1) + slip) if side is TradeType.BUY
+                else mid * (Decimal(1) - slip)
+            )
+            fee = order.amount_base * fill_px * self.costs.taker_fee
+            self._record_fill(order, order.amount_base, fill_px, fee)
         return copy.copy(order)
+
+    def _is_marketable_limit(
+        self, side: TradeType, order_type: OrderType, price: Optional[Decimal]
+    ) -> bool:
+        """True when a plain LIMIT is priced through the touch and must cross now."""
+        if order_type is not OrderType.LIMIT or price is None or self._candle is None:
+            return False
+        mid = self._candle.close
+        slip = self.costs.slippage_pct
+        if side is TradeType.BUY:
+            return price >= mid * (Decimal(1) + slip)
+        return price <= mid * (Decimal(1) - slip)
 
     async def cancel_order(self, order_id: str) -> bool:
         order = self._orders.get(order_id)
