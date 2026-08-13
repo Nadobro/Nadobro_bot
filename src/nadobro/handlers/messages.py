@@ -736,17 +736,20 @@ async def _dispatch_reply_button(update, context, telegram_id, callback_data, te
                     msg, reply_markup = render_portfolio_deck(cached)
                 else:
                     from src.nadobro.handlers.home_card import _warm_portfolio_snapshot
+                    from src.nadobro.handlers.portfolio_deck import empty_portfolio_snapshot
 
                     _warm_portfolio_snapshot(telegram_id)
-                    msg, reply_markup = (
-                        "⏳ Loading portfolio… tap again in a sec.",
-                        persistent_menu_kb(),
+                    msg, reply_markup = render_portfolio_deck(
+                        empty_portfolio_snapshot(telegram_id, network),
+                        refreshing=True,
                     )
             except Exception as e:
                 logging.getLogger(__name__).warning("message_portfolio_deck_failed user=%s err=%s", telegram_id, e)
                 msg, reply_markup = "⚠️ Portfolio refresh is temporarily unavailable. Try again shortly.", persistent_menu_kb()
-        await _reply_loc(update.message, 
+        await _reply_loc(
+            update.message,
             msg,
+            parse_mode=ParseMode.HTML,
             reply_markup=localize_markup(reply_markup, lang),
         )
         return

@@ -63,27 +63,51 @@ def portfolio_deck_kb(
     return InlineKeyboardMarkup(rows)
 
 
+def empty_portfolio_snapshot(user_id: int, network: str | None = None) -> dict[str, Any]:
+    """Instant tap placeholder: a real deck, not a loading dead-end.
+
+    Cold cache after a restart used to leave the user on "Loading portfolio…"
+    until a full venue+indexer sync finished (minutes). Render this immediately
+    and let the background refresh edit the message in place.
+    """
+    return {
+        "user_id": int(user_id),
+        "network": str(network or "mainnet"),
+        "positions": [],
+        "open_orders": [],
+        "stats": {},
+        "equity": {},
+        "stale": True,
+        "monotonic_ts": 0.0,
+    }
+
+
 async def snapshot_for_user(
     user_id: int,
     *,
     force: bool = False,
     max_age_ms: int | None = 2000,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """Return a portfolio snapshot, refreshing from Nado when stale.
 
     Every Portfolio render path passes ``max_age_ms=2000`` so Positions and
     Overview never show data older than ~2s when the user is actively
     navigating. Background polling keeps the cache warm between taps.
+
+    ``reason="ui"`` is the tap-path refresh: skip the indexer heavy pull so
+    the first paint is positions/orders/equity, not 200 fills + funding.
     """
+    from src.nadobro.core.async_utils import run_blocking_db
     from src.nadobro.venue.nado_sync import mark_user_active
 
     mark_user_active(int(user_id))
-    user = get_user(user_id)
+    user = await run_blocking_db(get_user, user_id)
     network = user.network_mode.value if user else "mainnet"
     return await sync_user(
         user_id,
         network=network,
-        reason="refresh" if force else "cold_render",
+        reason=reason or ("refresh" if force else "cold_render"),
         force=force,
         max_age_ms=max_age_ms,
     )

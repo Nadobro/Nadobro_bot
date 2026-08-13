@@ -173,6 +173,7 @@ async def _edit_or_send_card(
     reply_markup,
     *,
     prefer_reply_to_message: bool = False,
+    parse_mode: str = ParseMode.MARKDOWN_V2,
 ):
     """Show or refresh the home / module card.
 
@@ -208,7 +209,7 @@ async def _edit_or_send_card(
         try:
             msg = await user_message.reply_text(
                 text,
-                parse_mode=ParseMode.MARKDOWN_V2,
+                parse_mode=parse_mode,
                 reply_markup=reply_markup,
             )
         except BadRequest as e:
@@ -230,7 +231,7 @@ async def _edit_or_send_card(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=text,
-                parse_mode=ParseMode.MARKDOWN_V2,
+                parse_mode=parse_mode,
                 reply_markup=reply_markup,
             )
             return
@@ -261,7 +262,7 @@ async def _edit_or_send_card(
         message = await context.bot.send_message(
             chat_id=chat_id,
             text=text,
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=parse_mode,
             reply_markup=reply_markup,
         )
     except BadRequest as e:
@@ -294,7 +295,10 @@ def _view_positions_text(telegram_id: int):
 
 
 async def _view_portfolio_text(telegram_id: int):
-    from src.nadobro.handlers.portfolio_deck import render_portfolio_deck
+    from src.nadobro.handlers.portfolio_deck import (
+        empty_portfolio_snapshot,
+        render_portfolio_deck,
+    )
     from src.nadobro.venue.nado_sync import get_cached_snapshot, mark_user_active
 
     try:
@@ -305,9 +309,9 @@ async def _view_portfolio_text(telegram_id: int):
         if cached:
             return render_portfolio_deck(cached)
         _warm_portfolio_snapshot(telegram_id)
-        return (
-            localize_text("⏳ Loading portfolio… tap again in a sec\\.", get_active_language()),
-            home_card_kb(),
+        return render_portfolio_deck(
+            empty_portfolio_snapshot(telegram_id, network),
+            refreshing=True,
         )
     except Exception as e:
         logger.warning("portfolio_deck_unavailable user=%s err=%s", telegram_id, e)
@@ -324,9 +328,9 @@ def _warm_portfolio_snapshot(telegram_id: int) -> None:
         try:
             from src.nadobro.handlers.portfolio_deck import snapshot_for_user
 
-            await snapshot_for_user(telegram_id)
+            await snapshot_for_user(telegram_id, reason="ui")
         except Exception as e:
-            logger.debug("portfolio snapshot warm failed user=%s: %s", telegram_id, e)
+            logger.warning("portfolio snapshot warm failed user=%s: %s", telegram_id, e)
 
     try:
         asyncio.get_running_loop().create_task(_job())
@@ -409,7 +413,12 @@ async def open_home_card_view_from_message(update, context: CallbackContext, tel
         await _edit_or_send_card(update, context, text, kb, prefer_reply_to_message=True)
         return
     text, kb = await resolve_home_view(callback_data, telegram_id)
-    await _edit_or_send_card(update, context, text, kb, prefer_reply_to_message=True)
+    parse_mode = ParseMode.HTML if callback_data == "portfolio:view" else ParseMode.MARKDOWN_V2
+    await _edit_or_send_card(
+        update, context, text, kb,
+        prefer_reply_to_message=True,
+        parse_mode=parse_mode,
+    )
 
 
 async def open_home_card_from_command(update, context: CallbackContext, telegram_id: int):

@@ -113,11 +113,35 @@ def _gateway_circuit_open(network: str) -> bool:
         return False
 
 
-def mark_user_active(user_id: int) -> None:
+def _mark_user_active_write(user_id: int) -> None:
+    execute("UPDATE users SET last_active = now() WHERE telegram_id = %s", (int(user_id),))
+
+
+async def _mark_user_active_async(user_id: int) -> None:
     try:
-        execute("UPDATE users SET last_active = now() WHERE telegram_id = %s", (int(user_id),))
+        await run_blocking_db(_mark_user_active_write, int(user_id))
     except Exception:
         logger.debug("mark_user_active failed user=%s", user_id, exc_info=True)
+
+
+def mark_user_active(user_id: int) -> None:
+    """Touch last_active without blocking a Telegram tap.
+
+    The click path used to ``execute()`` this UPDATE on the event loop. From
+    Tokyo to a distant Postgres that wait is hundreds of ms on a good day and
+    the full connect_timeout (10s) when the pool is tired — which is the
+    3–8s ``callback.total`` the Portfolio button was logging.
+    """
+    uid = int(user_id)
+    try:
+        from src.nadobro.core.async_utils import fire_and_forget
+
+        fire_and_forget(_mark_user_active_async(uid), name=f"mark-active-{uid}")
+    except RuntimeError:
+        try:
+            _mark_user_active_write(uid)
+        except Exception:
+            logger.debug("mark_user_active failed user=%s", uid, exc_info=True)
 
 
 _ACTIVE_USERS_PAGE_SIZE = portfolio_sync_users_per_tick()
@@ -393,9 +417,17 @@ async def sync_user(
             prior = _snapshot_cache.get(key) or {}
             heavy_interval = float(portfolio_heavy_sync_seconds())
             last_heavy = float(prior.get("last_heavy_monotonic", 0))
-            need_heavy = force or str(reason) not in ("poll",) or (
-                time.time() - last_heavy >= heavy_interval
-            )
+            # Tap-path ``ui`` never waits on indexer matches/funding — that
+            # pull is what left Portfolio stuck on Loading for minutes.
+            # ``force`` still bypasses the in-memory age cache so Refresh
+            # hits the engine for positions/orders/equity; the poller fills
+            # the 24h/7d windows on its own cadence.
+            if str(reason) == "ui":
+                need_heavy = False
+            else:
+                need_heavy = force or str(reason) not in ("poll",) or (
+                    time.time() - last_heavy >= heavy_interval
+                )
 
             # The DB write below treats missing live orders as closed, so every
             # authoritative sync must include isolated subaccounts too.

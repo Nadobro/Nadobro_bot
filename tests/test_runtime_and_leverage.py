@@ -76,7 +76,8 @@ class RuntimeAndLeverageTests(unittest.TestCase):
         ):
             text, reply_markup = asyncio.run(home_card._view_portfolio_text(telegram_id=7))
 
-        self.assertIn("Loading portfolio", text)
+        self.assertIn("Portfolio", text)
+        self.assertIn("Refreshing", text)
         self.assertIsNotNone(reply_markup)
         snap.assert_not_called()
 
