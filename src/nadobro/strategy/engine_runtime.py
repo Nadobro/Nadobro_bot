@@ -1538,10 +1538,17 @@ def map_strategy_config(
     # but only reaches ``spread_floor_half_pct``, which this manual-step path never
     # reads. Floor at the real cost so a level cannot complete at a loss; the
     # 5 bp constant the old fallback used was already exactly this round trip.
-    from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
+    # Floored at the MIXED round trip (maker in, taker out), not the maker one:
+    # flooring at the maker round trip only buys break-even, which the cost-aware
+    # backtester measures as net -0.0001 across trend/range/chop — a level that
+    # completes for nothing. The mixed rate is what a level actually risks paying,
+    # because grid exits escalate to a bounded crossing order on the risk path.
+    # Measured net at 5bp: -0.0001 / -0.0004 / -0.0003 (trend/range/chop);
+    # at ~7bp and above: positive in all three. See tests/engine/backtester/.
+    from src.nadobro.quant.vol_fee_estimator import MIXED_ROUND_TRIP_RATE
 
     _user_floor = Decimal(str(max(0.0, _f(settings, "dgrid_min_spread_bp", 0.0)))) / Decimal(10000)
-    _step_floor = max(MAKER_ROUND_TRIP_RATE, _user_floor)
+    _step_floor = max(MIXED_ROUND_TRIP_RATE, _user_floor)
     if spread_frac < _step_floor:
         spread_frac = _step_floor
     span = spread_frac * Decimal(max(levels - 1, 1))
@@ -1579,6 +1586,13 @@ def map_strategy_config(
         # A participation chunk caps the per-cycle ladder notional when active.
         "total_amount_quote": _chunk_dec or Decimal(str(deployed)),
         "min_spread_between_orders": spread_frac,
+        # Carry the mapped step floor so the OVERLAY can honour it. The overlay
+        # scales min_spread_between_orders by up to 0.75x and used to clamp it only
+        # against a stale 1.5bp PER-SIDE constant, so a 6.8bp floored step became
+        # 5.1bp — below the worst-case round trip the floor exists to clear. The
+        # overlay cannot re-derive this (it depends on dgrid_min_spread_bp), so the
+        # value has to travel with the config.
+        "step_floor_pct": _step_floor,
         "max_open_orders": levels,
         "leverage": int(eff_lev),
         # Continuous laddering for the whole GridExecutor family (classic grid

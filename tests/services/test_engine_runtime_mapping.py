@@ -603,21 +603,22 @@ def test_spread_is_per_strategy_user_set():
     )
     assert g["min_spread_between_orders"] == Decimal("9.0") / Decimal(10000)
 
-    # DGRID-FEE-FLOOR: a sub-fee step IS raised, for every ladder strategy. A
-    # completed level earns exactly ``step`` gross against a 5bp resting round
-    # trip, so 3bp would lose money on every fill.
-    from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
+    # DGRID-FEE-FLOOR: a sub-fee step IS raised, for every ladder strategy. The
+    # floor is the MIXED round trip (maker in, taker out = 6.8bp), not the maker
+    # one: flooring at 5bp only buys break-even, which the cost-aware backtester
+    # measures as net -0.0001 across trend/range/chop.
+    from src.nadobro.quant.vol_fee_estimator import MIXED_ROUND_TRIP_RATE
 
     g_thin = map_strategy_config(
         "grid", {"notional_usd": 100.0, "spread_bp": 3.0, "levels": 2, "fill_anchored": 0},
         mid, product="BTC-PERP",
     )
-    assert g_thin["min_spread_between_orders"] == MAKER_ROUND_TRIP_RATE
+    assert g_thin["min_spread_between_orders"] == MIXED_ROUND_TRIP_RATE
     dg_thin = map_strategy_config(
         "dgrid", {"notional_usd": 100.0, "dgrid_spread_bp": 2.0, "levels": 4},
         mid, product="BTC-PERP",
     )
-    assert dg_thin["step_pct"] == MAKER_ROUND_TRIP_RATE
+    assert dg_thin["step_pct"] == MIXED_ROUND_TRIP_RATE
 
 
 def test_min_max_spread_bp_drive_auto_spread_bounds():

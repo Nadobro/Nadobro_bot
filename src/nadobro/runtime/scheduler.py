@@ -9,7 +9,7 @@ from src.nadobro.venue.nado_client import NadoClient
 from src.nadobro.core.async_utils import run_blocking
 from src.nadobro.core.perf import timed_metric
 from src.nadobro.trading.execution_queue import enqueue_alert
-from src.nadobro.users.lowiq_relay_client import relay_poll_interval_seconds
+from src.nadobro.users.lowiq_relay_client import relay_poll_interval_seconds, relay_poll_timeout_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -415,7 +415,14 @@ async def poll_lowiqpts_relay():
         return
     try:
         from src.nadobro.users.points_service import poll_lowiqpts_relay_events
-        await poll_lowiqpts_relay_events(_bot_app)
+
+        # Cap the tick so a hung relay cannot occupy max_instances=1 for the
+        # 210s session-start timeout and skip-warn every 2s.
+        interval = float(relay_poll_interval_seconds())
+        budget = max(0.6, min(interval * 0.9, relay_poll_timeout_seconds() + 0.4))
+        await asyncio.wait_for(poll_lowiqpts_relay_events(_bot_app), timeout=budget)
+    except asyncio.TimeoutError:
+        logger.debug("LOWIQPTS relay poll exceeded %.1fs budget", budget)
     except Exception as e:
         logger.error("LOWIQPTS relay poll failed: %s", e)
 

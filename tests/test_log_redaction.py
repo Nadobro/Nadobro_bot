@@ -7,6 +7,7 @@ from _stubs import install_test_stubs
 install_test_stubs()
 
 from src.nadobro.core.log_redaction import (
+    ApschedulerOverlapFilter,
     RedactingFormatter,
     SensitiveDataRedactFilter,
     redact_sensitive_text,
@@ -128,6 +129,29 @@ class LogRedactionTests(unittest.TestCase):
         # ``fe80::1`` while the new one catches them.
         for text in ("connected fe80::1", "rpc 2001:db8::8a2e:370:7334 ok"):
             self.assertIn("<REDACTED_IPV6>", redact_sensitive_text(text), text)
+
+    def test_apscheduler_overlap_filter_drops_skip_spam(self):
+        filt = ApschedulerOverlapFilter()
+        skip = logging.LogRecord(
+            name="apscheduler.scheduler",
+            level=logging.WARNING,
+            pathname="",
+            lineno=1,
+            msg='Execution of job "poll_lowiqpts_relay (trigger: interval[0:00:02], next run at: 2026-08-13 17:13:52 UTC)" skipped: maximum number of running instances reached (1)',
+            args=(),
+            exc_info=None,
+        )
+        keep = logging.LogRecord(
+            name="apscheduler.scheduler",
+            level=logging.WARNING,
+            pathname="",
+            lineno=1,
+            msg='Run time of job "tick_desk_runner" was missed by 8 seconds',
+            args=(),
+            exc_info=None,
+        )
+        self.assertFalse(filt.filter(skip))
+        self.assertTrue(filt.filter(keep))
 
 
 if __name__ == "__main__":

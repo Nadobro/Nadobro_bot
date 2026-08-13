@@ -18,7 +18,7 @@ from src.nadobro.users.lowiq_relay_client import (
     start_session as relay_start_session,
 )
 from src.nadobro.models.database import get_bot_state, set_bot_state
-from src.nadobro.core.async_utils import run_blocking
+from src.nadobro.core.async_utils import run_blocking_db
 from src.nadobro.users.user_service import get_user
 
 logger = logging.getLogger(__name__)
@@ -340,12 +340,23 @@ def _write_relay_state_sync(state: dict) -> None:
         logger.warning("Failed to persist LOWIQPTS relay state", exc_info=True)
 
 
+def _durable_relay_state(bot_data: dict) -> tuple:
+    """Queue + cursors without heartbeat ``ts`` — used to skip no-op persists."""
+    state = _serialize_relay_state(bot_data)
+    queue = []
+    for req in state.get("queue") or []:
+        row = dict(req)
+        row.pop("ts", None)
+        queue.append(row)
+    return (queue, state.get("cursors") or {})
+
+
 async def _persist_relay_state(bot_data: dict) -> None:
     """Mirror the in-memory pending queue to bot_state so a restart can resume mid-flow."""
     # Serialize on the event loop (no awaits here) so we never iterate bot_data
     # while another coroutine mutates it; hand only the DB write to a worker thread.
     state = _serialize_relay_state(bot_data)
-    await run_blocking(_write_relay_state_sync, state)
+    await run_blocking_db(_write_relay_state_sync, state)
 
 
 def _drop_relay_cursor(bot_data: dict, session_id: str) -> None:
@@ -1124,6 +1135,7 @@ async def poll_lowiqpts_relay_events(bot_app) -> None:
             session_ids.append(sid)
     if not session_ids:
         return
+    before = _durable_relay_state(bot_data)
     for session_id in session_ids:
         cursor_key = f"{_RELAY_CURSOR_KEY}:{session_id}"
         cursor = bot_data.get(cursor_key)
@@ -1154,7 +1166,11 @@ async def poll_lowiqpts_relay_events(bot_app) -> None:
             except Exception:
                 logger.warning("Failed to finalize dead LOWIQPTS session", exc_info=True)
 
-    await _persist_relay_state(bot_data)
+    # Heartbeat only updates in-memory ``ts``. Writing bot_state every 2s from
+    # nrt to a distant Postgres was enough to hold the poll slot past its
+    # interval and starve desk/sync ticks. Persist when queue or cursors change.
+    if _durable_relay_state(bot_data) != before:
+        await _persist_relay_state(bot_data)
 
 
 async def _on_points_refresh_timeout(context) -> None:

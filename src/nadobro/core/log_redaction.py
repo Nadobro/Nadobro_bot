@@ -125,6 +125,22 @@ class SensitiveDataRedactFilter(logging.Filter):
         return True
 
 
+class ApschedulerOverlapFilter(logging.Filter):
+    """Drop APScheduler max_instances skip warnings.
+
+    Short-tick jobs (LOWIQPTS 2s poll, desk 5s, alerts 5s) use ``max_instances=1``
+    + coalesce, so overlap is expected. Logging each skip at WARNING drowned
+    production on 2026-08-13 (poll held the slot while the AMS relay lagged).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return "maximum number of running instances reached" not in msg
+
+
 class RedactingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         return redact_sensitive_text(super().format(record))

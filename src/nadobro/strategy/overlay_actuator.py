@@ -29,6 +29,10 @@ from typing import Dict, Mapping, Optional, Tuple
 
 from src.nadobro.core.feature_flags import env_flag
 from src.nadobro.llm.signal_engine import Signal
+from src.nadobro.quant.vol_fee_estimator import (
+    MAKER_ROUND_TRIP_RATE,
+    MIXED_ROUND_TRIP_RATE,
+)
 
 OVERLAY_STRATEGIES = ("grid", "rgrid", "dgrid", "mid")
 
@@ -56,8 +60,18 @@ OVERLAY_DRAWDOWN_CAP_PCT = 10.0
 # leverage/exposure caps + session rails remain the hard limits downstream.
 _SIZE_LO, _SIZE_HI = 0.5, 1.25
 _SPREAD_LO, _SPREAD_HI = 0.75, 3.0
-# Per-side spread can never quote through this fee-clearing floor.
-_SPREAD_FLOOR_FRACTION = Decimal("0.00015")
+# Per-SIDE spread can never quote through this fee-clearing floor. A round trip
+# captures two half-spreads and pays the maker round trip (builder included), so the
+# per-side floor is half of it. The old 1.5bp literal predated the MANDATORY 1bp
+# builder leg, and let the overlay quote a 3bp round trip against a 5bp cost.
+_SPREAD_FLOOR_FRACTION = MAKER_ROUND_TRIP_RATE / Decimal(2)   # 2.5 bp
+# Per-LEVEL step floor. DIFFERENT QUANTITY, and conflating the two was the bug:
+# ``min_spread_between_orders`` is a whole round trip (a level's close leg sits one
+# step from its open leg), not a half, so clamping it against the per-side floor let
+# a 6.8bp mapped step be scaled to 5.1bp — under the cost it was floored to clear.
+# Overridden per-config by ``step_floor_pct`` when the mapper supplies it, since a
+# user's dgrid_min_spread_bp can raise the floor above this default.
+_STEP_FLOOR_FRACTION = MIXED_ROUND_TRIP_RATE                  # 6.8 bp
 
 
 def overlay_enabled() -> bool:
@@ -203,6 +217,26 @@ APPLIED_OVERRIDE_KEYS = (
 )
 
 
+def _floor_from(configs: Mapping[str, object], key: str, default: Decimal) -> Decimal:
+    """``max(mapped floor, fee-derived floor)`` — the mapped value may only RAISE it.
+
+    A user's ``dgrid_min_spread_bp`` legitimately raises the step floor above the fee
+    minimum, and the overlay cannot re-derive that, so the mapping layer ships it.
+    But the mapped floor must never LOWER the fee floor: mid's ``min_spread_bp``
+    defaults to 1.5bp (and its registry default of -10 resolves to 0), which predates
+    the mandatory 1bp builder leg — preferring it would let the overlay quote a 3bp
+    round trip against a 5bp cost, which is the defect this guard exists to stop.
+    """
+    raw = configs.get(key)
+    if raw is None:
+        return default
+    try:
+        val = Decimal(str(raw))
+    except Exception:  # noqa: BLE001 - unparseable floor: fall back to the default
+        return default
+    return max(val, default)
+
+
 def _mul_dec(configs: Dict[str, object], key: str, factor: float) -> bool:
     val = configs.get(key)
     if val is None:
@@ -233,12 +267,22 @@ def apply_overrides_to_configs(
 
     spread_factor = float(overrides.get("spread_factor", 1.0) or 1.0)
     if abs(spread_factor - 1.0) > 1e-9:
-        for key in ("spread_bid_pct", "spread_ask_pct", "min_spread_between_orders"):
+        # Each key gets the floor for ITS OWN quantity: the bid/ask keys are HALF
+        # spreads, min_spread_between_orders is a whole per-level round trip. Prefer
+        # the floors the mapper computed (they can be raised by user settings) and
+        # fall back to the fee-derived defaults.
+        _side_floor = _floor_from(configs, "spread_floor_half_pct", _SPREAD_FLOOR_FRACTION)
+        _step_floor = _floor_from(configs, "step_floor_pct", _STEP_FLOOR_FRACTION)
+        for key, floor in (
+            ("spread_bid_pct", _side_floor),
+            ("spread_ask_pct", _side_floor),
+            ("min_spread_between_orders", _step_floor),
+        ):
             if key in configs and _mul_dec(configs, key, spread_factor):
                 # Never quote through the fee floor.
                 try:
-                    if Decimal(str(configs[key])) < _SPREAD_FLOOR_FRACTION:
-                        configs[key] = _SPREAD_FLOOR_FRACTION
+                    if Decimal(str(configs[key])) < floor:
+                        configs[key] = floor
                 except Exception:  # noqa: BLE001
                     pass
                 changed[key] = str(configs[key])
