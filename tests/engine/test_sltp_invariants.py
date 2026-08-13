@@ -645,16 +645,16 @@ def test_a_grid_level_round_trip_can_never_complete_at_a_loss(strategy, spread_b
     this floor should invent. ``dgrid_min_spread_bp`` still raises the floor when
     the user sets it higher.
     """
-    from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
+    from src.nadobro.quant.vol_fee_estimator import MIXED_ROUND_TRIP_RATE
 
     cfg = map_strategy_config(
         strategy, {"dgrid_spread_bp": spread_bp, "spread_bp": spread_bp},
         MID, product=PRODUCT,
     )
     step = Decimal(str(cfg.get("step_pct") or cfg.get("min_spread_between_orders") or 0))
-    assert step >= MAKER_ROUND_TRIP_RATE, (
+    assert step >= MIXED_ROUND_TRIP_RATE, (
         f"{strategy} level round trip {step * 10000:.2f}bp is under the "
-        f"{MAKER_ROUND_TRIP_RATE * 10000:.2f}bp fee round trip — every completed "
+        f"{MIXED_ROUND_TRIP_RATE * 10000:.2f}bp worst-case round trip — a completed "
         "level loses money"
     )
 

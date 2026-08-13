@@ -46,6 +46,17 @@ DEFAULT_MAKER_FEE_RATE = Decimal("0.00015")        # 1.5 bp (matches SimCosts.ma
 # sits closer than this to its open leg LOSES money every time it completes, which
 # is DGRID-FEE-FLOOR (the shipped "Spread 2bp" preset was under it).
 MAKER_ROUND_TRIP_RATE = (DEFAULT_MAKER_FEE_RATE + DEFAULT_BUILDER_FEE_RATE) * Decimal(2)  # 5.0 bp
+# Worst REALISTIC round trip for a ladder level: rest the open (maker), but pay
+# taker on the way out. Not pessimism — grid/rgrid exits escalate to a bounded
+# CROSSING order on the risk path (_EXIT_CROSS_BP), and the venue can convert a
+# post-only to a taker fill. This is the floor a per-level step must clear for a
+# completed level to actually EARN something: flooring at MAKER_ROUND_TRIP_RATE
+# only guarantees break-even, which the cost-aware backtester measures as net
+# -0.0001 across trend/range/chop — a zero-edge grid that trades for nothing.
+MIXED_ROUND_TRIP_RATE = (
+    (DEFAULT_MAKER_FEE_RATE + DEFAULT_BUILDER_FEE_RATE)
+    + (DEFAULT_SPOT_TAKER_FEE_RATE + DEFAULT_BUILDER_FEE_RATE)
+)  # 6.8 bp
 
 # Product decision (2026-07-31): the spot volume bot sizes each cycle inside
 # this band. Enforced in the UI (buttons + custom input) and re-checked here so

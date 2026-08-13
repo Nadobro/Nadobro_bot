@@ -49,8 +49,21 @@ def _permissive_limits() -> RiskLimits:
 
 
 def _candle_to_dict(c: Candle) -> dict:
+    """Shape a sim candle like the LIVE feed's, so routines behave identically.
+
+    ``"time"`` is load-bearing and was missing. ``venue/nado_client`` keys the live
+    candle dicts ``"time"``, and ``routines/technical_analysis.chronological()`` —
+    the CANDLE-ORDER guard that ``variance_regime`` and ``regime_gate`` run before
+    classifying a regime — sorts on ``"time"`` and returns input order untouched
+    when it finds none. Emitting only ``"ts"`` therefore made that guard a silent
+    no-op in every backtest: the harness could not reproduce a newest-first candle
+    bug (the exact defect the 2026-08 R-Grid work fixed), and its dicts diverged
+    from the contract every controller reads live. Nothing in src/ consumes ``"ts"``
+    from a candle dict; it is kept only so an external caller cannot break.
+    """
     return {
-        "ts": c.ts, "open": c.open, "high": c.high, "low": c.low,
+        "time": c.ts, "ts": c.ts,
+        "open": c.open, "high": c.high, "low": c.low,
         "close": c.close, "volume": c.volume,
     }
 
@@ -73,7 +86,22 @@ class BacktestEngine:
         if not candles:
             raise ValueError("backtest requires at least one candle")
         self.strategy = strategy
+        # A newest-first tape used to run the whole backtest BACKWARDS with no error
+        # and no warning — every drift, EMA and trend read inverted, producing a
+        # confident, meaningless report. Only candles_from_ohlc sorted; a caller
+        # assembling candles by hand (or slicing a live newest-first response) got
+        # silent garbage. Sort here and say so loudly, rather than trusting callers.
         self.candles = list(candles)
+        if any(
+            self.candles[i].ts < self.candles[i - 1].ts
+            for i in range(1, len(self.candles))
+        ):
+            logger.warning(
+                "backtest candles were not chronological (%d bars) — sorting ascending "
+                "by ts; a newest-first tape would otherwise run the tape backwards",
+                len(self.candles),
+            )
+            self.candles.sort(key=lambda c: c.ts)
         self.user_id = user_id
         self.controller_id = controller_id
         self.adapter = SimNadoAdapter(costs=costs, meta=meta)
@@ -87,7 +115,16 @@ class BacktestEngine:
         # regime gate / dgrid variance classifier have data to work with.
         self._idx = 0
         cfg = dict(configs)
-        cfg.setdefault("candle_provider", self._candle_provider)
+        # setdefault is NOT enough: map_strategy_config ships the key PRESENT with
+        # value None as a placeholder for the live injection in run_engine_cycle
+        # (engine_runtime dgrid branch + the mm defaults block). So setdefault never
+        # fired, dgrid's _candles() returned [], and it logged "no candles ... cannot
+        # classify regime" and HELD whatever phase it started in for the whole run —
+        # every dgrid backtest ever produced by this harness measured a stuck-phase
+        # ladder, not the phase switcher. Same present-but-None trap as the disarmed
+        # SL/TP barrier: a key that exists with a null value is still absent.
+        if cfg.get("candle_provider") is None:
+            cfg["candle_provider"] = self._candle_provider
         from src.nadobro.strategy.engine_runtime import build_controller
 
         self.controller = build_controller(

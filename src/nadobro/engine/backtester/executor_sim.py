@@ -18,6 +18,12 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from decimal import Decimal
+
+from src.nadobro.quant.vol_fee_estimator import (
+    DEFAULT_BUILDER_FEE_RATE,
+    DEFAULT_MAKER_FEE_RATE,
+    DEFAULT_SPOT_TAKER_FEE_RATE,
+)
 from typing import AsyncIterator, Dict, List, Optional
 
 from src.nadobro.engine.adapter.base import (
@@ -41,8 +47,16 @@ class SimCosts:
     funding fraction charged/earned each candle on the held notional (a short
     EARNS it when positive — longs pay shorts)."""
 
-    taker_fee: Decimal = Decimal("0.00045")
-    maker_fee: Decimal = Decimal("0.00015")
+    # ALL-IN per-side rates: the venue's own fee PLUS the 1bp builder routing that
+    # policy locks on to every order. The previous defaults carried the base rates
+    # only, so a maker round trip modelled 3bp against a real 5bp
+    # (quant.vol_fee_estimator.MAKER_ROUND_TRIP_RATE) — understating maker cost by
+    # 40%, and by exactly the margin that decides whether a tight grid step is
+    # profitable. Every "net of fees" figure this harness produced was optimistic.
+    # Sourced from the canonical constants so the sim cannot drift from the mapper's
+    # fee floor again.
+    taker_fee: Decimal = DEFAULT_SPOT_TAKER_FEE_RATE + DEFAULT_BUILDER_FEE_RATE   # 4.3bp
+    maker_fee: Decimal = DEFAULT_MAKER_FEE_RATE + DEFAULT_BUILDER_FEE_RATE        # 2.5bp
     slippage_pct: Decimal = Decimal("0.0005")
     funding_rate_per_bar: Decimal = Decimal("0.0")
 
