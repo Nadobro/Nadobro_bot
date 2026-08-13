@@ -676,3 +676,64 @@ def test_dgrid_min_spread_bp_now_raises_the_step_floor():
     )
     step = Decimal(str(cfg.get("step_pct") or cfg.get("min_spread_between_orders") or 0))
     assert step == Decimal("0.0012"), f"dgrid_min_spread_bp ignored (step={step})"
+
+
+# ==========================================================================
+# OVERLAY-UNDOES-STEP-FLOOR (audit 2026-08-13, FIXED)
+# ==========================================================================
+@pytest.mark.parametrize("strategy", ["grid", "dgrid"])
+def test_the_overlay_can_never_shrink_a_level_step_below_the_round_trip(strategy):
+    """The mapper floors the per-level step at the worst-case round trip (6.8bp),
+    but the overlay then scales spread keys by as little as 0.75x and clamped the
+    result against a stale 1.5bp PER-SIDE constant — so a floored 6.8bp step became
+    5.1bp, under the very cost the floor exists to clear. The mapped floor now
+    travels in ``step_floor_pct`` and the step is clamped against ITS OWN quantity
+    (a whole round trip) rather than a half-spread.
+    """
+    from src.nadobro.quant.vol_fee_estimator import MIXED_ROUND_TRIP_RATE
+    from src.nadobro.strategy.overlay_actuator import apply_overrides_to_configs
+
+    cfg = map_strategy_config(
+        strategy, {"notional_usd": 100, "leverage": 5, "spread_bp": 2.0,
+                   "dgrid_spread_bp": 2.0, "levels": 4, "fill_anchored": 0},
+        MID, product=PRODUCT,
+    )
+    apply_overrides_to_configs(strategy, cfg, {"spread_factor": 0.75})
+
+    step = cfg.get("min_spread_between_orders")
+    assert step is not None
+    assert Decimal(str(step)) >= MIXED_ROUND_TRIP_RATE, (
+        f"{strategy}: overlay shrank the level step to {Decimal(str(step)) * 10000:.2f}bp, "
+        f"under the {MIXED_ROUND_TRIP_RATE * 10000:.2f}bp round trip it must clear"
+    )
+
+
+def test_the_overlay_respects_a_user_raised_step_floor():
+    """dgrid_min_spread_bp can raise the floor above the fee minimum; the overlay
+    must honour that too, which is why the mapper ships the resolved value."""
+    from src.nadobro.strategy.overlay_actuator import apply_overrides_to_configs
+
+    cfg = map_strategy_config(
+        "dgrid", {"notional_usd": 100, "leverage": 5, "dgrid_spread_bp": 20.0,
+                  "dgrid_min_spread_bp": 18.0, "levels": 4},
+        MID, product=PRODUCT,
+    )
+    apply_overrides_to_configs("dgrid", cfg, {"spread_factor": 0.75})
+    assert Decimal(str(cfg["min_spread_between_orders"])) >= Decimal("0.0018")
+
+
+def test_the_overlay_can_never_quote_a_side_through_the_fee_floor():
+    """The per-SIDE floor was also stale: 1.5bp predated the mandatory 1bp builder
+    leg, so the overlay could quote a 3bp round trip against a 5bp cost."""
+    from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
+    from src.nadobro.strategy.overlay_actuator import apply_overrides_to_configs
+
+    cfg = map_strategy_config(
+        "mid", {"notional_usd": 100, "spread_bp": 2.0}, MID, product=PRODUCT,
+    )
+    apply_overrides_to_configs("mid", cfg, {"spread_factor": 0.75})
+    half = MAKER_ROUND_TRIP_RATE / Decimal(2)
+    for key in ("spread_bid_pct", "spread_ask_pct"):
+        assert Decimal(str(cfg[key])) >= half, (
+            f"{key} quoted through the per-side fee floor"
+        )

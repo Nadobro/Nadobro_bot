@@ -1586,6 +1586,13 @@ def map_strategy_config(
         # A participation chunk caps the per-cycle ladder notional when active.
         "total_amount_quote": _chunk_dec or Decimal(str(deployed)),
         "min_spread_between_orders": spread_frac,
+        # Carry the mapped step floor so the OVERLAY can honour it. The overlay
+        # scales min_spread_between_orders by up to 0.75x and used to clamp it only
+        # against a stale 1.5bp PER-SIDE constant, so a 6.8bp floored step became
+        # 5.1bp — below the worst-case round trip the floor exists to clear. The
+        # overlay cannot re-derive this (it depends on dgrid_min_spread_bp), so the
+        # value has to travel with the config.
+        "step_floor_pct": _step_floor,
         "max_open_orders": levels,
         "leverage": int(eff_lev),
         # Continuous laddering for the whole GridExecutor family (classic grid
