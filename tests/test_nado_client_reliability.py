@@ -246,6 +246,30 @@ class NadoClientReliabilityTests(unittest.TestCase):
         # The class-level default also protects raw ``__new__`` instances.
         self.assertIsNone(NadoClient.__new__(NadoClient).acting_user_id)
 
+    def test_get_market_price_cache_only_never_queries(self):
+        import src.nadobro.venue.nado_client as nc
+
+        client = NadoClient.from_address("0x" + "a" * 40, network="mainnet")
+        client._initialized = True
+        engine = SimpleNamespace(get_market_price=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("gateway")))
+        client.client = SimpleNamespace(context=SimpleNamespace(engine_client=engine))
+        with nc._caches_lock:
+            nc._price_cache.clear()
+        self.assertEqual(client.get_market_price(2, cache_only=True), {"bid": 0, "ask": 0, "mid": 0})
+        with nc._caches_lock:
+            nc._price_cache["mainnet:2"] = {"data": {"bid": 1, "ask": 3, "mid": 2}, "ts": 0}
+        self.assertEqual(client.get_market_price(2, cache_only=True)["mid"], 2)
+
+    def test_get_funding_rate_cache_only_never_queries(self):
+        import src.nadobro.venue.nado_client as nc
+
+        client = NadoClient.from_address("0x" + "b" * 40, network="mainnet")
+        client.get_perp_funding_rates = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("indexer"))
+        with nc._caches_lock:
+            nc._FUNDING_CACHE.clear()
+        self.assertEqual(client.get_all_funding_rates(cache_only=True), {})
+        self.assertIsNone(client.get_funding_rate(4, cache_only=True))
+
     def test_get_all_market_prices_serves_cache_without_fanout_when_blocked(self):
         """Regression (gateway contract): when the batched ``market_prices``
         request is unavailable AND the gateway is throttling/blocked, callers

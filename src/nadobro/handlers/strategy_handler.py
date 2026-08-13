@@ -138,12 +138,8 @@ def _strategy_available_products(strategy_id: str, network: str, vol_market: str
 
 
 # F6 (Phase 5 audit): tiny per-process TTL cache for ``client.get_balance()``.
-# A strategy preview render calls _build_strategy_preview_text and (for MM
-# strategies) _append_mm_pretrade_breakdown back-to-back via run_blocking; both
-# need the wallet balance and previously hit the SDK twice. Cache TTL is small
-# (3s) so balance changes still propagate quickly. Race-safe under asyncio:
-# Python dict ops are atomic at the GIL level, and a duplicate concurrent fetch
-# is idempotent.
+# Preview + MM breakdown share this so they don't each hit the SDK. Click-path
+# reads are cache_only; a miss warms the cache off-thread.
 _BALANCE_CACHE_TTL_SECONDS = 3.0
 # Moved from callbacks.py with _cached_user_balance: the extraction's AST
 # mover collected Assign nodes but not AnnAssign, so this annotated dict
@@ -160,7 +156,14 @@ def _cached_user_balance(telegram_id: int) -> dict:
     bal: dict = {}
     if client:
         try:
-            bal = client.get_balance() or {}
+            # Click path: never block a preview tap on get_subaccount_info.
+            # Warm the cache off-thread so the next render is fresh.
+            bal = client.get_balance(cache_only=True) or {}
+            if bal.get("pending"):
+                from src.nadobro.handlers.home_card import _warm_balance_async
+
+                _warm_balance_async(client)
+                return {}
         except Exception:
             bal = {}
     _balance_cache[int(telegram_id)] = (now, bal)
@@ -491,22 +494,12 @@ async def _handle_strategy(query, data, context, telegram_id):
             context.user_data[f"strategy_pair:{strategy_id}"] = selected_product
         vkb_prev = _vol_market_pref(context) if strategy_id == "vol" else None
         with timed_metric("cb.strategy.preview"):
-            preview_text = await run_blocking(
-                _build_strategy_preview_text,
+            preview_text, mid_bias = await run_blocking(
+                _render_strategy_preview_card,
                 telegram_id,
                 strategy_id,
                 selected_product,
                 vkb_prev,
-            )
-        # Phase 3: append Tread-style breakdown for MM strategies. Built off the
-        # mm_dashboard module so the pre-trade card and /mm_status share math.
-        if strategy_id in ("grid", "rgrid", "dgrid", "mid"):
-            preview_text = await run_blocking(
-                _append_mm_pretrade_breakdown,
-                telegram_id,
-                strategy_id,
-                selected_product,
-                preview_text,
             )
         bot_status = get_user_bot_status(telegram_id) or {}
         is_running = bool(
@@ -514,10 +507,6 @@ async def _handle_strategy(query, data, context, telegram_id):
             and str(bot_status.get("strategy") or "").lower() == strategy_id
         )
         vkb = _vol_market_pref(context) if strategy_id == "vol" else "perp"
-        mid_bias = (
-            await run_blocking(_mid_bias_value, telegram_id)
-            if strategy_id == "mid" else None
-        )
         await _edit_loc(query,
             preview_text,
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -573,20 +562,12 @@ async def _handle_strategy(query, data, context, telegram_id):
         context.user_data[f"strategy_pair:{strategy_id}"] = selected_product
         vkb_pair = _vol_market_pref(context) if strategy_id == "vol" else None
         with timed_metric("cb.strategy.preview"):
-            preview_text = await run_blocking(
-                _build_strategy_preview_text,
+            preview_text, mid_bias = await run_blocking(
+                _render_strategy_preview_card,
                 telegram_id,
                 strategy_id,
                 selected_product,
                 vkb_pair,
-            )
-        if strategy_id in ("grid", "rgrid", "dgrid", "mid"):
-            preview_text = await run_blocking(
-                _append_mm_pretrade_breakdown,
-                telegram_id,
-                strategy_id,
-                selected_product,
-                preview_text,
             )
         bot_status = get_user_bot_status(telegram_id) or {}
         is_running = bool(
@@ -594,10 +575,6 @@ async def _handle_strategy(query, data, context, telegram_id):
             and str(bot_status.get("strategy") or "").lower() == strategy_id
         )
         vkb = _vol_market_pref(context) if strategy_id == "vol" else "perp"
-        mid_bias = (
-            await run_blocking(_mid_bias_value, telegram_id)
-            if strategy_id == "mid" else None
-        )
         await _edit_loc(query,
             preview_text,
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -2738,11 +2715,8 @@ def _build_bro_preview_text(telegram_id: int) -> str:
     client = get_user_readonly_client(telegram_id)
     if client:
         try:
-            bal = client.get_balance()
-            if bal and bal.get("exists"):
-                available_margin = float((bal.get("balances", {}) or {}).get(0, 0) or 0)
-                if available_margin == 0:
-                    available_margin = float((bal.get("balances", {}) or {}).get("0", 0) or 0)
+            bal = _cached_user_balance(telegram_id)
+            available_margin = _wallet_collateral_usd_from_balance(bal)
         except Exception:
             pass
 
@@ -2756,7 +2730,7 @@ def _build_bro_preview_text(telegram_id: int) -> str:
         status_emoji = "🟠"
         status_label = "READY"
 
-    wallet_ready, _wallet_msg = ensure_active_wallet_ready(telegram_id)
+    wallet_ready, _wallet_msg = ensure_active_wallet_ready(telegram_id, verify_on_chain=False)
     wallet_info = get_user_wallet_info(telegram_id, verify_signer=False) or {}
     wallet_addr = str(wallet_info.get("active_address") or "")
     wallet_short = "N/A"
@@ -2804,6 +2778,24 @@ def _build_bro_preview_text(telegram_id: int) -> str:
     )
 
 
+def _render_strategy_preview_card(
+    telegram_id: int,
+    strategy_id: str,
+    product: str,
+    vol_market: str | None = None,
+) -> tuple[str, float | None]:
+    """One worker hop for the whole preview card (text + MM breakdown + mid bias).
+
+    Previously this was two or three sequential ``run_blocking`` calls, each
+    paying thread-pool queue time on a starved event loop.
+    """
+    text = _build_strategy_preview_text(telegram_id, strategy_id, product, vol_market)
+    if strategy_id in ("grid", "rgrid", "dgrid", "mid"):
+        text = _append_mm_pretrade_breakdown(telegram_id, strategy_id, product, text)
+    mid_bias = _mid_bias_value(telegram_id) if strategy_id == "mid" else None
+    return text, mid_bias
+
+
 def _append_mm_pretrade_breakdown(
     telegram_id: int,
     strategy_id: str,
@@ -2839,7 +2831,9 @@ def _append_mm_pretrade_breakdown(
             try:
                 pid = get_product_id(product, network=network)
                 if pid is not None:
-                    pair_volume = get_pair_24h_volume_usd(network=network, product_id=int(pid))
+                    pair_volume = get_pair_24h_volume_usd(
+                        network=network, product_id=int(pid), cache_only=True
+                    )
             except Exception:
                 pair_volume = None
         breakdown = mm_dashboard.build_pretrade_breakdown(
@@ -2924,7 +2918,9 @@ def _build_strategy_preview_text(
     def _fmt_usd(value: float) -> str:
         return f"${value:,.2f}"
 
-    dn_pair = get_dn_pair(product, network=network, client=client) if strategy_id == "dn" else {}
+    # Don't pass the SDK client into catalog lookups — a cold catalog would
+    # fetch on this tap. Cached/static is enough for the preview card.
+    dn_pair = get_dn_pair(product, network=network) if strategy_id == "dn" else {}
     if client:
         try:
             user = get_user(telegram_id)
@@ -2932,16 +2928,16 @@ def _build_strategy_preview_text(
             vm_prev = str(vol_market or "perp").strip().lower() if strategy_id == "vol" else "perp"
             if strategy_id == "vol" and vm_prev == "spot":
                 sym = normalize_volume_spot_symbol(product)
-                pid = get_spot_product_id(sym, network=network, client=client)
+                pid = get_spot_product_id(sym, network=network)
             else:
-                pid = get_product_id(product, network=network, client=client)
+                pid = get_product_id(product, network=network)
             if pid is not None:
-                mp = client.get_market_price(pid)
+                mp = client.get_market_price(pid, cache_only=True)
                 mid = float(mp.get("mid", 0) or 0.0)
                 if strategy_id == "vol" and vm_prev == "spot":
                     funding_rate = 0.0
                 else:
-                    fr = client.get_funding_rate(pid) or {}
+                    fr = client.get_funding_rate(pid, cache_only=True) or {}
                     funding_rate = float(fr.get("funding_rate", 0) or 0.0)
         except Exception:
             pass
@@ -2965,7 +2961,7 @@ def _build_strategy_preview_text(
         status_emoji = "🟠"
         status_label = "READY"
 
-    wallet_ready, _wallet_msg = ensure_active_wallet_ready(telegram_id)
+    wallet_ready, _wallet_msg = ensure_active_wallet_ready(telegram_id, verify_on_chain=False)
     wallet_info = get_user_wallet_info(telegram_id, verify_signer=False) or {}
     wallet_addr = str(wallet_info.get("active_address") or "")
     wallet_short = "N/A"
@@ -3009,8 +3005,10 @@ def _build_strategy_preview_text(
                 telegram_id, strategy=strategy_id, network=network, limit=1
             )
             if _runs:
+                # client=None: use the DB position row. A live venue read on
+                # a stale row is what made opening a strategy hang the tap.
                 _snap = get_live_session_snapshot(
-                    telegram_id, network, _runs[0], state=conf, client=client
+                    telegram_id, network, _runs[0], state=conf, client=None
                 )
                 session_volume = float(_snap.get("volume") or 0.0)
                 session_fees = float(_snap.get("fees") or 0.0)

@@ -44,21 +44,41 @@ class RuntimeAndLeverageTests(unittest.TestCase):
         asyncio.run(_run())
 
     def test_portfolio_view_handles_snapshot_failures(self):
-        # ``build_portfolio_view`` was retired in the portfolio deck redesign
-        # (2026-05); the deck path (_view_portfolio_text -> snapshot_for_user)
-        # must degrade to the "temporarily unavailable" card when the
-        # snapshot fails, instead of raising into the handler.
-        from src.nadobro.handlers import portfolio_deck
+        # Click path no longer awaits snapshot_for_user. A boom on the cache
+        # read still degrades to the unavailable card instead of raising.
+        from src.nadobro.venue import nado_sync
 
         with patch.object(
-            portfolio_deck,
-            "snapshot_for_user",
-            AsyncMock(side_effect=RuntimeError("boom")),
+            home_card,
+            "get_user",
+            return_value=SimpleNamespace(network_mode=SimpleNamespace(value="mainnet")),
+        ), patch.object(nado_sync, "mark_user_active"), patch.object(
+            nado_sync, "get_cached_snapshot", side_effect=RuntimeError("boom")
         ):
             text, reply_markup = asyncio.run(home_card._view_portfolio_text(telegram_id=7))
 
         self.assertIn("Can't pull your portfolio right now", text)
         self.assertIsNotNone(reply_markup)
+
+    def test_portfolio_view_cache_miss_does_not_await_venue(self):
+        from src.nadobro.venue import nado_sync
+        from src.nadobro.handlers import portfolio_deck
+
+        snap = AsyncMock()
+        with patch.object(
+            home_card,
+            "get_user",
+            return_value=SimpleNamespace(network_mode=SimpleNamespace(value="mainnet")),
+        ), patch.object(nado_sync, "mark_user_active"), patch.object(
+            nado_sync, "get_cached_snapshot", return_value=None
+        ), patch.object(portfolio_deck, "snapshot_for_user", snap), patch.object(
+            home_card, "_warm_portfolio_snapshot"
+        ):
+            text, reply_markup = asyncio.run(home_card._view_portfolio_text(telegram_id=7))
+
+        self.assertIn("Loading portfolio", text)
+        self.assertIsNotNone(reply_markup)
+        snap.assert_not_called()
 
     def test_resolve_home_view_uses_new_portfolio_deck_path(self):
         view_mock = AsyncMock(return_value=("portfolio", "keyboard"))
