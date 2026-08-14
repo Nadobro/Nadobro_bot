@@ -192,6 +192,7 @@ def fmt_bro_answer_card(
         "educational_guide": "Trading Guide",
         "debugging": "Debug Desk",
         "market_analysis": "Market Read",
+        "market_call": "Market Call",
         "product_support": "Nadobro Help",
         "casual": "Trading Bro",
         "morning_brief": "Morning Brief",

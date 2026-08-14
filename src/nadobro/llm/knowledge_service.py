@@ -1137,8 +1137,33 @@ def _extract_market_product(question: str, network: str = "mainnet") -> str | No
     return None
 
 
+def _should_direct_price_brief(question: str) -> bool:
+    """Quote-only lookup on the RAW user text — never the Trading Bro frame.
+
+    Chart/predict questions must not hit the stats template (the ETH 4h bug).
+    """
+    from src.nadobro.llm.conversation_intent import classify_conversation_intent
+
+    routed = _question_for_routing(question)
+    return classify_conversation_intent(routed).name == "quote"
+
+
+def _resolve_quote_symbol(question: str, network: str) -> str | None:
+    routed = _question_for_routing(question)
+    product = _extract_market_product(routed, network=network)
+    if product:
+        return product
+    try:
+        from src.nadobro.market_data.asset_resolver import resolve_asset
+
+        asset = resolve_asset(routed, network=network)
+        return asset.symbol or None
+    except Exception:
+        return None
+
+
 def _is_market_stats_question(question: str) -> bool:
-    q = _normalize_question(question)
+    q = _normalize_question(_question_for_routing(question))
     stat_signals = (
         "price", "funding", "volume", "24h", "stats", "statistic",
         "open interest", "oi", "bid", "ask", "spread", "mark", "index",
@@ -1147,7 +1172,7 @@ def _is_market_stats_question(question: str) -> bool:
 
 
 def _requested_market_fields(question: str) -> set[str]:
-    q = _normalize_question(question)
+    q = _normalize_question(_question_for_routing(question))
     generic_full_signals = ("stats", "statistic", "overview", "snapshot", "all", "everything")
     if any(sig in q for sig in generic_full_signals):
         return set()
@@ -1176,14 +1201,12 @@ def _execute_price_brief(
     network: str = "mainnet",
     requested_fields: set[str] | None = None,
 ) -> tuple[str, list[str]]:
-    from src.nadobro.config import get_product_id, get_perp_products
-    from src.nadobro.venue.nado_client import NadoClient
+    from src.nadobro.config import get_product_id
 
     symbol = (product or "").strip().upper().replace("-PERP", "")
     product_id = get_product_id(symbol, network=network)
     if product_id is None:
-        supported = get_perp_products(network=network)
-        return f"[PRICE BRIEF] Unknown asset '{product}'. Supported: {', '.join(supported)}", []
+        return _execute_offvenue_quote(symbol)
 
     mid = None
     bid = 0.0
@@ -1196,6 +1219,7 @@ def _execute_price_brief(
     high_24h = None
     low_24h = None
     change_24h = None
+    client = None
     try:
         # NO_ORDERS_AUDIT-FIX-R6b: route through the digest-keyed cache.
         from src.nadobro.venue.nado_client import get_or_create_readonly_client
@@ -1215,6 +1239,29 @@ def _execute_price_brief(
     except Exception as e:
         logger.warning("Price brief live price fetch failed for %s: %s", symbol, e)
 
+    if client is not None and any(
+        v is None for v in (volume_24h_usd, high_24h, low_24h, change_24h)
+    ):
+        try:
+            from src.nadobro.llm.market_intel import enrich_from_candles
+
+            candles = client.get_candlesticks(int(product_id), "1h", 24) or []
+            filled = enrich_from_candles(
+                {
+                    "volume_24h_usd": volume_24h_usd,
+                    "high_24h": high_24h,
+                    "low_24h": low_24h,
+                    "change_24h_pct": change_24h,
+                },
+                candles,
+            )
+            volume_24h_usd = filled.get("volume_24h_usd")
+            high_24h = filled.get("high_24h")
+            low_24h = filled.get("low_24h")
+            change_24h = filled.get("change_24h_pct")
+        except Exception as e:
+            logger.debug("Price brief candle enrich failed for %s: %s", symbol, e)
+
     cmc_sources = []
     if _is_cmc_available():
         try:
@@ -1223,11 +1270,18 @@ def _execute_price_brief(
             row = data.get(symbol) or {}
             quote_usd = ((row.get("quote") or {}).get("USD") or {})
             if change_24h is None:
-                raw_change = quote_usd.get("percent_change_24h")
+                raw_change = row.get("change_24h")
+                if raw_change is None:
+                    raw_change = quote_usd.get("percent_change_24h")
                 if raw_change is not None:
                     change_24h = float(raw_change)
-            if (mid is None or mid <= 0) and quote_usd.get("price") is not None:
-                mid = float(quote_usd.get("price"))
+            cmc_px = row.get("price")
+            if cmc_px is None:
+                cmc_px = quote_usd.get("price")
+            if (mid is None or mid <= 0) and cmc_px is not None:
+                mid = float(cmc_px)
+            if volume_24h_usd is None and row.get("volume_24h") is not None:
+                volume_24h_usd = float(row.get("volume_24h"))
             cmc_sources = ["https://coinmarketcap.com"]
         except Exception as e:
             logger.warning("Price brief CMC fetch failed for %s: %s", symbol, e)
@@ -1249,7 +1303,6 @@ def _execute_price_brief(
     else:
         fng_line = "Fear & Greed Index is unavailable right now."
 
-    bias_line = _derive_price_bias(change_24h, fng_value)
     funding_line = (
         f"Funding: {float(funding_rate) * 100:.4f}%"
         if funding_rate is not None
@@ -1267,7 +1320,7 @@ def _execute_price_brief(
 
     requested_fields = set(requested_fields or set())
     if requested_fields and len(requested_fields) <= 2:
-        concise_lines = [f"[NADO MARKET STAT]", f"{symbol}-PERP on Nado"]
+        concise_lines = [f"[MARKET STAT]", f"{symbol}-PERP on Nado"]
         if "price" in requested_fields:
             concise_lines.append(f"Price: ${mid:,.2f} ({change_text} 24h)")
         if "funding" in requested_fields:
@@ -1291,20 +1344,72 @@ def _execute_price_brief(
         result = "\n".join(concise_lines)
     else:
         result = (
-            f"[NADO MARKET STATS]\n"
+            f"[MARKET STATS]\n"
             f"{symbol}-PERP on Nado: ${mid:,.2f} ({change_text} 24h)\n"
             f"Bid ${bid:,.2f} | Ask ${ask:,.2f} | Spread ${spread:,.2f} ({spread_bps:.1f} bps)\n"
             f"{funding_line} | {volume_line} | {oi_line}\n"
             f"{range_line}\n"
-            f"{fng_line}\n"
-            f"{bias_line}"
+            f"{fng_line}"
         )
     return result, [OFFICIAL_SOURCES["website"], *cmc_sources]
 
 
+def _execute_offvenue_quote(symbol: str) -> tuple[str, list[str]]:
+    """CMC / FMP quote for names that are not Nado perps. Never 'Supported: BTC…'."""
+    sources: list[str] = []
+    mid = None
+    change_24h = None
+    volume_24h = None
+    name = symbol
+    if _is_cmc_available():
+        try:
+            from src.nadobro.market_data.cmc_client import get_crypto_quotes
+
+            row = (get_crypto_quotes([symbol]) or {}).get(symbol) or {}
+            if row.get("price"):
+                mid = float(row["price"])
+            if row.get("change_24h") is not None:
+                change_24h = float(row["change_24h"])
+            if row.get("volume_24h") is not None:
+                volume_24h = float(row["volume_24h"])
+            name = str(row.get("name") or symbol)
+            if mid:
+                sources.append("https://coinmarketcap.com")
+        except Exception as e:
+            logger.debug("offvenue CMC quote failed %s: %s", symbol, e)
+    if mid is None:
+        try:
+            from src.nadobro.market_data.fmp_client import get_quote, is_available
+
+            if is_available():
+                row = get_quote(symbol) or {}
+                if row.get("price"):
+                    mid = float(row["price"])
+                    change_24h = row.get("change_pct")
+                    volume_24h = row.get("volume")
+                    name = str(row.get("name") or symbol)
+                    sources.append("https://financialmodelingprep.com")
+        except Exception as e:
+            logger.debug("offvenue FMP quote failed %s: %s", symbol, e)
+    if mid is None or mid <= 0:
+        return f"[MARKET STATS] No live quote for {symbol} right now.", sources
+    if change_24h is None:
+        change_text = "n/a"
+    elif float(change_24h) >= 0:
+        change_text = f"up {abs(float(change_24h)):.1f}%"
+    else:
+        change_text = f"down {abs(float(change_24h)):.1f}%"
+    result = (
+        f"[MARKET STATS]\n"
+        f"{name} ({symbol}): ${float(mid):,.2f} ({change_text} 24h)\n"
+        f"24h Volume: {_format_usd_compact(float(volume_24h) if volume_24h is not None else None)}\n"
+        f"Not listed as a Nado perp — quote from {', '.join(sources) or 'external feeds'}."
+    )
+    return result, sources
+
+
 def _execute_live_price(product: str, network: str = "mainnet") -> tuple[str, list[str]]:
-    from src.nadobro.config import get_product_id, get_perp_products
-    from src.nadobro.venue.nado_client import NadoClient
+    from src.nadobro.config import get_product_id
 
     symbol = product.strip().upper().replace("-PERP", "")
     product_id = get_product_id(symbol, network=network)
@@ -1325,8 +1430,7 @@ def _execute_live_price(product: str, network: str = "mainnet") -> tuple[str, li
                 logger.warning(f"All prices fetch failed: {e}")
                 return "[LIVE PRICE] Could not fetch prices right now.", []
 
-        supported = get_perp_products(network=network)
-        return f"[LIVE PRICE] Unknown asset '{product}'. Supported: {', '.join(supported)}", []
+        return _execute_offvenue_quote(symbol)
 
     try:
         # NO_ORDERS_AUDIT-FIX-R6b: cached.
@@ -1811,6 +1915,10 @@ def _should_skip_router(question: str) -> bool:
     q = _normalize_question(_question_for_routing(question))
     if not q:
         return True
+    from src.nadobro.llm.conversation_intent import wants_market_call
+
+    if wants_market_call(q) or _should_direct_price_brief(question):
+        return False
     if _is_price_question(q) or _is_sentiment_question(q) or _is_x_twitter_question(q):
         return False
     if _is_nado_specific_question(q):
@@ -1908,18 +2016,19 @@ async def stream_nado_answer(question: str, telegram_id: int = None, user_name: 
         return
 
     user_network = _get_user_network(telegram_id) if telegram_id else "mainnet"
-    market_product = _extract_market_product(question, network=user_network)
-    if market_product and _is_market_stats_question(question):
-        requested_fields = _requested_market_fields(question)
-        direct_answer, _ = _execute_price_brief(
-            market_product,
-            network=user_network,
-            requested_fields=requested_fields,
-        )
-        if telegram_id:
-            _add_to_chat_history(telegram_id, "assistant", direct_answer)
-        yield _append_freshness(direct_answer)
-        return
+    if _should_direct_price_brief(question):
+        symbol = _resolve_quote_symbol(question, user_network)
+        if symbol:
+            requested_fields = _requested_market_fields(question)
+            direct_answer, _ = _execute_price_brief(
+                symbol,
+                network=user_network,
+                requested_fields=requested_fields,
+            )
+            if telegram_id:
+                _add_to_chat_history(telegram_id, "assistant", direct_answer)
+            yield _append_freshness(direct_answer)
+            return
 
     _load_knowledge_base()
 
@@ -2152,17 +2261,18 @@ async def answer_nado_question(question: str, telegram_id: int = None, user_name
         return _lt("X/Twitter search needs my xAI connection, and it's not set up right now. Hit me with a different question!", lang)
 
     user_network = _get_user_network(telegram_id) if telegram_id else "mainnet"
-    market_product = _extract_market_product(question, network=user_network)
-    if market_product and _is_market_stats_question(question):
-        requested_fields = _requested_market_fields(question)
-        direct_answer, _ = _execute_price_brief(
-            market_product,
-            network=user_network,
-            requested_fields=requested_fields,
-        )
-        if telegram_id:
-            _add_to_chat_history(telegram_id, "assistant", direct_answer)
-        return _append_freshness(direct_answer)
+    if _should_direct_price_brief(question):
+        symbol = _resolve_quote_symbol(question, user_network)
+        if symbol:
+            requested_fields = _requested_market_fields(question)
+            direct_answer, _ = _execute_price_brief(
+                symbol,
+                network=user_network,
+                requested_fields=requested_fields,
+            )
+            if telegram_id:
+                _add_to_chat_history(telegram_id, "assistant", direct_answer)
+            return _append_freshness(direct_answer)
 
     _load_knowledge_base()
 

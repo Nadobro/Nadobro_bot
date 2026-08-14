@@ -113,6 +113,55 @@ class HLClient:
         return positions
 
 
+def get_candles_sync(coin: str, interval: str = "1h", lookback_ms: int = 7 * 24 * 3600 * 1000) -> list[dict]:
+    """Blocking HL candleSnapshot. Oldest-first. Empty on any failure."""
+    symbol = (coin or "").strip().upper()
+    if not symbol:
+        return []
+    end_ms = int(time.time() * 1000)
+    start_ms = max(0, end_ms - int(lookback_ms))
+    try:
+        resp = httpx.post(
+            HL_INFO_URL,
+            json={
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": symbol,
+                    "interval": interval,
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                },
+            },
+            timeout=HL_REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+    except Exception as exc:
+        logger.warning("HL candleSnapshot failed coin=%s interval=%s: %s", symbol, interval, exc)
+        return []
+    if not isinstance(rows, list):
+        return []
+    candles = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            candles.append(
+                {
+                    "time": int(row.get("t") or row.get("T") or 0) // 1000,
+                    "open": float(row.get("o") or 0),
+                    "high": float(row.get("h") or 0),
+                    "low": float(row.get("l") or 0),
+                    "close": float(row.get("c") or 0),
+                    "volume": float(row.get("v") or 0),
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    candles.sort(key=lambda c: int(c.get("time") or 0))
+    return candles
+
+
 _shared_client: HLClient | None = None
 
 

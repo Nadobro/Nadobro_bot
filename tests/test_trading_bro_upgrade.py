@@ -11,7 +11,7 @@ if "openai" not in sys.modules:
 
     class _OpenAI:
         def __init__(self, *args, **kwargs):
-            pass
+            self.base_url = kwargs.get("base_url") or "https://nano-gpt.com/api/v1"
 
     openai_mod.OpenAI = _OpenAI
     sys.modules["openai"] = openai_mod
@@ -37,7 +37,12 @@ if "cryptography.fernet" not in sys.modules:
     class _InvalidToken(Exception):
         pass
 
+    class _MultiFernet:
+        def __init__(self, *args, **kwargs):
+            pass
+
     fernet_mod.Fernet = _Fernet
+    fernet_mod.MultiFernet = _MultiFernet
     fernet_mod.InvalidToken = _InvalidToken
     crypto_mod.fernet = fernet_mod
     sys.modules["cryptography"] = crypto_mod
@@ -181,6 +186,43 @@ class TradingBroUpgradeTests(unittest.TestCase):
 
         self.assertTrue(_should_update_streaming_draft("This is a longer streamed chunk ", 0, 1.0, 2.0))
         self.assertFalse(_should_update_streaming_draft("This is a longer streamed chu", 0, 1.0, 2.0))
+
+    def test_eth_chart_predict_is_market_call_not_quote(self):
+        from src.nadobro.llm.conversation_intent import classify_conversation_intent, wants_market_call
+        from src.nadobro.llm.knowledge_service import _question_for_routing, _should_direct_price_brief
+        from src.nadobro.llm.trading_bro_service import answer_mode_for_text, build_trading_bro_question
+
+        q = "Read the ETH chart on Nado, predict the market direction for 4hrly, up or down?"
+        self.assertEqual(classify_conversation_intent(q).name, "chart_ta")
+        self.assertTrue(wants_market_call(q))
+        self.assertEqual(answer_mode_for_text(q), "market_call")
+        framed = build_trading_bro_question(q)
+        self.assertEqual(_question_for_routing(framed), q)
+        self.assertFalse(_should_direct_price_brief(framed))
+        self.assertFalse(_should_direct_price_brief(q))
+        self.assertNotIn("on Nado", framed.split("User message:")[0])
+
+    def test_eth_price_is_quote_lookup(self):
+        from src.nadobro.llm.conversation_intent import classify_conversation_intent, wants_market_call
+        from src.nadobro.llm.knowledge_service import _should_direct_price_brief
+        from src.nadobro.llm.trading_bro_service import answer_mode_for_text
+
+        q = "What's the current ETH price"
+        self.assertEqual(classify_conversation_intent(q).name, "quote")
+        self.assertFalse(wants_market_call(q))
+        self.assertEqual(answer_mode_for_text(q), "market_analysis")
+        self.assertTrue(_should_direct_price_brief(q))
+
+    def test_cbrs_earnings_is_event_predict(self):
+        from src.nadobro.llm.conversation_intent import classify_conversation_intent, wants_market_call
+        from src.nadobro.llm.knowledge_service import _should_direct_price_brief
+        from src.nadobro.llm.trading_bro_service import answer_mode_for_text
+
+        q = "CBRS earnings report after market close predict if miss or beat. predict up or down"
+        self.assertEqual(classify_conversation_intent(q).name, "event_predict")
+        self.assertTrue(wants_market_call(q))
+        self.assertEqual(answer_mode_for_text(q), "market_call")
+        self.assertFalse(_should_direct_price_brief(q))
 
 
 if __name__ == "__main__":
