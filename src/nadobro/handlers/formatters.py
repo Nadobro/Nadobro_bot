@@ -2089,6 +2089,10 @@ def fmt_ops_overview(status: dict, ops: dict) -> str:
             f"cycle cap *{escape_md(str(renv.get('NADO_STRATEGY_CYCLE_TIMEOUT_SECONDS')))}s*"
         )
 
+    egress_geo = str(ops.get("egress_geo") or "").strip()
+    if egress_geo:
+        lines.append(escape_md(egress_geo))
+
     if snap:
         if snap.get("success"):
             lines.append(

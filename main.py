@@ -264,10 +264,46 @@ def setup_bot():
         except Exception as exc:
             logger.warning("Could not validate BOT_USERNAME against Telegram getMe(): %s", exc)
 
+    # PTB's default httpx keepalive_expiry is 5s, so a low-traffic bot lets its
+    # connection to api.telegram.org go idle and pays a fresh TLS handshake on
+    # the next answerCallbackQuery / editMessageText — i.e. on almost every tap.
+    # Widen keepalive so the socket survives quiet gaps between taps. Kept below
+    # Fly's egress NAT idle timeout. read/write raised to 10s so a slow Bot API
+    # call doesn't clip a legitimate edit.
+    import httpx
+    from telegram.request import HTTPXRequest
+
+    _KEEPALIVE_EXPIRY = env_int("TELEGRAM_KEEPALIVE_EXPIRY_SECONDS", 90)
+    _bot_request = HTTPXRequest(
+        connection_pool_size=256,
+        connect_timeout=5.0,
+        read_timeout=10.0,
+        write_timeout=10.0,
+        pool_timeout=2.0,
+        httpx_kwargs={
+            "limits": httpx.Limits(
+                max_connections=256,
+                max_keepalive_connections=64,
+                keepalive_expiry=float(_KEEPALIVE_EXPIRY),
+            )
+        },
+    )
+    _updates_request = HTTPXRequest(
+        connection_pool_size=32,
+        httpx_kwargs={
+            "limits": httpx.Limits(
+                max_connections=32,
+                max_keepalive_connections=16,
+                keepalive_expiry=float(_KEEPALIVE_EXPIRY),
+            )
+        },
+    )
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .concurrent_updates(True)
+        .request(_bot_request)
+        .get_updates_request(_updates_request)
         .post_init(_post_init)
         .build()
     )

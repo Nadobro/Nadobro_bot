@@ -6,7 +6,7 @@ from src.nadobro.utils.env import env_float, env_int
 from src.nadobro.notify.alert_service import get_triggered_alerts
 from src.nadobro.trading.stop_loss_service import process_stop_losses
 from src.nadobro.venue.nado_client import NadoClient
-from src.nadobro.core.async_utils import run_blocking
+from src.nadobro.core.async_utils import run_blocking, run_blocking_bg
 from src.nadobro.core.perf import timed_metric
 from src.nadobro.trading.execution_queue import enqueue_alert
 from src.nadobro.users.lowiq_relay_client import relay_poll_interval_seconds, relay_poll_timeout_seconds
@@ -848,6 +848,22 @@ async def initial_ai_setup():
         logger.error("Initial AI setup failed: %s", e)
 
 
+async def tick_egress_geo_check():
+    """Verify the egress IP does not geolocate to a Nado-restricted territory.
+
+    Runs once shortly after boot and periodically after, because Fly can hand a
+    redeploy a US-registered egress IP even from an EU region. Blocking HTTP is
+    offloaded to the background pool; advisory only (logs + /ops), never blocks.
+    """
+    try:
+        from src.nadobro.core.egress_geo import evaluate_and_log, probe_egress
+
+        report = await run_blocking_bg(probe_egress)
+        evaluate_and_log(report)
+    except Exception as e:
+        logger.warning("Egress geo check failed: %s", e)
+
+
 _EDGE_SCAN_SECONDS = env_int("EDGE_SCAN_INTERVAL_SECONDS", 1800)
 _NEWS_WARMUP_MINUTES = env_int("NEWS_WARMUP_MINUTES", 12)
 # Signal grading. The shortest horizon is 15m, so a 5-minute cadence keeps the
@@ -1001,6 +1017,16 @@ def start_scheduler():
             id="desk_runner", replace_existing=True, **_SHORT_TICK,
         )
     scheduler.add_job(initial_ai_setup, "date", id="initial_ai_setup", replace_existing=True)
+    # Egress geo-guard: verify on boot (so a redeploy onto a US-registered Fly
+    # egress IP is caught immediately) and re-verify periodically (machine
+    # recreation can change the allocation). Advisory — logs + /ops, never blocks.
+    from src.nadobro.core.egress_geo import egress_geo_check_hours
+
+    scheduler.add_job(tick_egress_geo_check, "date", id="egress_geo_boot", replace_existing=True)
+    scheduler.add_job(
+        tick_egress_geo_check, "interval", hours=egress_geo_check_hours(),
+        id="egress_geo_check", replace_existing=True, **_LONG_TICK,
+    )
     scheduler.start()
     logger.info(
         "Scheduler started - alerts %ss, price tracker 60s, HOWL nightly 02:00 UTC, LOWIQ relay %ss, fill sync 30s, edge scanner %ss",

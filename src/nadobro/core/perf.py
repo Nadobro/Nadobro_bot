@@ -10,6 +10,13 @@ logger = logging.getLogger(__name__)
 
 _MAX_SAMPLES = 400
 
+# Samples carry a monotonic timestamp so the window can DECAY. Without this the
+# deque only has a count bound (400) — at low traffic one burst of slow taps sat
+# in the window for hours and check_slo re-reported the SAME p95 every 60s
+# indefinitely (2026-08-14: identical p95=38918ms/n=60 for 25+ min while the
+# actual fresh taps were 1-14s). A time window makes the aggregate reflect NOW.
+_METRIC_WINDOW_SECONDS = env_float("NADO_PERF_WINDOW_SECONDS", 900.0)
+
 # --- Service-level objectives ---------------------------------------------
 # A single slow call already logs via ``log_slow``; the SLO check is the
 # aggregate early-warning: it fires when the *p95* over the recent window
@@ -21,8 +28,14 @@ _SLO_THRESHOLDS_MS: dict[str, float] = {
     "card.home.build": env_float("NADO_SLO_HOME_BUILD_P95_MS", 250.0),
 }
 _SLO_MIN_SAMPLES = env_int("NADO_SLO_MIN_SAMPLES", 20)
+# Re-log a still-breaching SLO at most this often. check_slo used to WARN on
+# every 60s tick with no edge detection — 60 identical lines/hour per metric,
+# which (with the LOWIQ flood) drowned the fresh per-tap slow-path lines.
+_SLO_RELOG_SECONDS = env_float("NADO_SLO_RELOG_SECONDS", 600.0)
+# Each deque entry is ``(monotonic_ts, value_ms)``.
 _metrics: dict[str, deque] = defaultdict(lambda: deque(maxlen=_MAX_SAMPLES))
 _counters: dict[str, int] = defaultdict(int)
+_slo_last_warned: dict[str, float] = {}
 _lock = threading.Lock()
 
 
@@ -33,8 +46,9 @@ def record_metric(metric: str, value_ms: float) -> None:
         return
     if val < 0:
         return
+    now = time.monotonic()
     with _lock:
-        _metrics[metric].append(val)
+        _metrics[metric].append((now, val))
 
 
 def increment_counter(counter: str, value: int = 1) -> None:
@@ -75,12 +89,27 @@ def _percentile(values: list[float], p: float) -> float:
     return values[lo] * (1 - frac) + values[hi] * frac
 
 
+def _reset() -> None:
+    """Clear all samples/counters/SLO state. For test isolation."""
+    with _lock:
+        _metrics.clear()
+        _counters.clear()
+        _slo_last_warned.clear()
+
+
 def snapshot() -> dict[str, dict]:
     out = {}
+    now = time.monotonic()
+    cutoff = now - _METRIC_WINDOW_SECONDS
     with _lock:
-        items = list(_metrics.items())
+        items = []
+        for metric, buf in _metrics.items():
+            # Drop samples older than the window so aggregates reflect NOW.
+            while buf and buf[0][0] < cutoff:
+                buf.popleft()
+            items.append((metric, [v for _, v in buf]))
     for metric, samples in items:
-        vals = sorted(list(samples))
+        vals = sorted(samples)
         if not vals:
             continue
         out[metric] = {
@@ -130,17 +159,30 @@ def check_slo() -> list[str]:
     """
     snap = snapshot()
     breaches: list[str] = []
+    now = time.monotonic()
     for metric, threshold_ms in _SLO_THRESHOLDS_MS.items():
         data = snap.get(metric)
         if not data or data["count"] < _SLO_MIN_SAMPLES:
+            # Window aged out / not enough live samples: the breach is over.
+            if _slo_last_warned.pop(metric, None) is not None:
+                logger.info("SLO recovered %s: window below %d samples", metric, _SLO_MIN_SAMPLES)
             continue
         if data["p95_ms"] >= threshold_ms:
-            increment_counter(f"slo.breach.{metric}")
             line = (
                 f"SLO breach {metric}: p95={data['p95_ms']:.0f}ms "
                 f"(target {threshold_ms:.0f}ms) p50={data['p50_ms']:.0f}ms "
                 f"max={data['max_ms']:.0f}ms n={data['count']}"
             )
-            logger.warning(line)
+            # Edge-triggered: WARN on the first breach and then at most once per
+            # _SLO_RELOG_SECONDS, instead of every 60s tick, so the log stays
+            # readable and the counter tracks episodes not ticks.
+            last = _slo_last_warned.get(metric)
+            if last is None or (now - last) >= _SLO_RELOG_SECONDS:
+                _slo_last_warned[metric] = now
+                increment_counter(f"slo.breach.{metric}")
+                logger.warning(line)
             breaches.append(line)
+        else:
+            if _slo_last_warned.pop(metric, None) is not None:
+                logger.info("SLO recovered %s: p95=%.0fms", metric, data["p95_ms"])
     return breaches
