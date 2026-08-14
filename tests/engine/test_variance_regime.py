@@ -1,8 +1,8 @@
 """Variance-ratio regime routine — the tunable brain behind dgrid switching.
 
 Verifies:
-1. A trending market reads VR > 1 and picks the directional phase
-   (down -> rgrid short, up -> grid long).
+1. A trending market reads VR > 1 and picks the trend-follower phase
+   (rgrid) in BOTH directions. Range picks the long ladder (grid).
 2. A mean-reverting range reads VR < 1 and picks grid.
 3. The trend_on / range_on hysteresis band holds the current phase.
 4. Insufficient history holds the current phase (never flips on noise).
@@ -18,10 +18,12 @@ from src.nadobro.engine.routines import variance_regime as vr
 PAIR = "BTC-PERP"
 
 
-def ranging_candles(n: int = 60, base: float = 100.0, amp: float = 1.0, period: float = 7.0) -> list[dict]:
+def ranging_candles(n: int = 60, base: float = 100.0, amp: float = 0.12, period: float = 7.0) -> list[dict]:
     """Smooth oscillation — mean-reverting, grid-friendly (bounded long-horizon
-    displacement -> VR < 1). Period is coprime-ish to the 4/12 windows so short
-    returns never collapse to exact zeros."""
+    displacement -> VR < 1). Amplitude stays under the 0.30% drift trigger so a
+    sine's last-window slope cannot masquerade as a trend (amp=1% used to).
+    Period is coprime-ish to the 4/12 windows so short returns never collapse
+    to exact zeros."""
     return [{"close": base + amp * math.sin(2 * math.pi * i / period)} for i in range(n)]
 
 
@@ -43,12 +45,14 @@ def test_downtrend_reads_high_vr_and_picks_rgrid():
     assert result["phase"] == vr.RGRID
 
 
-def test_uptrend_reads_high_vr_but_stays_long_grid():
+def test_uptrend_reads_high_vr_and_picks_the_trend_follower():
     result = asyncio.run(vr.run(PAIR, trending_candles(step=0.4)))
     assert float(result["variance_ratio"]) >= 1.25
     assert result["direction"] == vr.UP
-    # A reverse grid bleeds in an uptrend: stay long.
-    assert result["phase"] == vr.GRID
+    # R-Grid adds WITH the move, so an uptrend is the trend-follower phase,
+    # not the ranging long ladder (a short reverse-grid ladder used to bleed
+    # here, which is why UP used to stay GRID).
+    assert result["phase"] == vr.RGRID
 
 
 def test_range_reads_low_vr_and_picks_grid():
@@ -206,10 +210,14 @@ def test_the_short_is_released_once_the_decline_stalls():
     assert r["phase"] == vr.GRID
 
 
-def test_a_turn_upward_releases_the_short_immediately():
+def test_a_turn_upward_keeps_the_trend_follower():
+    """A V-reversal is still a trend. R-Grid owns the side flip; dropping
+    back to the ranging ladder would flatten a short into a long mean-reversion
+    book in the middle of the turn.
+    """
     r = asyncio.run(vr.run(PAIR, _choppy(63500, -14.0), current_phase=vr.RGRID, **_RG))
     assert r["direction"] == vr.UP
-    assert r["phase"] == vr.GRID
+    assert r["phase"] == vr.RGRID
 
 
 def test_the_release_never_holds_a_phase_we_are_not_in():

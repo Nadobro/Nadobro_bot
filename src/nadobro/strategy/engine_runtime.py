@@ -513,6 +513,10 @@ def _apply_dgrid_controller_config(controller: Controller, configs: Dict[str, ob
     # THIS cycle's signal, not the one the controller was built with.
     controller.signal_regime = str(configs.get("signal_regime", "") or "")  # type: ignore[attr-defined]
     controller.signal_confidence = _num("signal_confidence", controller.signal_confidence)  # type: ignore[attr-defined]
+    packed = configs.get("trend_rgrid")
+    trend = getattr(controller, "_trend", None)
+    if trend is not None and isinstance(packed, dict):
+        _apply_rgrid_controller_config(trend, packed)
 
 
 def _apply_rgrid_controller_config(controller: Controller, configs: Dict[str, object]) -> None:
@@ -1621,11 +1625,9 @@ def map_strategy_config(
     # here makes the contract explicit and lets the cycle driver inject the
     # real provider on first start.
     if strategy == "dgrid":
-        # D-Grid is the phase SWITCHER: a volatility-balanced classifier that
-        # mean-reverts with a long ladder in ranges and flips to a short ladder on
-        # a clear directional signal. R-Grid used to share this engine, which is
-        # why R-Grid users were told "switched RGRID → GRID"; it now runs its own
-        # exposure-anchored controller and never reaches this branch.
+        # D-Grid is the phase SWITCHER: a long mean-reversion ladder in ranges
+        # and an embedded R-Grid trend follower on a clear directional signal
+        # (both directions). Standalone R-Grid never reaches this branch.
         cfg["candle_provider"] = None
         # (recycle_levels is set for the whole GridExecutor family above.)
         cfg["dgrid_short_window"] = int(max(2, _f(settings, "dgrid_short_window_points", 4)))
@@ -1688,6 +1690,16 @@ def map_strategy_config(
         _dg_cap = Decimal(str(_f(settings, "dgrid_max_spread_bp", 50.0))) / Decimal(10000)
         cfg["spread_floor_half_pct"] = _dg_floor
         cfg["spread_cap_half_pct"] = max(_dg_cap, _dg_floor)
+        # Trend phase is R-Grid (add with the move, flip when it turns), not a
+        # mirrored short ladder. Map the rgrid keys the delegate reads; dgrid
+        # spread fills in when the user never set rgrid_spread_bp.
+        _rg_settings = dict(settings)
+        if not _f(_rg_settings, "rgrid_spread_bp", 0.0):
+            _rg_settings["rgrid_spread_bp"] = float(_spread_bp)
+        cfg["trend_rgrid"] = map_strategy_config(
+            "rgrid", _rg_settings, mid, product=product,
+            leverage=leverage, network=network,
+        )
 
     # GRID in-place re-center: honor the user's reset threshold so the classic
     # long ladder follows price ("reset and continue") instead of going stale.

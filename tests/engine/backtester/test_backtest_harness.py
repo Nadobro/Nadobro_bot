@@ -257,6 +257,44 @@ def test_dgrid_actually_receives_candles_and_can_classify_regimes():
     )
 
 
+def test_dgrid_rides_an_uptrend_instead_of_shorting_it():
+    """Product ruling 2026-08-12: the trend phase is R-Grid (add with the move),
+    not a mirrored short ladder. A monotonic uptrend must not end short — that
+    was the reverse-grid bleed the ruling retired."""
+    from src.nadobro.engine.backtester.engine import BacktestEngine
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    cfg = map_strategy_config(
+        "dgrid", {"notional_usd": 100, "leverage": 5}, Decimal("100"), product="BTC-PERP"
+    )
+    prices = [100.0 * (1.0 + 0.003) ** i for i in range(80)]
+    candles = candles_from_prices(prices, interval_s=60)
+    eng = BacktestEngine("dgrid", dict(cfg), candles, costs=SimCosts())
+    asyncio.run(eng._run())
+    pair = str(eng.controller.cfg("trading_pair"))
+    net = eng.inventory.get(eng.user_id, pair, eng.controller.id).net_amount_base
+    assert net >= 0, f"dgrid shorted a monotonic uptrend (net={net})"
+    assert eng.controller.current_phase == "rgrid"
+    assert eng.controller._trend is not None
+
+
+def test_dgrid_range_tape_stays_on_the_long_ladder():
+    """A quiet oscillation must not trip the drift filter into the trend follower."""
+    from src.nadobro.engine.backtester.engine import BacktestEngine
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    cfg = map_strategy_config(
+        "dgrid", {"notional_usd": 100, "leverage": 5}, Decimal("100"), product="BTC-PERP"
+    )
+    prices = [100.0 + 0.08 * math.sin(i / 3.0) for i in range(80)]
+    candles = candles_from_prices(prices, interval_s=60)
+    eng = BacktestEngine("dgrid", dict(cfg), candles, costs=SimCosts())
+    asyncio.run(eng._run())
+    assert eng.controller.current_phase == "grid"
+    assert eng.controller._trend is None
+    assert eng.orchestrator.list(eng.controller.id, active_only=True)
+
+
 def test_the_backtest_candle_provider_has_no_look_ahead():
     """A provider that served future bars would make every backtest meaningless."""
     from src.nadobro.engine.backtester.engine import BacktestEngine

@@ -309,6 +309,10 @@ def test_only_dgrid_gets_the_phase_switcher_knobs():
                  "dgrid_short_window", "dgrid_reversal_flip_pct", "dgrid_range_on_vr"):
         assert knob in dg, knob
         assert knob not in rg, knob
+    assert isinstance(dg.get("trend_rgrid"), dict)
+    assert dg["trend_rgrid"].get("order_amount_quote")
+    assert dg["trend_rgrid"].get("controller_override") == "fill_anchored"
+    assert "trend_rgrid" not in rg
     # A dgrid_* setting left over on an R-Grid config cannot resurrect the switcher.
     rg_ov = er.map_strategy_config(
         "rgrid", {"notional_usd": 100.0, "dgrid_trend_on_variance_ratio": 1.40},

@@ -1,9 +1,13 @@
-"""Dynamic Grid controller — switches GRID <-> RGRID by volatility regime.
+"""Dynamic Grid controller — switches a ranging ladder <-> R-Grid by regime.
 
 Each tick it classifies the market with the tunable variance-ratio routine
 (``variance_regime``, driven by the user's ``dgrid_*`` settings) and runs the
-matching executor — a long :class:`GridExecutor` in ranges / uptrends, a short
-:class:`ReverseGridExecutor` in downtrends.
+matching engine — a long :class:`GridExecutor` in ranges, an embedded
+:class:`RGridController` in trends (add with the move, flip when it turns).
+
+The trend phase used to be :class:`ReverseGridExecutor` (a mirrored short
+*ladder*). That bled in uptrends and could not pyramid. The product ruling
+(2026-08-12) is that the trend leg is R-Grid.
 
 Mid-flight flip (2026-06 fix)
 =============================
@@ -39,8 +43,8 @@ from src.nadobro.engine.controllers.controller_base import (
     ladder_recenter_threshold_bp,
 )
 from src.nadobro.engine.controllers.grid_trading import build_grid_config
+from src.nadobro.engine.controllers.rgrid import RGridController
 from src.nadobro.engine.executors.grid_executor import GridExecutor
-from src.nadobro.engine.executors.reverse_grid_executor import ReverseGridExecutor
 from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.routines import variance_regime
 from src.nadobro.engine.types import TradeType, _dec
@@ -185,6 +189,10 @@ class DynamicGridController(Controller):
         self._phase_confirm_streak: int = 0
         self._grid_anchor_mid: Optional[Decimal] = None
         self._dgrid_event: Optional[Dict[str, str]] = None
+        # Trend-phase delegate. Same controller_id / inventory / orchestrator as
+        # this parent so fills stay on the session; never registered as a second
+        # orchestrator controller (that would overwrite this one).
+        self._trend: Optional[RGridController] = None
         # Per-tick diagnostics surfaced to the services log so a "no orders"
         # run is pinpointable (candle feed vs gate pause vs spawn refusal).
         self._last_candle_count: int = 0
@@ -417,15 +425,17 @@ class DynamicGridController(Controller):
         self._last_mid = mid
         self._update_realized_move(mid)
 
+        if self._trend is not None:
+            await self._tick_trend_phase(desired, mid)
+            return
+
         active = self.my_executors(active_only=True)
         if active:
-            # Trend-capture: track the run's favorable price extreme, then flip
-            # on a confirmed reversal once the run is in profit (closes the
-            # winner and arms the opposite side). Classifier already ran this
-            # tick; a pullback inside a declared trend is ignored
+            # Range-ladder path. Trend-capture reversal is only for the ladder
+            # (R-Grid owns its own trail). Classifier already ran this tick;
+            # a pullback inside a declared trend is ignored
             # (DGRID-REVERSAL-FLIPFLOP). Sharp turns the variance selector
-            # still reads as range still lock-and-switch. Runs before the
-            # slow phase-change path so a ranging reversal is caught immediately.
+            # still reads as range still lock-and-switch.
             self._update_run_extremes(mid)
             if await self._maybe_reversal_flip(mid):
                 return
@@ -441,25 +451,8 @@ class DynamicGridController(Controller):
             if (self.reset_threshold_bp > 0 and mid is not None
                     and self.realized_move_bp >= self.reset_threshold_bp
                     and (now - self._last_recenter_ts) >= _DGRID_RECENTER_MIN_INTERVAL_S):
-                # Price has run away from the grid anchor: re-center the resting
-                # ladder IN PLACE (re-quote unfilled opens around the new mid)
-                # WITHOUT closing the held position — no flatten, no realized
-                # loss, no fee churn. Rate-limited so a fast move can't churn
-                # cancels every tick.
-                # Do NOT return here: now that re-center fires often (default
-                # ~one band width), the executor must still be ticked this
-                # cycle so close-leg fills, the SL/TP barriers, and profit
-                # booking keep running. A slow same-regime grind would
-                # otherwise re-center every tick and never process fills.
-                # RGRID-STALE-LADDER: this used to sit inside the `else` above,
-                # so a tick that saw an UNCONFIRMED regime change (dgrid needs 2
-                # consecutive) skipped the re-center too — the ladder froze for
-                # exactly the ticks where price was moving enough to change the
-                # classifier's mind.
                 self._last_recenter_ts = now
                 await self._recenter(mid)
-            # Manage the live grid: gate / inventory cap suppress NEW entries
-            # only; fills, close legs and stops keep running.
             exposure = self.exposure_allowed_sides(pair, mid) if mid else {"buy": True, "sell": True}
             for ex in active:
                 worsening_allowed = (
@@ -467,13 +460,11 @@ class DynamicGridController(Controller):
                 )
                 ex.suppress_new_entries = self.gate_paused or not worsening_allowed
                 await self.orchestrator.tick(ex.id)
-            # Book partial profit as the run's uPnL climbs past rising tiers.
             await self._maybe_book_profit(mid)
             return
 
         # No live executor.
         self._phase_confirm_streak = 0
-        # Sit out: breakout / expansion (price accepted nowhere) — do NOT arm.
         if self.gate_paused:
             return
         await self._spawn_phase(desired, mid)
@@ -485,10 +476,8 @@ class DynamicGridController(Controller):
         if self.signal_confidence < self.signal_min_confidence:
             return None
         regime = str(self.signal_regime or "").lower()
-        if regime == "trend_down":
+        if regime in ("trend_down", "trend_up"):
             return variance_regime.RGRID
-        if regime == "trend_up":
-            return variance_regime.GRID
         return None
 
     def _required_confirm_ticks(self, desired: str) -> int:
@@ -516,8 +505,30 @@ class DynamicGridController(Controller):
     # -- spawn / flip ----------------------------------------------------
     async def _flip_to(self, new_phase: str, mid: Optional[Decimal], *, reason: str) -> None:
         old_phase = self.current_phase
-        # Close the live position via the executor's reduce-only flatten
-        # (GridExecutor._stop_out, keep_position=False), then re-arm the side.
+        if mid is None:
+            mid = await self._mid()
+        # Flatten the trend follower BEFORE dropping it. R-Grid's maker
+        # executors only cancel on stop — they do not close inventory — so a
+        # phase handoff that just nulled ``_trend`` would leave a naked
+        # position for the ranging ladder to inherit.
+        if self._trend is not None:
+            if mid is None or mid <= 0:
+                logger.warning(
+                    "dgrid %s: no mid to flatten the trend follower — retry next tick "
+                    "(controller=%s)",
+                    reason, self.id,
+                )
+                return
+            if not await self._trend.flatten_now(mid, reason=f"dgrid {reason}"):
+                logger.warning(
+                    "dgrid %s: trend flatten still open — deferring re-arm "
+                    "(controller=%s)",
+                    reason, self.id,
+                )
+                return
+            self._trend = None
+        # Close the live range-ladder position via the executor's reduce-only
+        # flatten (GridExecutor._stop_out, keep_position=False), then re-arm.
         for ex in self.my_executors(active_only=True):
             try:
                 await self.orchestrator.stop(ex.id)
@@ -563,7 +574,9 @@ class DynamicGridController(Controller):
         """Re-quote the live grid's resting ladder around a fresh mid without
         closing the position (delegates to GridExecutor.recenter). Re-anchors
         the realized-move counter so the next re-center measures from here."""
-        side = TradeType.SELL if self.current_phase == variance_regime.RGRID else TradeType.BUY
+        if self._trend is not None:
+            return
+        side = TradeType.BUY
         overlay = self._rebuild_bounds_for_side(side, _dec(mid))
         if not overlay:
             # No step/levels knobs -> cannot compute a side-correct band; skip.
@@ -770,6 +783,102 @@ class DynamicGridController(Controller):
         )
         return Decimal(0)
 
+    def _trend_mapped_config(self) -> dict:
+        packed = self.configs.get("trend_rgrid")
+        if isinstance(packed, dict) and packed.get("order_amount_quote"):
+            cfg = dict(packed)
+        else:
+            deployed = _dec(
+                self.cfg("margin_quote") or self.cfg("total_amount_quote") or 100
+            )
+            step = _dec(self.cfg("step_pct") or "0.001")
+            levels = max(1, int(self.cfg("levels_count") or 4))
+            cfg = {
+                "trading_pair": self.trading_pair,
+                "spread_bid_pct": step,
+                "spread_ask_pct": step,
+                "order_amount_quote": deployed / Decimal(levels),
+                "margin_quote": deployed,
+                "max_net_exposure_pct": 100.0,
+                "reset_threshold_pct": Decimal("0.002"),
+                "trail_enabled": True,
+                "ladder_levels": 1,
+                "leverage": int(self.cfg("leverage") or 1),
+                "regime_gate_enabled": 0.0,
+            }
+        for key in ("signal_regime", "signal_confidence"):
+            if key in self.configs:
+                cfg[key] = self.configs[key]
+        # Standalone R-Grid is NEVER_SUPPRESSED. Chop-suppress on the dgrid
+        # parent must not stand the nested follower down.
+        cfg.pop("suppress_new_entries", None)
+        cfg["trading_pair"] = self.trading_pair
+        return cfg
+
+    def _refresh_trend_config(self) -> None:
+        if self._trend is None:
+            return
+        packed = self._trend_mapped_config()
+        self._trend.configs = packed
+        self._trend.reset_threshold_pct = _dec(packed.get("reset_threshold_pct", "0.002"))
+        self._trend.trail_enabled = bool(packed.get("trail_enabled", True))
+        self._trend.order_amount_quote = _dec(
+            packed.get("order_amount_quote", self._trend.order_amount_quote)
+        )
+        self._trend.spread_bid_pct = _dec(
+            packed.get("spread_bid_pct", self._trend.spread_bid_pct)
+        )
+        self._trend.spread_ask_pct = _dec(
+            packed.get("spread_ask_pct", self._trend.spread_ask_pct)
+        )
+        self._trend.signal_regime = str(packed.get("signal_regime", "") or "")
+        try:
+            self._trend.signal_confidence = float(packed.get("signal_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+
+    async def _tick_trend_phase(self, desired: str, mid: Optional[Decimal]) -> None:
+        if desired != variance_regime.RGRID:
+            self._phase_confirm_streak += 1
+            if self._phase_confirm_streak >= self._required_confirm_ticks(desired):
+                await self._flip_to(desired, mid, reason="flip")
+                return
+        else:
+            self._phase_confirm_streak = 0
+        self._refresh_trend_config()
+        if self._trend is not None:
+            await self._trend.on_tick()
+
+    async def _spawn_trend(self, mid: Optional[Decimal]) -> bool:
+        if mid is None or mid <= 0:
+            logger.warning("dgrid %s: no mid for trend spawn — retry next tick", self.id)
+            return False
+        cfg = self._trend_mapped_config()
+        self._trend = RGridController(
+            user_id=self.user_id,
+            orchestrator=self.orchestrator,
+            adapter=self.adapter,
+            inventory=self.inventory,
+            configs=cfg,
+            limits=self.limits,
+            controller_id=self.id,
+        )
+        self._trend._set_active()
+        self.current_phase = variance_regime.RGRID
+        self._grid_anchor_mid = _dec(mid)
+        self.realized_move_bp = 0.0
+        self._booked_tiers = set()
+        self._book_slice = None
+        self._reset_run_tracking(mid)
+        logger.info(
+            "dgrid spawning R-Grid trend follower pair=%s vr=%.3f mid=%s "
+            "step=%s (controller=%s)",
+            self.trading_pair, self.variance_ratio, mid,
+            cfg.get("order_amount_quote"), self.id,
+        )
+        await self._trend.on_tick()
+        return True
+
     async def _spawn_phase(self, phase: str, mid: Optional[Decimal]) -> bool:
         net = self._inventory_net_base()
         if abs(net) > Decimal("1e-12"):
@@ -779,10 +888,9 @@ class DynamicGridController(Controller):
                 phase, self.trading_pair, net, self.id,
             )
             return False
-        side, cls = (
-            (TradeType.SELL, ReverseGridExecutor) if phase == variance_regime.RGRID
-            else (TradeType.BUY, GridExecutor)
-        )
+        if phase == variance_regime.RGRID:
+            return await self._spawn_trend(mid)
+        side, cls = (TradeType.BUY, GridExecutor)
         if mid is None or mid <= 0:
             logger.warning("dgrid %s: no mid for spawn (phase=%s) — retry next tick",
                            self.id, phase)
@@ -804,6 +912,7 @@ class DynamicGridController(Controller):
         )
         if spawned:
             self.current_phase = phase
+            self._trend = None
             self._grid_anchor_mid = _dec(mid)
             self.realized_move_bp = 0.0
             # Fresh position -> reset the profit-booking ladder so the new run
@@ -831,7 +940,9 @@ class DynamicGridController(Controller):
 
     def dgrid_metrics(self) -> Dict[str, object]:
         """Live phase + variance + anchor/side telemetry for the /status card."""
-        side = "SELL" if self.current_phase == variance_regime.RGRID else "BUY"
+        side = (
+            "SELL" if self.last_direction == variance_regime.DOWN else "BUY"
+        )
         return {
             "dgrid_phase": self.current_phase,
             "dgrid_variance_ratio": float(self.variance_ratio),

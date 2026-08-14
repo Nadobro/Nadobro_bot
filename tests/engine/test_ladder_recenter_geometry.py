@@ -243,7 +243,7 @@ _TRAIL_CFG = {
 }
 
 
-def _flat_range(n=60, base=100.0, amp=1.0, period=7.0):
+def _flat_range(n=60, base=100.0, amp=0.12, period=7.0):
     import math
     return [{"high": base + amp * math.sin(2 * math.pi * i / period) + 1,
              "low": base + amp * math.sin(2 * math.pi * i / period) - 1,

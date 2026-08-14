@@ -3286,11 +3286,11 @@ async def _run_cycle(
                 telegram_id,
                 "🔄 {mode} switched {frm} → {to} on {product} ({network}) — "
                 "{why} (variance ratio {vr}). Previous position closed; "
-                "now quoting the {side} ladder.",
+                "now quoting {book}.",
                 mode=_STRATEGY_DISPLAY_NAMES.get(str(strategy).lower(), str(strategy).upper()),
                 frm=str(dgrid_event.get("from", "")).upper(),
                 to=str(dgrid_event.get("to", "")).upper(),
-                side=("SHORT" if _to_phase == "rgrid" else "LONG"),
+                book=("the trend follower" if _to_phase == "rgrid" else "the LONG ladder"),
                 product=product, network=network,
                 why=dgrid_flip_reason(dgrid_event),
                 vr=str(dgrid_event.get("variance_ratio", "")),

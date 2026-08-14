@@ -579,6 +579,29 @@ def test_the_trail_only_ratchets_forward():
     assert c._trail_peak == Decimal("108"), "the trail gave ground"
 
 
+def test_an_armed_trail_does_not_loosen_when_the_band_widens():
+    """RGRID-TRAIL-LOOSENS. Overlay can 3x the live band after arm. The stop
+    must stay at the give-back latched at arm, not walk away from the peak.
+    """
+    adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100))
+    _, c = _controller(adapter, extra={
+        "reset_threshold_pct": Decimal("0.01"), "trail_enabled": True,
+    })
+    c._position_entry_price = lambda: Decimal(100)  # type: ignore[method-assign]
+    # Origin must be the entry, not the peak: a first tick at 108 would set
+    # both and read 0% excursion (the rebuild-untrusted-window path).
+    c._track_trail(Decimal("100"), Decimal(1))
+    c._track_trail(Decimal("108"), Decimal(1))
+    assert c._trail_armed
+    stop_at_arm = c._trail_price(Decimal(1))
+    c.spread_ask_pct = c.spread_ask_pct * Decimal(3)
+    c.spread_bid_pct = c.spread_bid_pct * Decimal(3)
+    c._track_trail(Decimal("108"), Decimal(1))
+    assert c._trail_price(Decimal(1)) == stop_at_arm, (
+        "widening the band after arm moved the trailing stop further from the peak"
+    )
+
+
 def test_the_trail_never_arms_underwater():
     adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100))
     _, c = _controller(adapter, extra={
@@ -620,10 +643,12 @@ def test_going_flat_clears_the_window_and_disarms():
     _, c = _controller(adapter)
     _seed_leg(c, "buy", 100)
     c._trail_armed, c._trail_peak = True, Decimal(105)
+    c._latched_giveback = Decimal("0.01")
     c._reset_exposure_window(Decimal(104))
     assert not c._has_fills()
     assert c._anchor == Decimal(104)
     assert c._trail_armed is False and c._trail_peak is None
+    assert c._latched_giveback is None
 
 
 # ==========================================================================

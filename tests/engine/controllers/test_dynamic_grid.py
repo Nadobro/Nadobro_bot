@@ -6,7 +6,6 @@ from tests.engine._mock_nado import MockNadoAdapter
 
 from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
 from src.nadobro.engine.executors.grid_executor import GridExecutor
-from src.nadobro.engine.executors.reverse_grid_executor import ReverseGridExecutor
 from src.nadobro.engine.inventory import InventoryRepository
 from src.nadobro.engine.orchestrator import ExecutorOrchestrator
 
@@ -26,11 +25,15 @@ def _down(n=60):
     return _candles([float(i) for i in range(n, 1, -1)])
 
 
-def _range(n=60, base=100.0, amp=1.0, period=7.0):
+def _up(n=60):
+    return _candles([float(i) for i in range(1, n)])
+
+
+def _range(n=60, base=100.0, amp=0.12, period=7.0):
     return _candles([base + amp * math.sin(2 * math.pi * i / period) for i in range(n)])
 
 
-def test_trending_down_selects_reverse_grid():
+def test_trending_down_selects_the_rgrid_follower():
     async def body():
         adapter = MockNadoAdapter(mid=Decimal(100))
         orch = ExecutorOrchestrator()
@@ -41,10 +44,38 @@ def test_trending_down_selects_reverse_grid():
         await orch.tick_controller(c.id)
         assert c.current_phase == "rgrid"
         assert c.variance_ratio >= 1.25
-        active = orch.list(c.id, active_only=True)
-        assert active and isinstance(active[0], ReverseGridExecutor)
+        assert c._trend is not None, "downtrend must run the R-Grid trend follower"
 
     asyncio.run(body())
+
+
+def test_trending_up_selects_the_rgrid_follower():
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100))
+        orch = ExecutorOrchestrator()
+        cfg = dict(CFG, candle_provider=lambda p: _up())
+        c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
+                                  inventory=InventoryRepository(), configs=cfg)
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        assert c.current_phase == "rgrid"
+        assert c._trend is not None, "uptrend must run the R-Grid trend follower"
+
+    asyncio.run(body())
+
+
+def test_chop_suppress_does_not_stand_the_trend_follower_down():
+    """Standalone R-Grid is NEVER_SUPPRESSED. The nested follower must not
+    inherit dgrid's overlay chop-suppress or a chop read pauses the pyramid."""
+    c = DynamicGridController(
+        user_id=1, orchestrator=ExecutorOrchestrator(),
+        adapter=MockNadoAdapter(mid=Decimal(100)), inventory=InventoryRepository(),
+        configs=dict(CFG, suppress_new_entries=True, signal_regime="chop",
+                     signal_confidence=0.9),
+    )
+    packed = c._trend_mapped_config()
+    assert "suppress_new_entries" not in packed
+    assert packed.get("signal_regime") == "chop"
 
 
 def test_ranging_selects_long_grid():
@@ -72,10 +103,10 @@ def test_same_regime_does_not_flip():
                                   inventory=InventoryRepository(), configs=cfg)
         await orch.spawn_controller(c)
         await orch.tick_controller(c.id)
-        first = orch.list(c.id, active_only=True)[0]
+        first = c._trend
+        assert first is not None
         await orch.tick_controller(c.id)  # still a downtrend -> no flip
-        active = orch.list(c.id, active_only=True)
-        assert len(active) == 1 and active[0] is first
+        assert c._trend is first and c.current_phase == "rgrid"
 
     asyncio.run(body())
 
@@ -99,9 +130,8 @@ def test_midflight_flip_grid_to_rgrid_on_confirmed_regime_change():
         active = orch.list(c.id, active_only=True)
         assert isinstance(active[0], GridExecutor), "must not flip on a single tick"
         await orch.tick_controller(c.id)  # streak 2 -> flip
-        active = orch.list(c.id, active_only=True)
-        assert len(active) == 1 and isinstance(active[0], ReverseGridExecutor)
         assert c.current_phase == "rgrid"
+        assert c._trend is not None, "confirmed downtrend must spawn the R-Grid follower"
         # Flip event surfaced exactly once.
         event = c.consume_dgrid_event()
         assert event and event["from"] == "grid" and event["to"] == "rgrid"
@@ -220,8 +250,37 @@ def test_flip_deferred_while_gate_paused():
         # Range/acceptance returns: now it arms the short side.
         c.gate_verdict, c.gate_reason = "QUOTE", ""
         await orch.tick_controller(c.id)
-        active = orch.list(c.id, active_only=True)
-        assert len(active) == 1 and isinstance(active[0], ReverseGridExecutor)
+        assert c.current_phase == "rgrid"
+        assert c._trend is not None, "must arm the R-Grid follower, not a short ladder"
+
+    asyncio.run(body())
+
+
+def test_leaving_the_trend_follower_flattens_before_the_range_ladder_arms():
+    """Phase handoff must close R-Grid inventory. Maker-executor stop only
+    cancels quotes; a leftover net would be inherited by the ranging ladder."""
+    from src.nadobro.engine.types import TradeType
+
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100), fill_marketable_limits=True)
+        orch = ExecutorOrchestrator()
+        box = {"data": _down()}
+        cfg = dict(CFG, candle_provider=lambda p: box["data"], dgrid_flip_confirm_ticks=1)
+        inv = InventoryRepository()
+        c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
+                                  inventory=inv, configs=cfg)
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        assert c._trend is not None
+        inv.apply_fill(1, "P", c.id, TradeType.BUY, Decimal("1.0"), Decimal("100"))
+        box["data"] = _range()
+        await orch.tick_controller(c.id)
+        net = inv.get(1, "P", c.id).net_amount_base
+        assert abs(net) <= Decimal("1e-12"), (
+            f"trend handoff left net={net} for the range ladder"
+        )
+        assert c.current_phase == "grid"
+        assert c._trend is None
 
     asyncio.run(body())
 
@@ -646,13 +705,17 @@ def _dg(**cfg):
 def test_a_confirming_overlay_leaves_the_debounce_alone():
     c = _dg(signal_regime="trend_down", signal_confidence=0.9)
     assert c._required_confirm_ticks("rgrid") == 2
+    c = _dg(signal_regime="trend_up", signal_confidence=0.9)
+    assert c._required_confirm_ticks("rgrid") == 2
 
 
 def test_a_contradicting_overlay_buys_one_more_confirming_tick():
-    """Overlay reads an UPtrend while the classifier wants the short phase: wait
-    one extra tick rather than flipping on a contested read."""
+    """Overlay reads a trend while the classifier wants the ranging ladder: wait
+    one extra tick rather than dropping the follower on a contested read."""
     c = _dg(signal_regime="trend_up", signal_confidence=0.9)
-    assert c._required_confirm_ticks("rgrid") == 3
+    assert c._required_confirm_ticks("grid") == 3
+    c = _dg(signal_regime="trend_down", signal_confidence=0.9)
+    assert c._required_confirm_ticks("grid") == 3
 
 
 def test_an_unconfident_overlay_is_ignored():
@@ -681,7 +744,7 @@ def test_the_overlay_can_never_shorten_the_debounce_or_flip_on_its_own():
 
 def test_the_switcher_still_flips_on_a_confirmed_regime_change():
     """The overlay must not break the core behaviour: a real downtrend still arms
-    the short ladder once the debounce is satisfied."""
+    the R-Grid follower once the debounce is satisfied."""
     async def body():
         adapter = MockNadoAdapter(mid=Decimal(100))
         orch = ExecutorOrchestrator()
@@ -713,6 +776,9 @@ def test_the_overlay_read_reaches_the_controller_through_the_mapped_config():
     c = _dg(signal_regime="trend_down", signal_confidence=0.8,
             dgrid_signal_min_confidence=cfg["dgrid_signal_min_confidence"])
     assert c._signal_phase() == "rgrid"
+    c_up = _dg(signal_regime="trend_up", signal_confidence=0.8,
+               dgrid_signal_min_confidence=cfg["dgrid_signal_min_confidence"])
+    assert c_up._signal_phase() == "rgrid"
 
 
 # ==========================================================================
