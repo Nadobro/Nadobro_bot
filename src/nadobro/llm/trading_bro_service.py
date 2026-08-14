@@ -7,12 +7,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from src.nadobro.llm.conversation_intent import classify_conversation_intent
+from src.nadobro.llm.conversation_intent import classify_conversation_intent, wants_market_call
 from src.nadobro.llm.knowledge_service import answer_nado_question, stream_nado_answer
 
 
 def answer_mode_for_text(text: str) -> str:
     intent = classify_conversation_intent(text)
+    if intent.name in {"chart_ta", "event_predict"}:
+        return "market_call"
     if intent.name == "learn":
         q = (text or "").lower()
         if any(term in q for term in ("build", "create", "design", "architecture", "implement", "code")):
@@ -20,7 +22,7 @@ def answer_mode_for_text(text: str) -> str:
         return "educational_guide"
     if intent.name == "debug":
         return "debugging"
-    if intent.name == "market":
+    if intent.name in {"market", "quote"}:
         return "market_analysis"
     if intent.name == "product_support":
         return "product_support"
@@ -41,8 +43,8 @@ def build_trading_bro_question(text: str, *, mode: str | None = None) -> str:
         "- For strategy/build questions, cover architecture, logic, risk controls, execution, monitoring, and tests.\n"
         "- Keep Telegram readability high: short headings, concise bullets, useful examples, no filler.\n"
         "- Include sources only when live data, X/social context, quoted docs, or external facts were actually used.\n"
-        "- Whenever the question touches markets, prices, or trade ideas, close with one '🎯 Actionable Insight: …' line"
-        " — one concrete next step on Nado, or 'sit out' if there is no edge.\n\n"
+        "- Whenever the question touches markets or trade ideas, close with one '🎯 Actionable Insight: …' line"
+        " — one concrete next step, or 'sit out' if there is no edge.\n\n"
         f"User message:\n{text}"
     )
 
@@ -54,6 +56,12 @@ async def stream_trading_bro_answer(
     *,
     mode: str | None = None,
 ) -> AsyncIterator[str]:
+    if wants_market_call(text):
+        from src.nadobro.llm.market_call_service import stream_market_call
+
+        async for chunk in stream_market_call(text, telegram_id=telegram_id, user_name=user_name):
+            yield chunk
+        return
     framed = build_trading_bro_question(text, mode=mode)
     async for chunk in stream_nado_answer(framed, telegram_id=telegram_id, user_name=user_name):
         yield chunk
@@ -66,5 +74,12 @@ async def answer_trading_bro_question(
     *,
     mode: str | None = None,
 ) -> str:
+    if wants_market_call(text):
+        from src.nadobro.llm.market_call_service import stream_market_call
+
+        chunks: list[str] = []
+        async for chunk in stream_market_call(text, telegram_id=telegram_id, user_name=user_name):
+            chunks.append(chunk)
+        return "".join(chunks)
     framed = build_trading_bro_question(text, mode=mode)
     return await answer_nado_question(framed, telegram_id=telegram_id, user_name=user_name)

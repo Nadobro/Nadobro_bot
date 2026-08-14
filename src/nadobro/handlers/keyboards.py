@@ -217,7 +217,7 @@ def bro_answer_kb(mode: str | None = None):
             InlineKeyboardButton("🧠 Strategy Lab", callback_data="nav:strategy_hub"),
             InlineKeyboardButton("🤖 Trade Console", callback_data="card:trade:start"),
         ])
-    elif mode == "market_analysis":
+    elif mode in {"market_analysis", "market_call"}:
         rows.append([
             InlineKeyboardButton("🏆 Market Radar", callback_data="points:view"),
             InlineKeyboardButton("📁 Portfolio", callback_data="portfolio:view"),

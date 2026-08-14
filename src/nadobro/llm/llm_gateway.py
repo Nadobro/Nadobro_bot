@@ -17,6 +17,9 @@ lists — e.g. ``anthropic/claude-sonnet-5``, ``openai/gpt-5.5``,
 trailing ``# note`` is stripped. Leave them UNSET to take the defaults below:
 
     NANOGPT_MODEL_CHAT      general chat + Ask Nadobro     (anthropic/claude-sonnet-5)
+    NANOGPT_MODEL_TA        Market Call synthesizer        (anthropic/claude-opus-4.8)
+    NANOGPT_MODEL_WEB       open-web research pack         (openai/gpt-5-mini)
+    NANOGPT_MODEL_X         X/Twitter research pack        (x-ai/grok-4-fast)
     NANOGPT_MODEL_FINANCE   finance / analyst reasoning    (dmind/dmind-1)
     NANOGPT_MODEL_BRIEF     morning brief / news synthesis (anthropic/claude-sonnet-5)
     NANOGPT_MODEL_INTENT    cheap/fast intent classify     (openai/gpt-5-mini)
@@ -47,6 +50,13 @@ _client: Optional["OpenAI"] = None
 # plan exposes.
 _TASK_MODEL_ENV: dict[str, tuple[str, str]] = {
     "chat": ("NANOGPT_MODEL_CHAT", "anthropic/claude-sonnet-5"),
+    # Market Call user-facing synthesizer. Claude only — Grok/GPT gather
+    # research packs, they never write this answer. Operators override with
+    # the exact Claude id their NanoGPT plan lists; the call site falls down
+    # the Claude chain on model_not_supported.
+    "ta": ("NANOGPT_MODEL_TA", "anthropic/claude-opus-4.8"),
+    "web": ("NANOGPT_MODEL_WEB", "openai/gpt-5-mini"),
+    "x": ("NANOGPT_MODEL_X", "x-ai/grok-4-fast"),
     "finance": ("NANOGPT_MODEL_FINANCE", "dmind/dmind-1"),
     "brief": ("NANOGPT_MODEL_BRIEF", "anthropic/claude-sonnet-5"),
     "intent": ("NANOGPT_MODEL_INTENT", "openai/gpt-5-mini"),
@@ -111,6 +121,29 @@ def model_for(task: str, fallback: Optional[str] = None) -> str:
             return val
     global_default = clean_env_value(os.environ.get("NANOGPT_MODEL"))
     return default or global_default or fallback or "anthropic/claude-sonnet-5"
+
+
+# Claude-only fallbacks for the Market Call synthesizer. Never GPT/Grok.
+TA_MODEL_FALLBACKS: tuple[str, ...] = (
+    "anthropic/claude-opus-4.8",
+    "anthropic/claude-opus-4",
+    "anthropic/claude-sonnet-4",
+    "anthropic/claude-sonnet-5",
+)
+
+
+def ta_model_candidates() -> list[str]:
+    """Primary ``ta`` model then lower Claude versions, de-duplicated.
+
+    Non-Claude ids are dropped so a mistaken env override cannot send the
+    user-facing Market Call to GPT or Grok.
+    """
+    primary = model_for("ta")
+    out: list[str] = []
+    for mid in (primary, *TA_MODEL_FALLBACKS):
+        if mid and mid not in out and "claude" in mid.lower():
+            out.append(mid)
+    return out or list(TA_MODEL_FALLBACKS)
 
 
 def reset_cache() -> None:

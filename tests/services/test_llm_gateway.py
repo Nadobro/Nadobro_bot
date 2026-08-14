@@ -39,12 +39,17 @@ def test_model_for_precedence(monkeypatch):
     # built-in defaults (verified NanoGPT ids)
     assert llm_gateway.model_for("finance") == "dmind/dmind-1"
     assert llm_gateway.model_for("chat") == "anthropic/claude-sonnet-5"
+    assert llm_gateway.model_for("ta") == "anthropic/claude-opus-4.8"
+    assert llm_gateway.model_for("web") == "openai/gpt-5-mini"
+    assert llm_gateway.model_for("x") == "x-ai/grok-4-fast"
     assert llm_gateway.model_for("intent") == "openai/gpt-5-mini"
     # a per-task env var beats the built-in default.
     monkeypatch.setenv("NANOGPT_MODEL_FINANCE", "dmind/dmind-3")
     monkeypatch.setenv("NANOGPT_MODEL_CHAT", "openai/gpt-5.5")
+    monkeypatch.setenv("NANOGPT_MODEL_TA", "anthropic/claude-sonnet-5")
     assert llm_gateway.model_for("finance") == "dmind/dmind-3"
     assert llm_gateway.model_for("chat") == "openai/gpt-5.5"
+    assert llm_gateway.model_for("ta") == "anthropic/claude-sonnet-5"
 
 
 def test_unknown_task_falls_back(monkeypatch):
@@ -107,3 +112,18 @@ def test_knowledge_service_no_native_xai_without_key(monkeypatch):
     # No XAI key -> no native client -> X-search path disabled, general still works.
     assert ks._get_native_xai_client() is None
     assert ks._get_xai_client() is not None
+
+
+def test_ta_candidates_are_claude_only(monkeypatch):
+    monkeypatch.setenv("NANOGPT_MODEL_TA", "anthropic/claude-opus-4.8")
+    cands = llm_gateway.ta_model_candidates()
+    assert cands[0] == "anthropic/claude-opus-4.8"
+    assert all("claude" in m for m in cands)
+    assert all("gpt" not in m and "grok" not in m and "x-ai" not in m for m in cands)
+
+
+def test_ta_candidates_drop_non_claude_override(monkeypatch):
+    monkeypatch.setenv("NANOGPT_MODEL_TA", "openai/gpt-5.5")
+    cands = llm_gateway.ta_model_candidates()
+    assert cands[0] == "anthropic/claude-opus-4.8"
+    assert all("claude" in m for m in cands)
