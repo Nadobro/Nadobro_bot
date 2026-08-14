@@ -107,9 +107,9 @@ from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.types import TradeType, _dec
 from src.nadobro.quant.rgrid_sizing import (
     EXIT_CROSS_RATE,
+    TAKER_ROUND_TRIP_RATE,
     arm_pct,
     exit_band_frac,
-    trail_giveback_frac,
 )
 
 logger = logging.getLogger(__name__)
@@ -412,43 +412,88 @@ class RGridController(MarketMakingController):
         """ENTRY trigger offset from the reference — the user's spread, fee-floored."""
         return max(self.spread_ask_pct, self.spread_floor_half_pct)
 
-    def _arm_pct(self) -> Decimal:
-        """Favourable excursion at which the trailing exit engages."""
-        return arm_pct(self._band(), self.reset_threshold_pct)
+    def _exit_geometry(self) -> Tuple[Decimal, Decimal]:
+        """The ``(exit_band, arm)`` PAIR. Jointly constrained, so derived together.
 
-    def _exit_band(self) -> Decimal:
-        """How far from the average entry the exposure-band exit fires.
+        THE INVARIANT: ``exit_band > arm``, always. The exposure-band exit fires at
+        ``avg_entry x (1 - exit_band)`` and is LOSS-ONLY by construction; only the
+        trail can book a gain. So the arm has to be the NEARER trigger, or on any
+        tape whose pullbacks reach one band the loss-only exit always wins — the
+        configuration that measured -85.27.
 
-        Kept SEPARATE from the entry band. When the two were one number the stop
-        stood exactly as far from the position as the break that opened it, so the
-        same pullback that qualifies as an entry signal also stopped the position
-        out — and, because the exit fires at ``avg_entry x (1 - band)``, it could
-        only ever book a LOSS of one band. Traced on the backtester: a +3.14%
-        uptrend with ordinary 12bp pullbacks produced 29 fills and -$12.10 realised,
-        the whole trend handed back one band at a time.
+        Kept SEPARATE from the entry band for the original reason: when the two were
+        one number the stop stood exactly as far from the position as the break that
+        opened it, so the same pullback that qualified as an entry also stopped the
+        position out. Traced on the backtester: a +3.14% uptrend with ordinary 12bp
+        pullbacks produced 29 fills and -$12.10 realised, the whole trend handed back
+        one band at a time.
 
-        DERIVED (``quant.rgrid_sizing.exit_band_frac``), not tuned, and shared with
-        the step-sizing cap so both bound the same adverse move. ``exit_band_mult``
-        may only WIDEN it past the derived floor — narrowing it below the arm point
-        would restore the pathology by letting the loss-only exit outrun the
-        profit-taking one again.
+        Deriving the two INDEPENDENTLY is what broke it (RGRID-EXITBAND-INVERT):
+        ``exit_band_cap`` is computed once in ``map_strategy_config`` from the
+        UNSCALED spread, while the overlay rescales ``spread_ask_pct`` live by up to
+        3x and pushes it here. The cap ceilinged the exit and NOTHING ceilinged the
+        arm, so they crossed:  x1.0 -> 10/20/30 ok;  x1.5 -> 15/30/30 INVERTED;
+        x3.0 -> 30/60/30 INVERTED. And the overlay only widens the spread BECAUSE
+        the tape is volatile, so the inversion armed itself exactly when noise was
+        largest.
+
+        The reconciliation shrinks the ARM. It does not widen the exit past the cap
+        (bar the degenerate branch below): widening is the pathology the cap exists
+        to prevent — the session rail firing before the strategy's own exit, so every
+        close becomes a rail flatten.
         """
         band = self._band()
-        derived = max(exit_band_frac(band, self.reset_threshold_pct),
-                      band * _dec(self.cfg("exit_band_mult", "0") or "0"))
+        arm = arm_pct(band, self.reset_threshold_pct)
+        exit_band = max(exit_band_frac(band, self.reset_threshold_pct),
+                        band * _dec(self.cfg("exit_band_mult", "0") or "0"))
         # CEILING (``exit_band_cap``, from the mapper's stop budget). The derived
         # distance is the one the strategy WANTS; this is the one the stop can
-        # AFFORD, and two paths push the two apart after the budget was sized:
-        # the overlay scales spread_ask_pct live by up to 3x, and the user's Reset
-        # knob feeds arm_pct (Reset 10% derives a 1010bp exit). Past the ceiling
-        # the session rail fires before the strategy's own exit and every close
-        # becomes a rail flatten — the exact pathology this geometry exists to
-        # remove. Never narrower than the entry band: an exit inside the trigger
+        # AFFORD. Never narrower than the entry band: an exit inside the trigger
         # that opened the position would fire on the noise that entered it.
         cap = _dec(self.cfg("exit_band_cap", "0") or "0")
         if cap > 0:
-            return max(min(derived, cap), band)
-        return derived
+            exit_band = max(min(exit_band, cap), band)
+        if arm < exit_band:
+            # The invariant already holds, so NOTHING is touched. This is the exact
+            # geometry commit #222 measured at +487 across five trending regimes,
+            # and it is the branch taken for every config where the cap does not
+            # bind — including every overlay x1.0 case in that run. Proof it is an
+            # identity: with A = arm_pct, D = exit_band_frac = A + band, and band > 0,
+            # D > A always; so whenever cap <= 0 or cap >= D the pair is returned
+            # unmodified.
+            return exit_band, arm
+        # Inverted: the cap truncated the exit under the derived arm. Pull the arm to
+        # one entry band inside the AFFORDABLE exit — the same ``exit = arm + band``
+        # relationship the derived geometry has, which is precisely why the branch
+        # above is an identity. Never below the round-trip cost: a "profit" smaller
+        # than the cost of taking it is not profit, and an arm near zero arms the
+        # trail on the first tick and fires it on the second.
+        arm = max(exit_band - band, TAKER_ROUND_TRIP_RATE)
+        if arm >= exit_band:
+            # Reachable only when the affordable exit is itself inside the round-trip
+            # cost, i.e. the stop budget cannot host ANY cost-clearing geometry.
+            # Honouring the cap buys nothing there — the rail fires either way — so
+            # take the coherent geometry and let the rail be the backstop. A bounded
+            # rail flatten is the safer of the two failures; the alternative is
+            # unbounded taker churn on a sub-cost arm.
+            exit_band = arm + band
+            logger.warning(
+                "rgrid exit geometry cannot fit the stop budget user=%s pair=%s "
+                "band=%s cap=%s -> arm=%s exit=%s (session rail is now the backstop)",
+                self.user_id, self.trading_pair, band,
+                _dec(self.cfg("exit_band_cap", "0") or "0"), arm, exit_band,
+            )
+        return exit_band, arm
+
+    def _arm_pct(self) -> Decimal:
+        """Favourable excursion at which the trailing exit engages. See
+        :meth:`_exit_geometry` — jointly derived with the exit band."""
+        return self._exit_geometry()[1]
+
+    def _exit_band(self) -> Decimal:
+        """How far from the average entry the (loss-only) exposure-band exit fires.
+        See :meth:`_exit_geometry`."""
+        return self._exit_geometry()[0]
 
     def _add_reference(self, net: Decimal, anchor: Decimal) -> Decimal:
         """The price the ENTRY/ADD leg is quoted around.
@@ -995,7 +1040,13 @@ class RGridController(MarketMakingController):
         the entry, i.e. breakeven — and ratchets into profit from there. A run can
         no longer be given back below the point at which it was recognised.
         """
-        floor = trail_giveback_frac(self._band(), self.reset_threshold_pct)
+        # Track the ARM, not a second independent derivation. Byte-for-byte
+        # identical today (rgrid_sizing.trail_giveback_frac just returns arm_pct),
+        # but load-bearing now that the arm can be clamped: otherwise the giveback
+        # would keep the UNCLAMPED value (e.g. 30bp) while the arm is clamped (15bp),
+        # putting the armed stop 15bp BELOW entry and inverting the "give-back == arm
+        # puts the stop at breakeven" property documented just above.
+        floor = self._arm_pct()
         mult = _dec(self.cfg("trail_giveback_mult", "0") or "0")
         return max(floor, self._band() * mult)
 

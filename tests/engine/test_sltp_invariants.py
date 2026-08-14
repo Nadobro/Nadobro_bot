@@ -535,53 +535,99 @@ def test_lowering_advisor_confidence_never_increases_the_overlay_size_factor():
 # Both run in the full pytest job. Keep this pointer in step with them.
 
 
-@pytest.mark.xfail(strict=True, reason="RGRID-EXITBAND-INVERT: exit_band_cap is "
-                                      "derived from the UNSCALED band while "
-                                      "spread_ask_pct is overlay-scaled up to 3x")
 def test_rgrid_band_exit_always_sits_outside_the_trail_arm_point():
-    """RGRID-EXITBAND-INVERT — [VERIFIED], recorded not fixed.
+    """RGRID-EXITBAND-INVERT — FIXED.
 
-    rgrid's own docstring states the invariant that makes it profitable: the band
-    exit fires at ``avg_entry x (1 - band)`` and is LOSS-ONLY by construction, so
-    the trail must arm strictly INSIDE it (``_exit_band() > _arm_pct()``). Shipped
-    the other way round, "the loss-only exit always won" — the configuration that
-    measured -85.27 on the backtester.
+    rgrid's docstring states the invariant that makes it profitable: the band exit
+    fires at ``avg_entry x (1 - exit_band)`` and is LOSS-ONLY by construction, so the
+    trail must arm strictly INSIDE it. Shipped the other way round, "the loss-only
+    exit always won" — the configuration that measured -85.27.
 
     ``exit_band_cap`` is computed once in ``map_strategy_config`` from the UNSCALED
-    band, but ``spread_ask_pct`` is scaled live by the overlay (up to 3x) and
-    pushed onto the controller. ``_exit_band()`` is ceilinged by that stale cap
-    while ``_arm_pct()`` is not, so they invert. Audit measured:
+    band, while the overlay rescales ``spread_ask_pct`` live by up to 3x and pushes
+    it onto the controller. The exit was ceilinged by that stale cap and the arm was
+    not, so they crossed — and because the overlay only widens the spread BECAUSE the
+    tape is volatile, the inversion armed itself exactly when noise was largest.
 
-        overlay x1.0: band=10.0bp arm=20.0bp exit_band=30.0bp  ok
-        overlay x1.5: band=15.0bp arm=30.0bp exit_band=30.0bp  INVERTED
-        overlay x3.0: band=30.0bp arm=60.0bp exit_band=30.0bp  INVERTED
-
-    1.5x needs a 15m ATR around 1.67% of price — and the overlay only widens the
-    spread BECAUSE the tape is volatile, so this arms itself exactly when the
-    noise is largest.
-
-    NOT fixed here deliberately. Every candidate fix moves live exit geometry:
-    raising ``_exit_band`` past the cap reintroduces the rail-flatten pathology the
-    cap exists to prevent, and clamping ``_arm_pct``/``_trail_giveback`` under the
-    cap changes the 1.0x geometry that commit #222 measured at +487 across five
-    trending regimes. That is a tuning change, and this repo's rule is that a
-    tuning change must be proven on the cost-aware backtester first — the checked-in
-    reference CSV resamples to 11 bars, which cannot prove it. Needs real trending
-    data before the fix lands.
+    The two are now derived jointly (``_exit_geometry``) and the reconciliation
+    shrinks the ARM rather than widening the exit past what the stop budget affords.
     """
     from src.nadobro.engine.controllers.rgrid import RGridController
+    from src.nadobro.quant.rgrid_sizing import TAKER_ROUND_TRIP_RATE
 
-    ctrl = object.__new__(RGridController)
-    ctrl.spread_ask_pct = Decimal("0.0015")        # overlay-scaled 1.5x from 10bp
-    ctrl.spread_floor_half_pct = Decimal("0.00015")
-    ctrl.reset_threshold_pct = Decimal("0.002")
-    ctrl._cfg = {"exit_band_cap": "0.003", "exit_band_mult": "0"}
-    ctrl.cfg = lambda key, default=None: ctrl._cfg.get(key, default)
+    def _ctrl(band_bp, reset_pct, cap_bp):
+        c = object.__new__(RGridController)
+        c.spread_ask_pct = Decimal(str(band_bp)) / Decimal(10000)
+        c.spread_floor_half_pct = Decimal("0.00015")
+        c.reset_threshold_pct = Decimal(str(reset_pct))
+        c._cfg = {"exit_band_cap": str(Decimal(str(cap_bp)) / Decimal(10000)),
+                  "exit_band_mult": "0"}
+        c.cfg = lambda k, d=None: c._cfg.get(k, d)
+        c.user_id = 1
+        c.trading_pair = "BTC-PERP"
+        return c
 
-    assert ctrl._exit_band() > ctrl._arm_pct(), (
-        f"band exit {ctrl._exit_band()} is inside the trail arm {ctrl._arm_pct()}: "
-        "only the loss-only exit can ever fire"
-    )
+    # Sweep the overlay's full scaling range against a cap sized from the UNSCALED
+    # band — the exact seam that produced the inversion.
+    violations = []
+    for base_bp in (5.0, 10.0, 20.0):
+        for reset in (0.002, 0.005, 0.01):
+            for cap_bp in (15.0, 30.0, 60.0):
+                for mult in (0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0):
+                    c = _ctrl(base_bp * mult, reset, cap_bp)
+                    exit_band, arm = c._exit_geometry()
+                    if not exit_band > arm:
+                        violations.append((base_bp, reset, cap_bp, mult, exit_band, arm))
+                    assert arm >= TAKER_ROUND_TRIP_RATE, (
+                        "an arm under the round-trip cost books a 'profit' smaller "
+                        "than the cost of taking it"
+                    )
+    assert not violations, f"exit_band <= arm at {len(violations)} points: {violations[:3]}"
+
+
+def test_the_exit_geometry_fix_is_a_no_op_where_the_invariant_already_held():
+    """The +487 measurement from commit #222 must still describe live code.
+
+    Whenever the cap does not bind, the derived pair is returned UNMODIFIED — so the
+    fix cannot have moved the geometry that measurement was taken on. Pinned rather
+    than argued: with A = arm_pct and D = exit_band_frac = A + band, D > A always,
+    so cap <= 0 or cap >= D takes the identity branch.
+    """
+    from src.nadobro.engine.controllers.rgrid import RGridController
+    from src.nadobro.quant.rgrid_sizing import arm_pct, exit_band_frac
+
+    c = object.__new__(RGridController)
+    c.spread_ask_pct = Decimal("0.0010")          # 10bp, the measured config
+    c.spread_floor_half_pct = Decimal("0.00015")
+    c.reset_threshold_pct = Decimal("0.002")
+    c._cfg = {"exit_band_cap": "0.003", "exit_band_mult": "0"}   # 30bp, does not bind
+    c.cfg = lambda k, d=None: c._cfg.get(k, d)
+    c.user_id = 1
+    c.trading_pair = "BTC-PERP"
+
+    band = c._band()
+    exit_band, arm = c._exit_geometry()
+    assert arm == arm_pct(band, c.reset_threshold_pct), "arm was altered at x1.0"
+    assert exit_band == exit_band_frac(band, c.reset_threshold_pct), "exit altered at x1.0"
+
+
+def test_the_trail_giveback_tracks_the_clamped_arm():
+    """Give-back == arm is what puts the armed stop at breakeven. It used to be a
+    second INDEPENDENT derivation, so once the arm could be clamped the two would
+    diverge and the stop would sit below entry."""
+    from src.nadobro.engine.controllers.rgrid import RGridController
+
+    c = object.__new__(RGridController)
+    c.spread_ask_pct = Decimal("0.0030")          # 30bp: overlay-scaled 3x
+    c.spread_floor_half_pct = Decimal("0.00015")
+    c.reset_threshold_pct = Decimal("0.002")
+    c._cfg = {"exit_band_cap": "0.003", "exit_band_mult": "0", "trail_giveback_mult": "0"}
+    c.cfg = lambda k, d=None: c._cfg.get(k, d)
+    c.user_id = 1
+    c.trading_pair = "BTC-PERP"
+
+    assert c._trail_giveback() == c._arm_pct()
+
 
 
 @pytest.mark.xfail(strict=True, reason="DGRID-REVERSAL-FLIPFLOP: _maybe_reversal_flip "
