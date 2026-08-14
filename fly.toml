@@ -3,6 +3,12 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
+# Region MUST stay in Europe: Postgres (Supabase, EU) and the @lowiqpts relay
+# (nadobro-relay, primary_region='ams') both live there. A 'nrt' (Tokyo) machine
+# put every DB round-trip and every relay poll ~230ms across the planet — that
+# is what pinned button taps at multi-second latency and made the 1.5s relay
+# poll time out every 2s (2026-08-14). 'fra' and 'ams' are both ~10ms from the
+# relay+DB; keep it here unless the DB and relay move too.
 app = 'nadobro-bot'
 primary_region = 'fra'
 kill_signal = 'SIGTERM'

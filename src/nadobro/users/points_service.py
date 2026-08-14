@@ -7,7 +7,7 @@ import time
 from io import BytesIO
 from typing import Optional
 
-from src.nadobro.utils.env import env_int
+from src.nadobro.utils.env import env_float, env_int
 from src.nadobro.users.points_ui import points_followup_options_kb, points_scope_kb
 from src.nadobro.users.lowiq_relay_client import (
     close_session as relay_close_session,
@@ -250,6 +250,60 @@ def _touch_pending_request(req: dict) -> None:
     req["ts"] = time.time()
 
 
+# --- Unreachable-relay tracking -------------------------------------------
+# A poll that never gets an answer must not keep a request alive forever. We
+# track, per relay session, how long it has been failing and back the polling
+# off while it is down. Two independent jobs here:
+#   * back off      — stop hammering an unreachable relay every 2s (log + CPU)
+#   * give up       — after _RELAY_UNREACHABLE_GIVEUP_SECONDS, finalize the
+#                     session and tell the user, so the poll gate actually closes
+# LOWIQPTS steps legitimately take minutes, so the give-up window is generous
+# enough to ride out a relay redeploy/restart without dropping a live flow.
+_RELAY_UNREACHABLE_GIVEUP_SECONDS = max(
+    30.0,
+    env_float("LOWIQPTS_RELAY_GIVEUP_SECONDS", 180.0),
+)
+_RELAY_BACKOFF_MAX_SECONDS = max(
+    2.0,
+    env_float("LOWIQPTS_RELAY_BACKOFF_MAX_SECONDS", 30.0),
+)
+# session_id -> {"since": monotonic, "fails": int, "next_try": monotonic}
+_relay_unreachable: dict[str, dict[str, float]] = {}
+
+
+def _in_unreachable_backoff(session_id: str) -> bool:
+    state = _relay_unreachable.get(str(session_id))
+    if not state:
+        return False
+    return time.monotonic() < float(state.get("next_try", 0.0))
+
+
+def _note_unreachable(session_id: str) -> float:
+    """Record a failed poll; return how long this session has been failing."""
+    sid = str(session_id)
+    now = time.monotonic()
+    state = _relay_unreachable.get(sid)
+    if state is None:
+        state = {"since": now, "fails": 0.0, "next_try": 0.0}
+        _relay_unreachable[sid] = state
+    state["fails"] = float(state["fails"]) + 1.0
+    # 2s, 4s, 8s ... capped. Bounds both the retry load and the log volume.
+    delay = min(_RELAY_BACKOFF_MAX_SECONDS, 2.0 * (2 ** min(int(state["fails"]) - 1, 6)))
+    state["next_try"] = now + delay
+    return now - float(state["since"])
+
+
+def _clear_unreachable(session_id: str) -> None:
+    _relay_unreachable.pop(str(session_id), None)
+
+
+def _forget_unreachable(live_sessions: set[str]) -> None:
+    """Drop tracking for sessions that are no longer in the pending queue."""
+    for sid in list(_relay_unreachable):
+        if sid not in live_sessions:
+            _relay_unreachable.pop(sid, None)
+
+
 def _prune_stale_pending(bot_data: dict, ttl_seconds: int | None = None) -> None:
     if ttl_seconds is None:
         ttl_seconds = _LOWIQPTS_PENDING_TTL_SECONDS
@@ -404,6 +458,7 @@ def rehydrate_lowiqpts_pending_state(application) -> None:
 
     now = time.time()
     restored = 0
+    expired = 0
     if isinstance(raw_queue, list):
         for raw in raw_queue:
             if not isinstance(raw, dict):
@@ -414,7 +469,16 @@ def rehydrate_lowiqpts_pending_state(application) -> None:
             # No relay session => the req was mid-start when we crashed: unrecoverable.
             if not req_id or not session_id or chat_id is None:
                 continue
+            # Age bound. Restamping ``ts = now`` below is what lets a healthy flow
+            # survive a bounce — but applied unconditionally it also resurrects a
+            # request from days ago on every boot, and that zombie then drives the
+            # 2s relay poll forever. Anchor on when the user actually tapped.
+            created_at = float(raw.get("created_at") or raw.get("ts") or 0.0)
+            if created_at and (now - created_at) > _LOWIQPTS_PENDING_TTL_SECONDS:
+                expired += 1
+                continue
             req = dict(raw)
+            req.setdefault("created_at", created_at or now)
             # Grace period: the restart was not the user's fault — do not let prune or
             # the timeout job immediately drop a flow that was healthy before the bounce.
             req["ts"] = now
@@ -451,8 +515,8 @@ def rehydrate_lowiqpts_pending_state(application) -> None:
         _schedule_timeout(application, str(req.get("req_id", "")))
 
     logger.info(
-        "LOWIQPTS rehydration: restored=%d skipped_no_session=%d",
-        restored, raw_queue_count - restored,
+        "LOWIQPTS rehydration: restored=%d expired=%d skipped_no_session=%d",
+        restored, expired, raw_queue_count - restored - expired,
     )
 
 
@@ -741,6 +805,9 @@ async def request_points_refresh(context, telegram_id: int, chat_id: int) -> dic
         "chat_id": int(chat_id),
         "wallet": wallet,
         "ts": time.time(),
+        # ``ts`` is a liveness heartbeat and gets restamped; ``created_at`` is the
+        # immutable moment the user tapped Refresh, so rehydration can bound age.
+        "created_at": time.time(),
     }
     queue.append(req)
     by_wallet.setdefault(wallet, []).append(req)
@@ -1122,10 +1189,6 @@ async def poll_lowiqpts_relay_events(bot_app) -> None:
         return
     bot_data = bot_app.bot_data
     queue, _ = _pending_maps(bot_data)
-    # Heartbeat: keep pending rows alive while we wait on a slow LOWIQPTS session.
-    for req in queue:
-        if str(req.get("relay_session_id", "")).strip():
-            _touch_pending_request(req)
     seen_sessions: set[str] = set()
     session_ids: list[str] = []
     for req in queue:
@@ -1133,15 +1196,36 @@ async def poll_lowiqpts_relay_events(bot_app) -> None:
         if sid and sid not in seen_sessions:
             seen_sessions.add(sid)
             session_ids.append(sid)
+    _forget_unreachable(set(seen_sessions))
     if not session_ids:
         return
     before = _durable_relay_state(bot_data)
     for session_id in session_ids:
+        if _in_unreachable_backoff(session_id):
+            continue
         cursor_key = f"{_RELAY_CURSOR_KEY}:{session_id}"
         cursor = bot_data.get(cursor_key)
         response = await relay_poll_events(session_id=session_id, cursor=str(cursor) if cursor else None)
         if not response.get("ok"):
+            # The relay did not answer. Do NOT heartbeat: a failed poll proves
+            # nothing about the session, and touching ``ts`` here is what made a
+            # wedged request immortal — the heartbeat kept re-arming the timeout
+            # job and kept _prune_stale_pending from ever reaping it, so the 2s
+            # poll ran forever (2026-08-14 log flood).
+            if _note_unreachable(session_id) >= _RELAY_UNREACHABLE_GIVEUP_SECONDS:
+                try:
+                    await _finalize_dead_session(bot_app, bot_data, session_id, "unreachable")
+                except Exception:
+                    logger.warning("Failed to finalize unreachable LOWIQPTS session", exc_info=True)
+                _clear_unreachable(session_id)
             continue
+
+        _clear_unreachable(session_id)
+        # The relay answered, so this session is genuinely alive: heartbeat its
+        # pending rows to hold off the staleness prune and the timeout job.
+        for req in queue:
+            if str(req.get("relay_session_id", "")).strip() == session_id:
+                _touch_pending_request(req)
 
         events, next_cursor = _extract_events_response(response)
         if next_cursor:

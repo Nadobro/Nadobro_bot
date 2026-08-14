@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 from src.nadobro.utils.env import env_float, env_int
 from typing import Any, Optional
@@ -7,6 +8,53 @@ from typing import Any, Optional
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Repeated-failure log damping. A wedged relay used to emit one WARNING per poll
+# — at the 2s tick that is 1800 identical lines/hour, which buried every other
+# signal in the Fly log (2026-08-14). Log the first failure of a streak, then
+# stay quiet and emit one periodic roll-up with the streak count.
+_FAIL_LOG_INTERVAL_SECONDS = env_float("LOWIQPTS_RELAY_FAIL_LOG_INTERVAL_SECONDS", 300.0)
+_fail_streaks: dict[str, dict[str, Any]] = {}
+
+
+def _describe_exc(exc: BaseException) -> str:
+    """httpx timeout/connect errors carry empty args — ``%s`` printed nothing.
+
+    The production symptom was literally ``relay request failed GET /events/poll:``
+    with no reason, which made a 30-minute outage undiagnosable. Always carry the
+    exception CLASS, and the message only when there is one.
+    """
+    text = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {text}" if text else name
+
+
+def _log_request_failure(method: str, path: str, exc: BaseException, detail: str = "") -> None:
+    """WARN on the first failure of a streak, then roll up periodically."""
+    key = f"{method} {path}"
+    reason = _describe_exc(exc)
+    if detail:
+        reason = f"{reason} body={detail}"
+    now = time.monotonic()
+    state = _fail_streaks.get(key)
+    if state is None:
+        _fail_streaks[key] = {"count": 1, "last_log": now}
+        logger.warning("LOWIQ relay request failed %s: %s", key, reason)
+        return
+    state["count"] += 1
+    if now - float(state["last_log"]) >= _FAIL_LOG_INTERVAL_SECONDS:
+        logger.warning(
+            "LOWIQ relay request failing %s: %d consecutive failures, latest %s",
+            key, state["count"], reason,
+        )
+        state["last_log"] = now
+
+
+def _clear_request_failures(method: str, path: str) -> None:
+    key = f"{method} {path}"
+    state = _fail_streaks.pop(key, None)
+    if state and int(state.get("count", 0)) > 1:
+        logger.info("LOWIQ relay recovered %s after %d failures", key, state["count"])
 
 # Session start/reply waits on @lowiqpts (can take minutes). The 2s scheduler
 # poll must NOT inherit this — a hung AMS call from nrt pinned the job for
@@ -77,6 +125,7 @@ async def _request(
         response = await client.request(method, path, json=json, params=params, **req_kwargs)
         response.raise_for_status()
         data = response.json()
+        _clear_request_failures(method, path)
         if isinstance(data, dict):
             return data
         return {"ok": True, "data": data}
@@ -86,10 +135,10 @@ async def _request(
             body = e.response.text[:400]
         except Exception:
             body = ""
-        logger.warning("LOWIQ relay HTTP error %s %s: %s", method, path, body)
+        _log_request_failure(method, path, e, detail=body)
         return {"ok": False, "error": "relay_http_error", "status_code": e.response.status_code, "body": body}
     except Exception as e:
-        logger.warning("LOWIQ relay request failed %s %s: %s", method, path, e)
+        _log_request_failure(method, path, e)
         return {"ok": False, "error": "relay_request_failed"}
 
 

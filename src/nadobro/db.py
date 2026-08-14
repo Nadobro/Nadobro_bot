@@ -10,7 +10,17 @@ logger = logging.getLogger(__name__)
 
 _pool = None
 _pool_pid = None
-_DB_POOL_MIN = env_int("DB_POOL_MIN", 2)
+# psycopg2's ``_putconn`` KEEPS a returned connection only while
+# ``len(self._pool) < minconn``; above that it CLOSES it. With minconn=2, any
+# time more than two DB ops overlap (routine on the click path — a home-card
+# render fans several reads across the 30-worker DB pool) every extra connection
+# was closed on return and the next getconn paid a full TCP+TLS+SCRAM handshake.
+# In-region that is ~10-40ms; the churn is invisible. It becomes the dominant tap
+# latency only when the DB is far — which is the real fix (keep the app in-region,
+# see fly.toml). Retaining a working set of idle connections removes the churn
+# regardless. minconn only sets retention + boot pre-open; the peak is still
+# maxconn, so this does not raise the Supabase connection ceiling.
+_DB_POOL_MIN = env_int("DB_POOL_MIN", 8)
 _DB_POOL_MAX = env_int("DB_POOL_MAX", 30)
 
 # Connection-level network hardening. Production runs against Supabase's

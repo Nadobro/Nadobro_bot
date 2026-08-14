@@ -298,11 +298,14 @@ def get_ops_diagnostics(telegram_id: int | None = None) -> dict[str, Any]:
     from src.nadobro.strategy.bot_runtime import get_runtime_diagnostics
     from src.nadobro.runtime.runtime_supervisor import runtime_mode
 
+    from src.nadobro.core.egress_geo import status_line as egress_status_line
+
     payload: dict[str, Any] = {
         "ts": time.time(),
         "queue": get_queue_diagnostics(),
         "runtime": get_runtime_diagnostics(),
         "perf": perf_snapshot(),
+        "egress_geo": egress_status_line(),
         "runtime_env": {
             "NADO_RUNTIME_MODE": runtime_mode(),
             "NADO_STRATEGY_WORKERS": (os.environ.get("NADO_STRATEGY_WORKERS") or "2").strip(),

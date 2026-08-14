@@ -140,12 +140,34 @@ curl -s https://ipinfo.io/<egress-ip>/json
   need their help, or a different provider/proxy — see fallback below).
 
 **Re-verify the country after every redeploy / egress change** (Machine
-recreation can drop or change the allocation). Bake a geo-check into the release
-process so a redeploy can't silently land back on a US IP.
+recreation can drop or change the allocation). This is now automated:
 
-Set `NADO_FORCE_IPV4=1` (default in `fly.toml`) so Nado REST/SDK traffic uses
-the static IPv4 egress rather than IPv6 when the destination publishes AAAA
-records.
+- **In-bot guard** (`core/egress_geo.py`): on boot and every
+  `NADO_EGRESS_GEO_CHECK_HOURS` (default 6h) the bot probes its own IPv4 **and**
+  IPv6 egress country and logs `EGRESS GEO-BLOCK RISK: ...` at ERROR if either
+  geolocates to a restricted territory. It is **advisory** (never blocks
+  trading — a flaky geo lookup must not halt the desk); the authoritative
+  reactive defense stays the `ip_query_only` write circuit. The current status
+  also shows in `/ops` under Diagnostics (`egress geo: ok|RESTRICTED|unverified`).
+- **On-demand / release check** — run from inside the machine; exits non-zero on
+  a restricted egress so a deploy pipeline can gate on it:
+
+  ```bash
+  fly ssh console -a nadobro-bot -C "python scripts/check_egress_geo.py"
+  ```
+
+Restricted set defaults to `US,CA,PA,BY,CU,IR,KP,RU,SY` — the whole-country
+entries from Nado's Terms of Use (US, Canada, Panama, Belarus, Cuba, Iran, North
+Korea, Russia, plus Syria via comprehensive US/UK sanctions). Ukraine is excluded
+because only the Crimea/Donetsk/Luhansk **regions** are restricted, not the
+country. Tune with `NADO_RESTRICTED_COUNTRIES` if Nado revises the list.
+
+`NADO_FORCE_IPV4` defaults to `0` (dual-stack) in `fly.toml` — forcing IPv4-only
+also forced the DB resolver to IPv4 and broke Supabase's IPv6-only direct host.
+Because egress is dual-stack, Nado may see **either** the IPv4 or the IPv6 egress
+on a connect, so both families must geolocate to an allowed country — which is
+why the guard above checks both. Set `NADO_FORCE_IPV4=1` only if you have pinned
+a single clean IPv4 egress and need Nado to see exactly that address.
 
 ### Fallback if Fly can't provide an allowed-geo egress
 

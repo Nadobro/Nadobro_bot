@@ -387,15 +387,16 @@ def test_rehydrate_lowiqpts_pending_state_round_trip(monkeypatch):
 
     wallet_a = "0x" + "ab" * 20
     wallet_b = "0x" + "cd" * 20
+    recent = time.time() - 30  # a genuine recent restart persists ts ~= now
     saved = {
         "queue": [
             {"req_id": "r1", "telegram_id": 1, "chat_id": 100, "wallet": wallet_a,
-             "ts": 1000.0, "relay_session_id": "sess_1"},
+             "ts": recent, "created_at": recent, "relay_session_id": "sess_1"},
             {"req_id": "r2", "telegram_id": 2, "chat_id": 200, "wallet": wallet_b,
-             "ts": 1001.0, "relay_session_id": "sess_2"},
+             "ts": recent, "created_at": recent, "relay_session_id": "sess_2"},
             # No relay session => was mid-start at crash; unrecoverable, must be dropped.
             {"req_id": "r3", "telegram_id": 3, "chat_id": 300, "wallet": "0x" + "ef" * 20,
-             "ts": 1002.0},
+             "ts": recent, "created_at": recent},
         ],
         "cursors": {"sess_1": "55", "sess_2": "66", "sess_dead": "77"},
     }
@@ -413,7 +414,7 @@ def test_rehydrate_lowiqpts_pending_state_round_trip(monkeypatch):
     queue = bot_data[points_service._PENDING_QUEUE_KEY]
     assert sorted(r["req_id"] for r in queue) == ["r1", "r2"]  # r3 dropped
     # Grace period: ts is refreshed to "now" so prune/timeout do not fire on resume.
-    assert all(r["ts"] > 1002.0 for r in queue)
+    assert all(r["ts"] >= recent for r in queue)
     by_wallet = bot_data[points_service._PENDING_BY_WALLET_KEY]
     assert set(by_wallet.keys()) == {wallet_a.lower(), wallet_b.lower()}
     active = bot_data[points_service._ACTIVE_BY_CHAT_KEY]
@@ -424,6 +425,109 @@ def test_rehydrate_lowiqpts_pending_state_round_trip(monkeypatch):
     assert f"{points_service._RELAY_CURSOR_KEY}:sess_dead" not in bot_data
     # Timeout jobs re-armed so each resumed flow stays bounded.
     assert sorted(rearmed) == ["r1", "r2"]
+
+
+def test_rehydrate_drops_requests_older_than_ttl(monkeypatch):
+    """A request whose created_at predates the TTL must NOT be resurrected on boot.
+
+    Regression for the 2026-08-14 log flood: rehydration stamped ts=now on every
+    persisted row unconditionally, so a day-old zombie request came back to life
+    every restart and drove the 2s relay poll forever.
+    """
+    from src.nadobro.users import points_service
+
+    ancient = time.time() - points_service._LOWIQPTS_PENDING_TTL_SECONDS - 600
+    recent = time.time() - 30
+    saved = {
+        "queue": [
+            {"req_id": "old", "telegram_id": 1, "chat_id": 100, "wallet": "0x" + "ab" * 20,
+             "ts": ancient, "created_at": ancient, "relay_session_id": "sess_old"},
+            {"req_id": "new", "telegram_id": 2, "chat_id": 200, "wallet": "0x" + "cd" * 20,
+             "ts": recent, "created_at": recent, "relay_session_id": "sess_new"},
+        ],
+        "cursors": {},
+    }
+    monkeypatch.setattr(points_service, "get_bot_state", lambda key: saved)
+    monkeypatch.setattr(points_service, "_schedule_timeout", lambda *a, **k: None)
+
+    application = SimpleNamespace(bot_data={})
+    points_service.rehydrate_lowiqpts_pending_state(application)
+
+    queue = application.bot_data[points_service._PENDING_QUEUE_KEY]
+    assert [r["req_id"] for r in queue] == ["new"]  # ancient row dropped
+
+
+def test_poll_does_not_heartbeat_on_failed_poll(monkeypatch):
+    """A poll that fails (relay unreachable) must NOT touch ts.
+
+    Heartbeating on failure is what made a wedged request immortal: it kept
+    re-arming the timeout job and kept _prune_stale_pending from ever reaping
+    the row, so the 2s poll ran forever (2026-08-14 flood root cause).
+    """
+    from src.nadobro.users import points_service
+
+    points_service._relay_unreachable.clear()
+
+    async def _poll_events(*, session_id, cursor):
+        return {"ok": False, "error": "relay_request_failed"}
+
+    monkeypatch.setattr(points_service, "relay_is_configured", lambda: True)
+    monkeypatch.setattr(points_service, "relay_poll_events", _poll_events)
+    monkeypatch.setattr(points_service, "_persist_relay_state", _noop_async)
+
+    original_ts = time.time() - 5
+    bot_app = SimpleNamespace(bot_data={
+        points_service._PENDING_QUEUE_KEY: [
+            {"relay_session_id": "sess_x", "req_id": "r1", "chat_id": 5, "ts": original_ts}
+        ],
+    })
+
+    asyncio.run(points_service.poll_lowiqpts_relay_events(bot_app))
+
+    # ts is UNCHANGED — the failed poll did not falsely refresh liveness.
+    assert bot_app.bot_data[points_service._PENDING_QUEUE_KEY][0]["ts"] == original_ts
+
+
+def test_poll_finalizes_session_after_unreachable_giveup(monkeypatch):
+    """After the give-up window of continuous failures, the dead session is
+    finalized, the row leaves the queue, and polling stops — so the user is told
+    instead of the poll churning forever."""
+    from src.nadobro.users import points_service
+
+    points_service._relay_unreachable.clear()
+
+    async def _poll_events(*, session_id, cursor):
+        return {"ok": False, "error": "relay_request_failed"}
+
+    monkeypatch.setattr(points_service, "relay_is_configured", lambda: True)
+    monkeypatch.setattr(points_service, "relay_poll_events", _poll_events)
+    monkeypatch.setattr(points_service, "_persist_relay_state", _noop_async)
+    # Seed the failure state so this session is already past the give-up window.
+    session_id = "sess_dead"
+    points_service._relay_unreachable[session_id] = {
+        "since": time.monotonic() - points_service._RELAY_UNREACHABLE_GIVEUP_SECONDS - 1,
+        "fails": 99.0,
+        "next_try": 0.0,
+    }
+
+    req_row = {
+        "req_id": "req_gone", "chat_id": 88, "telegram_id": 8,
+        "wallet": "0x" + "ab" * 20, "ts": time.time(), "relay_session_id": session_id,
+    }
+    send_mock = AsyncMock()
+    bot_app = SimpleNamespace(
+        bot_data={
+            points_service._PENDING_QUEUE_KEY: [req_row],
+            points_service._ACTIVE_BY_CHAT_KEY: {88: "req_gone"},
+        },
+        bot=SimpleNamespace(send_message=send_mock),
+    )
+
+    asyncio.run(points_service.poll_lowiqpts_relay_events(bot_app))
+
+    assert bot_app.bot_data[points_service._PENDING_QUEUE_KEY] == []  # finalized
+    assert send_mock.await_count == 1  # user notified
+    assert session_id not in points_service._relay_unreachable  # tracking cleared
 
 
 def test_poll_finalizes_dead_relay_session(monkeypatch):

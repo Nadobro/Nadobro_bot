@@ -81,3 +81,37 @@ def test_scheduler_poll_is_a_no_op_when_disabled(monkeypatch):
     finally:
         sched._bot_app = previous
     assert called == []
+
+
+def test_request_failures_are_throttled_and_describe_the_exception(monkeypatch, caplog):
+    """A wedged relay must not emit one WARNING per 2s poll, and the reason must
+    never be blank (httpx timeout/connect errors carry empty args)."""
+    import logging
+    from src.nadobro.users import lowiq_relay_client as client
+
+    client._fail_streaks.clear()
+    monkeypatch.setattr(client, "_FAIL_LOG_INTERVAL_SECONDS", 10_000.0)
+
+    with caplog.at_level(logging.WARNING, logger=client.logger.name):
+        # First failure logs once with the exception class, even for empty args.
+        client._log_request_failure("GET", "/events/poll", client.httpx.ConnectTimeout(""))
+        for _ in range(50):  # a stream of identical failures
+            client._log_request_failure("GET", "/events/poll", client.httpx.ConnectTimeout(""))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "streak of failures must collapse to a single WARNING"
+    assert "ConnectTimeout" in warnings[0].getMessage()  # reason is never blank
+    assert client._fail_streaks["GET /events/poll"]["count"] == 51
+
+
+def test_request_failure_recovery_is_logged(monkeypatch, caplog):
+    import logging
+    from src.nadobro.users import lowiq_relay_client as client
+
+    client._fail_streaks.clear()
+    client._log_request_failure("GET", "/events/poll", client.httpx.ConnectError(""))
+    client._log_request_failure("GET", "/events/poll", client.httpx.ConnectError(""))
+    with caplog.at_level(logging.INFO, logger=client.logger.name):
+        client._clear_request_failures("GET", "/events/poll")
+    assert any("recovered" in r.getMessage() for r in caplog.records)
+    assert "GET /events/poll" not in client._fail_streaks
