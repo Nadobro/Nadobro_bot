@@ -13,7 +13,8 @@ def _clean_env(monkeypatch):
     for var in (
         "NANOGPT_API_KEY", "NANO_GPT_API_KEY", "NANOGPT_MODEL",
         "NANOGPT_MODEL_CHAT", "NANOGPT_MODEL_FINANCE", "NANOGPT_MODEL_JSON",
-        "NANOGPT_MODEL_SCAN", "XAI_API_KEY", "OPENAI_API_KEY",
+        "NANOGPT_MODEL_SCAN", "NANOGPT_MODEL_TA", "NANOGPT_MODEL_WEB",
+        "NANOGPT_MODEL_X", "XAI_API_KEY", "OPENAI_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
     llm_gateway.reset_cache()
@@ -118,6 +119,8 @@ def test_ta_candidates_are_claude_only(monkeypatch):
     monkeypatch.setenv("NANOGPT_MODEL_TA", "anthropic/claude-opus-4.8")
     cands = llm_gateway.ta_model_candidates()
     assert cands[0] == "anthropic/claude-opus-4.8"
+    assert "anthropic/claude-sonnet-5" in cands
+    assert cands.index("anthropic/claude-sonnet-5") < cands.index("anthropic/claude-opus-4")
     assert all("claude" in m for m in cands)
     assert all("gpt" not in m and "grok" not in m and "x-ai" not in m for m in cands)
 

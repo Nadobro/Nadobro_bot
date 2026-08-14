@@ -67,6 +67,42 @@ def test_nanogpt_chat_uses_provider_timeout_and_records_degraded(monkeypatch):
         timeout=30,
     )
 
-    assert (ok, text, raw) == (False, "", {})
+    assert ok is False
+    assert text == ""
+    assert raw.get("error")
+    assert "timeout" in str(raw.get("error"))
     assert degraded["provider"] == "nanogpt"
     assert "timeout" in degraded["detail"]
+
+
+def test_openai_compatible_chat_logs_model_and_status_on_400(monkeypatch):
+    from src.nadobro.llm import nanogpt_client
+
+    class _Bad:
+        status_code = 400
+        text = '{"error":{"message":"model_not_supported","code":"model_not_supported"}}'
+
+        def json(self):
+            return {"error": {"message": "model_not_supported", "code": "model_not_supported"}}
+
+    monkeypatch.setattr(
+        nanogpt_client,
+        "post_json_with_retries",
+        lambda *args, **kwargs: (_Bad(), 12.0),
+    )
+    monkeypatch.setattr(nanogpt_client, "provider_timeout_seconds", lambda provider, default: 7)
+    monkeypatch.setattr(nanogpt_client, "record_provider_degraded", lambda *a, **k: None)
+
+    ok, text, raw = nanogpt_client.openai_compatible_chat(
+        base_url="https://nano.example",
+        api_key="key",
+        model="anthropic/claude-opus-4.8",
+        messages=[{"role": "user", "content": "hi"}],
+        timeout=30,
+    )
+
+    assert ok is False
+    assert text == ""
+    assert raw["status"] == 400
+    assert raw["model"] == "anthropic/claude-opus-4.8"
+    assert "model_not_supported" in str(raw["error"])

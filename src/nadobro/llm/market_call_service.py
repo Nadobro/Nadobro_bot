@@ -155,17 +155,24 @@ def enrich_research_legs(pack: EvidencePack) -> EvidencePack:
     """GPT web + Grok X via NanoGPT. Never writes the user answer."""
     try:
         web = _research_web(pack)
-        if web:
+        if web.get("model_task") == "web":
             pack.web = web
             pack.sources.append("GPT web (NanoGPT)")
+        else:
+            pack.missing.append("web")
     except Exception as exc:
         logger.warning("web research failed: %s", exc)
         pack.missing.append("web")
     try:
         xleg = _research_x(pack)
-        if xleg:
+        if xleg.get("model_task") == "x":
             pack.x = xleg
             pack.sources.append("Grok X (NanoGPT)")
+        elif xleg:
+            pack.x = xleg
+            if xleg.get("tweets_fetched"):
+                pack.sources.append("X API tweets")
+            pack.missing.append("grok_x")
         elif "x" not in pack.missing:
             pack.missing.append("x")
     except Exception as exc:
@@ -202,12 +209,15 @@ def _claude_complete(pack: EvidencePack, user_name: str) -> str:
         if ok and (text or "").strip():
             return text.strip()
         err = ""
+        status = None
         if isinstance(raw, dict):
             err = str(raw.get("error") or raw.get("message") or "")[:200]
+            status = raw.get("status")
         last_err = err or "empty"
         logger.warning("TA model %s failed: %s", model, last_err)
-        low = last_err.lower()
-        if "model_not_supported" not in low and "not found" not in low and "does not exist" not in low:
+        # 401 is the key — later Claude ids will fail the same way. 400/403/empty
+        # are often per-model (opus-4.8 not on the plan) so keep walking.
+        if status == 401:
             break
     logger.warning("Claude Market Call failed, using deterministic fallback: %s", last_err)
     return _deterministic_fallback(pack)
@@ -238,8 +248,14 @@ def _deterministic_fallback(pack: EvidencePack) -> str:
     reasons = list(sig.get("reasons") or [])[:3]
     risks = list(sig.get("risks") or [])[:2]
     why = reasons or [f"Regime {regime}, bias {bias:+.2f}."]
+    mid = (pack.quote or {}).get("mid")
+    imb = ((pack.chart or {}).get("book") or {}).get("imbalance")
+    if mid not in (None, ""):
+        why.append(f"Nado mid {mid}.")
+    if imb is not None:
+        why.append(f"Top-of-book imbalance {imb:+.2f}.")
     lines.append("**Why**")
-    for r in why:
+    for r in why[:5]:
         lines.append(f"- {r}")
     for r in risks:
         lines.append(f"- Risk: {r}")

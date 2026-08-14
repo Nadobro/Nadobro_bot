@@ -14,6 +14,9 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 _HORIZON_RE = re.compile(r"\b(15m|15\s*min|1h|1hr|4h|4hr|4hrs|4hrly|4\s*hour(?:ly)?|1d|daily)\b", re.I)
+_CANDLE_TFS = ("15m", "1h", "4h")
+# 80 bars covers EMA21 / ATR14 / RSI without a 200-bar indexer storm (weight 5 vs 11).
+_CANDLE_LIMIT = 80
 
 
 def parse_horizon(text: str, *, default: str = "4h") -> str:
@@ -166,6 +169,144 @@ class EvidencePack:
         return d
 
 
+def _ordered_tfs(horizon: str) -> tuple[str, ...]:
+    preferred = horizon if horizon in _CANDLE_TFS else "4h"
+    rest = tuple(tf for tf in _CANDLE_TFS if tf != preferred)
+    return (preferred, *rest)
+
+
+def _fetch_candles_nado(client: Any, pid: int, horizon: str) -> dict[str, list]:
+    out: dict[str, list] = {}
+    for tf in _ordered_tfs(horizon):
+        try:
+            out[tf] = list(client.get_candlesticks(int(pid), tf, _CANDLE_LIMIT) or [])
+        except Exception as exc:
+            logger.warning("candles failed pid=%s tf=%s: %s", pid, tf, exc)
+            out[tf] = []
+    logger.info(
+        "market_call nado candles pid=%s counts=%s",
+        pid,
+        {tf: len(rows) for tf, rows in out.items()},
+    )
+    return out
+
+
+def _fetch_candles_hl(symbol: str, horizon: str) -> dict[str, list]:
+    try:
+        from src.nadobro.market_data.hl_client import get_candles_sync
+    except Exception as exc:
+        logger.warning("HL candle import failed: %s", exc)
+        return {tf: [] for tf in _ordered_tfs(horizon)}
+    out: dict[str, list] = {}
+    for tf in _ordered_tfs(horizon):
+        try:
+            out[tf] = list(get_candles_sync(symbol, tf) or [])
+        except Exception as exc:
+            logger.warning("HL candles failed %s %s: %s", symbol, tf, exc)
+            out[tf] = []
+    logger.info(
+        "market_call hl candles symbol=%s counts=%s",
+        symbol,
+        {tf: len(rows) for tf, rows in out.items()},
+    )
+    return out
+
+
+def _fetch_candles_binance(symbol: str, horizon: str) -> dict[str, list]:
+    try:
+        from src.nadobro.market_data.binance_client import get_klines_sync
+    except Exception as exc:
+        logger.warning("Binance kline import failed: %s", exc)
+        return {tf: [] for tf in _ordered_tfs(horizon)}
+    out: dict[str, list] = {}
+    for tf in _ordered_tfs(horizon):
+        try:
+            out[tf] = list(get_klines_sync(symbol, tf, _CANDLE_LIMIT) or [])
+        except Exception as exc:
+            logger.warning("Binance candles failed %s %s: %s", symbol, tf, exc)
+            out[tf] = []
+    logger.info(
+        "market_call binance candles symbol=%s counts=%s",
+        symbol,
+        {tf: len(rows) for tf, rows in out.items()},
+    )
+    return out
+
+
+_CANDLE_SOURCE_LABEL = {
+    "hyperliquid": "Hyperliquid candles",
+    "binance": "Binance candles",
+    "nado": "Nado candles",
+}
+
+
+def _load_signal_candles(
+    symbol: str,
+    horizon: str,
+    *,
+    nado_client: Any = None,
+    nado_pid: int | None = None,
+) -> tuple[dict[str, list], str | None, list[str]]:
+    """HL first, Binance second, Nado indexer only if both are empty.
+
+    Live strategy ticks still fetch Nado candles themselves. This path is
+    Market Call TA only — off-venue bars cut the archive-budget storm.
+    """
+    missing: list[str] = []
+    hl_rows = _fetch_candles_hl(symbol, horizon)
+    if any(hl_rows.values()):
+        return hl_rows, "hyperliquid", missing
+    missing.append("hl_candles")
+    bn_rows = _fetch_candles_binance(symbol, horizon)
+    if any(bn_rows.values()):
+        return bn_rows, "binance", missing
+    missing.append("binance_candles")
+    if nado_client is not None and nado_pid is not None:
+        nado_rows = _fetch_candles_nado(nado_client, int(nado_pid), horizon)
+        if any(nado_rows.values()):
+            return nado_rows, "nado", missing
+        missing.append("nado_candles")
+    empty = {tf: [] for tf in _ordered_tfs(horizon)}
+    return empty, None, missing
+
+
+def _assemble_chart(
+    candles_by_tf: dict[str, list],
+    horizon: str,
+    *,
+    venue: str,
+    funding_rate: Any = None,
+    depth_summary: dict[str, Any] | None = None,
+    candle_source: str | None = None,
+) -> dict[str, Any]:
+    from src.nadobro.strategy.market_features import compute_tf_features
+    from src.nadobro.llm.signal_engine import build_signal
+
+    features = {tf: _compact_features(compute_tf_features(rows)) for tf, rows in candles_by_tf.items()}
+    signal = build_signal(features, funding_rate=funding_rate)
+    horizon_rows = candles_by_tf.get(horizon) or candles_by_tf.get("4h") or candles_by_tf.get("1h") or []
+    last_close = None
+    last_time = None
+    if horizon_rows:
+        last_close = float(horizon_rows[-1].get("close") or 0) or None
+        last_time = horizon_rows[-1].get("time")
+    chart: dict[str, Any] = {
+        "venue": venue,
+        "horizon": horizon,
+        "last_close": last_close,
+        "last_candle_time": last_time,
+        "features_by_tf": features,
+        "signal": signal.as_dict(),
+        "sr": _sr_from_candles(horizon_rows),
+        "candle_counts": {tf: len(rows) for tf, rows in candles_by_tf.items()},
+    }
+    if depth_summary:
+        chart["book"] = depth_summary
+    if candle_source:
+        chart["candle_source"] = candle_source
+    return chart
+
+
 def _nado_chart(asset, horizon: str, network: str) -> tuple[dict[str, Any], dict[str, Any], list[str], list[str]]:
     chart: dict[str, Any] = {}
     quote: dict[str, Any] = {}
@@ -186,72 +327,57 @@ def _nado_chart(asset, horizon: str, network: str) -> tuple[dict[str, Any], dict
         missing.append("nado_client")
         return chart, quote, sources, missing
 
-    tfs = ("15m", "1h", "4h")
-    candles_by_tf: dict[str, list] = {}
-    for tf in tfs:
-        try:
-            candles_by_tf[tf] = list(client.get_candlesticks(int(pid), tf, 200) or [])
-        except Exception as exc:
-            logger.warning("candles failed pid=%s tf=%s: %s", pid, tf, exc)
-            candles_by_tf[tf] = []
-    if not any(candles_by_tf.values()):
-        missing.append("nado_candles")
-    else:
-        sources.append("Nado candles")
+    candles_by_tf, candle_source, candle_missing = _load_signal_candles(
+        str(getattr(asset, "symbol", "") or ""),
+        horizon,
+        nado_client=client,
+        nado_pid=int(pid),
+    )
+    missing.extend(candle_missing)
+    label = _CANDLE_SOURCE_LABEL.get(candle_source or "")
+    if label:
+        sources.append(label)
 
     try:
-        from src.nadobro.strategy.market_features import compute_tf_features
-        from src.nadobro.llm.signal_engine import build_signal
-
-        features = {tf: _compact_features(compute_tf_features(rows)) for tf, rows in candles_by_tf.items()}
-        funding = None
-        try:
-            stats = client.get_product_market_stats(int(pid)) or {}
-        except Exception:
-            stats = {}
-        stats = enrich_from_candles(stats, candles_by_tf.get("1h") or [])
-        quote = {
-            "venue": "nado",
-            "mid": stats.get("mid"),
-            "bid": stats.get("bid"),
-            "ask": stats.get("ask"),
-            "spread_bps": stats.get("spread_bps"),
-            "funding_rate": stats.get("funding_rate"),
-            "volume_24h_usd": stats.get("volume_24h_usd"),
-            "open_interest": stats.get("open_interest"),
-            "change_24h_pct": stats.get("change_24h_pct"),
-            "high_24h": stats.get("high_24h"),
-            "low_24h": stats.get("low_24h"),
-        }
+        stats = client.get_product_market_stats(int(pid)) or {}
+    except Exception:
+        stats = {}
+    stats = enrich_from_candles(stats, candles_by_tf.get("1h") or [])
+    quote = {
+        "venue": "nado",
+        "mid": stats.get("mid"),
+        "bid": stats.get("bid"),
+        "ask": stats.get("ask"),
+        "spread_bps": stats.get("spread_bps"),
+        "funding_rate": stats.get("funding_rate"),
+        "volume_24h_usd": stats.get("volume_24h_usd"),
+        "open_interest": stats.get("open_interest"),
+        "change_24h_pct": stats.get("change_24h_pct"),
+        "high_24h": stats.get("high_24h"),
+        "low_24h": stats.get("low_24h"),
+    }
+    if stats:
         sources.append("Nado book")
-        funding = stats.get("funding_rate")
-        signal = build_signal(features, funding_rate=funding)
-        horizon_rows = candles_by_tf.get(horizon) or candles_by_tf.get("4h") or candles_by_tf.get("1h") or []
-        last_close = None
-        last_time = None
-        if horizon_rows:
-            last_close = float(horizon_rows[-1].get("close") or 0) or None
-            last_time = horizon_rows[-1].get("time")
-        depth_summary = {}
-        try:
-            depth = client.get_market_liquidity(int(pid), depth=10) or {}
-            depth_summary = _book_imbalance(depth)
-            if depth_summary.get("levels"):
-                sources.append("Nado depth")
-        except Exception as exc:
-            logger.debug("depth failed pid=%s: %s", pid, exc)
-            missing.append("nado_depth")
-        chart = {
-            "venue": "nado",
-            "horizon": horizon,
-            "last_close": last_close,
-            "last_candle_time": last_time,
-            "features_by_tf": features,
-            "signal": signal.as_dict(),
-            "sr": _sr_from_candles(horizon_rows),
-            "book": depth_summary,
-            "candle_counts": {tf: len(rows) for tf, rows in candles_by_tf.items()},
-        }
+
+    depth_summary: dict[str, Any] = {}
+    try:
+        depth = client.get_market_liquidity(int(pid), depth=10) or {}
+        depth_summary = _book_imbalance(depth)
+        if depth_summary.get("levels"):
+            sources.append("Nado depth")
+    except Exception as exc:
+        logger.debug("depth failed pid=%s: %s", pid, exc)
+        missing.append("nado_depth")
+
+    try:
+        chart = _assemble_chart(
+            candles_by_tf,
+            horizon,
+            venue="nado",
+            funding_rate=stats.get("funding_rate"),
+            depth_summary=depth_summary,
+            candle_source=candle_source,
+        )
     except Exception as exc:
         logger.warning("nado chart pack failed: %s", exc)
         missing.append("nado_chart")
@@ -261,35 +387,24 @@ def _nado_chart(asset, horizon: str, network: str) -> tuple[dict[str, Any], dict
 def _hl_chart(symbol: str, horizon: str) -> tuple[dict[str, Any], list[str], list[str]]:
     missing: list[str] = []
     sources: list[str] = []
-    try:
-        from src.nadobro.market_data.hl_client import get_candles_sync
-        from src.nadobro.strategy.market_features import compute_tf_features
-        from src.nadobro.llm.signal_engine import build_signal
-    except Exception as exc:
-        return {}, [], [f"hl_import:{exc}"]
-
-    tfs = ("15m", "1h", "4h")
-    candles_by_tf = {}
-    for tf in tfs:
-        candles_by_tf[tf] = get_candles_sync(symbol, tf) or []
+    candles_by_tf, candle_source, candle_missing = _load_signal_candles(symbol, horizon)
+    missing.extend(candle_missing)
     if not any(candles_by_tf.values()):
-        missing.append("hl_candles")
         return {}, sources, missing
-    sources.append("Hyperliquid candles")
-    features = {tf: _compact_features(compute_tf_features(rows)) for tf, rows in candles_by_tf.items()}
-    signal = build_signal(features)
-    horizon_rows = candles_by_tf.get(horizon) or candles_by_tf.get("1h") or []
-    last_close = float(horizon_rows[-1]["close"]) if horizon_rows else None
-    return {
-        "venue": "hyperliquid",
-        "horizon": horizon,
-        "last_close": last_close,
-        "last_candle_time": horizon_rows[-1].get("time") if horizon_rows else None,
-        "features_by_tf": features,
-        "signal": signal.as_dict(),
-        "sr": _sr_from_candles(horizon_rows),
-        "candle_counts": {tf: len(rows) for tf, rows in candles_by_tf.items()},
-    }, sources, missing
+    label = _CANDLE_SOURCE_LABEL.get(candle_source or "")
+    if label:
+        sources.append(label)
+    try:
+        chart = _assemble_chart(
+            candles_by_tf,
+            horizon,
+            venue=candle_source or "hyperliquid",
+            candle_source=candle_source,
+        )
+    except Exception as exc:
+        logger.warning("off-venue chart pack failed: %s", exc)
+        return {}, sources, ["hl_chart"]
+    return chart, sources, missing
 
 
 def _cmc_quote(symbol: str) -> tuple[dict[str, Any], list[str]]:
