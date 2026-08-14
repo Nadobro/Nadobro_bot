@@ -107,7 +107,6 @@ from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.types import TradeType, _dec
 from src.nadobro.quant.rgrid_sizing import (
     EXIT_CROSS_RATE,
-    TAKER_ROUND_TRIP_RATE,
     arm_pct,
     exit_band_frac,
 )
@@ -117,10 +116,9 @@ logger = logging.getLogger(__name__)
 # Retained fills per leg. Large enough that a volume-fraction window has history.
 _FILL_HISTORY = 200
 # The soft-reset arm floor (a "profit" smaller than the round-trip cost is not
-# profit) now lives with the rest of the exit geometry in quant.rgrid_sizing, as
-# TAKER_ROUND_TRIP_RATE — it was the same 8.6bp written out twice, and the step
-# cap has to agree with the controller about these distances or the session rail
-# fires before the strategy's own exit can.
+# profit) lives inside ``arm_pct`` in quant.rgrid_sizing, which floors on the
+# round-trip cost itself — so the arm this controller derives can never sit under
+# it, and the step cap agrees with the controller about these distances.
 # How far through the touch a crossing exit prices. Wide enough to cross a normal
 # book, bounded so a gapped book cannot fill it at an arbitrary price. Shared with
 # the step cap (quant.rgrid_sizing.EXIT_CROSS_RATE) — it is realised cost on the way
@@ -462,26 +460,32 @@ class RGridController(MarketMakingController):
             # D > A always; so whenever cap <= 0 or cap >= D the pair is returned
             # unmodified.
             return exit_band, arm
-        # Inverted: the cap truncated the exit under the derived arm. Pull the arm to
-        # one entry band inside the AFFORDABLE exit — the same ``exit = arm + band``
-        # relationship the derived geometry has, which is precisely why the branch
-        # above is an identity. Never below the round-trip cost: a "profit" smaller
-        # than the cost of taking it is not profit, and an arm near zero arms the
-        # trail on the first tick and fires it on the second.
-        arm = max(exit_band - band, TAKER_ROUND_TRIP_RATE)
-        if arm >= exit_band:
-            # Reachable only when the affordable exit is itself inside the round-trip
-            # cost, i.e. the stop budget cannot host ANY cost-clearing geometry.
-            # Honouring the cap buys nothing there — the rail fires either way — so
-            # take the coherent geometry and let the rail be the backstop. A bounded
-            # rail flatten is the safer of the two failures; the alternative is
-            # unbounded taker churn on a sub-cost arm.
-            exit_band = arm + band
+        # Inverted: the cap truncated the exit UNDER the derived arm.
+        #
+        # RECONCILE BY WIDENING THE EXIT, NEVER BY SHRINKING THE ARM (product ruling,
+        # 2026-08-13: "when the strategy is in profit, the wins shouldn't be capped").
+        # The arm is the profit-taking trigger, so pulling it inward arms the trail
+        # sooner and hands the rest of the move back — measured at -205/-328/-233bp
+        # across trend/weak-trend/chop at overlay x1.5, because a trend's value is in
+        # win SIZE and an early arm truncates exactly that.
+        #
+        # So the arm stays where the geometry derives it and the exit moves out to one
+        # entry band beyond it — the same ``exit = arm + band`` relationship the
+        # derived geometry already has, which is why the branch above is an identity.
+        #
+        # THE TRADE-OFF IS REAL AND DELIBERATE: this puts the exit past what the stop
+        # budget affords, so the user's own %-of-margin session rail can now fire
+        # before the strategy's own band exit. That is the backstop by design — the
+        # rail is fee-aware, judged net, and is the number the user actually set —
+        # but it means some closes become rail flattens rather than strategy exits.
+        # Logged every time so the choice is visible in prod rather than inferred.
+        exit_band = arm + band
+        if cap > 0 and exit_band > cap:
             logger.warning(
-                "rgrid exit geometry cannot fit the stop budget user=%s pair=%s "
-                "band=%s cap=%s -> arm=%s exit=%s (session rail is now the backstop)",
-                self.user_id, self.trading_pair, band,
-                _dec(self.cfg("exit_band_cap", "0") or "0"), arm, exit_band,
+                "rgrid exit widened past the stop budget user=%s pair=%s band=%s "
+                "arm=%s cap=%s -> exit=%s — winners are uncapped by design; the "
+                "session SL/TP rail is the backstop from here",
+                self.user_id, self.trading_pair, band, arm, cap, exit_band,
             )
         return exit_band, arm
 
