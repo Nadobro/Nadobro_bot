@@ -638,41 +638,23 @@ def test_the_trail_giveback_tracks_the_clamped_arm():
 
 
 
-@pytest.mark.xfail(strict=True, reason="DGRID-REVERSAL-FLIPFLOP: _maybe_reversal_flip "
-                                      "runs BEFORE the classifier and never consults "
-                                      "its hysteresis / directional release")
 def test_dgrid_reversal_flip_respects_the_classifier_hysteresis():
-    """DGRID-REVERSAL-FLIPFLOP — [VERIFIED], recorded not fixed.
+    """DGRID-REVERSAL-FLIPFLOP — FIXED.
 
     ``variance_regime`` carries hysteresis and a directional release added
-    specifically to stop side-flapping ("six flips in forty minutes … paid a round
-    trip to end up on the wrong side of the move it had just identified").
-    ``_maybe_reversal_flip`` runs BEFORE that classifier and reads neither
-    ``last_direction`` nor ``last_is_trend``, so it can arm a counter-trend ladder
-    inside a declared trend. Audit reproduced on a steady uptrend at shipped
-    defaults (trail_arm_pct=1.0, reversal_flip_pct=0.4, flip_confirm_ticks=2):
-
-        t1 +1.2%  phase=grid  armed=True
-        t3 -0.5%  phase=rgrid  <-- SHORT ladder armed inside a 1.46-VR uptrend
-        t5        phase=grid   <-- classifier flips it straight back
-
-    A 0.5% retrace arms sell entries that rest ABOVE mid and fill into the
-    continuing rally; ~60s later the classifier reverses and flattens them. Cost
-    per event: two reduce-only exits crossing 30bp through the touch plus the
-    adverse move, repeated on every 0.4% retrace in a trend — and the user gets two
-    contradictory notifications a minute apart.
-
-    Structural pin (the behavioural repro needs a full tape + orchestrator): the
-    reversal path must consult the classifier's directional state before changing
-    side. Fix: require classifier agreement, or flatten-and-hold instead of
-    flipping.
+    specifically to stop side-flapping. The reversal path used to ignore
+    ``last_direction`` / ``last_is_trend`` and arm a counter-trend ladder
+    inside a declared trend (0.4% retrace → SHORT inside a 1.46-VR uptrend,
+    classifier flipped it back ~60s later). It now consults that state and
+    stays. Behavioural pin:
+    ``test_dgrid_reversal_does_not_arm_a_short_inside_an_uptrend``.
     """
     import inspect
 
     from src.nadobro.engine.controllers import dynamic_grid
 
     src = inspect.getsource(dynamic_grid.DynamicGridController._maybe_reversal_flip)
-    assert ("last_direction" in src) or ("last_is_trend" in src), (
+    assert ("last_direction" in src) and ("last_is_trend" in src), (
         "_maybe_reversal_flip changes side without consulting the classifier's "
         "hysteresis, so it can arm a counter-trend ladder inside a declared trend"
     )

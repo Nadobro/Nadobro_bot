@@ -374,6 +374,19 @@ class DynamicGridController(Controller):
                 or not self._run_extreme or self._run_extreme <= 0):
             return False
         long = self._is_long_phase()
+        # DGRID-REVERSAL-FLIPFLOP: `_classify` already ran this tick. A
+        # pullback inside a declared trend is not a reversal — arming the
+        # opposite ladder puts sell entries above mid into the rally (or
+        # buys below mid into the dump), and the classifier flips them back
+        # ~60s later. Two contradictory notifications, a round-trip, and
+        # the book on the wrong side of the move it had just identified.
+        # Stay on this side until the classifier itself releases the trend.
+        if self.last_is_trend and (
+            (long and self.last_direction == variance_regime.UP)
+            or ((not long) and self.last_direction == variance_regime.DOWN)
+        ):
+            self._reversal_streak = 0
+            return False
         ext = self._run_extreme
         retrace = ((ext - mid) / ext) if long else ((mid - ext) / ext)
         if float(retrace) * 100.0 < self.reversal_flip_pct:
@@ -406,10 +419,13 @@ class DynamicGridController(Controller):
 
         active = self.my_executors(active_only=True)
         if active:
-            # Trend-capture: track the run's favorable price extreme, then flip on
-            # a confirmed reversal once the run is in profit (closes the winner in
-            # profit and arms the opposite side). Runs BEFORE the slow variance
-            # flip so a sharp turn is caught immediately.
+            # Trend-capture: track the run's favorable price extreme, then flip
+            # on a confirmed reversal once the run is in profit (closes the
+            # winner and arms the opposite side). Classifier already ran this
+            # tick; a pullback inside a declared trend is ignored
+            # (DGRID-REVERSAL-FLIPFLOP). Sharp turns the variance selector
+            # still reads as range still lock-and-switch. Runs before the
+            # slow phase-change path so a ranging reversal is caught immediately.
             self._update_run_extremes(mid)
             if await self._maybe_reversal_flip(mid):
                 return

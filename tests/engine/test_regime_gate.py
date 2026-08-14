@@ -387,6 +387,40 @@ def test_dgrid_reversal_flip_locks_profit_and_switches_side():
     asyncio.run(body())
 
 
+def test_dgrid_reversal_does_not_arm_a_short_inside_an_uptrend():
+    """DGRID-REVERSAL-FLIPFLOP. A 0.4% retrace inside a declared uptrend must
+    NOT arm the short ladder. The ranging-candle sibling still lock-and-switches;
+    this is the trend case that used to flip twice in a minute.
+    """
+    from src.nadobro.engine.executors.grid_executor import GridExecutor
+
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        orch, c = _dgrid(adapter, {"data": trending_candles(step=0.4)})
+        c.trail_arm_pct = 1.0
+        c.reversal_flip_pct = 0.4
+        c.flip_confirm_ticks = 1
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        assert isinstance(c.my_executors()[0], GridExecutor), "uptrend starts long GRID"
+        assert c.last_is_trend and c.last_direction == "up"
+
+        adapter.set_mid(Decimal("102"))
+        await orch.tick_controller(c.id)
+        assert c._run_armed
+        assert c.current_phase == "grid"
+
+        adapter.set_mid(Decimal("101.2"))
+        await orch.tick_controller(c.id)
+        assert c.current_phase == "grid", (
+            "a pullback inside a declared uptrend armed the short ladder"
+        )
+        assert isinstance(c.my_executors()[0], GridExecutor)
+        assert c.last_is_trend and c.last_direction == "up"
+
+    asyncio.run(body())
+
+
 def expansion_candles(n: int = 80, base: float = 100.0) -> list[dict]:
     """Flat EMAs (alternating closes) but volume smeared across a WIDE range:
     no acceptance anywhere — the chaos dgrid must sit out, NOT a trend."""
