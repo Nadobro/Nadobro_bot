@@ -32,6 +32,18 @@ def nanogpt_default_model() -> str:
     return clean_env_value(os.environ.get("NANOGPT_MODEL")) or "chatgpt-4o-latest"
 
 
+def _nano_error_text(payload: dict[str, Any], body_text: str, status_code: int) -> str:
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("code") or err)[:300]
+    if err:
+        return str(err)[:300]
+    msg = payload.get("message") if isinstance(payload, dict) else None
+    if msg:
+        return str(msg)[:300]
+    return (body_text or f"HTTP {status_code}")[:300]
+
+
 def openai_compatible_chat(
     *,
     base_url: str,
@@ -62,27 +74,59 @@ def openai_compatible_chat(
             json_body=body,
             timeout=effective_timeout,
         )
-        resp.raise_for_status()
-        payload = resp.json()
     except Exception as exc:
-        logger.warning("openai_compatible_chat failed: %s", exc)
+        logger.warning("openai_compatible_chat failed model=%s: %s", model, exc)
         record_provider_degraded(
             "nanogpt",
-            f"OpenAI-compatible chat failed: {exc}",
+            f"OpenAI-compatible chat failed model={model}: {exc}",
             allowed_use="llm",
             source_url=base_url,
         )
-        return False, "", {}
+        return False, "", {"error": str(exc)[:300], "model": model}
+
+    status_code = int(getattr(resp, "status_code", 0) or 0)
+    body_text = ""
+    try:
+        body_text = str(getattr(resp, "text", "") or "")[:500]
+    except Exception:
+        body_text = ""
+    payload: dict[str, Any] = {}
+    try:
+        parsed = resp.json()
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = {}
+
+    if status_code >= 400:
+        err = _nano_error_text(payload, body_text, status_code)
+        logger.warning(
+            "openai_compatible_chat failed model=%s status=%s err=%s",
+            model,
+            status_code,
+            err[:240],
+        )
+        record_provider_degraded(
+            "nanogpt",
+            f"OpenAI-compatible chat failed model={model} status={status_code}: {err[:180]}",
+            allowed_use="llm",
+            source_url=base_url,
+        )
+        return False, "", {
+            "error": err,
+            "status": status_code,
+            "model": model,
+        }
 
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
-        return False, "", payload
+        return False, "", payload or {"error": "empty", "model": model, "status": status_code}
     msg = choices[0].get("message") if isinstance(choices[0], dict) else None
     if isinstance(msg, dict) and isinstance(msg.get("content"), str):
         return True, msg["content"], payload
     if isinstance(choices[0], dict) and isinstance(choices[0].get("text"), str):
         return True, choices[0]["text"], payload
-    return False, "", payload
+    return False, "", payload or {"error": "empty", "model": model, "status": status_code}
 
 
 def nanogpt_chat_completion(

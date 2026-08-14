@@ -124,11 +124,13 @@ def model_for(task: str, fallback: Optional[str] = None) -> str:
 
 
 # Claude-only fallbacks for the Market Call synthesizer. Never GPT/Grok.
+# Sonnet 5 sits second: it is the working chat default on this NanoGPT plan,
+# so a 403/400 on opus-4.8 recovers instead of walking older Claude ids first.
 TA_MODEL_FALLBACKS: tuple[str, ...] = (
     "anthropic/claude-opus-4.8",
+    "anthropic/claude-sonnet-5",
     "anthropic/claude-opus-4",
     "anthropic/claude-sonnet-4",
-    "anthropic/claude-sonnet-5",
 )
 
 
