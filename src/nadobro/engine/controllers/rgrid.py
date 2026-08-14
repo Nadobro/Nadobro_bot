@@ -184,6 +184,9 @@ class RGridController(MarketMakingController):
         # seeded window cannot be trusted (see _track_trail).
         self._trail_origin: Optional[Decimal] = None
         self._trail_armed = False
+        # Give-back latched at arm so an overlay-widened band cannot move an
+        # already-armed stop further away (RGRID-TRAIL-LOOSENS).
+        self._latched_giveback: Optional[Decimal] = None
         # Overlay telemetry only — the actuator has already applied its effect to
         # size/spread/exposure in the mapped config before this controller sees it.
         self.signal_regime = str(self.cfg("signal_regime", "") or "")
@@ -328,6 +331,7 @@ class RGridController(MarketMakingController):
         self._anchor = mid
         self._trail_peak = None
         self._trail_armed = False
+        self._latched_giveback = None
 
     def _has_fills(self) -> bool:
         return any(self._leg_fills[leg] for leg in (BUY, SELL))
@@ -804,7 +808,40 @@ class RGridController(MarketMakingController):
 
     # -- soft reset ----------------------------------------------------------
 
-    # -- tick ----------------------------------------------------------------
+    async def flatten_now(self, mid: Decimal, *, reason: str = "handoff") -> bool:
+        """Cancel maker quotes and cross the whole position. True iff flat.
+
+        D-Grid calls this on a phase handoff. Stopping R-Grid's maker executors
+        only cancels resting quotes — inventory would otherwise survive into
+        the ranging ladder.
+        """
+        eps = Decimal("1e-12")
+        if abs(self._net_base()) <= eps:
+            await self._cancel_leg(TradeType.BUY)
+            await self._cancel_leg(TradeType.SELL)
+            if mid > 0:
+                self._reset_exposure_window(mid)
+            return True
+        if mid <= 0:
+            return False
+        if self._stop_in_flight():
+            standing = await self._reap_stale_stop()
+            if standing and self._stop_id is not None:
+                await self.orchestrator.tick(self._stop_id)
+            self._absorb_fills()
+        if abs(self._net_base()) <= eps:
+            self._reset_exposure_window(mid)
+            return True
+        if not self._stop_in_flight():
+            await self._fire_trail_stop(self._net_base(), mid, reason=reason)
+            if self._stop_id is not None:
+                await self.orchestrator.tick(self._stop_id)
+            self._absorb_fills()
+        if abs(self._net_base()) <= eps:
+            self._reset_exposure_window(mid)
+            return True
+        return False
+
     # -- tick ----------------------------------------------------------------
     async def on_tick(self) -> None:
         # Absorb fills BEFORE pricing: the anchor is defined by them.
@@ -1023,6 +1060,7 @@ class RGridController(MarketMakingController):
         if excursion < arm and not (opposed and excursion > 0):
             return
         self._trail_armed = True
+        self._latched_giveback = self._trail_giveback()
         logger.info(
             "rgrid soft reset armed%s: %s%% favourable from %s — the exit leg now "
             "follows the trend (user=%s pair=%s)",
@@ -1058,7 +1096,9 @@ class RGridController(MarketMakingController):
         """Where the armed exit fires: one give-back behind the best price seen.
         It only ever ratchets forward."""
         peak = self._trail_peak or Decimal(0)
-        band = self._trail_giveback()
+        # RGRID-TRAIL-LOOSENS: once armed, the give-back is the value at arm —
+        # an ATR/overlay rise must not push the stop further from the peak.
+        band = self._latched_giveback if self._latched_giveback is not None else self._trail_giveback()
         return (
             peak * (Decimal(1) - band) if net > 0
             else peak * (Decimal(1) + band)

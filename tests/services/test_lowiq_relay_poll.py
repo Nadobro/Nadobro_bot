@@ -56,3 +56,28 @@ def test_start_session_does_not_use_poll_timeout(monkeypatch):
         )
     )
     assert captured["timeout"] is None
+
+
+def test_relay_poll_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("LOWIQPTS_RELAY_POLL_ENABLED", raising=False)
+    from src.nadobro.core.feature_flags import lowiqpts_relay_poll_enabled
+
+    assert lowiqpts_relay_poll_enabled() is False
+
+
+def test_scheduler_poll_is_a_no_op_when_disabled(monkeypatch):
+    from src.nadobro.runtime import scheduler as sched
+
+    called = []
+    monkeypatch.setattr(
+        "src.nadobro.users.points_service.poll_lowiqpts_relay_events",
+        lambda _app: called.append(True),
+    )
+    monkeypatch.delenv("LOWIQPTS_RELAY_POLL_ENABLED", raising=False)
+    previous = sched._bot_app
+    sched._bot_app = object()
+    try:
+        asyncio.run(sched.poll_lowiqpts_relay())
+    finally:
+        sched._bot_app = previous
+    assert called == []

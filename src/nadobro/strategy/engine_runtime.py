@@ -513,6 +513,10 @@ def _apply_dgrid_controller_config(controller: Controller, configs: Dict[str, ob
     # THIS cycle's signal, not the one the controller was built with.
     controller.signal_regime = str(configs.get("signal_regime", "") or "")  # type: ignore[attr-defined]
     controller.signal_confidence = _num("signal_confidence", controller.signal_confidence)  # type: ignore[attr-defined]
+    packed = configs.get("trend_rgrid")
+    trend = getattr(controller, "_trend", None)
+    if trend is not None and isinstance(packed, dict):
+        _apply_rgrid_controller_config(trend, packed)
 
 
 def _apply_rgrid_controller_config(controller: Controller, configs: Dict[str, object]) -> None:
@@ -1313,48 +1317,46 @@ def map_strategy_config(
             min_step_usd=DEFAULT_MIN_ORDER_NOTIONAL_USD,
             band_frac=step_band_frac(_band, Decimal(str(_reset_pct)) / Decimal(100)),
         )
-        # Derive the exposure ceiling from the same budget the step cap uses.
-        _rg_budget = _dec(str(_rg_margin * _rg_sl_pct / 100.0))
         # THE PYRAMID HAS TO FIT INSIDE ITS OWN CEILING.
         #
         # ``margin_quote`` for this family is the DEPLOYED notional (margin x
         # leverage), the step is ``deployed / levels``, and a full pyramid is
         # therefore 100% of it. The shared MM default of 30% admitted 1.0-1.4
-        # steps at every realistic configuration — so R-Grid took its entry and
-        # then had every single add refused by _projected_order_within_exposure.
-        # It could not pyramid at all, which is the whole strategy. The default is
-        # the plan the user actually configured (levels x step == deployed); an
-        # explicit user setting still wins, and the stop-budget ceiling below still
-        # only ever tightens it.
+        # steps — R-Grid took its entry and then had every add refused. It could
+        # not pyramid at all, which is the whole strategy.
         #
-        # The 100% default is only safe BECAUSE the stop-budget ceiling below
-        # tightens it. With the rail DISARMED there is no budget, nothing
-        # tightens, and the full pyramid would run with no stop at all — 3.3x the
-        # old exposure and no rail behind it. A disarmed stop is a reason to hold
-        # the conservative ceiling, not to lift it.
+        # A later stop-budget ``min()`` then mapped a 1% stop at 5x to ~29% of
+        # deployed: one rung, then silence. That clamp is gone. The step cap
+        # still shrinks each add so a ``levels``-rung plan fits the budget; the
+        # inventory cap now admits the full deployed notional so a winner can
+        # keep adding. When that larger book exceeds the stop, the session rail
+        # is the backstop — the same 2026-08-13 ruling as the exit-widen.
+        #
+        # A DISARMED stop still holds the conservative 30% ceiling. There is no
+        # rail behind a 100% pyramid if the user turned the stop off.
+        _rg_budget = _dec(str(_rg_margin * _rg_sl_pct / 100.0))
         _rg_default_pct = 100.0 if _rg_budget > 0 else 30.0
         _rg_exposure_pct = _f(settings, "max_net_exposure_pct", _rg_default_pct)
-        # Largest adverse move the reachable pyramid can take and still leave the
-        # strategy's own exit inside the budget. Handed to the controller as a
-        # CEILING on its exit distance, because two things widen that distance
-        # after this point and neither re-derives the ceiling: the overlay scales
-        # spread_ask_pct live (0.75-3.0x, `overlay_actuator`), and the user's Reset
-        # knob feeds arm_pct — at Reset 10% the derived exit is 1010bp, which no
-        # realistic stop can afford. Without the ceiling the session rail fires
-        # first and the strategy never exits on its own terms.
+        if _rg_exposure_pct <= 0:
+            _rg_exposure_pct = _rg_default_pct
+        if _rg_budget > 0:
+            _rg_exposure_pct = min(100.0, _rg_exposure_pct)
+        else:
+            _rg_exposure_pct = min(30.0, _rg_exposure_pct)
+        # Largest adverse move the *planned* pyramid (levels x step, already
+        # stop-budget-capped per add) can take and still leave the strategy's
+        # own exit inside the budget. Sized against that plan, NOT against the
+        # 100% inventory cap: shrinking the exit to fit a full-deployed book
+        # would undo the exit-widen. Overlay-scaled spread and a large Reset
+        # knob still need this ceiling so they cannot push the exit out to
+        # 1010bp. 0 = no budget (disarmed stop), so no ceiling.
         _rg_exit_cap = Decimal(0)
         if _rg_budget > 0 and deployed > 0:
-            _rg_move = _rg_exit_cost
-            if _rg_move > 0:
-                _afford = _rg_budget / _rg_move          # USD of exposure
-                _rg_exposure_pct = min(
-                    _rg_exposure_pct,
-                    float(_afford / _dec(str(deployed)) * Decimal(100)),
-                )
-            # Exposure actually reachable, including the floor the controller
-            # applies (`market_making._projected_order_within_exposure` never lets
-            # the cap fall below one step, or the strategy could not place its
-            # first order at all).
+            # Exposure actually reachable for EXIT sizing, including the floor
+            # the controller applies (`_projected_order_within_exposure` never
+            # lets the cap fall below one step, or the first order could not
+            # place). Capped at ``levels x step`` so a 100% inventory cap does
+            # not silently shrink the exit band.
             _rg_step = _dec(str(_step_plan.step))
             _rg_reach = max(
                 _rg_step,
@@ -1421,18 +1423,12 @@ def map_strategy_config(
                 1.0, max(0.0, _f(settings, "rgrid_discretion", 0.0)) * 2.0
             ),
             **_quote_defense_defaults(settings, deployed, auto_spread=spread_frac <= 0),
-            # THE CEILING THE STEP CAP CANNOT REACH — after the defaults on
-            # purpose, so this wins the dict literal.
-            # R-Grid has no break counter: it adds one step per break until the
-            # NET-EXPOSURE CAP stops it, and that cap is step-INDEPENDENT. A bound
-            # written as ``levels * step`` therefore models a pyramid the strategy
-            # never stops at: at $100/50x the modelled $400 is really $1,500 (15
-            # steps), where ONE crossing exit costs 81% of a 0.8% stop and a single
-            # band of adverse move costs 3.5x it. Shrinking the step cannot fix
-            # that — it just takes more breaks to reach the same ceiling. So bound
-            # the CAP: hold only the exposure that a band of adverse move plus the
-            # round trip can afford out of the stop budget. min() with the user's
-            # setting, so this only ever tightens.
+            # After the defaults on purpose, so this wins the dict literal.
+            # R-Grid has no break counter: it adds one step per break until this
+            # cap stops it. Armed: 100% of deployed (the controller docstring's
+            # requirement). That can exceed the stop-capped ``levels x step``
+            # plan; the session rail is the backstop. A disarmed stop keeps 30%
+            # so that book cannot run without a rail.
             "max_net_exposure_pct": _rg_exposure_pct,
             # The regime gate would pause momentum exactly when it must act. OFF
             # unless the user (or the overlay's suppress posture) re-arms it; the
@@ -1629,11 +1625,9 @@ def map_strategy_config(
     # here makes the contract explicit and lets the cycle driver inject the
     # real provider on first start.
     if strategy == "dgrid":
-        # D-Grid is the phase SWITCHER: a volatility-balanced classifier that
-        # mean-reverts with a long ladder in ranges and flips to a short ladder on
-        # a clear directional signal. R-Grid used to share this engine, which is
-        # why R-Grid users were told "switched RGRID → GRID"; it now runs its own
-        # exposure-anchored controller and never reaches this branch.
+        # D-Grid is the phase SWITCHER: a long mean-reversion ladder in ranges
+        # and an embedded R-Grid trend follower on a clear directional signal
+        # (both directions). Standalone R-Grid never reaches this branch.
         cfg["candle_provider"] = None
         # (recycle_levels is set for the whole GridExecutor family above.)
         cfg["dgrid_short_window"] = int(max(2, _f(settings, "dgrid_short_window_points", 4)))
@@ -1696,6 +1690,16 @@ def map_strategy_config(
         _dg_cap = Decimal(str(_f(settings, "dgrid_max_spread_bp", 50.0))) / Decimal(10000)
         cfg["spread_floor_half_pct"] = _dg_floor
         cfg["spread_cap_half_pct"] = max(_dg_cap, _dg_floor)
+        # Trend phase is R-Grid (add with the move, flip when it turns), not a
+        # mirrored short ladder. Map the rgrid keys the delegate reads; dgrid
+        # spread fills in when the user never set rgrid_spread_bp.
+        _rg_settings = dict(settings)
+        if not _f(_rg_settings, "rgrid_spread_bp", 0.0):
+            _rg_settings["rgrid_spread_bp"] = float(_spread_bp)
+        cfg["trend_rgrid"] = map_strategy_config(
+            "rgrid", _rg_settings, mid, product=product,
+            leverage=leverage, network=network,
+        )
 
     # GRID in-place re-center: honor the user's reset threshold so the classic
     # long ladder follows price ("reset and continue") instead of going stale.

@@ -413,6 +413,9 @@ async def poll_lowiqpts_relay():
     global _bot_app
     if not _bot_app:
         return
+    from src.nadobro.core.feature_flags import lowiqpts_relay_poll_enabled
+    if not lowiqpts_relay_poll_enabled():
+        return
     try:
         from src.nadobro.users.points_service import poll_lowiqpts_relay_events
 
@@ -895,6 +898,7 @@ async def tick_vault_deposit_watch_job():
 def start_scheduler():
     relay_poll_seconds = relay_poll_interval_seconds()
     from src.nadobro.core.feature_flags import (
+        lowiqpts_relay_poll_enabled,
         portfolio_sync_enabled,
         portfolio_sync_interval_seconds,
         vault_deposit_watch_enabled,
@@ -943,10 +947,20 @@ def start_scheduler():
             tick_signal_scorer, "interval", seconds=_SIGNAL_SCORER_SECONDS,
             id="signal_scorer", replace_existing=True, **_LONG_TICK,
         )
-    scheduler.add_job(
-        poll_lowiqpts_relay, "interval", seconds=relay_poll_seconds,
-        id="lowiqpts_relay_poll", replace_existing=True, **_SHORT_TICK,
-    )
+    if lowiqpts_relay_poll_enabled():
+        scheduler.add_job(
+            poll_lowiqpts_relay, "interval", seconds=relay_poll_seconds,
+            id="lowiqpts_relay_poll", replace_existing=True, **_SHORT_TICK,
+        )
+    else:
+        try:
+            scheduler.remove_job("lowiqpts_relay_poll")
+        except Exception:
+            pass
+        logger.info(
+            "LOWIQPTS relay poll disabled (LOWIQPTS_RELAY_POLL_ENABLED=0); "
+            "on-demand points refresh is unchanged"
+        )
     # sync_pending_fills can legitimately take longer than its 30s interval
     # when the archive lags. Keep a single in-flight tick so overlapping runs
     # do not amplify archive API pressure.

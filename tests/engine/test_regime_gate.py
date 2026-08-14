@@ -333,19 +333,17 @@ def _dgrid(adapter, candle_box):
     return orch, c
 
 
-def test_dgrid_trades_a_trend_with_reverse_grid():
-    # The gate must NOT pre-empt dgrid's defining behavior: TRENDING_DOWN
-    # spawns a ReverseGrid (pause_on_trend=False for dgrid).
-    from src.nadobro.engine.executors.reverse_grid_executor import ReverseGridExecutor
+def test_dgrid_trades_a_trend_with_rgrid_follower():
+    # The gate must NOT pre-empt dgrid's defining behavior: a downtrend
+    # spawns the R-Grid pyramiding follower (pause_on_trend=False).
 
     async def body():
         adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
         orch, c = _dgrid(adapter, {"data": trending_candles(step=-0.4)})
         await orch.spawn_controller(c)
         await orch.tick_controller(c.id)
-        executors = c.my_executors()
-        assert len(executors) == 1, "dgrid must trade a downtrend"
-        assert isinstance(executors[0], ReverseGridExecutor)
+        assert c.current_phase == "rgrid"
+        assert c._trend is not None, "dgrid must trade a downtrend with R-Grid"
 
     asyncio.run(body())
 
@@ -357,7 +355,6 @@ def test_dgrid_reversal_flip_locks_profit_and_switches_side():
     candles stay RANGING so the flip is driven by the price reversal, not the
     slow variance selector."""
     from src.nadobro.engine.executors.grid_executor import GridExecutor
-    from src.nadobro.engine.executors.reverse_grid_executor import ReverseGridExecutor
 
     async def body():
         adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
@@ -381,8 +378,38 @@ def test_dgrid_reversal_flip_locks_profit_and_switches_side():
         # Reverse 0.78% off the 102 high (>= 0.4%) -> confirmed flip to short.
         adapter.set_mid(Decimal("101.2"))
         await orch.tick_controller(c.id)
-        assert c.current_phase == "rgrid", "reversal must flip long->short"
-        assert isinstance(c.my_executors()[0], ReverseGridExecutor)
+        assert c.current_phase == "rgrid"
+        assert c._trend is not None, "reversal in range arms the R-Grid follower"
+
+    asyncio.run(body())
+
+
+def test_dgrid_reversal_does_not_arm_a_short_inside_an_uptrend():
+    """DGRID-REVERSAL-FLIPFLOP. A retrace inside a declared uptrend must
+    stay on the R-Grid follower, not drop into a short ladder. The ranging
+    sibling still lock-and-switches onto the follower.
+    """
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        orch, c = _dgrid(adapter, {"data": trending_candles(step=0.4)})
+        c.trail_arm_pct = 1.0
+        c.reversal_flip_pct = 0.4
+        c.flip_confirm_ticks = 1
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        assert c._trend is not None, "uptrend starts on the R-Grid follower"
+        assert c.last_is_trend and c.last_direction == "up"
+        first = c._trend
+
+        adapter.set_mid(Decimal("102"))
+        await orch.tick_controller(c.id)
+        adapter.set_mid(Decimal("101.2"))
+        await orch.tick_controller(c.id)
+        assert c.current_phase == "rgrid"
+        assert c._trend is first, (
+            "a pullback inside a declared uptrend tore down the trend follower"
+        )
+        assert c.last_is_trend and c.last_direction == "up"
 
     asyncio.run(body())
 

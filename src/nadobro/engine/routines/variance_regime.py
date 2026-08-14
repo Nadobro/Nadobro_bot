@@ -38,20 +38,22 @@ Two thresholds form a hysteresis band so a ratio flickering at the boundary
 never churns a flip:
 
 - ``VR >= trend_on`` (``dgrid_trend_on_variance_ratio``, default 1.25):
-  trending. Direction picks the side — a downtrend wants a short **RGRID**, an
-  uptrend keeps the long **GRID** (a short grid bleeds in an uptrend).
+  trending. The trend phase is **RGRID** in BOTH directions — R-Grid adds with
+  the move (a mirrored short *ladder* used to bleed in an uptrend).
 - ``VR <= range_on`` (``dgrid_range_on_variance_ratio``, default 1.15):
   ranging -> long **GRID** (the classic short-vol grid).
 - In between -> hold the current phase.
 
 DIRECTIONAL RELEASE (``TREND_RELEASE_FRACTION``)
 -----------------------------------------------
-Leaving a short **RGRID** needs the decline to actually STALL, not merely ease.
+Leaving **RGRID** needs the move to actually STALL, not merely ease.
 The trend trigger is ``|drift| >= trend_drift_pct``; the release is only half
 that. Without it the range branch was direction-blind — a low variance ratio
-says "no volatility burst", it does NOT say "price is rising" — so the moment a
-decline slowed a little, ``VR <= range_on`` handed the short ladder straight
-back to the long grid while price was still falling.
+says "no volatility burst", it does NOT say "price has stopped" — so the moment
+a decline slowed a little, ``VR <= range_on`` handed the trend follower straight
+back to the long grid while price was still falling. A V-reversal (sign flip
+with ``|drift|`` still above the release) stays **RGRID**: R-Grid owns the side
+flip.
 
 Deterministic: no LLM, no state beyond the inputs + the caller's current phase.
 """
@@ -64,8 +66,8 @@ from src.nadobro.engine.routines.technical_analysis import _closes, chronologica
 
 Candle = Mapping[str, float]
 
-GRID = "grid"        # long grid (range / uptrend)
-RGRID = "rgrid"      # short reverse grid (downtrend)
+GRID = "grid"        # long mean-reversion ladder (range)
+RGRID = "rgrid"      # R-Grid trend follower (both directions)
 
 UP = "up"
 DOWN = "down"
@@ -75,7 +77,7 @@ FLAT = "flat"
 # ``|drift| >= trend_drift_pct``; release it only once |drift| has decayed below
 # this fraction of that threshold. Halving gives a wide enough dead band that
 # ordinary variation in the rate of a decline cannot churn the side, while a
-# genuine stall (or a turn) still returns the ladder to the long grid promptly.
+# genuine stall still returns the ranging ladder; a V-reversal stays RGRID.
 TREND_RELEASE_FRACTION = 0.5
 
 
@@ -206,25 +208,20 @@ async def run(
     phase = current_phase
     holding_trend = False
     if trend_by_vr or trend_by_drift:
-        # Trending (by burst OR by sustained drift): trade the direction. Down ->
-        # short reverse grid; up keeps the long grid (a reverse grid bleeds in an
-        # uptrend). A flat direction with a borderline VR holds the phase.
-        if direction == DOWN:
+        # Trending (by burst OR by sustained drift): the trend phase is the
+        # pyramiding follower (R-Grid), both directions. A reverse-grid SHORT
+        # ladder used to bleed in an uptrend, so UP stayed on the long mean-
+        # reversion grid; R-Grid adds WITH the move, so both sides belong here.
+        if direction in (DOWN, UP):
             phase = RGRID
-        elif direction == UP:
-            phase = GRID
-    elif current_phase == RGRID and release > 0 and drift <= -release:
-        # Short ladder armed and price is STILL falling — just not fast enough to
-        # re-trip the trend threshold. Hold the short.
+    elif current_phase == RGRID and release > 0 and abs(drift) >= release:
+        # Trend follower armed and price is STILL moving — just not fast enough
+        # to re-trip the trend threshold. Hold the follower (it owns the side
+        # flip). Releasing on a mere ease used to hand a short ladder back to
+        # the long grid: six flips in forty minutes, a round trip each time.
         #
-        # This branch is the fix for the reported bug (2026-07-28): the code fell
-        # straight through to ``vr <= range_on -> GRID`` here, which ignores
-        # direction entirely. rgrid/dgrid therefore flipped GRID<->RGRID every
-        # couple of minutes in a downtrend — six flips in forty minutes on BTC,
-        # every notification correctly reading "downtrend detected" while half of
-        # them armed the LONG grid. Each flip flattens the position reduce-only,
-        # so the bot paid a round trip to end up on the wrong side of the move it
-        # had just identified, and never held a trend long enough to catch it.
+        # abs(drift) so an UP trend is held the same way a DOWN trend is; a
+        # genuine stall (|drift| < release) still falls through to GRID.
         phase = RGRID
         holding_trend = True
     elif vr <= range_on:
