@@ -549,11 +549,14 @@ def test_rgrid_band_exit_always_sits_outside_the_trail_arm_point():
     not, so they crossed — and because the overlay only widens the spread BECAUSE the
     tape is volatile, the inversion armed itself exactly when noise was largest.
 
-    The two are now derived jointly (``_exit_geometry``) and the reconciliation
-    shrinks the ARM rather than widening the exit past what the stop budget affords.
+    The two are now derived jointly (``_exit_geometry``). Per the 2026-08-13 product
+    ruling ("when the strategy is in profit, the wins shouldn't be capped"), the
+    reconciliation WIDENS THE EXIT to arm + band and leaves the arm where the
+    geometry derives it — the user's %-of-margin session rail is the backstop when
+    that exceeds the stop budget. The arm is never shrunk to fit the cap.
     """
     from src.nadobro.engine.controllers.rgrid import RGridController
-    from src.nadobro.quant.rgrid_sizing import TAKER_ROUND_TRIP_RATE
+    from src.nadobro.quant.rgrid_sizing import TAKER_ROUND_TRIP_RATE, arm_pct
 
     def _ctrl(band_bp, reset_pct, cap_bp):
         c = object.__new__(RGridController)
@@ -581,6 +584,11 @@ def test_rgrid_band_exit_always_sits_outside_the_trail_arm_point():
                     assert arm >= TAKER_ROUND_TRIP_RATE, (
                         "an arm under the round-trip cost books a 'profit' smaller "
                         "than the cost of taking it"
+                    )
+                    # The ruling: the arm is the profit-taking trigger and is NEVER
+                    # pulled inward to fit the cap — that is what capped winners.
+                    assert arm == arm_pct(c._band(), c.reset_threshold_pct), (
+                        "the arm was shrunk to fit the cap instead of widening exit"
                     )
     assert not violations, f"exit_band <= arm at {len(violations)} points: {violations[:3]}"
 

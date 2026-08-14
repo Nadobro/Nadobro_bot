@@ -1073,23 +1073,25 @@ def test_status_reports_the_levels_the_engine_is_actually_working():
 # ==========================================================================
 # 10. Findings from the pre-push SL/TP trace — the exit must stay affordable
 # ==========================================================================
-def test_the_exit_distance_is_capped_at_what_the_stop_can_afford():
-    """SLTP-F1 / SLTP-F3. The mapper sizes the exposure ceiling against the exit
-    distance, but TWO paths widen that distance afterwards and neither re-derives
-    the ceiling:
+def test_the_exit_widens_past_the_cap_so_winners_are_not_capped():
+    """RGRID-EXITBAND-INVERT, reconciled per the 2026-08-13 product ruling:
+    "when the strategy is in profit, the wins shouldn't be capped."
 
-      * the financial overlay scales ``spread_ask_pct`` LIVE by 0.75-3.0x
-        (overlay_actuator; rgrid is in OVERLAY_STRATEGIES), and _band() reads it;
-      * ``arm_pct`` is floored on the user's Reset threshold, whose card button
-        goes to 10% — deriving a 1010bp exit that no realistic stop can cover.
+    The mapper sizes ``exit_band_cap`` against the UNSCALED exit distance, but the
+    overlay scales ``spread_ask_pct`` live by up to 3x and _band() reads it, so the
+    derived exit outgrows the cap. The earlier fix reconciled by SHRINKING THE ARM
+    to fit the cap — which armed the trail sooner and handed back the rest of a
+    trend (measured -205/-328/-233bp at overlay x1.5). The ruling reverses that: the
+    ARM is never touched, the EXIT widens to arm + band, and the user's own
+    %-of-margin session rail becomes the backstop when that exceeds the stop budget.
 
-    Past the affordable distance the session rail fires first and every close
-    becomes a rail flatten, which is the pathology this geometry exists to remove.
+    So the property is no longer "exit <= cap". It is: the exit sits exactly one
+    entry band beyond the arm (the derived geometry's own relationship), and never
+    inside the entry trigger.
     """
     adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100))
     cap = Decimal("0.00314")
 
-    # Overlay scaling cannot push the exit past the ceiling.
     for factor in ("1.5", "2.0", "3.0"):
         _, c = _controller(adapter, extra={
             "spread_bid_pct": SPREAD * Decimal(factor),
@@ -1097,19 +1099,31 @@ def test_the_exit_distance_is_capped_at_what_the_stop_can_afford():
             "reset_threshold_pct": Decimal("0.002"),
             "exit_band_cap": cap,
         })
-        assert c._exit_band() <= cap, f"overlay x{factor} escaped the ceiling"
-        assert c._exit_band() >= c._band(), "the exit fell inside the entry trigger"
+        exit_band, arm = c._exit_geometry()
+        # THE INVARIANT that stops the loss-only exit winning: exit strictly outside
+        # the arm. This is what -85.27 violated; it must hold in EVERY branch — the
+        # whole point of the fix.
+        assert exit_band > arm, f"overlay x{factor} inverted the geometry"
+        assert exit_band >= c._band(), "the exit fell inside the entry trigger"
+        # The arm is NEVER shrunk to fit the cap — that is the ruling. It stays at
+        # the value the geometry derives from the (scaled) band.
+        from src.nadobro.quant.rgrid_sizing import arm_pct
+        assert arm == arm_pct(c._band(), c.reset_threshold_pct), (
+            f"overlay x{factor} shrank the arm instead of widening the exit"
+        )
+        # When the cap truncated the exit UNDER the arm, the exit is widened back out
+        # to one entry band beyond the arm (winners uncapped, rail is the backstop).
+        # When the cap still leaves exit > arm, the cap is honoured as-is — no
+        # widening is needed and none happens.
+        if exit_band > cap:
+            assert exit_band == arm + c._band(), (
+                f"overlay x{factor}: inverted cap should widen to arm + band"
+            )
 
-    # Nor can a large Reset threshold.
-    _, c = _controller(adapter, extra={
-        "reset_threshold_pct": Decimal("0.10"), "exit_band_cap": cap,
-    })
-    assert c._exit_band() <= cap
-
-    # And with no ceiling configured the derived distance is untouched.
+    # With no ceiling configured the derived distance is untouched (the identity
+    # branch), so the +487-measured geometry is unchanged.
     _, c = _controller(adapter, extra={"reset_threshold_pct": Decimal("0.002")})
     assert c._exit_band() == Decimal("0.003")
-
 
 def test_a_disarmed_stop_does_not_unlock_the_full_pyramid():
     """SLTP-F4. The 100% exposure default is only safe because the stop-budget
