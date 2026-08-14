@@ -995,15 +995,14 @@ def test_a_rebuilt_controller_will_not_price_its_add_off_a_seeded_fill():
 
 
 def test_the_strategy_exit_still_fires_before_the_session_rail():
-    """The safety ordering the step cap exists to guarantee, re-proved after the
-    exit was widened and the exposure ceiling raised to 100% of deployed.
+    """The step cap still sizes a ``levels``-rung plan inside the stop.
 
-    R-Grid must be able to exit on its OWN terms; if a full pyramid taking the
-    adverse move to its band exit already costs more than the stop budget, the
-    session rail always fires first and the user "never sees a losing trade, just
-    a strategy that keeps stopping". Both the raised cap and the widened exit push
-    against this, so it is checked at the tight-SL / high-leverage corners where
-    the stop-budget ceiling has to bind.
+    The inventory cap now admits 100% of deployed so a winner can keep adding.
+    That larger book can exceed the stop; the session rail is the backstop
+    (same ruling as the exit-widen). This test keeps proving the *step* plan
+    — ``levels x order_amount_quote`` — still fits, which is the property the
+    step cap exists to guarantee. The 100% inventory cap is covered by
+    ``test_a_tight_stop_admits_the_full_deployed_pyramid``.
     """
     from src.nadobro.quant.rgrid_sizing import TAKER_ROUND_TRIP_RATE, exit_band_frac
     from src.nadobro.strategy.engine_runtime import map_strategy_config
@@ -1018,18 +1017,93 @@ def test_the_strategy_exit_still_fires_before_the_session_rail():
             Decimal(2000), product="ETH-PERP", leverage=lev,
         )
         step = Decimal(str(cfg["order_amount_quote"]))
-        deployed = Decimal(str(cfg["margin_quote"]))
-        cap_quote = deployed * Decimal(str(cfg["max_net_exposure_pct"])) / Decimal(100)
-        reachable = min(max(cap_quote, step), step * Decimal(levels))
+        if cfg.get("step_below_venue_minimum"):
+            continue
+        planned = step * Decimal(levels)
         move = exit_band_frac(Decimal(str(cfg["spread_ask_pct"])),
                               Decimal(str(cfg["reset_threshold_pct"])))
-        loss_at_own_exit = reachable * (move + TAKER_ROUND_TRIP_RATE)
+        loss_at_own_exit = planned * (move + TAKER_ROUND_TRIP_RATE)
         stop_budget = Decimal(str(margin)) * Decimal(str(sl)) / Decimal(100)
         assert loss_at_own_exit <= stop_budget, (
-            f"margin={margin} lev={lev} levels={levels} SL={sl}%: a full pyramid "
-            f"loses ${loss_at_own_exit:.2f} reaching R-Grid's own exit against a "
-            f"${stop_budget:.2f} stop — the session rail fires first"
+            f"margin={margin} lev={lev} levels={levels} SL={sl}%: the planned "
+            f"{levels}-rung pyramid loses ${loss_at_own_exit:.2f} reaching "
+            f"R-Grid's own exit against a ${stop_budget:.2f} stop"
         )
+
+
+def test_a_winner_can_add_past_the_first_rung():
+    """The 29% cap stopped a 1%/5x book after one $100 step. At 100% a weak
+    grind is allowed to pyramid — more fills, which is the whole point of
+    increasing position to gain more wins. Chop/range can churn more; the
+    session rail is the backstop.
+    """
+    import math
+    from src.nadobro.engine.backtester import SimCosts, candles_from_prices, run_backtest
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    settings = {
+        "notional_usd": 100, "leverage": 5, "levels": 4,
+        "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 1.0,
+        "rgrid_reset_threshold_pct": 0.2,
+    }
+    cfg = map_strategy_config(
+        "rgrid", settings, Decimal(100), product="ETH-PERP", leverage=5,
+    )
+    assert Decimal(str(cfg["max_net_exposure_pct"])) == Decimal("100")
+    old = dict(cfg)
+    old["max_net_exposure_pct"] = 29.15
+    prices = [100 + 0.04 * i + 0.3 * math.sin(i / 4) for i in range(180)]
+    candles = candles_from_prices(prices, interval_s=60, wick_pct=Decimal("0.0008"))
+    capped = run_backtest("rgrid", old, candles, costs=SimCosts())
+    open_book = run_backtest("rgrid", dict(cfg), candles, costs=SimCosts())
+    assert open_book.fills > capped.fills, (
+        f"100% cap did not pyramid past the 29% book "
+        f"(capped fills={capped.fills}, open fills={open_book.fills})"
+    )
+    assert open_book.net_pnl > capped.net_pnl, (
+        f"pyramiding a winner must not lose to the 29% cap on this grind "
+        f"(capped {capped.net_pnl}, open {open_book.net_pnl})"
+    )
+
+
+def test_a_tight_stop_admits_the_full_deployed_pyramid():
+    """The stop-budget used to map a 1% stop at 5x to ~29% of deployed — one
+    rung, then every add refused. The inventory cap is now 100% of deployed
+    whenever the rail is armed, so the pyramid can actually be built. The
+    session rail is the backstop when that book's own-exit loss exceeds the
+    stop (logged, same ruling as the exit-widen).
+    """
+    from src.nadobro.quant.rgrid_sizing import exit_cost_frac
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    # The 29% case: 1% stop, 5x, 4 levels, 10bp band.
+    cfg = map_strategy_config(
+        "rgrid",
+        {"notional_usd": 100, "leverage": 5, "levels": 4,
+         "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 1.0},
+        Decimal(2000), product="ETH-PERP", leverage=5,
+    )
+    deployed = Decimal(str(cfg["margin_quote"]))
+    exposure_pct = Decimal(str(cfg["max_net_exposure_pct"]))
+    assert exposure_pct == Decimal("100"), (
+        f"tight 1% stop mapped exposure to {exposure_pct}% of deployed — "
+        f"the pyramid is still capped"
+    )
+    cap_quote = deployed * exposure_pct / Decimal(100)
+    # Controller admits the full deployed book (no levels*step break counter).
+    assert cap_quote == deployed
+    band = Decimal(str(cfg["spread_ask_pct"]))
+    reset = Decimal(str(cfg["reset_threshold_pct"]))
+    loss_at_full = deployed * (
+        exit_cost_frac(band, reset)  # trigger + fees + crossing print
+    )
+    stop_budget = Decimal("1.00")  # 1% of $100
+    # This is the acknowledged trade-off, not a failure: the rail fires first.
+    assert loss_at_full > stop_budget, (
+        "the 100% pyramid should exceed a 1% stop — otherwise this is not "
+        "the case the rail-as-backstop ruling covers"
+    )
+
 
 
 def test_status_reports_the_levels_the_engine_is_actually_working():
@@ -1126,9 +1200,10 @@ def test_the_exit_widens_past_the_cap_so_winners_are_not_capped():
     assert c._exit_band() == Decimal("0.003")
 
 def test_a_disarmed_stop_does_not_unlock_the_full_pyramid():
-    """SLTP-F4. The 100% exposure default is only safe because the stop-budget
-    ceiling tightens it. With the rail disarmed there is no budget, nothing
-    tightens, and the full pyramid would run with no stop behind it at all."""
+    """SLTP-F4. The 100% exposure default is only safe with a rail behind it.
+    With the stop disarmed there is no budget, so the conservative 30%
+    ceiling stays — a 100% pyramid with no rail is 3.3x the old book and
+    nothing to flatten it."""
     from src.nadobro.strategy.engine_runtime import map_strategy_config
 
     armed, disarmed = (
@@ -1143,9 +1218,34 @@ def test_a_disarmed_stop_does_not_unlock_the_full_pyramid():
     assert float(disarmed["max_net_exposure_pct"]) <= 30.0, (
         "a disarmed stop lifted the exposure ceiling instead of holding it"
     )
-    assert float(armed["max_net_exposure_pct"]) <= 100.0
+    assert float(armed["max_net_exposure_pct"]) == 100.0
     # No budget to size against means no exit ceiling either.
     assert Decimal(str(disarmed["exit_band_cap"])) == 0
+
+
+def test_a_zero_exposure_setting_does_not_disable_the_cap():
+    """cap_frac <= 0 is INACTIVE in exposure_allowed_sides. A leftover 0
+    (the overlay used to write this) must remap to the armed/disarmed
+    default, not unlock an unbounded pyramid.
+    """
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    armed = map_strategy_config(
+        "rgrid",
+        {"notional_usd": 100, "leverage": 5, "levels": 4,
+         "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 1.0,
+         "max_net_exposure_pct": 0},
+        Decimal(2000), product="ETH-PERP", leverage=5,
+    )
+    disarmed = map_strategy_config(
+        "rgrid",
+        {"notional_usd": 100, "leverage": 5, "levels": 4,
+         "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 0.0,
+         "max_net_exposure_pct": 0},
+        Decimal(2000), product="ETH-PERP", leverage=5,
+    )
+    assert float(armed["max_net_exposure_pct"]) == 100.0
+    assert float(disarmed["max_net_exposure_pct"]) == 30.0
 
 
 # ==========================================================================
@@ -1227,10 +1327,15 @@ def test_a_refused_exit_never_falls_through_into_an_add():
 
 
 def test_the_stop_budget_covers_the_crossing_print_not_just_the_fees():
-    """AUDIT-F4. The exit is priced THROUGH the touch so it actually fills, bounded
-    at _EXIT_CROSS_BP. That bound is realised cost on the way out, so the exposure
-    ceiling has to carry it; sized against fees alone the exit could print 30bp
-    worse than the modelled level — up to 1.8x the stop at shipped defaults."""
+    """AUDIT-F4. The exit is priced THROUGH the touch so it actually fills,
+    bounded at _EXIT_CROSS_BP. That print is realised cost, so the STEP cap
+    sizes against ``exit_cost_frac`` (band + fees + crossing), not fees alone.
+
+    The inventory cap is no longer this bound — it admits 100% of deployed and
+    the session rail is the backstop. This test proves the *planned*
+    ``levels x step`` rungs still carry the print. Floored (unplaceable) steps
+    are the stop-too-tight path, not this one.
+    """
     from src.nadobro.quant.rgrid_sizing import exit_cost_frac
     from src.nadobro.strategy.engine_runtime import map_strategy_config
 
@@ -1242,11 +1347,11 @@ def test_the_stop_budget_covers_the_crossing_print_not_just_the_fees():
              "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": sl},
             Decimal(2000), product="ETH-PERP", leverage=lev,
         )
+        if cfg.get("step_below_venue_minimum"):
+            continue
         step = Decimal(str(cfg["order_amount_quote"]))
-        cap = (Decimal(str(cfg["margin_quote"]))
-               * Decimal(str(cfg["max_net_exposure_pct"])) / Decimal(100))
-        reachable = min(max(cap, step), step * Decimal(levels))
-        worst = reachable * exit_cost_frac(
+        planned = step * Decimal(levels)
+        worst = planned * exit_cost_frac(
             Decimal(str(cfg["spread_ask_pct"])),
             Decimal(str(cfg["reset_threshold_pct"])),
         )
