@@ -113,3 +113,14 @@ def dgrid_intelligence_enabled() -> bool:
     ``state["dgrid_intelligence_enabled"]`` (True/False).
     """
     return env_flag("NADO_DGRID_INTELLIGENCE", False)
+
+
+def lowiqpts_relay_poll_enabled() -> bool:
+    """Background 2s @lowiqpts event poll. Default OFF.
+
+    A hung poll occupied APScheduler ``max_instances=1`` and skip-warned every
+    2s, drowning Fly logs and starving other ticks. Points refresh on tap still
+    talks to the relay; only the always-on poller is gated. Set
+    ``LOWIQPTS_RELAY_POLL_ENABLED=1`` to turn it back on.
+    """
+    return env_flag("LOWIQPTS_RELAY_POLL_ENABLED", False)
