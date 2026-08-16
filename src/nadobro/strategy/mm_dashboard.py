@@ -178,29 +178,47 @@ def _spread_recommendation(
     *,
     maker_bp: Optional[float] = None,
 ) -> Optional[dict]:
-    """Compare the configured spread to the live book and advise resting near the
-    touch. ``spread_bp`` is the half-offset from mid, so a quote sits
-    ``spread_bp - book_half`` behind the best price; when that is large it rarely
-    fills. Recommend a half-offset near the book half-spread, floored so it still
-    clears the maker fee. Returns None when the book is unavailable."""
+    """Advise a spread that is ECONOMICALLY HONEST about the maker round-trip cost.
+
+    ``spread_bp`` is the half-offset from mid; a symmetric round trip captures ~the
+    full quoted spread (2×half) and pays the maker round trip. On Nado that round
+    trip is ~5 bp ((1.5 venue + 1.0 builder) × 2), so a round trip is only
+    fee-positive when the CAPTURED spread exceeds it, i.e. half-offset ≳ 2.5 bp.
+
+    The trap this corrects: on a liquid major the book spread is ~1 bp, far below
+    the 5 bp round trip, so quoting AT the touch to "capture the spread" LOSES
+    ~(5 − book) bp per round trip. There is no spread to capture there — it is a
+    directional / volume play, not a market-making profit. Spread capture only
+    clears fees on instruments whose book spread itself exceeds ~5-6 bp (thin
+    alts). Returns None when the book is unavailable."""
     if book_spread_bp is None or book_spread_bp <= 0:
         return None
+    from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
+    maker_rt_bp = float(MAKER_ROUND_TRIP_RATE) * 10000.0   # ~5.0 bp
+    breakeven_half_bp = maker_rt_bp / 2.0                  # ~2.5 bp per side
     book_half = book_spread_bp / 2.0
-    fee_floor = max(0.5, float(maker_bp or 0.0))  # must clear the maker fee
-    recommended_half = round(max(book_half, fee_floor), 2)
+    # Spread capture only clears fees when the book spread exceeds the round trip.
+    spread_capture_viable = book_spread_bp >= maker_rt_bp
+    if spread_capture_viable:
+        recommended_half = round(book_half, 2)            # join the touch — capture works
+    else:
+        recommended_half = round(breakeven_half_bp, 2)    # nearest fee-positive half (fills rarely)
     behind = None
     verdict = "unknown"
     if configured_spread_bp is not None:
         behind = round(configured_spread_bp - book_half, 2)
         if configured_spread_bp <= book_half + 1e-9:
-            verdict = "at_touch"       # aggressive maker, joins/betters the touch
+            verdict = "at_touch"       # joins/betters the touch (loses ~RT on a tight book)
         elif behind <= max(1.0, book_half):
-            verdict = "near_touch"     # a touch behind, still fills
+            verdict = "near_touch"
         else:
             verdict = "far"            # parked well behind the book -> rare fills
     return {
         "book_spread_bp": round(book_spread_bp, 3),
         "book_half_bp": round(book_half, 3),
+        "maker_round_trip_bp": round(maker_rt_bp, 2),
+        "breakeven_half_bp": round(breakeven_half_bp, 2),
+        "spread_capture_viable": spread_capture_viable,
         "recommended_half_bp": recommended_half,
         "behind_touch_bp": behind,
         "verdict": verdict,
@@ -426,19 +444,26 @@ def render_pretrade_card_lines(breakdown: dict) -> list[str]:
         line = f"Book spread now: {rec['book_spread_bp']:.2f} bp (±{rec['book_half_bp']:.2f} from mid)"
         if cfg_bp is not None:
             line += f"; your spread: {cfg_bp:.1f} bp"
-        verdict = rec.get("verdict")
-        if verdict == "far" and rec.get("behind_touch_bp") is not None:
-            line += (
-                f" — rests ~{rec['behind_touch_bp']:.1f} bp BEHIND the touch, so it "
-                f"fills rarely. To capture the spread, set it near {rec['recommended_half_bp']:.1f} bp."
-            )
-        elif verdict == "at_touch":
-            line += " — quotes at/inside the touch ✅"
-        elif verdict == "near_touch":
-            line += " — quotes near the touch ✅"
-        else:
-            line += f" — to rest at the touch, set ~{rec['recommended_half_bp']:.1f} bp."
         lines.append(line)
+        if rec.get("spread_capture_viable"):
+            # Book spread exceeds the maker round trip -> capture clears fees.
+            verdict = rec.get("verdict")
+            if verdict in ("at_touch", "near_touch"):
+                lines.append("  Spread capture viable here — your quote is near the touch ✅")
+            else:
+                lines.append(
+                    f"  Spread capture viable here (book > {rec['maker_round_trip_bp']:.1f} bp round trip); "
+                    f"to rest at the touch set ~{rec['recommended_half_bp']:.1f} bp."
+                )
+        else:
+            # The honest reality on a liquid major: no spread to capture.
+            lines.append(
+                f"  ⚠ Spread capture LOSES here: a maker round trip costs "
+                f"~{rec['maker_round_trip_bp']:.1f} bp but the book is only {rec['book_spread_bp']:.2f} bp, "
+                f"so quoting at the touch loses ~{rec['maker_round_trip_bp'] - rec['book_spread_bp']:.1f} bp per "
+                f"round trip. To be fee-positive you must quote ≥ {rec['breakeven_half_bp']:.1f} bp/side "
+                f"(fills rarely). On this pair MM pays as a DIRECTIONAL/volume play, not spread capture."
+            )
     elif cfg_bp is not None:
         lines.append(
             f"Your spread: {cfg_bp:.1f} bp (live book spread unavailable — reopen in a moment)"

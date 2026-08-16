@@ -38,22 +38,25 @@ def test_configured_spread_reads_per_strategy_key():
     assert md._configured_spread_bp("rgrid", {"spread_bp": 4.0}) == 4.0
 
 
-def test_wide_spread_on_a_tight_book_is_flagged_as_far_from_touch():
-    rec = md._spread_recommendation(1.0, 10.0, maker_bp=1.0)  # 1bp book, 10bp setting
-    assert rec["verdict"] == "far"
-    assert rec["behind_touch_bp"] > 0
-    assert rec["recommended_half_bp"] <= 2.0  # steer toward the touch
+def test_tight_book_is_flagged_as_spread_capture_NOT_viable():
+    # 1 bp book << ~5 bp maker round trip: capturing the spread is a structural loss.
+    rec = md._spread_recommendation(1.0, 10.0)
+    assert rec["spread_capture_viable"] is False
+    # Do NOT steer to the touch; the nearest fee-positive half is the RT breakeven.
+    assert rec["recommended_half_bp"] >= rec["breakeven_half_bp"] - 1e-9
+    assert rec["breakeven_half_bp"] >= 2.0  # ~2.5 bp/side to clear the ~5 bp round trip
 
 
-def test_touch_tight_spread_is_approved():
-    rec = md._spread_recommendation(1.0, 0.5, maker_bp=1.0)
-    assert rec["verdict"] in ("at_touch", "near_touch")
+def test_wide_book_alt_is_spread_capture_viable():
+    # A thin alt whose book spread exceeds the maker round trip: capture clears fees.
+    rec = md._spread_recommendation(8.0, 8.0)  # 8 bp book > ~5 bp RT
+    assert rec["spread_capture_viable"] is True
+    assert abs(rec["recommended_half_bp"] - 4.0) < 0.5  # join near the 4 bp half-touch
 
 
-def test_recommendation_clears_the_maker_fee_floor():
-    # Even on a ~0 bp book, do not recommend resting below the maker fee.
-    rec = md._spread_recommendation(0.2, 5.0, maker_bp=1.0)
-    assert rec["recommended_half_bp"] >= 1.0
+def test_recommendation_never_below_the_round_trip_breakeven_on_a_tight_book():
+    rec = md._spread_recommendation(0.2, 5.0)
+    assert rec["recommended_half_bp"] >= rec["breakeven_half_bp"] - 1e-9
 
 
 def test_card_line_shows_book_vs_configured_spread():
@@ -69,4 +72,8 @@ def test_card_line_shows_book_vs_configured_spread():
     book_line = next((ln for ln in lines if "Book spread now" in ln), None)
     assert book_line is not None
     assert "your spread: 10.0 bp" in book_line
-    assert "BEHIND the touch" in book_line  # the low-volume warning fires
+    # On a ~1 bp book the card must warn that spread capture LOSES (5 bp round trip),
+    # not tell the user to quote at the touch.
+    warn = next((ln for ln in lines if "Spread capture LOSES" in ln), None)
+    assert warn is not None
+    assert "DIRECTIONAL/volume play" in warn
