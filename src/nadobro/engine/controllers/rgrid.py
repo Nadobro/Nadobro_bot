@@ -97,9 +97,11 @@ from typing import Deque, Dict, Optional, Tuple
 from src.nadobro.engine.controllers.market_making import MarketMakingController
 from src.nadobro.engine.executors.rgrid_maker_executor import (
     LEG_ENTRY,
+    LEG_ENTRY_CROSS,
     LEG_EXIT,
     LEG_TRAIL_STOP,
     RGridMakerExecutor,
+    build_cross_entry,
     build_maker_quote,
     build_trail_stop,
 )
@@ -107,6 +109,7 @@ from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.types import TradeType, _dec
 from src.nadobro.quant.rgrid_sizing import (
     EXIT_CROSS_RATE,
+    TAKER_ROUND_TRIP_RATE,
     arm_pct,
     exit_band_frac,
 )
@@ -131,6 +134,18 @@ _MAX_CONSECUTIVE_EXIT_FAILURES = 5
 # executor has no timeout of its own for a plain LIMIT, so without this a gapped
 # book or a partial fill freezes the controller indefinitely (see _reap_stale_stop).
 _STOP_STALE_TICKS = 3
+# Ticks a crossing ADD may sit unfilled before it is cancelled and re-priced through
+# the current touch (same reasoning as _STOP_STALE_TICKS, see _reap_stale_add).
+_ADD_STALE_TICKS = 3
+# How far through the touch a crossing ADD prices. Tighter than the emergency exit
+# bound (_EXIT_CROSS_BP=30): an add is not time-critical, so a book that gaps past it
+# re-fires next tick via the stale-reap rather than filling at an arbitrary price.
+_ADD_CROSS_BP_DEFAULT = Decimal(10)
+# Extra spacing (over the trail giveback) each ADD must clear so the MARGINAL add is
+# net-of-fee positive: s_add = arm + cushion, and cushion covers the taker round trip
+# plus a small edge. See _add_spacing. This lives in add-trigger pricing ONLY — the
+# exit geometry (arm, exit_band) is untouched, so the exit_band>arm invariant holds.
+_ADD_CUSHION_BP_DEFAULT = Decimal(13)
 # How far the FLAT-book anchor may lag mid, in bands. The lag is the whole point —
 # it is what makes a break a break — but it has to be bounded or the reference goes
 # stale (see _track_flat_anchor). One band is degenerate: it parks the trigger
@@ -173,6 +188,18 @@ class RGridController(MarketMakingController):
         # The armed trailing stop is the one order that crosses; never stack two.
         self._stop_id: Optional[str] = None
         self._stop_age = 0
+        # Crossing-add mode. "maker" (default) = the legacy post-only rest, which
+        # cannot fill in a clean trend (0 fills, measured); "cross" = a bounded
+        # marketable-limit ADD fired on confirmed momentum. Only ONE crossing add
+        # is in flight at a time (mirror of the stop), tracked here.
+        self.add_mode = str(self.cfg("add_mode", "maker") or "maker").strip().lower()
+        self._add_cross_bp = _dec(self.cfg("add_cross_bp", _ADD_CROSS_BP_DEFAULT))
+        self._add_cushion_bp = _dec(self.cfg("add_cushion_bp", _ADD_CUSHION_BP_DEFAULT))
+        # Trend gate: in cross mode, only OPEN/ADD in a confirmed trend (exits are
+        # never gated). Taker adds in chop are a guaranteed per-false-break bleed.
+        self.trend_gate = bool(self.cfg("trend_gate", self.add_mode == "cross"))
+        self._add_id: Optional[str] = None
+        self._add_age = 0
         # Exposure-price window as a fraction of each leg's recent fill VOLUME.
         # 0 ⇒ VWAP over the whole retained window.
         self.vwap_volume_fraction = _dec(self.cfg("vwap_volume_fraction", "0") or "0")
@@ -365,6 +392,14 @@ class RGridController(MarketMakingController):
             _dec(self.cfg("flat_anchor_lag_bands", _FLAT_ANCHOR_MAX_BANDS)),
             Decimal(1),
         )
+        # Cross mode fires the FIRST entry when mid has extended one add-spacing
+        # (s_add ≈ arm+cushion, ~33bp) past this reference. The maker leash (2 bands
+        # ≈ 20bp) is TIGHTER than s_add, so the flat break trigger would be
+        # structurally unreachable — the anchor would drag along with mid before the
+        # break ever completes, and cross mode would place nothing. Widen the leash
+        # past the trigger so a genuine breakout can accumulate before the drag.
+        if self.add_mode == "cross":
+            lag = max(lag, self._add_spacing() * Decimal("1.5"))
         clamped = min(max(self._anchor, mid * (Decimal(1) - lag)), mid * (Decimal(1) + lag))
         if clamped != self._anchor:
             self._anchor = clamped
@@ -502,6 +537,24 @@ class RGridController(MarketMakingController):
         """How far from the average entry the (loss-only) exposure-band exit fires.
         See :meth:`_exit_geometry`."""
         return self._exit_geometry()[0]
+
+    def _add_spacing(self) -> Decimal:
+        """Fresh extension each CROSS-MODE add requires — add-trigger pricing ONLY.
+
+        ``s_add = arm + cushion``. The trailing exit gives back only ``arm``, so
+        requiring ``arm + cushion`` of favourable extension before adding makes the
+        MARGINAL add net-of-fee positive: it captures ``s_add`` of move and can only
+        give back ``arm``, and the cushion covers the taker round trip plus a small
+        edge. The cushion is floored at the taker round trip so a mis-set config can
+        never make a marginal add a structural loss.
+
+        This is DELIBERATELY not ``_band()`` and is NEVER fed into ``_exit_geometry``
+        — the arm and exit band stay derived from the entry band, so the
+        ``exit_band > arm`` invariant and the exposure-band backstop are preserved
+        exactly. It only moves WHERE the add trigger sits, not the exit machinery.
+        """
+        cushion = max(self._add_cushion_bp / Decimal(10000), TAKER_ROUND_TRIP_RATE)
+        return self._arm_pct() + cushion
 
     def _add_reference(self, net: Decimal, anchor: Decimal) -> Decimal:
         """The price the ENTRY/ADD leg is quoted around.
@@ -770,6 +823,144 @@ class RGridController(MarketMakingController):
         )
         return True
 
+    # -- crossing add (rgrid_add_mode="cross") -------------------------------
+    def _add_in_flight(self) -> bool:
+        """Is a crossing add currently working? Mirror of :meth:`_stop_in_flight`."""
+        if self._add_id is None:
+            self._add_age = 0
+            return False
+        ex = self.orchestrator.get(self._add_id)
+        if ex is None or ex.is_terminated:
+            self._add_id = None
+            self._add_age = 0
+            return False
+        return True
+
+    async def _reap_stale_add(self) -> bool:
+        """Cancel a crossing add that has not filled so it can re-fire at the current
+        mid. Returns True if the caller should stand down this tick (add still
+        working, not yet stale). Mirror of :meth:`_reap_stale_stop`.
+
+        A bounded marketable LIMIT that a gapped/one-sided book does not fill rests
+        forever (OrderExecutor does not time out a plain LIMIT), which would freeze
+        the pyramid. Ageing it out re-prices through the current touch. Re-firing is
+        safe: it is one step, sized off the same budget, exposure-checked at fire.
+        """
+        if not self._add_in_flight():
+            return False
+        self._add_age += 1
+        if self._add_age <= _ADD_STALE_TICKS:
+            return True
+        add_id, self._add_id, self._add_age = self._add_id, None, 0
+        if add_id is not None:
+            await self.orchestrator.stop(add_id)
+        return False
+
+    def _add_gate_admits(self, side: TradeType) -> bool:
+        """Trend gate for cross-mode opens/adds. Exits are NEVER gated (they do not
+        route through here). When the gate is off, always admit.
+
+        The crossing add is itself a momentum filter — it only fires once mid has
+        extended one full add-spacing (s_add ≈ arm+cushion, ~33bp) in one direction,
+        so chop below that amplitude never triggers a false add. When the overlay
+        supplies a regime read, additionally refuse an add the regime opposes
+        (a long while the overlay reads trend_down, or a short while trend_up), which
+        is the same signal ``_overlay_opposes`` already uses to tighten protection.
+        """
+        if not self.trend_gate:
+            return True
+        long_side = side is TradeType.BUY
+        # Only veto when the overlay is confident AND reads against the add side.
+        if self._overlay_opposes(long_side):
+            return False
+        return True
+
+    async def _fire_cross_add(self, side: TradeType, mid: Decimal, step_base: Decimal) -> bool:
+        """Cross the spread to ADD one step on ``side`` — the cross-mode entry.
+
+        Mirror of :meth:`_fire_trail_stop` for the OPEN side: a bounded marketable
+        LIMIT (``_add_cross_bp`` through the touch), NOT reduce-only. Cancels any
+        resting maker leg first so cross and maker never both rest on the add side.
+        """
+        amount = self._quantize_quote(step_base, mid)
+        if amount is None or amount <= 0:
+            return False
+        await self._cancel_leg(side)
+        slip = self._add_cross_bp / Decimal(10000)
+        px = (mid * (Decimal(1) + slip) if side is TradeType.BUY
+              else mid * (Decimal(1) - slip))
+        cfg = build_cross_entry(
+            self.trading_pair, side, amount,
+            leverage=int(self.cfg("leverage", 1) or 1), price=px,
+        )
+        ex = RGridMakerExecutor(
+            cfg, user_id=self.user_id, controller_id=self.id,
+            adapter=self.adapter, inventory=self.inventory, leg=LEG_ENTRY_CROSS,
+        )
+        if not await self.spawn_executor(
+            ex, ExecutorRequest(
+                order_amount_quote=amount * mid, reduce_only=False,
+                position_action=cfg.position_action,
+            )
+        ):
+            return False
+        self._add_id = ex.id
+        self._add_age = 0
+        logger.info(
+            "rgrid crossing add: %s one step (%s) at %s (mid %s, s_add %s) "
+            "(user=%s pair=%s)",
+            "BUY" if side is TradeType.BUY else "SELL", amount, px, mid,
+            self._add_spacing(), self.user_id, self.trading_pair,
+        )
+        return True
+
+    async def _drive_cross_add(
+        self, net: Decimal, add_ref: Decimal, mid: Decimal, step_base: Decimal,
+        allow_buy: bool, allow_sell: bool,
+    ) -> None:
+        """Cross-mode add driver. Fires ONE bounded marketable add per direction once
+        mid has extended one add-spacing past the reference (confirmed momentum),
+        subject to the trend gate, the exposure cap, and one-add-in-flight.
+
+        A refused/gated add stands down for the tick — it NEVER falls through into a
+        resting maker quote (the same pile-on rule the refused exit already follows).
+        Both resting maker legs are dropped in cross mode so the two paths never mix.
+        """
+        # Re-price a stranded add; stand down while one is still working.
+        if await self._reap_stale_add():
+            return
+        # No resting maker orders in cross mode.
+        await self._cancel_leg(TradeType.BUY)
+        await self._cancel_leg(TradeType.SELL)
+        if self._add_in_flight() or step_base <= 0:
+            return
+        s_add = self._add_spacing()
+        buy_trigger = add_ref * (Decimal(1) + s_add)
+        sell_trigger = add_ref * (Decimal(1) - s_add)
+
+        def _ready(side: TradeType) -> bool:
+            allowed = allow_buy if side is TradeType.BUY else allow_sell
+            if not allowed or not self._add_gate_admits(side):
+                return False
+            reached = mid >= buy_trigger if side is TradeType.BUY else mid <= sell_trigger
+            if not reached:
+                return False
+            return self._projected_order_within_exposure(side, mid, step_base * mid)
+
+        # Long adds buy; short adds sell; flat fires whichever trigger price reached
+        # (only one can be — buy trigger is above the ref, sell below).
+        if net > 0:
+            if _ready(TradeType.BUY):
+                await self._fire_cross_add(TradeType.BUY, mid, step_base)
+        elif net < 0:
+            if _ready(TradeType.SELL):
+                await self._fire_cross_add(TradeType.SELL, mid, step_base)
+        else:
+            if _ready(TradeType.BUY):
+                await self._fire_cross_add(TradeType.BUY, mid, step_base)
+            elif _ready(TradeType.SELL):
+                await self._fire_cross_add(TradeType.SELL, mid, step_base)
+
     def _is_postable(self, side: TradeType, price: Decimal, mid: Decimal) -> bool:
         """Can this price rest without crossing? A bid must sit below the market
         and an ask above it.
@@ -953,6 +1144,15 @@ class RGridController(MarketMakingController):
         # Sizing: only the ADDING leg rests, one step at a time. The reducing side
         # is the trigger above, so there is no resting exit to size.
         step_base = (self.order_amount_quote / mid) if mid > 0 else Decimal(0)
+
+        # CROSS MODE: the add is a bounded marketable LIMIT fired on confirmed
+        # momentum (mid extended one add-spacing past the reference), trend-gated —
+        # not a resting post-only bid, which cannot fill a rising market (0 fills,
+        # measured). A refused/gated add stands down and never rests a maker quote.
+        if self.add_mode == "cross":
+            await self._drive_cross_add(net, add_ref, mid, step_base, allow_buy, allow_sell)
+            return
+
         if net > 0:
             # Long: the sell side is the exit trigger; only the buy adds.
             await self._quote_leg(

@@ -38,6 +38,14 @@ from src.nadobro.engine.types import ExecutionStrategy, PositionAction, TradeTyp
 LEG_ENTRY = "entry"            # the side that ADDS into the move — post-only
 LEG_EXIT = "exit"              # the resting reduce-only side that books it — post-only
 LEG_TRAIL_STOP = "trail_stop"  # the armed trailing stop — the ONE order that crosses
+# The crossing ADD (rgrid_add_mode="cross"). A resting post-only bid can only fill
+# on a down-tick, so it CANNOT buy a rising market — measured at 0 fills across every
+# clean/shallow/moderate uptrend. So, when cross mode is armed, the ADD becomes a
+# bounded marketable LIMIT (never a naked MARKET) fired the instant momentum has
+# confirmed (mid has already extended one add-spacing past the last fill). This is a
+# deliberate, gated exemption from maker-first for the OPEN leg — the mirror of the
+# already-crossing trailing exit — bounded, trend-gated, and revertible to "maker".
+LEG_ENTRY_CROSS = "entry_cross"
 
 
 class RGridMakerExecutor(OrderExecutor):
@@ -64,12 +72,31 @@ class RGridMakerExecutor(OrderExecutor):
             if config.execution_strategy is not ExecutionStrategy.LIMIT:
                 raise ValueError(
                     "the trailing stop is the crossing order: execution_strategy "
-                    f"must be MARKET (got {config.execution_strategy.value})"
+                    f"must be LIMIT (got {config.execution_strategy.value})"
                 )
             if config.position_action is not PositionAction.CLOSE:
                 raise ValueError(
                     "the trailing stop must be reduce-only so it can never open or "
                     "flip a position"
+                )
+        elif self.leg == LEG_ENTRY_CROSS:
+            # The crossing ADD: a bounded marketable LIMIT that OPENS/extends.
+            # Exact permission — LIMIT + OPEN + crosses_book only — so no edit can
+            # sneak a naked MARKET entry or a crossing reduce-only flip through here.
+            if config.execution_strategy is not ExecutionStrategy.LIMIT:
+                raise ValueError(
+                    "the crossing add is a marketable LIMIT: execution_strategy "
+                    f"must be LIMIT (got {config.execution_strategy.value})"
+                )
+            if config.position_action is not PositionAction.OPEN:
+                raise ValueError(
+                    "the crossing add opens/extends the position: position_action "
+                    "must be OPEN"
+                )
+            if not getattr(config, "crosses_book", False):
+                raise ValueError(
+                    "the crossing add must set crosses_book=True so the taker fee "
+                    "attributes honestly (the venue reports realized_pnl_x18=0)"
                 )
         elif config.execution_strategy is not ExecutionStrategy.LIMIT_MAKER:
             raise ValueError(
@@ -119,6 +146,32 @@ def build_maker_quote(
         price=_dec(price),
         leverage=int(leverage or 1),
         position_action=PositionAction.CLOSE if reduce_only else PositionAction.OPEN,
+    )
+
+
+def build_cross_entry(
+    trading_pair: str,
+    side: TradeType,
+    amount_base: object,
+    *,
+    leverage: int = 1,
+    price: object = None,
+) -> OrderExecutorConfig:
+    """Config for a crossing ADD: a MARKETABLE LIMIT that OPENS/extends.
+
+    The mirror of :func:`build_trail_stop` for the entry side. A resting post-only
+    bid cannot buy a rising market, so cross mode fires this the instant momentum
+    has confirmed. It is a bounded LIMIT priced through the touch, never a naked
+    MARKET, so a thin/gapped book refuses rather than fills at an arbitrary price;
+    ``crosses_book`` keeps the taker-fee attribution honest. NOT reduce-only — this
+    is the leg that builds the pyramid.
+    """
+    return OrderExecutorConfig(
+        trading_pair, side, _dec(amount_base), ExecutionStrategy.LIMIT,
+        price=_dec(price) if price is not None else None,
+        leverage=int(leverage or 1),
+        position_action=PositionAction.OPEN,
+        crosses_book=True,
     )
 
 
