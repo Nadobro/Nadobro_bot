@@ -64,3 +64,40 @@ def snapshot() -> dict:
         net: {"age_s": round(now - ts, 2), "products": len(_cache.get(net, {}))}
         for net, ts in _ts.items()
     }
+
+
+def cached_top_of_book(network: str, product: str) -> Optional[dict[str, Any]]:
+    """Best-effort SYNC read of the cached ``{bid, ask, mid}`` for a product.
+
+    Reads the shared cache the alert scanner refreshes for every product every
+    few seconds — WITHOUT the async lock and WITHOUT any network call, so it is
+    safe on a click/worker path (a display read tolerates a slightly stale dict).
+    Keyed by the display name with ``-PERP`` stripped (e.g. ``BTC``), matching
+    ``get_all_market_prices``. Returns None when the product is not cached yet.
+    """
+    net = str(network or "mainnet").lower()
+    key = str(product or "").upper().replace("-PERP", "").strip()
+    row = (_cache.get(net) or {}).get(key)
+    if not isinstance(row, dict):
+        return None
+    return dict(row)
+
+
+def cached_spread_bps(network: str, product: str) -> Optional[float]:
+    """The cached top-of-book spread in basis points, or None if unavailable.
+
+    ``(ask - bid) / mid * 1e4``. This is the number to SHOW the user so they can
+    set a strategy spread that actually rests near the touch rather than far
+    behind it (a quote parked well beyond the book spread rarely fills)."""
+    row = cached_top_of_book(network, product)
+    if not row:
+        return None
+    try:
+        bid = float(row.get("bid") or 0.0)
+        ask = float(row.get("ask") or 0.0)
+        mid = float(row.get("mid") or 0.0) or ((bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0)
+        if bid <= 0 or ask <= 0 or mid <= 0 or ask < bid:
+            return None
+        return (ask - bid) / mid * 10000.0
+    except (TypeError, ValueError):
+        return None

@@ -146,6 +146,67 @@ def estimate_pretrade_fees_usd(
     }
 
 
+def _cached_book_spread_bp(network: str, product: str) -> Optional[float]:
+    """Live top-of-book spread (bp), cache-only so it never blocks the click path."""
+    try:
+        from src.nadobro.venue.market_feed import cached_spread_bps
+        return cached_spread_bps(network, product)
+    except Exception:
+        return None
+
+
+def _configured_spread_bp(strategy_id: str, conf: dict) -> Optional[float]:
+    """The spread the user has set, read the SAME way the engine mapper does
+    (rgrid_spread_bp / dgrid_spread_bp fall back to the generic spread_bp)."""
+    keys = {
+        "rgrid": ("rgrid_spread_bp", "spread_bp"),
+        "dgrid": ("dgrid_spread_bp", "spread_bp"),
+    }.get(strategy_id, ("spread_bp",))
+    for k in keys:
+        v = conf.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _spread_recommendation(
+    book_spread_bp: Optional[float],
+    configured_spread_bp: Optional[float],
+    *,
+    maker_bp: Optional[float] = None,
+) -> Optional[dict]:
+    """Compare the configured spread to the live book and advise resting near the
+    touch. ``spread_bp`` is the half-offset from mid, so a quote sits
+    ``spread_bp - book_half`` behind the best price; when that is large it rarely
+    fills. Recommend a half-offset near the book half-spread, floored so it still
+    clears the maker fee. Returns None when the book is unavailable."""
+    if book_spread_bp is None or book_spread_bp <= 0:
+        return None
+    book_half = book_spread_bp / 2.0
+    fee_floor = max(0.5, float(maker_bp or 0.0))  # must clear the maker fee
+    recommended_half = round(max(book_half, fee_floor), 2)
+    behind = None
+    verdict = "unknown"
+    if configured_spread_bp is not None:
+        behind = round(configured_spread_bp - book_half, 2)
+        if configured_spread_bp <= book_half + 1e-9:
+            verdict = "at_touch"       # aggressive maker, joins/betters the touch
+        elif behind <= max(1.0, book_half):
+            verdict = "near_touch"     # a touch behind, still fills
+        else:
+            verdict = "far"            # parked well behind the book -> rare fills
+    return {
+        "book_spread_bp": round(book_spread_bp, 3),
+        "book_half_bp": round(book_half, 3),
+        "recommended_half_bp": recommended_half,
+        "behind_touch_bp": behind,
+        "verdict": verdict,
+    }
+
+
 def build_pretrade_breakdown(
     *,
     strategy_id: str,
@@ -248,10 +309,23 @@ def build_pretrade_breakdown(
         sl_pct=sl_pct,
     )
 
+    # Live orderbook spread vs the user's configured spread. The core MM job is to
+    # rest near the touch and capture the spread as price moves; a quote parked far
+    # beyond the book spread (e.g. 10-50 bp on a ~1 bp BTC book) rarely fills, which
+    # is the low-volume complaint. Surface both so the user sets the spread wisely.
+    book_spread_bp = _cached_book_spread_bp(network, product)
+    configured_spread_bp = _configured_spread_bp(strategy_id, conf)
+
     return {
         "strategy_id": strategy_id,
         "network": network,
         "product": product,
+        "book_spread_bp": book_spread_bp,
+        "configured_spread_bp": configured_spread_bp,
+        "spread_recommendation": _spread_recommendation(
+            book_spread_bp, configured_spread_bp,
+            maker_bp=(_bps(maker_rate_fraction) if maker_rate_fraction is not None else None),
+        ),
         "notional_usd": notional_usd,
         "cycle_target_notional_usd": cycle_target,
         "leverage": leverage,
@@ -342,6 +416,32 @@ def render_pretrade_card_lines(breakdown: dict) -> list[str]:
             f"~{pov['duration_minutes']:.1f} min duration, "
             f"cycle ${pov['cycle_notional_usd']:,.2f} every {pov['interval_seconds']}s"
             f"{pov.get('pacing_note', '')}"
+        )
+    # Live book spread vs the configured spread — so the user can set a spread that
+    # actually rests near the touch (the core spread-capture job) rather than far
+    # behind it, which is the low-volume failure mode.
+    rec = breakdown.get("spread_recommendation")
+    cfg_bp = breakdown.get("configured_spread_bp")
+    if rec:
+        line = f"Book spread now: {rec['book_spread_bp']:.2f} bp (±{rec['book_half_bp']:.2f} from mid)"
+        if cfg_bp is not None:
+            line += f"; your spread: {cfg_bp:.1f} bp"
+        verdict = rec.get("verdict")
+        if verdict == "far" and rec.get("behind_touch_bp") is not None:
+            line += (
+                f" — rests ~{rec['behind_touch_bp']:.1f} bp BEHIND the touch, so it "
+                f"fills rarely. To capture the spread, set it near {rec['recommended_half_bp']:.1f} bp."
+            )
+        elif verdict == "at_touch":
+            line += " — quotes at/inside the touch ✅"
+        elif verdict == "near_touch":
+            line += " — quotes near the touch ✅"
+        else:
+            line += f" — to rest at the touch, set ~{rec['recommended_half_bp']:.1f} bp."
+        lines.append(line)
+    elif cfg_bp is not None:
+        lines.append(
+            f"Your spread: {cfg_bp:.1f} bp (live book spread unavailable — reopen in a moment)"
         )
     return lines
 

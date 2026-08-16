@@ -1435,6 +1435,26 @@ def map_strategy_config(
             # net-exposure cap, the trailing soft reset and the session SL/TP rails
             # are the backstops.
             **({"regime_gate_enabled": 0.0} if "regime_gate_enabled" not in settings else {}),
+            # ADD EXECUTION MODEL. "maker" (default) rests the add post-only, which
+            # cannot fill a clean trend (0 fills, measured). "cross" fires a bounded
+            # marketable-limit add on confirmed momentum (mid extended one
+            # add-spacing past the reference), trend-gated. Revertible without a
+            # logic redeploy; the taker cost is pre-budgeted (the step is already
+            # sized against the TAKER round trip above).
+            "add_mode": str(settings.get("rgrid_add_mode") or "maker").strip().lower(),
+            # How far through the touch the crossing add prices (bp). Bounded — a
+            # gapped book refuses and it re-fires next tick rather than filling wild.
+            "add_cross_bp": _f(settings, "rgrid_add_cross_bp", 10.0),
+            # Extra spacing (bp) over the trail giveback each add must clear so the
+            # MARGINAL add is net-of-fee positive. Add-trigger pricing only; the exit
+            # geometry (exit_band>arm) is untouched.
+            "add_cushion_bp": _f(settings, "rgrid_add_cushion_bp", 13.0),
+            # Trend gate for cross-mode opens/adds (exits never gated). Default ON in
+            # cross mode, OFF in maker mode.
+            "trend_gate": bool(_f(
+                settings, "rgrid_trend_gate",
+                1.0 if str(settings.get("rgrid_add_mode") or "maker").strip().lower() == "cross" else 0.0,
+            )),
         }
     #
     # GRID's fill-anchored maker mode (FillAnchoredQuotingController) — opt-in via
