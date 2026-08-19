@@ -11,40 +11,74 @@ from _stubs import install_test_stubs
 install_test_stubs()
 
 from src.nadobro.handlers.strategy_handler import (  # noqa: E402
-    _TURBO_LEVERAGE_DEFAULT,
-    _TURBO_SESSION_SL_PCT,
+    _TURBO_ADVERSE_MOVE_PCT,
     _replace_mm_preset,
     _turbo_preset_settings,
+    _turbo_session_sl_pct,
+)
+from src.nadobro.quant.liquidation import (  # noqa: E402
+    fallback_mmf,
+    liquidation_safety,
+    safe_max_sl_pct,
 )
 
 
-def test_mid_turbo_writes_the_coherent_trio():
-    cfg = _turbo_preset_settings("mid", product_max_leverage=50.0)
-    assert cfg["mm_leverage_override"] == 10          # min(10, 50)
+def test_mid_turbo_writes_the_coherent_trio_at_pair_max():
+    # Product-owner directive 2026-08: Turbo deploys at per-asset PAIR MAX,
+    # not a flat 10x. Pass the pair mmf so the session stop is clamped to the
+    # liquidation-safe ceiling.
+    mmf = fallback_mmf(1.0 / 50.0)
+    cfg = _turbo_preset_settings("mid", product_max_leverage=50.0, mmf=mmf)
+    assert cfg["mm_leverage_override"] == 50          # pair max, not min(10, 50)
     assert cfg["mm_quote_mode"] == "touch"
     assert cfg["inventory_soft_limit_usd"] == 0.0     # auto = deployed
     assert cfg["max_net_exposure_pct"] == 100.0       # one full-size fill fits
-    assert cfg["sl_pct"] == _TURBO_SESSION_SL_PCT
+    assert cfg["sl_pct"] > 0                           # armed, scaled with leverage
     assert cfg["tp_pct"] == 0.0                       # no session profit-stop
     assert cfg["interval_seconds"] == 5
     assert cfg["spread_bp"] == 2.0
     assert cfg["mm_preset"] == "turbo"
 
 
-def test_leverage_is_capped_by_the_product_max():
+def test_turbo_leverage_is_the_pair_max():
+    assert _turbo_preset_settings("mid", 50.0)["mm_leverage_override"] == 50
+    assert _turbo_preset_settings("grid", 40.0)["mm_leverage_override"] == 40
+    assert _turbo_preset_settings("grid", 20.0)["mm_leverage_override"] == 20
     assert _turbo_preset_settings("mid", 5.0)["mm_leverage_override"] == 5
     assert _turbo_preset_settings("mid", 1.0)["mm_leverage_override"] == 1
-    assert _turbo_preset_settings("grid", 40.0)["mm_leverage_override"] == int(
-        _TURBO_LEVERAGE_DEFAULT
-    )
+
+
+def test_turbo_stop_is_liquidation_safe_at_pair_max():
+    """The Turbo stop must scale with leverage AND stay at or below the
+    liquidation-safe ceiling S*, so a max-leverage Turbo passes the pre-start
+    liquidation guard rather than sitting inside the liquidation buffer."""
+    for pair_max in (20, 40, 50):
+        mmf = fallback_mmf(1.0 / pair_max)
+        cfg = _turbo_preset_settings("grid", float(pair_max), mmf=mmf)
+        sl = cfg["sl_pct"]
+        assert sl <= safe_max_sl_pct(pair_max, mmf) + 1e-9
+        verdict = liquidation_safety(
+            leverage=pair_max, mmf=mmf, sl_pct=sl, sl_armed=True,
+        )
+        assert verdict.ok, (pair_max, sl, verdict.reason)
+
+
+def test_turbo_stop_scales_to_the_adverse_move_target_when_below_the_ceiling():
+    """Below the safe ceiling the stop follows the fixed adverse-move target
+    (sl% = target × leverage), preserving a leverage-independent price cushion."""
+    # No mmf -> uncapped: sl% = target × leverage (floored at the min).
+    sl = _turbo_session_sl_pct(20.0, mmf=None)
+    assert abs(sl - _TURBO_ADVERSE_MOVE_PCT * 20.0) < 0.11  # truncated to 1 decimal
 
 
 def test_rgrid_dgrid_write_their_own_sl_keys_and_keep_tp():
     """rgrid/dgrid rails read rgrid_stop_loss_pct; their TP and level
     mechanics must NOT be disturbed (position exits flow through barriers)."""
+    mmf = fallback_mmf(1.0 / 50.0)
     for sid, spread_key in (("rgrid", "rgrid_spread_bp"), ("dgrid", "dgrid_spread_bp")):
-        cfg = _turbo_preset_settings(sid, 50.0)
-        assert cfg["rgrid_stop_loss_pct"] == _TURBO_SESSION_SL_PCT
+        cfg = _turbo_preset_settings(sid, 50.0, mmf=mmf)
+        assert cfg["rgrid_stop_loss_pct"] > 0
+        assert cfg["rgrid_stop_loss_pct"] <= safe_max_sl_pct(50.0, mmf) + 1e-9
         assert cfg[spread_key] == 3.0
         assert "rgrid_take_profit_pct" not in cfg
         assert "tp_pct" not in cfg
@@ -52,20 +86,11 @@ def test_rgrid_dgrid_write_their_own_sl_keys_and_keep_tp():
 
 
 def test_grid_keeps_tp_and_touch_mode_stays_mid_only():
-    cfg = _turbo_preset_settings("grid", 50.0)
-    assert cfg["sl_pct"] == _TURBO_SESSION_SL_PCT
+    cfg = _turbo_preset_settings("grid", 50.0, mmf=fallback_mmf(1.0 / 50.0))
+    assert cfg["sl_pct"] > 0
     assert "tp_pct" not in cfg
     assert "mm_quote_mode" not in cfg
     assert "inventory_soft_limit_usd" not in cfg
-
-
-def test_session_sl_survives_typical_noise_at_turbo_leverage():
-    """Coherence invariant: at the turbo leverage, the session SL (% of
-    margin) must tolerate at least a 0.5% adverse price move on full
-    one-sided inventory — otherwise routine noise auto-stops the bot and
-    volume collapses (a stopped bot prints zero fills)."""
-    tolerated_price_move_pct = _TURBO_SESSION_SL_PCT / _TURBO_LEVERAGE_DEFAULT
-    assert tolerated_price_move_pct >= 0.5
 
 
 def test_tiny_after_turbo_removes_turbo_only_settings():
@@ -109,7 +134,7 @@ def test_turbo_after_tiny_removes_tiny_only_settings():
     _replace_mm_preset(cfg, "mid", "turbo", _turbo_preset_settings("mid", 50.0))
 
     assert cfg["mm_preset"] == "turbo"
-    assert cfg["mm_leverage_override"] == 10
+    assert cfg["mm_leverage_override"] == 50
     assert "min_order_notional_usd" not in cfg
     assert "mm_collateral_safety_factor" not in cfg
     assert cfg["mm_quote_mode"] == "touch"
@@ -269,6 +294,16 @@ def test_the_card_reads_the_leverage_the_run_will_deploy_at():
     assert _conf_for_card(
         {"strategies": {"dn": {}}, "default_leverage": 20}, "dn", ctx, "mainnet",
     )["leverage"] == 5.0
+
+    # mid now deploys at the PAIR MAX too (product-owner directive 2026-08),
+    # fixing the old card/engine divergence where the card advertised pair-max
+    # while the run used default_leverage.
+    ctx_mid = SimpleNamespace(user_data={"strategy_pair:mid": "BTC"})
+    conf_mid = _conf_for_card(
+        {"strategies": {"mid": {"notional_usd": 100.0}}, "default_leverage": 3},
+        "mid", ctx_mid, "mainnet",
+    )
+    assert conf_mid["leverage"] == pair_max, "mid must use the pair max, not default_leverage"
 
 
 def test_rgrid_risk_card_explains_the_cap_and_its_failure_modes():

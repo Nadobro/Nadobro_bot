@@ -176,6 +176,37 @@ def get_product_max_leverage(product: str, network: str = None, client=None) -> 
         return int(PRODUCT_MAX_LEVERAGE[product_key])
 
 
+def get_product_initial_margin_fraction(product: str, network: str = None, client=None) -> float:
+    """Initial-margin fraction (``1/max_leverage``). Mirrors
+    ``get_product_max_leverage``: live catalog first, static table on failure."""
+    network_name = str(network or _default_catalog_network())
+    try:
+        from src.nadobro.venue.product_catalog import (
+            get_product_initial_margin_fraction as _catalog_imf,
+        )
+
+        return float(_catalog_imf(product, network=network_name, client=client))
+    except Exception:
+        return 1.0 / max(1, get_product_max_leverage(product, network=network_name, client=client))
+
+
+def get_product_maintenance_margin_fraction(product: str, network: str = None, client=None) -> float:
+    """Maintenance-margin fraction — the liquidation buffer the strategy leverage
+    guard checks. Live catalog first (venue maintenance weight when available,
+    else a conservative fallback derived from imf); static fallback on failure."""
+    network_name = str(network or _default_catalog_network())
+    try:
+        from src.nadobro.venue.product_catalog import (
+            get_product_maintenance_margin_fraction as _catalog_mmf,
+        )
+
+        return float(_catalog_mmf(product, network=network_name, client=client))
+    except Exception:
+        imf = get_product_initial_margin_fraction(product, network=network_name, client=client)
+        from src.nadobro.quant.liquidation import fallback_mmf
+        return fallback_mmf(imf)
+
+
 def get_perp_products(network: str = None, client=None) -> list[str]:
     network_name = str(network or _default_catalog_network())
     try:
