@@ -24,10 +24,15 @@ _PRICE_CACHE_TTL = env_int("NADO_PRICE_CACHE_TTL_SECONDS", 10)
 # Sized book depth. Shorter TTL than the price cache because depth is the input
 # to imbalance/adverse-selection reads, where a 10s-old ladder is worse than no
 # ladder — but long enough to collapse a burst of per-user structure reads on
-# the same product into one query. Process-local by design: a Redis round-trip
-# costs more than it saves at this TTL.
+# the same product into one query. Default is the strategy cadence FLOOR
+# (``core.cadence`` floors every strategy at 3s): a TTL below the floor means
+# two phase-offset users on the same product both miss and each pay a query,
+# which is what makes depth polling scale with USERS instead of PRODUCTS.
+# Process-local by design: a Redis round-trip costs more than it saves at this
+# TTL, and production runs single-process (NADO_RUNTIME_MODE=single) so there is
+# one cache to share. Revisit if multiprocess strategies are ever enabled.
 _liquidity_cache: dict = {}
-_LIQUIDITY_CACHE_TTL = env_float("NADO_LIQUIDITY_CACHE_TTL_SECONDS", 2.0)
+_LIQUIDITY_CACHE_TTL = env_float("NADO_LIQUIDITY_CACHE_TTL_SECONDS", 3.0)
 _ALL_PRODUCTS_CACHE = {}
 # Product list is static metadata — align with catalog hourly refresh.
 _ALL_PRODUCTS_TTL = env_int("NADO_ALL_PRODUCTS_CACHE_TTL_SECONDS", 3600)
@@ -769,11 +774,23 @@ class NadoClient:
                     _liquidity_cache[cache_key] = {"data": result, "ts": time.time()}
             return result
         except Exception as e:
+            self._record_gateway_error(e)
             logger.warning(
                 "SDK get_market_liquidity failed product_id=%s depth=%s: %s",
                 product_id, depth, _format_sdk_error(e),
             )
             return {"bids": [], "asks": [], "timestamp": 0.0}
+        finally:
+            # GATEWAY-INFLIGHT-LEAK: ``_gateway_allowed`` defaults to
+            # ``user_scoped=True``, which takes a per-user in-flight slot that
+            # ONLY ``release()`` frees (gateway_budget.release is the single
+            # decrement of ``_user_inflight``). Without this ``finally`` the slot
+            # leaked on every cache-missing call, so FOUR depth polls pinned the
+            # counter at ``_USER_MAX_INFLIGHT`` (4) and every subsequent
+            # user-scoped query for that user — mid price, open orders, balance —
+            # was denied for the life of the process. Mid mode polls depth once
+            # per tick, which would trip this in ~12s.
+            self._gateway_release()
 
     def get_candlesticks(self, product_id: int, timeframe: str = "1h", limit: int = 200, max_time: int | None = None) -> list[dict]:
         """Fetch OHLCV candles from the Nado indexer through the official SDK.

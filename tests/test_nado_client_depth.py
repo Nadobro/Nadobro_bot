@@ -115,6 +115,47 @@ class MarketLiquidityTests(unittest.TestCase):
             client.get_market_liquidity(2)
         self.assertEqual(len(market.calls), 2)
 
+    # --- GATEWAY-INFLIGHT-LEAK regression -------------------------------
+    # ``_gateway_allowed`` defaults to ``user_scoped=True``, which takes a
+    # per-user in-flight slot that only ``release()`` frees. This function
+    # acquired and never released, so four cache-missing depth polls pinned the
+    # counter at ``_USER_MAX_INFLIGHT`` and denied every later user-scoped query
+    # for that user. Mid mode polls depth once per tick — ~12s to brick a user.
+
+    def test_inflight_slot_is_released_after_a_successful_read(self):
+        market = _FakeMarket([_lvl(100.0, 1.0)], [_lvl(101.0, 1.0)])
+        with patch.object(NadoClient, "_gateway_allowed", return_value=True), \
+             patch.object(NadoClient, "_gateway_release") as release:
+            _client(market).get_market_liquidity(2)
+        self.assertEqual(release.call_count, 1)
+
+    def test_inflight_slot_is_released_when_the_sdk_raises(self):
+        market = _FakeMarket([], [], raises=True)
+        with patch.object(NadoClient, "_gateway_allowed", return_value=True), \
+             patch.object(NadoClient, "_gateway_release") as release:
+            _client(market).get_market_liquidity(2)
+        self.assertEqual(release.call_count, 1)
+
+    def test_nothing_is_released_when_the_budget_denied_the_call(self):
+        # The slot was never taken, so releasing would decrement someone else's.
+        market = _FakeMarket([_lvl(100.0, 1.0)], [_lvl(101.0, 1.0)])
+        with patch.object(NadoClient, "_gateway_allowed", return_value=False), \
+             patch.object(NadoClient, "_gateway_release") as release:
+            _client(market).get_market_liquidity(2)
+        self.assertEqual(release.call_count, 0)
+
+    def test_every_acquire_is_paired_with_exactly_one_release(self):
+        # An empty book is deliberately not cached, so each call is a real
+        # acquire/release round trip — the shape that leaked.
+        market = _FakeMarket([], [])
+        client = _client(market)
+        with patch.object(NadoClient, "_gateway_allowed", return_value=True) as allowed, \
+             patch.object(NadoClient, "_gateway_release") as release:
+            for _ in range(6):
+                client.get_market_liquidity(2)
+        self.assertEqual(allowed.call_count, 6)
+        self.assertEqual(release.call_count, 6)
+
     def test_depth_is_part_of_the_cache_key(self):
         market = _FakeMarket([_lvl(100.0, 1.0)], [_lvl(101.0, 1.0)])
         client = _client(market)
