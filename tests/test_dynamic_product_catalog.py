@@ -98,6 +98,38 @@ class DynamicProductCatalogTests(unittest.TestCase):
             self.assertIsInstance(val, float)
             self.assertGreater(val, 0.0)
 
+    def test_margin_fractions_worst_case_and_conservative_fallback(self):
+        """LIQ-GUARD-MMF-EXPOSED: the catalog derives a maintenance-margin
+        fraction (never read before). It is always a real buffer 0 < mmf < imf,
+        and when the venue omits a maintenance weight the fallback is derived
+        conservatively from imf."""
+        # No venue weights -> conservative fallback from imf = 1/max_lev.
+        imf, mmf, used_fallback = product_catalog._margin_fractions_from_weights(
+            None, None, None, None, 50,
+        )
+        self.assertTrue(used_fallback)
+        self.assertAlmostEqual(imf, 1 / 50)
+        self.assertTrue(0 < mmf < imf)
+
+        # x18 long/short weights present -> worst (larger) mmf/imf across sides.
+        x18 = 10 ** 18
+        long_i, long_m = int(0.95 * x18), int(0.97 * x18)    # imf .05, mmf .03
+        short_i, short_m = int(1.10 * x18), int(1.06 * x18)  # imf .10, mmf .06
+        imf2, mmf2, used2 = product_catalog._margin_fractions_from_weights(
+            long_i, long_m, short_i, short_m, 20,
+        )
+        self.assertFalse(used2)
+        self.assertAlmostEqual(imf2, 0.10)
+        self.assertAlmostEqual(mmf2, 0.06)
+        self.assertTrue(mmf2 < imf2)
+
+    def test_static_catalog_row_carries_margin_fractions(self):
+        cat = product_catalog._build_static_catalog()
+        btc = cat["perps"]["BTC"]
+        self.assertIn("imf", btc)
+        self.assertIn("mmf", btc)
+        self.assertTrue(0 < btc["mmf"] < btc["imf"])
+
 
 if __name__ == "__main__":
     unittest.main()

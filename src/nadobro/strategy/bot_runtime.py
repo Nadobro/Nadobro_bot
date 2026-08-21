@@ -865,7 +865,7 @@ def _active_position_size_for_product(client, product_id: int) -> float | None:
         return None
 
 
-def _run_mm_start_guard(telegram_id: int, network: str, product: str, leverage: float, state: dict) -> tuple[bool, str]:
+def _run_mm_start_guard(telegram_id: int, network: str, product: str, leverage: float, state: dict, strategy: str = "") -> tuple[bool, str]:
     client = get_user_readonly_client(telegram_id, network=network) or get_user_nado_client(telegram_id, network=network)
     if not client:
         return False, "Could not initialize market-maker account checks. Please retry."
@@ -930,6 +930,82 @@ def _run_mm_start_guard(telegram_id: int, network: str, product: str, leverage: 
             f"(trade margin ${required_margin:,.2f} + rebalance buffer ${rebalance_buffer:,.2f} + safety ${safety_buffer:,.2f}). "
             f"Reduce margin or deposit more funds."
         )
+
+    # --- Liquidation-safety guard (leverage vs maintenance margin) ----------
+    # Higher leverage deploys more notional against the same collateral, shrinking
+    # the adverse move to venue liquidation. Block a (leverage, session-SL) combo
+    # that would risk liquidation before the stop trips, and forbid a disarmed
+    # stop at a leverage where liquidation is only a small move away. The live
+    # proximity rail (_evaluate_session_pnl_rail) is the runtime backstop; this is
+    # the pre-start gate. Skipped at 1x. Best-effort: a resolver hiccup never
+    # blocks start (the live rail still protects a started session).
+    _lev_strategy = strategy or str(state.get("strategy") or "")
+    try:
+        from src.nadobro.strategy.engine_runtime import _effective_leverage
+        eff_lev = float(_effective_leverage(state, float(leverage or 1.0)))
+    except Exception:  # noqa: BLE001
+        eff_lev = float(leverage or 1.0)
+    if eff_lev > 1.0:
+        try:
+            from src.nadobro.config import get_product_maintenance_margin_fraction
+            from src.nadobro.strategy.strategy_registry import effective_sl_tp_pct
+            from src.nadobro.quant.liquidation import liquidation_safety
+
+            mmf = float(get_product_maintenance_margin_fraction(product, network=network))
+            sl_pct, _tp_pct = effective_sl_tp_pct(_lev_strategy, state)
+            sl_pct = float(sl_pct or 0.0)
+            verdict = liquidation_safety(
+                leverage=eff_lev, mmf=mmf, sl_pct=sl_pct, sl_armed=sl_pct > 0.0,
+            )
+            if not verdict.ok:
+                P = product.upper()
+                safe_sl = max(0.0, verdict.safe_max_sl_pct)
+                safe_lev = max(1.0, verdict.max_safe_leverage)
+                move_pct = verdict.liq_move_frac * 100.0
+                if verdict.reason == "disarmed_sl_high_lev":
+                    return False, (
+                        f"At {eff_lev:.0f}x on {P}, venue liquidation is only a "
+                        f"~{move_pct:.1f}% adverse price move away, so running with no "
+                        f"session stop-loss is unsafe. Set a session stop-loss "
+                        f"(≤ {safe_sl:.1f}% of margin) or lower leverage to ≤ {safe_lev:.0f}x."
+                    )
+                if verdict.reason == "sl_too_loose":
+                    return False, (
+                        f"At {eff_lev:.0f}x on {P}, venue liquidation hits near a "
+                        f"{verdict.liq_loss_pct:.0f}% loss of margin (~{move_pct:.1f}% adverse "
+                        f"move). Your session stop-loss of {sl_pct:.1f}% of margin is too loose "
+                        f"to trip first. Set it ≤ {safe_sl:.1f}% of margin, or lower leverage "
+                        f"to ≤ {safe_lev:.0f}x."
+                    )
+                return False, (
+                    f"{eff_lev:.0f}x on {P} leaves no safe buffer before venue liquidation "
+                    f"(~{move_pct:.1f}% adverse move). Lower leverage to ≤ {safe_lev:.0f}x."
+                )
+
+            # Cross-margin contagion (advisory, log-only): a high-leverage grid
+            # shares the account's collateral, so its drawdown can liquidate OTHER
+            # positions. Isolated-only markets post to a dedicated child subaccount
+            # and are exempt. Best-effort — never blocks start.
+            if eff_lev > verdict.l_arm:
+                try:
+                    from src.nadobro.venue.product_catalog import is_product_isolated_only
+                    if not is_product_isolated_only(product, network=network):
+                        others = [
+                            p for p in (client.get_all_positions() or [])
+                            if abs(float(p.get("size") or p.get("amount") or 0.0)) > 1e-9
+                            and int(p.get("product_id") or -1) != int(product_id)
+                        ]
+                        if others:
+                            logger.warning(
+                                "liq-contagion: user=%s starting %s %s at %.0fx shares account "
+                                "collateral with %d other open position(s); adverse move here can "
+                                "affect their liquidation.",
+                                telegram_id, _lev_strategy, product.upper(), eff_lev, len(others),
+                            )
+                except Exception:  # noqa: BLE001 - advisory only
+                    logger.debug("liq-contagion check skipped", exc_info=True)
+        except Exception:  # noqa: BLE001 - never block start on a resolver hiccup
+            logger.debug("liquidation-safety start guard skipped", exc_info=True)
 
     return True, ""
 
@@ -1099,7 +1175,7 @@ def start_user_bot(
         }
     )
     if strategy in ("grid", "rgrid", "dgrid", "mid"):
-        mm_ok, mm_msg = _run_mm_start_guard(telegram_id, network, product.upper(), float(state.get("leverage") or leverage or 1.0), state)
+        mm_ok, mm_msg = _run_mm_start_guard(telegram_id, network, product.upper(), float(state.get("leverage") or leverage or 1.0), state, strategy)
         if not mm_ok:
             return False, mm_msg
         # Participation/Duration (TWAP): resolve the enforced run duration AND
@@ -2639,6 +2715,40 @@ async def _evaluate_mm_duration_rail(
     return True, None
 
 
+def _liq_proximity_tripped(strategy: str, snap: dict) -> bool:
+    """True when the live position has consumed enough of its runway to venue
+    liquidation that we should protectively flatten NOW — closing before the
+    venue does, to avoid the liquidation penalty.
+
+    Uses venue-truth snapshot fields (entry/mark/liq/net_base), so it is
+    cross-margin-correct: the venue's ``liq_price`` already reflects the whole
+    account's collateral. Conservative by construction: any missing, zero, or
+    wrong-side datum returns ``False`` so the caller falls through to the
+    %-of-margin session SL rather than acting on a bad number. Env kill-switch
+    ``NADO_LIQ_GUARD_ENABLED`` (default on)."""
+    if str(strategy or "") not in ("grid", "rgrid", "dgrid", "mid"):
+        return False
+    try:
+        from src.nadobro.utils.env import env_bool
+        if not env_bool("NADO_LIQ_GUARD_ENABLED", True):
+            return False
+        liq = float(snap.get("liq_price") or 0.0)
+        mark = float(snap.get("mark") or 0.0)
+        if liq <= 0 or mark <= 0:
+            return False
+        from src.nadobro.quant.liquidation import consumed_runway, runway_trigger
+        consumed = consumed_runway(
+            float(snap.get("entry_price") or 0.0), mark, liq,
+            float(snap.get("net_base") or 0.0),
+        )
+        if consumed is None:
+            return False
+        return consumed >= runway_trigger()
+    except Exception:  # noqa: BLE001 - the guard must never raise into the rail
+        logger.debug("liq-proximity check skipped", exc_info=True)
+        return False
+
+
 async def _evaluate_session_pnl_rail(
     telegram_id: int,
     network: str,
@@ -2708,9 +2818,11 @@ async def _evaluate_session_pnl_rail(
                 tp_pct = max(float(ov_tp), tp_pct) if tp_pct > 0 else float(ov_tp)
     except Exception:  # noqa: BLE001 - fall back to the user's config barriers
         logger.debug("overlay barrier read failed", exc_info=True)
-    if sl_pct <= 0 and tp_pct <= 0:
-        return None
-
+    # NOTE: the "both barriers disarmed -> return None" short-circuit used to sit
+    # HERE, before the session/snapshot fetch — which made the live liquidation-
+    # proximity guard below unreachable for exactly the disarmed high-leverage
+    # session that needs it most. It now runs AFTER the snapshot, gated on there
+    # being no liq_guard trip (see LIQ-GUARD-PROXIMITY-ALWAYS-ON).
     from src.nadobro.trading.session_resolver import resolve_current_strategy_session
 
     sess = await run_blocking(
@@ -2770,9 +2882,18 @@ async def _evaluate_session_pnl_rail(
     pct_net = float(snap.get("session_pnl_pct_net", pct) or 0.0)
 
     reason = ""
-    if sl_pct > 0 and pct_net <= -sl_pct:
+    # Live liquidation-proximity guard — HIGHEST priority, and evaluated even
+    # when the user disarmed SL/TP. Protectively flatten before the venue
+    # liquidates (avoiding the liquidation penalty). Cross-margin-correct: it
+    # reads the venue's own liq_price from THIS snapshot (no extra read).
+    if _liq_proximity_tripped(strategy, snap):
+        reason = "liq_guard"
+    # Both barriers disarmed AND not near liquidation -> nothing to enforce.
+    if not reason and sl_pct <= 0 and tp_pct <= 0:
+        return None
+    if not reason and sl_pct > 0 and pct_net <= -sl_pct:
         reason = "sl_hit"
-    elif tp_pct > 0 and pct_net >= tp_pct:
+    elif not reason and tp_pct > 0 and pct_net >= tp_pct:
         reason = "tp_hit"
     # Overlay drawdown kill-switch: a SECOND, independent stop for the financial
     # overlay (10% of margin by default), armed only when the overlay steers
@@ -2805,6 +2926,14 @@ async def _evaluate_session_pnl_rail(
             f"margin): PnL ${pnl:,.2f} ({pct:.2f}% of "
             f"${float(snap.get('margin') or 0.0):,.2f} margin)."
         )
+    elif reason == "liq_guard":
+        state["last_error"] = (
+            f"Protective flatten: approaching venue liquidation "
+            f"(mark ${float(snap.get('mark') or 0.0):,.4f} vs liq "
+            f"${float(snap.get('liq_price') or 0.0):,.4f}). Closed to avoid the "
+            f"liquidation penalty. PnL ${pnl:,.2f} ({pct:.2f}% of "
+            f"${float(snap.get('margin') or 0.0):,.2f} margin)."
+        )
     else:
         state["last_error"] = (
             f"Stopped by session SL: PnL ${pnl:,.2f} ({pct:.2f}% of "
@@ -2833,6 +2962,10 @@ async def _evaluate_session_pnl_rail(
         elif reason == "overlay_drawdown":
             _msg = ("🛑 {strategy} stopped on {market} ({network}) — overlay drawdown "
                     "kill-switch (PnL ${pnl} / {pct}% of margin).")
+        elif reason == "liq_guard":
+            _msg = ("🛡 {strategy} protectively flattened on {market} ({network}) — approaching "
+                    "venue liquidation; closed to avoid the liquidation penalty "
+                    "(PnL ${pnl} / {pct}% of margin).")
         else:
             _msg = ("🛑 {strategy} stopped on {market} ({network}) — session SL hit "
                     "(PnL ${pnl} / {pct}% of margin).")
@@ -2851,7 +2984,12 @@ async def _evaluate_session_pnl_rail(
             telegram_id,
             "⚠️ {strategy} session {kind} triggered on {market} ({network}), but cleanup "
             "failed. Please close remaining exposure on Nado. Error: {error}",
-            strategy=strategy_label, kind=("TP" if reason == "tp_hit" else "SL"),
+            strategy=strategy_label,
+            kind=(
+                "TP" if reason == "tp_hit"
+                else "liquidation-protection" if reason == "liq_guard"
+                else "SL"
+            ),
             market=label, network=network, error=close_res.get("error", "unknown"),
         )
     return True, None

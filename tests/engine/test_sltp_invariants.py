@@ -110,6 +110,41 @@ def test_vol_target_volume_and_cap_reach_the_controller():
     assert int(cfg["max_cycles"]) == 25
 
 
+# --------------------------------------------------------------------------- #
+# Per-asset strategy leverage — maintenance-margin liquidation guard          #
+# (2026-08). Higher leverage is only safe with a maintenance-margin-aware      #
+# distance check; these pin that the guard blocks the dangerous configs and    #
+# leaves normal ones alone.                                                     #
+# --------------------------------------------------------------------------- #
+
+def test_liq_guard_blocks_loose_and_disarmed_high_lev_but_not_tight():
+    """LIQ-GUARD-SAFE-SL-MATH + LIQ-GUARD-DISARMED-SL-HIGH-LEV: at pair-max
+    leverage a loose or disarmed session stop must be rejected (with an
+    actionable safe-SL / safe-leverage), while a tight armed stop passes."""
+    from src.nadobro.quant.liquidation import fallback_mmf, liquidation_safety
+
+    mmf = fallback_mmf(1 / 50)
+    tight = liquidation_safety(leverage=50, mmf=mmf, sl_pct=5.0, sl_armed=True)
+    loose = liquidation_safety(leverage=50, mmf=mmf, sl_pct=40.0, sl_armed=True)
+    disarmed = liquidation_safety(leverage=50, mmf=mmf, sl_pct=0.0, sl_armed=False)
+    assert tight.ok
+    assert not loose.ok and loose.reason == "sl_too_loose"
+    assert 0 < loose.safe_max_sl_pct < 40.0 and 1.0 <= loose.max_safe_leverage < 50.0
+    assert not disarmed.ok and disarmed.reason == "disarmed_sl_high_lev"
+
+
+def test_liq_guard_leaves_default_configs_untouched():
+    """Regression: default grid/rgrid/dgrid/mid ship an armed session stop
+    (0.5–0.8% of margin). At pair-max leverage that must stay safe, or enabling
+    per-asset leverage would block every default strategy start."""
+    from src.nadobro.quant.liquidation import fallback_mmf, liquidation_safety
+
+    for max_lev, default_sl in ((50, 0.5), (40, 0.8), (20, 0.8)):
+        mmf = fallback_mmf(1 / max_lev)
+        v = liquidation_safety(leverage=max_lev, mmf=mmf, sl_pct=default_sl, sl_armed=True)
+        assert v.ok, (max_lev, default_sl, v.reason)
+
+
 def test_grid_does_not_set_fill_blind_limit_price_stop():
     """GRID-DUAL-UNIT fix: the grid config must NOT derive a hard ``limit_price``
     stop from sl_pct. That stop is mid-referenced and fill-blind, firing on a
