@@ -24,6 +24,7 @@ from src.nadobro.engine.controllers.controller_base import Controller
 from src.nadobro.engine.executors.order_executor import OrderExecutor, OrderExecutorConfig
 from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.types import ExecutionStrategy, TradeType, _dec
+from src.nadobro.quant import microstructure as _ms
 from src.nadobro.quant.ladder import FLAT, LadderLevel, describe as _describe_ladder, plan_ladder
 
 # Auto ladder spacing when ``ladder_step_bp`` is unset: one venue tick, floored
@@ -132,6 +133,23 @@ class MarketMakingController(Controller):
         self._slots: Dict[Tuple[bool, int], _QuoteSlot] = {}
         self._cap_floor_warned = False
         self._last_plan_desc: str = ""
+        # --- Mid Mode v3 Phase 2: microstructure telemetry ------------------
+        # OBSERVATION ONLY. Reads the SIZED book (``depth_book``) once per tick
+        # and records microprice / imbalance / spread. It does NOT price a
+        # quote, move a target, or change a requote decision — that lands in a
+        # later, separately reviewed phase.
+        #
+        # Default OFF so the two subclasses that inherit this controller
+        # (FillAnchoredQuotingController, RGridController) are bit-for-bit
+        # unchanged; only the ``mid`` mapping switches it on.
+        #
+        # Why it needs its own read: ``order_book`` fabricates levels with
+        # amount=0, so the controller has never seen size. ``depth_book`` is the
+        # sized ladder at the same weight-1 query cost, TTL-cached at the
+        # cadence floor so concurrent users on a product share one fetch.
+        self.microstructure_log = bool(_dec(self.cfg("microstructure_log", "0") or "0"))
+        self.micro: Dict[str, object] = {}
+        self._micro_last_hash: str = ""
 
     # -- level-0 compatibility -------------------------------------------------
     # The ladder generalises what used to be two scalar pairs. Level 0 keeps the
@@ -328,8 +346,65 @@ class MarketMakingController(Controller):
         # per-fill edge for fill rate, bounded by the session SL rail.
         if touch is not None:
             target_bid, target_ask = touch[0], touch[1]
+        # Observation only — must run AFTER targets are fixed so it cannot
+        # influence them, and never raise into the quoting path.
+        await self._record_microstructure(mid, target_bid, target_ask)
         await self._quote_side(TradeType.BUY, target_bid, allow_buy, mid)
         await self._quote_side(TradeType.SELL, target_ask, allow_sell, mid)
+
+    async def _record_microstructure(
+        self, mid: Decimal, target_bid: Decimal, target_ask: Decimal
+    ) -> None:
+        """Read the sized book and record the microstructure view. Pure
+        telemetry: it changes nothing about this tick's quotes.
+
+        The number to watch is ``micro_vs_mid_bp`` — how far the size-weighted
+        fair value sits from the arithmetic mid we currently quote around. If
+        that is persistently non-zero and signed with our fills, the mid is the
+        wrong reference and the later pricing phase has its evidence.
+        """
+        if not self.microstructure_log:
+            return
+        try:
+            snap = await self.adapter.depth_book(self.trading_pair)
+            book = {
+                "bids": [[float(l.price), float(l.amount)] for l in snap.bids],
+                "asks": [[float(l.price), float(l.amount)] for l in snap.asks],
+            }
+            micro = _ms.microprice(book)
+            mid_f = float(mid) if mid else 0.0
+            self.micro = {
+                "microprice": micro,
+                "book_mid": _ms.mid(book),
+                "spread_bp": _ms.spread_bp(book),
+                "obi": _ms.obi_bands(book),
+                "bid_depth_20bp": _ms.depth_notional(book, _ms.BUY, bp=20),
+                "ask_depth_20bp": _ms.depth_notional(book, _ms.SELL, bp=20),
+                "levels": (len(snap.bids), len(snap.asks)),
+                # Displacement of size-weighted fair value from the quoted mid.
+                "micro_vs_mid_bp": (
+                    (micro - mid_f) / mid_f * 10_000.0
+                    if micro is not None and mid_f > 0 else None
+                ),
+                "target_bid": float(target_bid),
+                "target_ask": float(target_ask),
+            }
+            # Log on change only: a repeated hash means a frozen feed, and a
+            # per-tick line on a 3s cadence would drown the log.
+            digest = _ms.book_hash(book)
+            if digest != self._micro_last_hash:
+                self._micro_last_hash = digest
+                logger.info(
+                    "microstructure %s micro_vs_mid_bp=%s spread_bp=%s obi=%s depth20=(%.0f/%.0f)",
+                    self.trading_pair,
+                    self.micro.get("micro_vs_mid_bp"),
+                    self.micro.get("spread_bp"),
+                    self.micro.get("obi"),
+                    self.micro.get("bid_depth_20bp") or 0.0,
+                    self.micro.get("ask_depth_20bp") or 0.0,
+                )
+        except Exception:  # noqa: BLE001 - telemetry must never break quoting
+            logger.debug("microstructure read failed %s", self.trading_pair, exc_info=True)
 
     # -- ladder (Phase 2) ------------------------------------------------------
     def _effective_step_bp(self, mid: Decimal) -> Decimal:

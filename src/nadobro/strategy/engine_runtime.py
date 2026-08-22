@@ -1041,6 +1041,12 @@ def map_strategy_config(
             # POLICY (2026-07-15): mid is MAKER-ONLY — the cross-on-deadline
             # taker flatten was removed (fees + Nado wash-trading policy).
             "quote_mode": str(settings.get("mm_quote_mode") or "mid"),
+            # Mid Mode v3 Phase 2: read the SIZED book once per tick and record
+            # microprice / imbalance / spread. OBSERVATION ONLY — it does not
+            # price a quote or change a requote decision. Set here and nowhere
+            # else, so the two controllers that INHERIT MarketMakingController
+            # (fill-anchored Grid, R-Grid) keep their shipped behaviour exactly.
+            "microstructure_log": Decimal(1) if _f(settings, "microstructure_log", 1.0) > 0 else Decimal(0),
             "price_distance_tolerance": (spread_frac / Decimal(2)) or Decimal("0.0005"),
             "leverage": int(eff_lev),
             # Regime gate + inventory cap + ATR auto-spread (2026-06 upgrade).
