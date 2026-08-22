@@ -1044,6 +1044,47 @@ def init_db():
             conn.commit()
             logger.info("signal_outcomes table verified/created")
 
+        # --- fill_markouts (migrations/0020_fill_markouts.sql) ---
+        # Post-fill mark-out ledger: where the reference price was 1s..300s
+        # after each strategy fill. Spread capture is the gross edge; adverse
+        # selection is what you keep, and Mid mode has never measured it.
+        # One row per (trade, horizon) — horizons complete at different times.
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fill_markouts (
+                    id                  BIGSERIAL PRIMARY KEY,
+                    trade_id            BIGINT NOT NULL,
+                    network             TEXT NOT NULL,
+                    user_id             BIGINT,
+                    strategy            TEXT,
+                    product_name        TEXT,
+                    strategy_session_id BIGINT,
+                    ts_fill             TIMESTAMPTZ NOT NULL,
+                    side                TEXT,
+                    fill_price          DOUBLE PRECISION,
+                    fill_size           DOUBLE PRECISION,
+                    fee_bp              DOUBLE PRECISION,
+                    is_taker            BOOLEAN,
+                    horizon_nominal_s   DOUBLE PRECISION NOT NULL,
+                    horizon_actual_s    DOUBLE PRECISION,
+                    ref_price           DOUBLE PRECISION,
+                    ref_source          TEXT,
+                    markout_bp          DOUBLE PRECISION,
+                    net_markout_bp      DOUBLE PRECISION,
+                    basis_bp            DOUBLE PRECISION,
+                    graded_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (trade_id, network, horizon_nominal_s)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fill_markouts_user
+                    ON fill_markouts (user_id, network, ts_fill DESC);
+                CREATE INDEX IF NOT EXISTS idx_fill_markouts_horizon
+                    ON fill_markouts (horizon_nominal_s, ts_fill DESC);
+                CREATE INDEX IF NOT EXISTS idx_fill_markouts_session
+                    ON fill_markouts (strategy_session_id) WHERE strategy_session_id IS NOT NULL;
+            """)
+            conn.commit()
+            logger.info("fill_markouts table verified/created")
+
         # --- Engine v2 tables (migrations/0007_engine_v2_tables.sql) ---
         with conn.cursor() as cur:
             cur.execute("""
