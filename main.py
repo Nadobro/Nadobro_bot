@@ -388,6 +388,23 @@ async def run_bot():
             logger.info("Fill-nudge listener registered (WS fills trigger immediate cycles)")
         except Exception:
             logger.warning("Fill-nudge listener registration failed", exc_info=True)
+    # Mid Mode v3 signal feed. Nado publishes no public book/trade websocket,
+    # so the microstructure signals come from Hyperliquid's pushed streams.
+    # ONE process-wide connection serves every user (the data is public), and
+    # it never prices a Nado quote — Nado's own depth stays the quote anchor.
+    # Kill switch: NADO_HL_FEED_ENABLED=false. Failure here must never block
+    # boot; Mid degrades to anchor-only quoting without it.
+    try:
+        from src.nadobro.market_data.hl_ws import enabled as hl_feed_enabled, hl_ws
+
+        if hl_feed_enabled():
+            from src.nadobro.config import get_perp_products
+
+            hl_ws.subscribe_coins(get_perp_products())
+            hl_ws.start()
+            logger.info("Hyperliquid signal feed started")
+    except Exception:
+        logger.warning("Hyperliquid signal feed failed to start", exc_info=True)
     register_handlers(handle_strategy_job, handle_alert_job)
     _sw_raw = env_str("NADO_STRATEGY_WORKERS")
     _sw = int(_sw_raw) if _sw_raw else None
@@ -664,6 +681,12 @@ async def run_bot():
         if strategy_scheduler_enabled():
             await get_scheduler().stop()
         await portfolio_ws.stop()
+        try:
+            from src.nadobro.market_data.hl_ws import hl_ws
+
+            await hl_ws.stop()
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            logger.debug("Hyperliquid feed stop failed", exc_info=True)
         await stop_copy_polling()
         stop_runtime()
         stop_runtime_supervisor()
