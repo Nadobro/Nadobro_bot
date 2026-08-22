@@ -202,3 +202,25 @@ def test_lookback_is_derived_from_the_candle_reach_not_asserted():
 def test_invalid_network_is_rejected_rather_than_interpolated():
     with pytest.raises(ValueError):
         sc._trades_table("'; DROP TABLE trades_mainnet; --")
+
+
+# --- scheduling -------------------------------------------------------------
+
+def test_the_grading_job_covers_both_networks_and_survives_one_failing(monkeypatch):
+    # A grader nothing runs measures nothing, and one network's outage must not
+    # silently skip the other's backlog.
+    import asyncio
+
+    from src.nadobro.runtime import scheduler
+
+    seen = []
+
+    def _fake(network, **_kw):
+        seen.append(network)
+        if network == "mainnet":
+            raise RuntimeError("archive down")
+        return {"fills": 0, "samples": 0, "skipped": 0}
+
+    monkeypatch.setattr(sc, "grade_pending_markouts", _fake)
+    asyncio.run(scheduler.tick_markout_scorer())
+    assert seen == ["mainnet", "testnet"]
