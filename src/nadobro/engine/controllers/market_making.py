@@ -299,6 +299,14 @@ class MarketMakingController(Controller):
         # provides both the touch targets and the mid (mid_price() is itself an
         # order_book fetch — calling both doubled the per-tick hit on the
         # shared per-IP query budget). Dead/degraded book -> classic mid fetch.
+        #
+        # ONE EXCEPTION, and it is opt-in: with ``microstructure_log`` on (mid
+        # only, off by default) ``_record_microstructure`` adds a second
+        # weight-1 read for the SIZED book, which ``order_book`` cannot give —
+        # it fabricates levels with amount=0. It is TTL-cached at the cadence
+        # floor so concurrent users on a product share one fetch. Folding the
+        # two into a single depth snapshot is the pricing phase's job; until
+        # then this comment states what the code actually does.
         self._touch_bid = self._touch_ask = None
         touch = await self._touch_targets() if self.quote_mode == "touch" else None
         mid = touch[2] if touch is not None else await self.adapter.mid_price(self.trading_pair)

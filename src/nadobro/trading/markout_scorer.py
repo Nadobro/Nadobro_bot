@@ -28,9 +28,23 @@ durable primary here; the sub-minute horizons are served live from the pushed
 mid ring and are not graded by this job.
 
 That choice has one hazard, and the schema carries the antidote: the fill
-happened on Nado while the reference is HL, so a persistent basis would
-masquerade as toxicity. ``basis_bp`` is recorded per row so the two can always
-be separated after the fact.
+happened on Nado while the reference is HL, so a persistent price offset would
+masquerade as toxicity. Every row therefore records ``basis_bp`` — the
+displacement of the Nado fill price from the HL reference AT FILL TIME, on the
+same 1m grid the mark-out itself is read from:
+
+    basis_bp = (fill_price - ref(t0)) / ref(t0) * 10_000
+
+Because ``markout_bp = side * (ref(t+h) - fill) / fill``, that displacement is
+exactly the level term:
+
+    post-fill reference drift ~= markout_bp + side * basis_bp
+
+so subtracting it leaves the drift alone, which is the thing adverse selection
+actually is. Grouped by side it also separates its two components: the venue
+basis is the part that survives averaging across buys and sells, our own
+half-spread is the part that cancels. A row whose t0 reference is missing
+stores NULL rather than a guess.
 
 Package placement: ``trading`` may import ``quant``, ``venue``, ``models``,
 ``db`` and ``market_data`` at module level (tests/lint/test_architecture_layers),
@@ -44,6 +58,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from src.nadobro.db import execute, query_all
+from src.nadobro.quant import fair_value as fv
 from src.nadobro.quant import markout as mk
 from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
 from src.nadobro.utils.env import env_int
@@ -98,18 +113,29 @@ def select_ungraded_fills(network: str, *, limit: int = DEFAULT_BATCH) -> List[D
     LEFT JOIN + HAVING rather than a cursor: a fill graded at 60s but not yet
     at 300s stays selected until both exist, and a transient failure costs
     nothing but a retry next pass.
+
+    The age bound is the SHORTEST horizon (plus one bar for the reference to
+    land), not the longest: gating on 300s would hold every 60s grade back by
+    five minutes for no reason, since the HAVING clause already keeps the row
+    selected until the slow horizon catches up.
+
+    ``strategy`` comes from ``strategy_sessions`` — ``trades_<network>`` has no
+    such column, so reading it off the trade row silently wrote NULL.
     """
     table = _trades_table(network)
     now = datetime.now(timezone.utc)
-    newest = now - timedelta(seconds=max(CANDLE_HORIZONS_S))
+    newest = now - timedelta(seconds=min(CANDLE_HORIZONS_S) + _TF_SECONDS)
     oldest = now - timedelta(seconds=lookback_seconds())
     rows = query_all(
         f"""
         SELECT t.id, t.user_id, t.product_name, t.side,
                t.fill_price, t.price, t.fill_size, t.size,
                t.fill_fee, t.builder_fee, t.is_taker, t.strategy_session_id,
+               s.strategy AS strategy,
                COALESCE(t.filled_at, t.created_at) AS ts_fill
           FROM {table} t
+          LEFT JOIN strategy_sessions s
+                 ON s.id = t.strategy_session_id
           LEFT JOIN fill_markouts m
                  ON m.trade_id = t.id AND m.network = %s
          WHERE COALESCE(t.filled_at, t.created_at) <= %s
@@ -119,7 +145,7 @@ def select_ungraded_fills(network: str, *, limit: int = DEFAULT_BATCH) -> List[D
          GROUP BY t.id, t.user_id, t.product_name, t.side,
                   t.fill_price, t.price, t.fill_size, t.size,
                   t.fill_fee, t.builder_fee, t.is_taker,
-                  t.strategy_session_id, t.filled_at, t.created_at
+                  t.strategy_session_id, s.strategy, t.filled_at, t.created_at
         HAVING COUNT(m.id) < %s
          ORDER BY COALESCE(t.filled_at, t.created_at) ASC
          LIMIT %s
@@ -131,6 +157,14 @@ def select_ungraded_fills(network: str, *, limit: int = DEFAULT_BATCH) -> List[D
 
 def _hl_close_series(coin: str) -> List[Sequence[float]]:
     """HL 1m closes as ``[(epoch_seconds, close), ...]`` oldest-first.
+
+    ``hl_client`` stamps each candle with HL's ``t`` — the bar's OPEN time,
+    which is the right convention for an OHLC series and what every TA consumer
+    expects. A CLOSE price, though, is observed at the bar's END, so pairing it
+    with the open time would date every reference one full bar early: a "60s"
+    mark-out would be read off a price that is really 0-60s older than that,
+    biasing the whole series toward whatever happened before the horizon. One
+    bar is added here so the timestamp says when the price actually existed.
 
     Blocking HTTP — callers must run this off the event loop.
     """
@@ -145,7 +179,7 @@ def _hl_close_series(coin: str) -> List[Sequence[float]]:
         except (TypeError, ValueError):
             continue
         if ts > 0 and close > 0:
-            series.append((ts, close))
+            series.append((ts + _TF_SECONDS, close))
     series.sort(key=lambda r: r[0])
     return series
 
@@ -206,6 +240,12 @@ def grade_fill(row: Dict[str, Any], series: Sequence[Sequence[float]]) -> List[m
         size_base=float(row.get("fill_size") or row.get("size") or 0.0),
     )
     fee_bp = _fee_bp(row)
+    # Displacement of the Nado fill from the HL reference AT FILL TIME, read
+    # off the same grid as the horizons themselves (same at-or-after
+    # convention), so markout(h) - basis is exactly h worth of reference drift.
+    # None when t0 has no reference: NULL is honest, a guess is not.
+    ref0 = mk.pick_reference(series, ts, max_jitter_s=float(_TF_SECONDS))
+    basis = fv.basis_bp(ref0[0], fill_price) if ref0 else None
     out: List[mk.MarkoutSample] = []
     for horizon in CANDLE_HORIZONS_S:
         sample = mk.build_sample(
@@ -216,6 +256,7 @@ def grade_fill(row: Dict[str, Any], series: Sequence[Sequence[float]]) -> List[m
             # One bar of tolerance: closes land on a 60s grid, so a horizon
             # that is not a multiple of the bar can never hit it exactly.
             max_jitter_s=float(_TF_SECONDS),
+            basis_bp=basis,
         )
         if sample is not None:
             out.append(sample)

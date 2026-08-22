@@ -99,9 +99,23 @@ _mids_listeners: list = []
 
 def register_mids_listener(callback: Callable[[str], None]) -> None:
     """Register ``callback("")`` fired on every allMids update. Used to
-    reconcile per-coin subscriptions against what HL actually lists."""
+    reconcile per-coin subscriptions against what HL actually lists.
+
+    Register a BOUND METHOD, never a fresh closure: dedupe is by equality, and
+    two lambdas built from the same source are never equal, so a closure
+    registered per instance accumulates forever and every allMids frame fans
+    out to objects nobody uses any more.
+    """
     if callback not in _mids_listeners:
         _mids_listeners.append(callback)
+
+
+def unregister_mids_listener(callback: Callable[[str], None]) -> None:
+    """Drop a previously registered allMids listener. Idempotent."""
+    try:
+        _mids_listeners.remove(callback)
+    except ValueError:
+        pass
 
 
 def register_book_listener(callback: Callable[[str], None]) -> None:
@@ -380,7 +394,16 @@ class HyperliquidWs:
         self._desired: set = set()
         self._active: set = set()
         self._ws: Any = None
-        register_mids_listener(lambda _c: self._schedule_reconcile())
+
+    def _on_mids_update(self, _coin: str) -> None:
+        """allMids arrived -> some desired coin may now be known to be listed.
+
+        A bound method, and registered in ``start()`` rather than ``__init__``:
+        registering a per-instance lambda at construction time made the dedupe
+        in ``register_mids_listener`` unreachable, so every instance ever built
+        stayed alive in the module-global list.
+        """
+        self._schedule_reconcile()
 
     def subscribe_coins(self, coins: Iterable[str]) -> None:
         """Register interest in ``coins`` (Nado product bases). Idempotent.
@@ -419,9 +442,11 @@ class HyperliquidWs:
             return
         if self._task and not self._task.done():
             return
+        register_mids_listener(self._on_mids_update)
         self._task = asyncio.create_task(self._run(), name="hl-market-data-ws")
 
     async def stop(self) -> None:
+        unregister_mids_listener(self._on_mids_update)
         task, self._task = self._task, None
         self._ws = None
         if task:

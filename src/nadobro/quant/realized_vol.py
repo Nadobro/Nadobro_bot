@@ -147,7 +147,7 @@ def vol_of_vol(values: Sequence[float]) -> Optional[float]:
     """Dispersion of a volatility series — high values mean the vol estimate
     itself is unstable, which is a reason to widen beyond what the level alone
     suggests."""
-    vals = [float(v) for v in (values or []) if v is not None]
+    vals = [x for x in (_num(v) for v in (values or [])) if x is not None]
     if len(vals) < 2:
         return None
     mean = sum(vals) / len(vals)

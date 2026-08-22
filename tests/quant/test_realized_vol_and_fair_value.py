@@ -77,6 +77,12 @@ def test_vol_of_vol_flags_an_unstable_estimate():
     assert rv.vol_of_vol([0.1]) is None
 
 
+def test_vol_of_vol_drops_junk_instead_of_raising():
+    # Same defensive posture as the rest of the module: every input here comes
+    # off a wire payload, so a non-numeric entry must not take down the caller.
+    assert rv.vol_of_vol([0.1, "junk", None, 0.1]) == pytest.approx(0.0)
+
+
 # --- fair value -------------------------------------------------------------
 
 def test_robust_median_ignores_missing_values():

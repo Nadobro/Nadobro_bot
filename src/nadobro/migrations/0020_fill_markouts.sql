@@ -49,9 +49,15 @@ CREATE TABLE IF NOT EXISTS fill_markouts (
   markout_bp          DOUBLE PRECISION,
   net_markout_bp      DOUBLE PRECISION,
 
-  -- Nado-vs-Hyperliquid basis at fill time. Mark-out is measured on the HL
+  -- Displacement of the Nado fill price from the HL reference AT FILL TIME,
+  --     (fill_price - ref(t0)) / ref(t0) * 10000
+  -- read off the same grid as the horizons. Mark-out is measured on the HL
   -- reference while the fill happened on Nado, so without this a persistent
-  -- price offset would masquerade as adverse selection.
+  -- price offset would masquerade as adverse selection: since
+  -- markout_bp = side * (ref(t+h) - fill)/fill, the post-fill reference drift
+  -- is markout_bp + side * basis_bp, and grouping by side splits the offset
+  -- into the venue basis (survives averaging over both sides) and our own
+  -- half-spread (cancels). NULL when t0 had no reference sample.
   basis_bp            DOUBLE PRECISION,
 
   graded_at           TIMESTAMPTZ NOT NULL DEFAULT now(),

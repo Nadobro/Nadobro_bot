@@ -13,6 +13,7 @@ the design leans on:
 
 Pure: no socket is opened. ``_dispatch`` is fed the frames HL would send.
 """
+import asyncio
 import time
 import unittest
 
@@ -191,6 +192,47 @@ class HlFeedTests(unittest.TestCase):
             hl_ws._dispatch(_trade_frame())
         first_frames = [r for r in cap.output if "first frame" in r]
         self.assertEqual(len(first_frames), 2)          # l2Book + trades, not 3
+
+    # --- listener lifecycle -------------------------------------------------
+    # The registry is module-global and dedupes by EQUALITY. A per-instance
+    # lambda is never equal to another, so registering one at construction time
+    # leaked every instance ever built and fanned every allMids frame out to
+    # objects nobody was using.
+
+    def test_constructing_a_listener_registers_nothing(self):
+        before = list(hl_ws._mids_listeners)
+        hl_ws.HyperliquidWs()
+        hl_ws.HyperliquidWs()
+        self.assertEqual(hl_ws._mids_listeners, before)
+
+    def test_the_module_singleton_registers_nothing_at_import(self):
+        self.assertNotIn(hl_ws.hl_ws._on_mids_update, hl_ws._mids_listeners)
+
+    def test_the_reconcile_listener_is_deduped_and_removable(self):
+        ws = hl_ws.HyperliquidWs()
+        self.addCleanup(hl_ws.unregister_mids_listener, ws._on_mids_update)
+        hl_ws.register_mids_listener(ws._on_mids_update)
+        hl_ws.register_mids_listener(ws._on_mids_update)
+        self.assertEqual(hl_ws._mids_listeners.count(ws._on_mids_update), 1)
+        hl_ws.unregister_mids_listener(ws._on_mids_update)
+        self.assertNotIn(ws._on_mids_update, hl_ws._mids_listeners)
+        hl_ws.unregister_mids_listener(ws._on_mids_update)   # idempotent
+
+    def test_stop_removes_the_reconcile_listener(self):
+        ws = hl_ws.HyperliquidWs()
+        hl_ws.register_mids_listener(ws._on_mids_update)
+        asyncio.run(ws.stop())
+        self.assertNotIn(ws._on_mids_update, hl_ws._mids_listeners)
+
+    def test_all_mids_still_drives_the_subscription_reconcile(self):
+        # The leak fix must not cost the behaviour it was there for.
+        ws = hl_ws.HyperliquidWs()
+        calls = []
+        ws._schedule_reconcile = lambda: calls.append(1)   # type: ignore[method-assign]
+        hl_ws.register_mids_listener(ws._on_mids_update)
+        self.addCleanup(hl_ws.unregister_mids_listener, ws._on_mids_update)
+        hl_ws._dispatch({"channel": "allMids", "data": {"mids": {"BTC": "1"}}})
+        self.assertEqual(len(calls), 1)
 
     def test_health_reports_the_feed_without_gating_anything(self):
         hl_ws._dispatch(_book_frame())

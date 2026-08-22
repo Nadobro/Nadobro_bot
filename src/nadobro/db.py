@@ -1071,6 +1071,10 @@ def init_db():
                     ref_source          TEXT,
                     markout_bp          DOUBLE PRECISION,
                     net_markout_bp      DOUBLE PRECISION,
+                    -- (fill_price - hl_ref(t0)) / hl_ref(t0) * 10000: the
+                    -- level offset, so a persistent Nado-vs-HL basis cannot
+                    -- read as adverse selection. NULL when t0 has no
+                    -- reference. See migrations/0020 for the decomposition.
                     basis_bp            DOUBLE PRECISION,
                     graded_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
                     UNIQUE (trade_id, network, horizon_nominal_s)

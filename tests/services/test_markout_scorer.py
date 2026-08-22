@@ -132,6 +132,64 @@ def test_net_markout_reflects_the_fill_s_own_fee():
     assert sample.net_markout_bp == pytest.approx(90.0)
 
 
+# --- the reference clock ----------------------------------------------------
+
+def test_close_prices_are_stamped_at_the_bar_END_not_its_open(monkeypatch):
+    # HL's `t` is the bar's OPEN time. A close is observed at the bar's END, so
+    # pairing the two would date every reference one full bar early and bias
+    # every mark-out toward what happened BEFORE the horizon.
+    from src.nadobro.market_data import hl_client
+
+    monkeypatch.setattr(
+        hl_client, "get_candles_sync",
+        lambda coin, interval="1m", lookback_ms=0: [
+            {"time": 1_000_000, "close": 100.0},
+            {"time": 1_000_060, "close": 101.0},
+        ],
+    )
+    assert sc._hl_close_series("BTC") == [(1_000_060.0, 100.0), (1_000_120.0, 101.0)]
+
+
+# --- basis ------------------------------------------------------------------
+
+def test_every_sample_records_the_fill_s_displacement_from_the_reference():
+    # Without this the fill's Nado-vs-HL offset is indistinguishable from
+    # adverse selection, and the column the schema documents stays NULL.
+    t0 = _row()["ts_fill"].timestamp()
+    series = _series(t0, [99.0, 101.0, 101.0, 101.0, 101.0, 101.0])
+    samples = sc.grade_fill(_row(fill_price=100.0), series)
+    assert samples
+    # Nado filled at 100 while HL read 99: our venue is richer => positive.
+    expected = (100.0 - 99.0) / 99.0 * 10_000.0
+    assert all(s.basis_bp == pytest.approx(expected) for s in samples)
+
+
+def test_the_basis_is_zero_when_the_venues_agree_at_fill_time():
+    t0 = _row()["ts_fill"].timestamp()
+    series = _series(t0, [100.0, 101.0, 101.0, 101.0, 101.0, 101.0])
+    samples = sc.grade_fill(_row(fill_price=100.0), series)
+    assert all(s.basis_bp == pytest.approx(0.0) for s in samples)
+
+
+def test_removing_the_basis_leaves_the_post_fill_reference_drift():
+    # The whole point of storing it: a level offset must not read as toxicity.
+    t0 = _row()["ts_fill"].timestamp()
+    series = _series(t0, [99.0, 101.0, 101.0, 101.0, 101.0, 101.0])
+    sample = next(s for s in sc.grade_fill(_row(fill_price=100.0), series)
+                  if s.horizon_nominal_s == 60.0)
+    drift_bp = (101.0 - 99.0) / 99.0 * 10_000.0      # what the reference did
+    assert sample.markout_bp + sample.basis_bp == pytest.approx(drift_bp, rel=0.01)
+
+
+def test_no_reference_at_fill_time_stores_null_rather_than_a_guess():
+    t0 = _row()["ts_fill"].timestamp()
+    # First close lands well after the fill: t0 has no reference within jitter,
+    # but t0+300 does.
+    series = [(t0 + 240.0, 101.0), (t0 + 300.0, 101.0)]
+    samples = sc.grade_fill(_row(fill_price=100.0), series)
+    assert samples and all(s.basis_bp is None for s in samples)
+
+
 # --- query bounds -----------------------------------------------------------
 
 def test_lookback_is_derived_from_the_candle_reach_not_asserted():
