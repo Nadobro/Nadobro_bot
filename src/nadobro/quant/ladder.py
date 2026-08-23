@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 FLAT = "flat"
 LINEAR = "linear"
@@ -97,6 +97,45 @@ def _weights(n: int, curve: str) -> List[Decimal]:
     return [Decimal(1)] * n
 
 
+def proximity_weights(
+    prices: Sequence[object],
+    levels: Sequence[object],
+    *,
+    tolerance_bp: object = 25,
+    boost: object = 1.5,
+) -> List[Decimal]:
+    """Per-rung multipliers that favour rungs sitting on a price LEVEL.
+
+    Support and resistance are the one slow-timeframe object with real quoting
+    value, because they are PRICES rather than directions: a bid resting where
+    buyers have repeatedly shown up fills more often and gets run over less.
+    Everything else the candle stack produces (EMA, RSI, MACD) is a direction
+    or a magnitude, and on a 3-8s tick it cannot change between two quote
+    decisions anyway.
+
+    Returns a multiplier per rung, 1.0 where no level is near. The result is a
+    RESHAPING input for :func:`plan_ladder`, which divides by the weight total —
+    so this redistributes a side's deployment and never adds to it.
+    """
+    tol = _dec(tolerance_bp)
+    factor = _dec(boost)
+    refs = [_dec(v) for v in (levels or [])]
+    refs = [r for r in refs if r > 0]
+    out: List[Decimal] = []
+    for raw in prices or []:
+        price = _dec(raw)
+        weight = Decimal(1)
+        if price > 0 and refs and tol > 0 and factor > 0:
+            nearest = min(abs(price - r) / price * Decimal(10000) for r in refs)
+            if nearest <= tol:
+                # Linear falloff to 1.0 at the tolerance edge, so a rung does
+                # not jump in size as a level drifts one bp closer.
+                closeness = (tol - nearest) / tol
+                weight = Decimal(1) + (factor - Decimal(1)) * closeness
+        out.append(weight)
+    return out
+
+
 def plan_ladder(
     deployed_quote: object,
     *,
@@ -105,6 +144,7 @@ def plan_ladder(
     first_offset_bp: object = 0,
     curve: str = FLAT,
     min_notional: object = 0,
+    level_weights: Optional[Sequence[object]] = None,
 ) -> List[LadderLevel]:
     """Plan one side of the ladder.
 
@@ -116,6 +156,12 @@ def plan_ladder(
     Deeper levels are further from the reference (``offset_bp`` increasing),
     which is what makes the ladder scale INTO an adverse move and out of a
     favourable one.
+
+    ``level_weights`` multiplies the curve's own weights per rung (see
+    :func:`proximity_weights`). It reshapes the distribution only: the per-side
+    total is unchanged, and the min-notional stepdown below is computed on the
+    COMBINED weights, so a reshaped ladder cannot smuggle a sub-minimum rung
+    past the check the curve stepdown exists for.
     """
     deployed = _dec(deployed_quote)
     if deployed <= 0:
@@ -137,9 +183,22 @@ def plan_ladder(
     # to when product metadata is unavailable — a steep curve quantised the
     # near rungs to ZERO, and a zero-size order is either rejected or grown by
     # the venue client into an unbudgeted one.
+    def _combined(count: int) -> List[Decimal]:
+        base = _weights(count, curve)
+        if not level_weights:
+            return base
+        out: List[Decimal] = []
+        for i, b in enumerate(base):
+            try:
+                m = _dec(level_weights[i]) if i < len(level_weights) else Decimal(1)
+            except Exception:  # noqa: BLE001 - a malformed weight is just 1.0
+                m = Decimal(1)
+            out.append(b * (m if m > 0 else Decimal(1)))
+        return out if sum(out, Decimal(0)) > 0 else base
+
     floor = _dec(min_notional)
     while n > 1:
-        w = _weights(n, curve)
+        w = _combined(n)
         smallest = (deployed * min(w) / sum(w, Decimal(0))).quantize(
             _SIZE_QUANTUM, rounding=ROUND_DOWN
         )
@@ -147,7 +206,7 @@ def plan_ladder(
             break
         n -= 1
 
-    w = _weights(n, curve)
+    w = _combined(n)
     total_w = sum(w, Decimal(0))
     first = _dec(first_offset_bp)
     step = _dec(step_bp)

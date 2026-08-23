@@ -27,7 +27,13 @@ from src.nadobro.engine.types import ExecutionStrategy, TradeType, _dec
 from src.nadobro.quant import alpha as _alpha
 from src.nadobro.quant import microstructure as _ms
 from src.nadobro.quant import mm_profile as _mp
-from src.nadobro.quant.ladder import FLAT, LadderLevel, describe as _describe_ladder, plan_ladder
+from src.nadobro.quant.ladder import (
+    FLAT,
+    LadderLevel,
+    describe as _describe_ladder,
+    plan_ladder,
+    proximity_weights,
+)
 
 # Auto ladder spacing when ``ladder_step_bp`` is unset: one venue tick, floored
 # so a very tight book (BTC-PERP's tick is ~0.16bp) doesn't stack every level
@@ -198,6 +204,16 @@ class MarketMakingController(Controller):
         self.signal_degraded = False
         self.markout_widen: Decimal = Decimal(1)
         self._stp_blocks = 0
+        # --- Mid Mode v3 Phase 7: support/resistance ladder shaping ----------
+        # Injected async callable ``() -> {"support": [...], "resistance": [...]}``,
+        # TTL-cached on the other side. Off unless the mid mapping enables it.
+        self.levels_provider = self.cfg("levels_provider")
+        self.level_weights_enabled = bool(
+            _dec(self.cfg("level_weights_enabled", "0") or "0")
+        )
+        self.level_tolerance_bp = _dec(self.cfg("level_tolerance_bp", "25") or "25")
+        self.level_boost = _dec(self.cfg("level_boost", "1.5") or "1.5")
+        self._sr_levels: Dict[str, object] = {}
 
     # -- level-0 compatibility -------------------------------------------------
     # The ladder generalises what used to be two scalar pairs. Level 0 keeps the
@@ -511,6 +527,18 @@ class MarketMakingController(Controller):
         # evidence that quoting TIGHTER is safe.
         self.markout_widen = _dec(str(max(1.0, min(3.0, factor))))
 
+    async def _refresh_levels(self) -> None:
+        """Pull cached support/resistance. Never blocks, never raises."""
+        if not self.level_weights_enabled or not callable(self.levels_provider):
+            return
+        try:
+            levels = await self.levels_provider()
+        except Exception:  # noqa: BLE001 - no levels just leaves the shape alone
+            logger.debug("levels provider failed %s", self.trading_pair, exc_info=True)
+            return
+        if isinstance(levels, dict):
+            self._sr_levels = levels
+
     def _defensive_spread_mult(self) -> Decimal:
         """Combined widening from the mark-out ledger and feed degradation."""
         mult = self.markout_widen
@@ -553,6 +581,7 @@ class MarketMakingController(Controller):
         # OPEN — no signal means alpha 0 and a wider quote, never a skipped tick.
         await self._refresh_alpha(mid)
         await self._refresh_markout_widen()
+        await self._refresh_levels()
         base_value = self._base_value(mid)
         at_max = self.max_base_quote is not None and base_value >= self.max_base_quote
         at_min = self.min_base_quote is not None and base_value <= self.min_base_quote
@@ -697,7 +726,46 @@ class MarketMakingController(Controller):
             return self.ladder_levels - 1
         return self.ladder_levels
 
-    def _plan_side(self, mid: Decimal) -> List[LadderLevel]:
+    def _side_level_weights(
+        self, mid: Decimal, base_target: Decimal, is_bid: bool
+    ) -> Optional[List[Decimal]]:
+        """Phase 7: bias rung SIZE toward support (bids) / resistance (asks).
+
+        Reshaping only — ``plan_ladder`` divides by the weight total, so the
+        per-side deployment is identical. The asymmetry is the point: weighting
+        a bid toward a resistance level would put size exactly where sellers
+        are waiting.
+        """
+        if not self.level_weights_enabled or base_target <= 0 or mid <= 0:
+            return None
+        raw = (self._sr_levels or {}).get("support" if is_bid else "resistance")
+        if not isinstance(raw, (list, tuple)):
+            return None
+        # The payload is injected, so validate it here rather than trusting it:
+        # a NaN or a negative level would silently reshape the whole ladder.
+        refs: List[Decimal] = []
+        for value in raw:
+            try:
+                level = _dec(value)
+            except Exception:  # policy: degrade-ok(junk level -> rung keeps its curve weight)
+                continue
+            if level > 0:
+                refs.append(level)
+        if not refs:
+            return None
+        step = self._effective_step_bp(mid)
+        prices = [
+            self._level_price(base_target, step * Decimal(i), is_bid)
+            for i in range(self._effective_levels())
+        ]
+        return proximity_weights(
+            prices, refs,
+            tolerance_bp=self.level_tolerance_bp, boost=self.level_boost,
+        )
+
+    def _plan_side(
+        self, mid: Decimal, *, base_target: Decimal = Decimal(0), is_bid: bool = True
+    ) -> List[LadderLevel]:
         """Split this side's deployed notional into levels, clamped so every
         level clears the venue minimum (a sub-minimum level is simply rejected,
         which is how the ``levels`` input silently died the first time)."""
@@ -712,6 +780,7 @@ class MarketMakingController(Controller):
             first_offset_bp=0,
             curve=self.ladder_curve,
             min_notional=min_notional,
+            level_weights=self._side_level_weights(mid, base_target, is_bid),
         )
 
     @staticmethod
@@ -735,7 +804,10 @@ class MarketMakingController(Controller):
     ) -> None:
         """Reconcile the whole ladder on one side against ``base_target``."""
         is_bid = side is TradeType.BUY
-        plan = self._plan_side(mid) if base_target > 0 else []
+        plan = (
+            self._plan_side(mid, base_target=base_target, is_bid=is_bid)
+            if base_target > 0 else []
+        )
         if not plan:
             # Degenerate deployment/target: fall through to the single-quote path
             # so behaviour is exactly what it was before the ladder existed.

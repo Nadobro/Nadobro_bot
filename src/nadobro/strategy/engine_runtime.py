@@ -726,6 +726,7 @@ _LIVE_CONFIG_SIGNATURE_EXCLUDE = frozenset({
     # whole ladder for nothing.
     "signal_provider",
     "markout_provider",
+    "levels_provider",
     # DN-only restore fields; excluded defensively if a future strategy shares
     # this helper.
     "restore_cycles_completed",
@@ -1110,6 +1111,17 @@ def map_strategy_config(
             ),
             "signal_provider": None,      # injected in run_engine_cycle
             "markout_provider": None,     # injected in run_engine_cycle
+            # --- Mid Mode v3 Phase 7: support/resistance ladder shaping ------
+            # S/R is the ONE slow-timeframe object with quoting value, because
+            # it is a PRICE rather than a direction: EMA/RSI/MACD cannot change
+            # between two 3-8s quote decisions, so they can only set the
+            # envelope. Reshaping only — the per-side deployment is unchanged.
+            "level_weights_enabled": (
+                Decimal(1) if _f(settings, "level_weights_enabled", 1.0) > 0 else Decimal(0)
+            ),
+            "level_tolerance_bp": Decimal(str(_f(settings, "level_tolerance_bp", 25.0))),
+            "level_boost": Decimal(str(_f(settings, "level_boost", 1.5))),
+            "levels_provider": None,      # injected in run_engine_cycle
             "price_distance_tolerance": (spread_frac / Decimal(2)) or Decimal("0.0005"),
             "leverage": int(eff_lev),
             # Regime gate + inventory cap + ATR auto-spread (2026-06 upgrade).
@@ -2603,8 +2615,33 @@ async def _run_engine_cycle_locked(
                 logger.debug("markout_provider failed product=%s", _prod, exc_info=True)
                 return 1.0
 
+        async def _levels_provider() -> object:
+            """Support/resistance from HL 1m candles. TTL-cached, non-blocking."""
+            try:
+                from src.nadobro.trading import hl_levels, hl_signals
+
+                return await hl_levels.levels_for(hl_signals.coin_for(_prod))
+            except Exception:  # noqa: BLE001 - no levels just leaves the shape alone
+                logger.debug("levels_provider failed product=%s", _prod, exc_info=True)
+                return {}
+
         configs["signal_provider"] = _signal_provider
         configs["markout_provider"] = _markout_provider
+        configs["levels_provider"] = _levels_provider
+
+        # Phase 7 fast requote: announce interest so a material move on HL's
+        # pushed book wakes this session via the existing nudge path instead of
+        # waiting up to 8s for the next tick. The announcement EXPIRES, so a
+        # stopped session stops being nudged with nothing to unregister, and
+        # the listener is attached exactly once (module-level function, so the
+        # registry's equality dedupe fires).
+        try:
+            from src.nadobro.strategy import hl_fast_requote
+
+            hl_fast_requote.ensure_registered()
+            hl_fast_requote.note_active(_uid, _net, _prod)
+        except Exception:  # noqa: BLE001 - a missing feed just means slower ticks
+            logger.debug("hl fast requote registration failed", exc_info=True)
 
     # BUG-TICK-1 recovery: if the local controller went terminal-FAILED (a
     # genuinely fatal error, or an exhausted transient-error streak), force a
@@ -2991,6 +3028,14 @@ async def _run_engine_cycle_locked(
             counts_fn = getattr(controller, "order_counts", None)
             if callable(counts_fn):
                 order_counts = counts_fn() or {}
+            # Mid Mode v3: the resolved profile, the fee floor, alpha and the
+            # defensive state, for /mm_status. ``ladder_metrics`` had NO reader
+            # until now, so the dashboard could not say which playbook was
+            # running or whether the signal feed was alive.
+            if strategy == "mid":
+                lm_fn = getattr(controller, "ladder_metrics", None)
+                if callable(lm_fn):
+                    state["mm_engine_metrics"] = lm_fn() or {}
             if strategy == "vol":
                 vol_metrics_fn = getattr(controller, "volume_metrics", None)
                 if callable(vol_metrics_fn):
