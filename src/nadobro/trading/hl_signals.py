@@ -202,8 +202,15 @@ def _ofi(coin: str, book: dict) -> Optional[float]:
 
 
 def _record_side_check(coin: str, signed_vol: Optional[float]) -> None:
-    """Accumulate (signed volume, subsequent return) pairs and judge the
-    convention once there is enough of them."""
+    """Accumulate (signed volume, CONTEMPORANEOUS return) pairs and judge the
+    convention once there are enough of them.
+
+    Contemporaneous, not subsequent, on purpose: aggressive buying moves the
+    price up WITHIN the window it happens in. That makes this a test of the
+    mapping rather than a test of whether the tape predicts anything — the
+    second question is the calibration phase's, and conflating them would
+    disable a correct convention on a market that simply mean-reverts.
+    """
     ring = _mids.get(coin)
     if signed_vol is None or not ring or len(ring) < 2:
         return

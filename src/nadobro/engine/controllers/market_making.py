@@ -1009,11 +1009,17 @@ class MarketMakingController(Controller):
             crosses = target >= slot.price if is_bid else target <= slot.price
             if crosses:
                 self._stp_blocks += 1
-                logger.warning(
-                    "MM %s self-trade blocked: %s at %s would cross our own %s at %s",
-                    self.trading_pair, "BUY" if is_bid else "SELL", target,
-                    "ASK" if is_bid else "BID", slot.price,
-                )
+                # Throttled: a crossed anchor can block every rung on every
+                # tick, and a 3s cadence would turn one condition into a
+                # WARNING flood. The running count is on /mm_status either way.
+                if self._stp_blocks == 1 or self._stp_blocks % 50 == 0:
+                    logger.warning(
+                        "MM %s self-trade blocked (%s so far): %s at %s would "
+                        "cross our own %s at %s",
+                        self.trading_pair, self._stp_blocks,
+                        "BUY" if is_bid else "SELL", target,
+                        "ASK" if is_bid else "BID", slot.price,
+                    )
                 return True
         return False
 

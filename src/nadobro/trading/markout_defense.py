@@ -51,6 +51,25 @@ MAX_FACTOR = env_float("NADO_MARKOUT_DEFENSE_MAX_FACTOR", 2.0)
 _cache: Dict[Tuple[int, str, str], Tuple[float, float]] = {}
 _inflight: set = set()
 
+# The cache is keyed per (user, network, product) and the process is long-lived,
+# so without a bound it grows with every user who ever ran Mid. Entries are
+# cheap, but "cheap and unbounded" is still a leak.
+_CACHE_MAX = env_int("NADO_MARKOUT_DEFENSE_CACHE_MAX", 2000)
+
+
+def _prune_cache(now: float) -> None:
+    if len(_cache) <= _CACHE_MAX:
+        return
+    # Drop anything well past its TTL first; if that is not enough, drop the
+    # oldest. A dropped entry costs one refresh, never correctness.
+    stale_cutoff = now - (_TTL_S * 4)
+    for key in [k for k, (ts, _) in _cache.items() if ts < stale_cutoff]:
+        _cache.pop(key, None)
+    if len(_cache) <= _CACHE_MAX:
+        return
+    for key, _ in sorted(_cache.items(), key=lambda kv: kv[1][0])[: len(_cache) - _CACHE_MAX]:
+        _cache.pop(key, None)
+
 
 def reset_state() -> None:
     """Tests only."""
@@ -148,6 +167,7 @@ async def widen_factor(
             "markout defense %s user=%s widen=%.2fx", product_name, user_id, value
         )
     _cache[key] = (now, value)
+    _prune_cache(now)
     return value
 
 

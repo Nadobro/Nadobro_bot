@@ -132,3 +132,12 @@ def test_products_are_cached_independently(monkeypatch):
         md.widen_factor(1, "mainnet", "BTC-PERP", half_spread_bp=10.0)) > 1.0
     assert asyncio.run(
         md.widen_factor(1, "mainnet", "ETH-PERP", half_spread_bp=10.0)) == 1.0
+
+
+def test_the_cache_is_bounded_so_a_long_lived_process_does_not_leak(monkeypatch):
+    # Keyed per (user, network, product) in a process that runs for weeks.
+    monkeypatch.setattr(md, "_CACHE_MAX", 10)
+    monkeypatch.setattr(md, "_load_samples", lambda *a, **k: [])
+    for uid in range(40):
+        asyncio.run(md.widen_factor(uid, "mainnet", "BTC-PERP", half_spread_bp=10.0))
+    assert len(md._cache) <= 10
