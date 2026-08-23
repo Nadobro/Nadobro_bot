@@ -307,9 +307,12 @@ class ExecutorOrchestrator:
         only wires the bookkeeping (and NEVER opens a second order, which is the
         whole point of the fused path). Falls back to a plain register if the
         executor type has no ``adopt_order``.
+
+        It does NOT honour the kill switch: the order is ALREADY resting on the
+        venue, so refusing to register it could only orphan it (an untracked
+        resting order that teardown cannot find). Tracking it means a killed
+        controller's stop sweep will cancel it like any other executor.
         """
-        if self.is_killed:
-            return False
         self._executors[executor.id] = executor
         if self._trade_recorder is not None and getattr(executor, "trade_recorder", None) is None:
             executor.trade_recorder = self._trade_recorder
