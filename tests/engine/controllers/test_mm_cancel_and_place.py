@@ -164,3 +164,42 @@ def test_a_held_quote_is_never_replaced():
                    mids=[100, 100.001])
     assert adapter.replaced == []            # nothing requoted; the quote held
     assert adapter.cancelled == []
+
+
+# --- non-atomic venue (audit finding 2) -------------------------------------
+
+def test_a_non_atomic_venue_that_leaves_the_old_order_resting_is_cleaned_up():
+    # If cancel_and_place places the NEW order but fails to cancel the OLD one,
+    # the settle path must detect the still-resting old order and cancel it, so
+    # the venue never ends with two live orders on a side.
+    adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+    adapter.cap_leaves_old_resting = True
+    _run(adapter, _enabled(), mids=[100, 100.5])
+    # The old orders were rescued by an explicit fallback cancel...
+    assert adapter.cancelled          # settle issued the fallback cancel_order
+    # ...leaving exactly one live order per side, not two.
+    assert len(_live_orders(adapter)) == 2
+
+
+# --- leverage consistency (audit finding 1) ---------------------------------
+
+def test_the_fused_path_signs_the_configured_leverage():
+    adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+    _run(adapter, {**_enabled(), "leverage": "5"}, mids=[100, 100.5])
+    # Every fused replace signed the configured leverage, not a bare default.
+    assert adapter.cap_leverages
+    assert all(lev == 5 for lev in adapter.cap_leverages)
+
+
+def test_the_classic_path_signs_the_same_leverage_as_the_fused_path():
+    # Audit finding 1: the two paths must agree, or the same logical quote rests
+    # at a different isolated margin / liquidation distance depending on which
+    # placed it.
+    classic = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+    _run(classic, {**BASE, "leverage": "5"}, mids=[100, 100.5])   # fused OFF
+    fused = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+    _run(fused, {**_enabled(), "leverage": "5"}, mids=[100, 100.5])   # fused ON
+    assert set(classic.place_leverages) == {5}
+    # The fused run's initial placements also sign 5, and its replaces sign 5.
+    assert set(fused.place_leverages) == {5}
+    assert set(fused.cap_leverages) == {5}

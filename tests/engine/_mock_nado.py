@@ -63,6 +63,13 @@ class MockNadoAdapter(NadoAdapterBase):
         # from cancel_and_place, and digests dropped via forget_cancelled.
         self.replaced: List[tuple] = []
         self.forgotten: List[str] = []
+        # Model a NON-ATOMIC venue: cancel_and_place places the new order but
+        # leaves the old one RESTING (partial success). Exercises the settle
+        # fallback that must then cancel it to avoid a double order.
+        self.cap_leaves_old_resting = False
+        # Leverage each path signs, so a test can prove classic == fused.
+        self.place_leverages: List[int] = []
+        self.cap_leverages: List[int] = []
         # Funding the short leg "earns" per call to funding_since (received-
         # positive). Tests can set this to simulate accrued funding.
         self.funding_quote: Decimal = Decimal(0)
@@ -128,6 +135,7 @@ class MockNadoAdapter(NadoAdapterBase):
         reduce_only: bool = False,
     ) -> NadoOrder:
         self._maybe_fail("place_order")
+        self.place_leverages.append(int(leverage))
         self._counter += 1
         oid = f"ord-{self._counter}"
         order = NadoOrder(
@@ -205,8 +213,9 @@ class MockNadoAdapter(NadoAdapterBase):
         # ATOMIC like the venue: _maybe_fail raises BEFORE any state change, so a
         # failure leaves the OLD order resting and nothing new placed.
         self._maybe_fail("cancel_and_place")
+        self.cap_leverages.append(int(leverage))
         old = self._orders.get(cancel_order_id)
-        if old is not None and not old.state.is_terminal:
+        if old is not None and not old.state.is_terminal and not self.cap_leaves_old_resting:
             # Atomic cancel — recorded in ``replaced`` below, NOT in ``cancelled``
             # (which tracks classic cancel_order calls, so tests can tell the
             # fused path from a stop-then-spawn).

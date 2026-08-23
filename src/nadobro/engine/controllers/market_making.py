@@ -999,7 +999,15 @@ class MarketMakingController(Controller):
             return
         amount_base = order_quote / target
         cfg = OrderExecutorConfig(
-            self.trading_pair, side, amount_base, ExecutionStrategy.LIMIT_MAKER, price=target
+            self.trading_pair, side, amount_base, ExecutionStrategy.LIMIT_MAKER,
+            price=target,
+            # Sign the configured leverage, matching the fused replace path.
+            # Cross-margin perps ignore it (leverage is account-level on Nado),
+            # but isolated-only perps size their posted margin from it — so
+            # omitting it made the classic quote over-reserve collateral and,
+            # worse, disagree with the fused replace's margin for the same
+            # logical quote. One leverage everywhere.
+            leverage=int(self.leverage_hint),
         )
         ex = OrderExecutor(
             cfg, user_id=self.user_id, controller_id=self.id, adapter=self.adapter,
@@ -1041,40 +1049,39 @@ class MarketMakingController(Controller):
         if new_order is None:
             return False
 
-        # Venue state now: OLD cancelled, NEW resting. Settle the old executor
-        # (capturing any fill that raced the cancel) with NO second venue
-        # cancel, drop the old order's local bookkeeping, then ADOPT the new
-        # order into a fresh executor with NO second placement.
-        await self.orchestrator.settle_replaced(old_ex_id)
-        try:
-            self.adapter.forget_cancelled(old_digest)
-        except Exception:  # noqa: BLE001 - bookkeeping only
-            logger.debug("forget_cancelled failed for %s", old_digest, exc_info=True)
+        # Venue state now: OLD cancelled, NEW resting. The new order is LIVE, so
+        # the one thing that must never happen is leaving it untracked. ADOPT it
+        # into a fresh executor FIRST — adopt is pure bookkeeping (no venue call,
+        # no risk gate) and always registers, so from here the new order is
+        # owned and the controller's teardown/tick can see it. Only THEN settle
+        # the old executor and point the slot at the new one.
         new_ex = OrderExecutor(
             OrderExecutorConfig(
                 self.trading_pair, side, amount_base,
                 ExecutionStrategy.LIMIT_MAKER, price=target,
+                leverage=int(self.leverage_hint),
             ),
             user_id=self.user_id, controller_id=self.id, adapter=self.adapter,
             inventory=self.inventory,
         )
-        adopted = await self.orchestrator.adopt(new_ex, new_order)
-        if not adopted:
-            # Kill switch flipped between the place and the adopt (rare). The new
-            # order is live but unowned — cancel it so we never leak a resting
-            # order. The old one is already gone, so we must NOT fall through to
-            # place yet another; report handled.
-            try:
-                await self.adapter.cancel_order(new_order.id)
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "orphaned replace order cancel failed for %s",
-                    new_order.id, exc_info=True,
-                )
-            self._set_quote(is_bid, None, None, level=level)
-            return True
+        await self.orchestrator.adopt(new_ex, new_order)
+        # Repoint the slot to the new executor immediately after it is tracked,
+        # so no later failure can leave the slot on the stale executor.
         self._set_quote(is_bid, new_ex.id, target, level=level, size_quote=order_quote)
         self._replace_count += 1
+        # Settle the OLD executor: capture any fill that raced the cancel, with
+        # NO second venue cancel (the fused request already cancelled it), then
+        # drop its local bookkeeping. Best-effort — the new quote is already
+        # live and owned, and a stale old executor simply terminates on its next
+        # tick (its order reads CANCELLED) rather than leaking.
+        try:
+            await self.orchestrator.settle_replaced(old_ex_id)
+            self.adapter.forget_cancelled(old_digest)
+        except Exception:  # noqa: BLE001 - the new quote is already owned
+            logger.debug(
+                "settle of replaced quote failed for %s; it will terminate on "
+                "its next tick", old_digest, exc_info=True,
+            )
         return True
 
     # -- Phase 6: self-trade prevention ----------------------------------------

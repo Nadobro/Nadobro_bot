@@ -303,14 +303,27 @@ class OrderExecutor(Executor):
         self.order = order
         self.orders_placed += 1
         self._terminal_counted = False
-        self._ingest(order)
+        try:
+            self._ingest(order)
+        except Exception:  # noqa: BLE001 - an ingest hiccup must not orphan a live order
+            logger.debug(
+                "adopt_order ingest failed for %s; order remains tracked",
+                order.id, exc_info=True,
+            )
 
     async def settle_after_external_cancel(self) -> None:
-        """Terminate this executor whose resting order was cancelled EXTERNALLY,
-        as part of an atomic cancel_and_place. Issues NO venue cancel — the
-        cancel already happened — but refreshes once to capture a fill that
-        raced the cancel, exactly as :meth:`on_stop` would, so inventory is not
-        short a last-instant fill.
+        """Terminate this executor whose resting order was cancelled as part of
+        an atomic cancel_and_place. Refreshes once to capture a fill that raced
+        the cancel, exactly as :meth:`on_stop` would, so inventory is not short
+        a last-instant fill.
+
+        Defence in depth against a NON-atomic venue: the whole no-orphan
+        argument assumes cancel_and_place cancelled the old order. If the
+        refresh shows it STILL RESTING (open / partially filled), the venue
+        applied the place leg but not the cancel — so issue an explicit cancel
+        here rather than terminating and forgetting a live resting order. This
+        is the one place a partial venue success could otherwise leave two live
+        orders on one side.
         """
         if self.is_terminated:
             return
@@ -328,9 +341,36 @@ class OrderExecutor(Executor):
                     "settle_after_external_cancel status refresh failed for %s",
                     order.id, exc_info=True,
                 )
+            still_resting = (
+                self.order is not None
+                and self.order.state in (OrderState.OPEN, OrderState.PARTIALLY_FILLED)
+            )
+            if still_resting:
+                logger.warning(
+                    "settle_after_external_cancel: %s still RESTING after a "
+                    "cancel_and_place — venue did not cancel it atomically; "
+                    "issuing an explicit cancel to avoid a double order",
+                    order.id,
+                )
+                try:
+                    await self._guard(
+                        lambda: self.adapter.cancel_order(order.id),
+                        label="settle_replaced_fallback_cancel",
+                    )
+                    self._ingest(await self._guard(
+                        lambda: self.adapter.order_status(order.id),
+                        label="settle_replaced_fallback_status",
+                    ))
+                except Exception:  # noqa: BLE001 - surfaced above; do not mask
+                    logger.warning(
+                        "settle_after_external_cancel fallback cancel failed for "
+                        "%s — a resting order may remain; the venue sync sweep "
+                        "must reconcile it", order.id, exc_info=True,
+                    )
         self._count_terminal_order()
-        # We KNOW the venue cancelled it; if the refresh could not confirm a
-        # terminal state, still count the cancel so /status stays honest.
+        # We KNOW the venue cancelled it (or we just did); if the refresh could
+        # not confirm a terminal state, still count the cancel so /status stays
+        # honest.
         if not self._terminal_counted:
             self.orders_cancelled += 1
             self._terminal_counted = True
