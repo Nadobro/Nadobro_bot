@@ -298,6 +298,58 @@ class ExecutorOrchestrator:
         )
         return True
 
+    async def adopt(self, executor: Executor, order: object) -> bool:
+        """Register an executor around an order ALREADY placed atomically by a
+        ``cancel_and_place`` (see the MM controller's fused requote).
+
+        No risk pre-check and no venue call: the placement is a fait accompli
+        and size-neutral — it replaced an equal-notional resting quote — so this
+        only wires the bookkeeping (and NEVER opens a second order, which is the
+        whole point of the fused path). Falls back to a plain register if the
+        executor type has no ``adopt_order``.
+        """
+        if self.is_killed:
+            return False
+        self._executors[executor.id] = executor
+        if self._trade_recorder is not None and getattr(executor, "trade_recorder", None) is None:
+            executor.trade_recorder = self._trade_recorder
+        adopt_order = getattr(executor, "adopt_order", None)
+        if callable(adopt_order):
+            adopt_order(order)
+        self._last_spawn_reason.pop(executor.controller_id, None)
+        self._emit(
+            ExecutorEvent(
+                kind="spawned",
+                executor_id=executor.id,
+                controller_id=executor.controller_id,
+            )
+        )
+        return True
+
+    async def settle_replaced(self, executor_id: str) -> bool:
+        """Terminate an executor whose resting order was cancelled EXTERNALLY by
+        an atomic ``cancel_and_place``. Captures any racing fill but issues NO
+        venue cancel — the cancel already happened as part of the fused request,
+        so a second one would waste execute budget and could race a fresh order.
+        """
+        ex = self._executors.get(executor_id)
+        if ex is None:
+            return False
+        settle = getattr(ex, "settle_after_external_cancel", None)
+        if callable(settle):
+            await settle()
+        else:
+            ex._terminate(CloseType.EARLY_STOP)
+        self._emit(
+            ExecutorEvent(
+                kind="stopped",
+                executor_id=ex.id,
+                controller_id=ex.controller_id,
+                close_type=ex.close_type,
+            )
+        )
+        return True
+
     # -- controller management -------------------------------------------
     async def spawn_controller(self, controller: "Controller") -> bool:
         if self.is_killed:

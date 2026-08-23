@@ -570,10 +570,30 @@ def build_status_snapshot(
     if live_snapshot:
         session_fees = _safe_float(live_snapshot.get("fees"), session_fees)
 
+    # Mid Mode v3 engine telemetry, written back by run_engine_cycle from
+    # ``MarketMakingController.ladder_metrics()``. Absent for every other
+    # strategy and for a Mid session that has not ticked yet, so every read
+    # below defaults rather than assuming.
+    engine_metrics = state.get("mm_engine_metrics") or {}
+
     return {
         "strategy_id": strategy_id,
         "network": network,
         "product": product,
+        # --- Mid Mode v3 --------------------------------------------------
+        "mm_profile": str(engine_metrics.get("profile") or ""),
+        "half_spread_floor_bp": _safe_float(engine_metrics.get("half_spread_floor_bp"), 0.0),
+        "reservation_offset_bp": _safe_float(engine_metrics.get("reservation_offset_bp"), 0.0),
+        "alpha": _safe_float(engine_metrics.get("alpha"), 0.0),
+        "alpha_confidence": _safe_float(engine_metrics.get("alpha_confidence"), 0.0),
+        "alpha_offset_bp": _safe_float(engine_metrics.get("alpha_offset_bp"), 0.0),
+        "signal_degraded": bool(engine_metrics.get("signal_degraded")),
+        "markout_widen": _safe_float(engine_metrics.get("markout_widen"), 1.0),
+        "self_trade_blocks": int(_safe_float(engine_metrics.get("self_trade_blocks"), 0)),
+        "atomic_replaces": int(_safe_float(engine_metrics.get("atomic_replaces"), 0)),
+        "ladder_live_bids": int(_safe_float(engine_metrics.get("ladder_live_bids"), 0)),
+        "ladder_live_asks": int(_safe_float(engine_metrics.get("ladder_live_asks"), 0)),
+        "has_engine_metrics": bool(engine_metrics),
         "running": bool(state.get("running")),
         "is_paused": bool(state.get("mm_paused")),
         "leverage": _safe_float(state.get("leverage"), 1.0),
@@ -696,6 +716,46 @@ def _render_volume_status_lines(snapshot: dict) -> list[str]:
     return lines
 
 
+def _render_mid_v3_lines(snapshot: dict) -> list[str]:
+    """Mid Mode v3 block: which playbook is running, and what is defending it.
+
+    Empty for every strategy other than Mid, and for a Mid session that has not
+    ticked yet — showing "VOLUME / alpha 0.00" before the controller has
+    resolved anything would read as fact rather than as absence.
+    """
+    if not snapshot.get("has_engine_metrics"):
+        return []
+    profile = snapshot.get("mm_profile") or ""
+    if not profile:
+        return []
+    lines = [
+        f"Profile: {profile.upper()} "
+        f"(half-spread floor {snapshot.get('half_spread_floor_bp', 0.0):.1f} bp)"
+    ]
+    if snapshot.get("signal_degraded"):
+        # The one state a user must be able to see: quoting continues off
+        # Nado's own book, wider and shallower, with no forecast at all.
+        lines.append("Signal feed: DEGRADED — anchor-only, quoting wider")
+    else:
+        lines.append(
+            f"Alpha: {snapshot.get('alpha', 0.0):+.2f} "
+            f"(confidence {snapshot.get('alpha_confidence', 0.0) * 100:.0f}%, "
+            f"anchor {snapshot.get('alpha_offset_bp', 0.0):+.1f} bp)"
+        )
+    shifts = []
+    if snapshot.get("reservation_offset_bp"):
+        shifts.append(f"inventory {snapshot['reservation_offset_bp']:+.1f} bp")
+    if (snapshot.get("markout_widen") or 1.0) > 1.0:
+        shifts.append(f"mark-out widen {snapshot['markout_widen']:.2f}x")
+    if snapshot.get("self_trade_blocks"):
+        shifts.append(f"self-trade blocked {snapshot['self_trade_blocks']}")
+    if snapshot.get("atomic_replaces"):
+        shifts.append(f"atomic requotes {snapshot['atomic_replaces']}")
+    if shifts:
+        lines.append("Adjustments: " + " | ".join(shifts))
+    return lines
+
+
 def render_status_lines(snapshot: dict) -> list[str]:
     """Plain-text (non-MarkdownV2) lines for /mm_status output."""
     if str(snapshot.get("strategy_id") or "").lower() == "vol":
@@ -752,6 +812,7 @@ def render_status_lines(snapshot: dict) -> list[str]:
             f"{snapshot['fill_count']} fills (fill rate {snapshot['fill_rate'] * 100:.1f}%)"
         ),
         f"Spread: {snapshot['spread_bp']:.1f} bp / Ref: {snapshot['reference_price']:,.4f}",
+        *_render_mid_v3_lines(snapshot),
     ]
     # Dynamic Grid ONLY. R-Grid used to run the D-Grid engine, so R-Grid cards
     # showed a "DGRID phase" line for a strategy that has no phases; a stale

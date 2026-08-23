@@ -23,8 +23,17 @@ from typing import Dict, List, Optional, Tuple
 from src.nadobro.engine.controllers.controller_base import Controller
 from src.nadobro.engine.executors.order_executor import OrderExecutor, OrderExecutorConfig
 from src.nadobro.engine.risk import ExecutorRequest
-from src.nadobro.engine.types import ExecutionStrategy, TradeType, _dec
-from src.nadobro.quant.ladder import FLAT, LadderLevel, describe as _describe_ladder, plan_ladder
+from src.nadobro.engine.types import ExecutionStrategy, OrderType, TradeType, _dec
+from src.nadobro.quant import alpha as _alpha
+from src.nadobro.quant import microstructure as _ms
+from src.nadobro.quant import mm_profile as _mp
+from src.nadobro.quant.ladder import (
+    FLAT,
+    LadderLevel,
+    describe as _describe_ladder,
+    plan_ladder,
+    proximity_weights,
+)
 
 # Auto ladder spacing when ``ladder_step_bp`` is unset: one venue tick, floored
 # so a very tight book (BTC-PERP's tick is ~0.16bp) doesn't stack every level
@@ -132,6 +141,95 @@ class MarketMakingController(Controller):
         self._slots: Dict[Tuple[bool, int], _QuoteSlot] = {}
         self._cap_floor_warned = False
         self._last_plan_desc: str = ""
+        # --- Mid Mode v3 Phase 2: microstructure telemetry ------------------
+        # OBSERVATION ONLY. Reads the SIZED book (``depth_book``) once per tick
+        # and records microprice / imbalance / spread. It does NOT price a
+        # quote, move a target, or change a requote decision — that lands in a
+        # later, separately reviewed phase.
+        #
+        # Default OFF so the two subclasses that inherit this controller
+        # (FillAnchoredQuotingController, RGridController) are bit-for-bit
+        # unchanged; only the ``mid`` mapping switches it on.
+        #
+        # Why it needs its own read: ``order_book`` fabricates levels with
+        # amount=0, so the controller has never seen size. ``depth_book`` is the
+        # sized ladder at the same weight-1 query cost, TTL-cached at the
+        # cadence floor so concurrent users on a product share one fetch.
+        self.microstructure_log = bool(_dec(self.cfg("microstructure_log", "0") or "0"))
+        self.micro: Dict[str, object] = {}
+        self._micro_last_hash: str = ""
+        # --- Mid Mode v3 Phase 5: objective profile, fee floor, reservation ---
+        # THE FIRST PHASE THAT ACTUATES. Everything here is off unless the
+        # ``mid`` mapping switches it on, because FillAnchoredQuotingController
+        # and RGridController inherit this class and must stay bit-for-bit
+        # identical — a default-on flag here silently re-prices Grid and R-Grid.
+        self.profile_enabled = bool(_dec(self.cfg("profile_enabled", "0") or "0"))
+        self.mid_objective = _mp.normalize_objective(self.cfg("mid_objective", ""))
+        # Round-trip maker+builder fee in bp. 0 => the pure module's default.
+        self.fee_round_trip_bp = _dec(self.cfg("fee_round_trip_bp", "0") or "0")
+        self.min_edge_bp = _dec(self.cfg("min_edge_bp", "1") or "1")
+        self.inventory_skew_enabled = bool(
+            _dec(self.cfg("inventory_skew_enabled", "0") or "0")
+        )
+        self.inventory_skew_gamma = _dec(self.cfg("inventory_skew_gamma", "0.1") or "0.1")
+        # Resolved ONCE per session (see _resolve_profile_once): the two
+        # profiles imply different requote and inventory behaviour, so flipping
+        # per tick would churn the book instead of running either playbook.
+        self.profile: str = ""
+        self._profile_resolved = False
+        self.reservation_offset_bp: Decimal = Decimal(0)
+        # --- Mid Mode v3 Phase 6: alpha, mark-out defence, STP, failover -----
+        # Same gating rule as Phase 5: off unless the ``mid`` mapping says so.
+        self.alpha_enabled = bool(_dec(self.cfg("alpha_enabled", "0") or "0"))
+        self.alpha_max = _dec(self.cfg("alpha_max", "0.35") or "0.35")
+        self.alpha_strength = _dec(self.cfg("alpha_strength", "0.5") or "0.5")
+        # Injected async callable ``(pair) -> {"components": {...},
+        # "trusted": bool} | None``. None (or a None return) means the signal
+        # feed is unavailable, which is a DEGRADED MODE, not an outage: the
+        # controller keeps quoting off Nado's own anchor, just wider and
+        # shallower. Injected in engine_runtime beside candle_provider, because
+        # engine/ has no module-level edge to market_data/.
+        self.signal_provider = self.cfg("signal_provider")
+        # Injected sync callable ``() -> float`` in [1, 3]: how much measured
+        # adverse selection says to widen. 1.0 = no evidence of harm.
+        self.markout_provider = self.cfg("markout_provider")
+        self.degraded_spread_mult = _dec(self.cfg("degraded_spread_mult", "1.25") or "1.25")
+        self.self_trade_prevention = bool(
+            _dec(self.cfg("self_trade_prevention", "0") or "0")
+        )
+        # Phase 8: fuse a requote's cancel+replace into ONE atomic venue request
+        # (no unquoted gap, one execute round trip). Off unless the mid mapping
+        # enables it — the base class is shared with Grid/R-Grid — and it always
+        # falls back to the classic stop-then-spawn on any failure.
+        self.cancel_and_place_enabled = bool(
+            _dec(self.cfg("cancel_and_place_enabled", "0") or "0")
+        )
+        # Leverage hint for the replace path's placement. Cross-margin perps
+        # ignore it (leverage is account-level on Nado), but isolated RWA perps
+        # size margin from it, so carry the configured value rather than a bare
+        # default. Read once; the value is fixed for the session.
+        try:
+            self.leverage_hint = int(_dec(self.cfg("leverage", "1") or "1"))
+        except Exception:  # noqa: BLE001 - a malformed leverage falls back to 1
+            self.leverage_hint = 1
+        self._replace_count = 0
+        self.alpha: float = 0.0
+        self.alpha_confidence: float = 0.0
+        self.alpha_detail: Dict[str, object] = {}
+        self.alpha_offset_bp: Decimal = Decimal(0)
+        self.signal_degraded = False
+        self.markout_widen: Decimal = Decimal(1)
+        self._stp_blocks = 0
+        # --- Mid Mode v3 Phase 7: support/resistance ladder shaping ----------
+        # Injected async callable ``() -> {"support": [...], "resistance": [...]}``,
+        # TTL-cached on the other side. Off unless the mid mapping enables it.
+        self.levels_provider = self.cfg("levels_provider")
+        self.level_weights_enabled = bool(
+            _dec(self.cfg("level_weights_enabled", "0") or "0")
+        )
+        self.level_tolerance_bp = _dec(self.cfg("level_tolerance_bp", "25") or "25")
+        self.level_boost = _dec(self.cfg("level_boost", "1.5") or "1.5")
+        self._sr_levels: Dict[str, object] = {}
 
     # -- level-0 compatibility -------------------------------------------------
     # The ladder generalises what used to be two scalar pairs. Level 0 keeps the
@@ -264,6 +362,206 @@ class MarketMakingController(Controller):
             max(self.spread_floor_half_pct, self.spread_ask_pct * (Decimal(1) + skew)),
         )
 
+    # -- Phase 5: objective profile ------------------------------------------
+    async def _observed_spread_bp(self) -> Optional[float]:
+        """Live spread in bp, cheapest source first.
+
+        Touch mode already fetched the book this tick, so reuse it. Otherwise
+        this costs ONE weight-1 depth read — and only ever once per session,
+        because the profile is resolved once.
+        """
+        if self._touch_bid and self._touch_ask and self._touch_bid > 0:
+            mid = (self._touch_bid + self._touch_ask) / Decimal(2)
+            if mid > 0:
+                return float((self._touch_ask - self._touch_bid) / mid) * 10_000.0
+        try:
+            snap = await self.adapter.depth_book(self.trading_pair)
+            book = {
+                "bids": [[float(l.price), float(l.amount)] for l in snap.bids],
+                "asks": [[float(l.price), float(l.amount)] for l in snap.asks],
+            }
+        except Exception:  # noqa: BLE001 - an unreadable book resolves to VOLUME
+            return None
+        return _ms.spread_bp(book)
+
+    async def _resolve_profile_once(self) -> None:
+        """Pick VOLUME or SPREAD for this session and apply the fee floor.
+
+        Resolved once and then left alone. The SPREAD profile raises the
+        half-spread floor to ``δ* = f + edge`` so a quote can never rest inside
+        the fee; VOLUME deliberately keeps the shipped floor, because quoting
+        inside the fee to buy fill rate is that profile's entire purpose and it
+        is bounded by the session SL rail instead.
+        """
+        if not self.profile_enabled or self._profile_resolved:
+            return
+        spread_bp = await self._observed_spread_bp()
+        if spread_bp is None and self.mid_objective == _mp.AUTO:
+            # No reading and no explicit choice: try again next tick rather than
+            # committing the session to a playbook picked from nothing.
+            return
+        self._profile_resolved = True
+        self.profile = _mp.resolve_profile(
+            self.mid_objective,
+            spread_bp=spread_bp,
+            fee_round_trip_bp=float(self.fee_round_trip_bp) or None,
+        )
+        if self.profile == _mp.SPREAD:
+            floor_bp = _mp.half_spread_floor_bp(
+                fee_round_trip_bp=float(self.fee_round_trip_bp) or None,
+                min_edge_bp=float(self.min_edge_bp),
+            )
+            floor = _dec(str(floor_bp)) / Decimal(10000)
+            if floor > self.spread_floor_half_pct:
+                self.spread_floor_half_pct = floor
+                # Re-apply to the MANUAL spreads too: __init__ floored them at
+                # the old value, and a user spread under the fee is exactly what
+                # this profile exists to refuse.
+                self.spread_bid_pct = max(self.spread_bid_pct, floor)
+                self.spread_ask_pct = max(self.spread_ask_pct, floor)
+        logger.info(
+            "MM %s profile=%s (spread=%s bp, objective=%s, half-spread floor=%s bp)",
+            self.trading_pair, self.profile,
+            None if spread_bp is None else round(spread_bp, 2),
+            self.mid_objective, float(self.spread_floor_half_pct) * 10_000.0,
+        )
+
+    def _inventory_ratio(self, mid: Decimal) -> Decimal:
+        """Signed inventory as a fraction of the ceiling. +1 = fully long."""
+        cap = self.max_base_quote if (self.max_base_quote or 0) > 0 else self.order_amount_quote
+        if not cap or cap <= 0:
+            return Decimal(0)
+        return self._base_value(mid) / cap
+
+    def _reservation_price(self, mid: Decimal) -> Decimal:
+        """Quoting anchor after the inventory and alpha shifts.
+
+        Both are displacements of the SAME quantity — the fair value the quotes
+        are built around — so they compose additively and share one bound. That
+        is also why neither touches ``directional_bias``: that field is a spread
+        skew the user owns, and a second writer would break its dead-band.
+
+        Returns ``mid`` unchanged when both are off, so the disabled path is
+        bit-for-bit the shipped one.
+        """
+        self.reservation_offset_bp = Decimal(0)
+        self.alpha_offset_bp = Decimal(0)
+        if mid <= 0:
+            return mid
+        half_bp = float((self.spread_bid_pct + self.spread_ask_pct) / Decimal(2)) * 10_000.0
+        total = 0.0
+        if self.inventory_skew_enabled:
+            inv = _mp.reservation_offset_bp(
+                float(self._inventory_ratio(mid)),
+                sigma_bp=self.gate_atr_pct * 10_000.0,
+                half_spread_bp=half_bp,
+                gamma=float(self.inventory_skew_gamma),
+            )
+            self.reservation_offset_bp = _dec(str(inv))
+            total += inv
+        if self.alpha_enabled and self.alpha:
+            a_off = _alpha.anchor_offset_bp(
+                self.alpha, half_spread_bp=half_bp,
+                strength=float(self.alpha_strength),
+            )
+            self.alpha_offset_bp = _dec(str(a_off))
+            total += a_off
+        if not total:
+            return mid
+        # ONE joint bound: each part is individually capped at half the
+        # half-spread, so their sum could still reach a full half-spread and
+        # push a quote onto the wrong side of the anchor. Cap the total too.
+        cap = half_bp * 0.5
+        total = max(-cap, min(cap, total))
+        return mid * (Decimal(1) + _dec(str(total)) / Decimal(10000))
+
+    # -- Phase 6: signal refresh, degraded mode, mark-out defence -------------
+    async def _refresh_alpha(self, mid: Decimal) -> None:
+        """Pull the forecast components and blend them. Never raises.
+
+        Three outcomes, and the middle one matters:
+
+        * no payload — the feed should have this market and is not answering.
+          DEGRADED: lean on nothing, quote wider and shallower. Still quoting,
+          off Nado's own book, which is strictly better than the blind
+          mid-quoting Mid shipped with.
+        * ``supported: False`` — Hyperliquid does not list this market at all
+          (every equity/RWA). Permanent and expected, so alpha is simply 0 and
+          nothing is widened; treating it as degradation would quote those
+          markets wide forever waiting for a feed that is never coming.
+        * components — blend them.
+        """
+        if not self.alpha_enabled:
+            return
+        payload = None
+        provider = self.signal_provider
+        if callable(provider):
+            try:
+                payload = await provider(self.trading_pair, mid)
+            except Exception:  # noqa: BLE001 - a dead feed must not stop quoting
+                logger.debug("signal provider failed %s", self.trading_pair, exc_info=True)
+                payload = None
+        if isinstance(payload, dict) and payload.get("supported") is False:
+            self.signal_degraded = False
+            self.alpha = 0.0
+            self.alpha_confidence = 0.0
+            self.alpha_detail = {"unsupported": True}
+            return
+        if not isinstance(payload, dict) or not payload.get("components"):
+            self.signal_degraded = True
+            self.alpha = 0.0
+            self.alpha_confidence = 0.0
+            self.alpha_detail = {}
+            return
+        self.signal_degraded = False
+        out = _alpha.blend(
+            payload.get("components") or {},
+            weights=payload.get("weights"),
+            trusted=bool(payload.get("trusted")),
+            max_alpha=float(self.alpha_max),
+        )
+        self.alpha = float(out.get("alpha") or 0.0)
+        self.alpha_confidence = float(out.get("confidence") or 0.0)
+        self.alpha_detail = out
+
+    async def _refresh_markout_widen(self) -> None:
+        """How much measured adverse selection says to widen. 1.0 = no harm.
+
+        The provider is async and TTL-cached on the other side; it must never
+        block the tick on a query.
+        """
+        self.markout_widen = Decimal(1)
+        if not self.alpha_enabled or not callable(self.markout_provider):
+            return
+        half_bp = float((self.spread_bid_pct + self.spread_ask_pct) / Decimal(2)) * 10_000.0
+        try:
+            factor = float(await self.markout_provider(half_bp))
+        except Exception:  # noqa: BLE001 - a grading outage must not move quotes
+            logger.debug("markout provider failed %s", self.trading_pair, exc_info=True)
+            return
+        # Never below 1: a mark-out series is evidence of harm, and never
+        # evidence that quoting TIGHTER is safe.
+        self.markout_widen = _dec(str(max(1.0, min(3.0, factor))))
+
+    async def _refresh_levels(self) -> None:
+        """Pull cached support/resistance. Never blocks, never raises."""
+        if not self.level_weights_enabled or not callable(self.levels_provider):
+            return
+        try:
+            levels = await self.levels_provider()
+        except Exception:  # noqa: BLE001 - no levels just leaves the shape alone
+            logger.debug("levels provider failed %s", self.trading_pair, exc_info=True)
+            return
+        if isinstance(levels, dict):
+            self._sr_levels = levels
+
+    def _defensive_spread_mult(self) -> Decimal:
+        """Combined widening from the mark-out ledger and feed degradation."""
+        mult = self.markout_widen
+        if self.alpha_enabled and self.signal_degraded:
+            mult *= self.degraded_spread_mult
+        return mult
+
     def _unrealized(self, mid: Decimal) -> Decimal:
         if self.inventory is None:
             return Decimal(0)
@@ -281,9 +579,25 @@ class MarketMakingController(Controller):
         # provides both the touch targets and the mid (mid_price() is itself an
         # order_book fetch — calling both doubled the per-tick hit on the
         # shared per-IP query budget). Dead/degraded book -> classic mid fetch.
+        #
+        # ONE EXCEPTION, and it is opt-in: with ``microstructure_log`` on (mid
+        # only, off by default) ``_record_microstructure`` adds a second
+        # weight-1 read for the SIZED book, which ``order_book`` cannot give —
+        # it fabricates levels with amount=0. It is TTL-cached at the cadence
+        # floor so concurrent users on a product share one fetch. Folding the
+        # two into a single depth snapshot is the pricing phase's job; until
+        # then this comment states what the code actually does.
         self._touch_bid = self._touch_ask = None
         touch = await self._touch_targets() if self.quote_mode == "touch" else None
         mid = touch[2] if touch is not None else await self.adapter.mid_price(self.trading_pair)
+        # Phase 5: pick the playbook for this market. Once per session, and it
+        # can raise the half-spread floor before any spread is computed below.
+        await self._resolve_profile_once()
+        # Phase 6: refresh the forecast and the defensive widening. Both fail
+        # OPEN — no signal means alpha 0 and a wider quote, never a skipped tick.
+        await self._refresh_alpha(mid)
+        await self._refresh_markout_widen()
+        await self._refresh_levels()
         base_value = self._base_value(mid)
         at_max = self.max_base_quote is not None and base_value >= self.max_base_quote
         at_min = self.min_base_quote is not None and base_value <= self.min_base_quote
@@ -317,9 +631,23 @@ class MarketMakingController(Controller):
             self.spread_ask_pct = half
 
         eff_bid_pct, eff_ask_pct = self.effective_spreads()
+        # Phase 6: widen for measured adverse selection and for a degraded
+        # signal feed. Widening only — the mark-out ledger can prove harm, it
+        # can never prove that quoting tighter is safe.
+        defensive = self._defensive_spread_mult()
+        if defensive != 1:
+            eff_bid_pct *= defensive
+            eff_ask_pct *= defensive
 
-        target_bid = mid * (Decimal(1) - eff_bid_pct)
-        target_ask = mid * (Decimal(1) + eff_ask_pct)
+        # Phase 5: quote around the RESERVATION price, not the raw mid. Long
+        # inventory shifts the anchor down so the ask works the position off;
+        # short mirrors it. Bounded to a fraction of the half-spread, so the
+        # two sides can never cross and neither can breach the fee floor.
+        # Kept out of ``directional_bias`` on purpose — that field is the
+        # user's, and two writers to one field is how dead-bands stop working.
+        theta = self._reservation_price(mid)
+        target_bid = theta * (Decimal(1) - eff_bid_pct)
+        target_ask = theta * (Decimal(1) + eff_ask_pct)
         # Touch mode (Turbo Volume): glue quotes to the live touch instead of
         # mid ± spread (targets computed once at the top of the tick).
         # Bias/auto-spread math above still ran — it provides the fallback
@@ -328,8 +656,65 @@ class MarketMakingController(Controller):
         # per-fill edge for fill rate, bounded by the session SL rail.
         if touch is not None:
             target_bid, target_ask = touch[0], touch[1]
+        # Observation only — must run AFTER targets are fixed so it cannot
+        # influence them, and never raise into the quoting path.
+        await self._record_microstructure(mid, target_bid, target_ask)
         await self._quote_side(TradeType.BUY, target_bid, allow_buy, mid)
         await self._quote_side(TradeType.SELL, target_ask, allow_sell, mid)
+
+    async def _record_microstructure(
+        self, mid: Decimal, target_bid: Decimal, target_ask: Decimal
+    ) -> None:
+        """Read the sized book and record the microstructure view. Pure
+        telemetry: it changes nothing about this tick's quotes.
+
+        The number to watch is ``micro_vs_mid_bp`` — how far the size-weighted
+        fair value sits from the arithmetic mid we currently quote around. If
+        that is persistently non-zero and signed with our fills, the mid is the
+        wrong reference and the later pricing phase has its evidence.
+        """
+        if not self.microstructure_log:
+            return
+        try:
+            snap = await self.adapter.depth_book(self.trading_pair)
+            book = {
+                "bids": [[float(l.price), float(l.amount)] for l in snap.bids],
+                "asks": [[float(l.price), float(l.amount)] for l in snap.asks],
+            }
+            micro = _ms.microprice(book)
+            mid_f = float(mid) if mid else 0.0
+            self.micro = {
+                "microprice": micro,
+                "book_mid": _ms.mid(book),
+                "spread_bp": _ms.spread_bp(book),
+                "obi": _ms.obi_bands(book),
+                "bid_depth_20bp": _ms.depth_notional(book, _ms.BUY, bp=20),
+                "ask_depth_20bp": _ms.depth_notional(book, _ms.SELL, bp=20),
+                "levels": (len(snap.bids), len(snap.asks)),
+                # Displacement of size-weighted fair value from the quoted mid.
+                "micro_vs_mid_bp": (
+                    (micro - mid_f) / mid_f * 10_000.0
+                    if micro is not None and mid_f > 0 else None
+                ),
+                "target_bid": float(target_bid),
+                "target_ask": float(target_ask),
+            }
+            # Log on change only: a repeated hash means a frozen feed, and a
+            # per-tick line on a 3s cadence would drown the log.
+            digest = _ms.book_hash(book)
+            if digest != self._micro_last_hash:
+                self._micro_last_hash = digest
+                logger.info(
+                    "microstructure %s micro_vs_mid_bp=%s spread_bp=%s obi=%s depth20=(%.0f/%.0f)",
+                    self.trading_pair,
+                    self.micro.get("micro_vs_mid_bp"),
+                    self.micro.get("spread_bp"),
+                    self.micro.get("obi"),
+                    self.micro.get("bid_depth_20bp") or 0.0,
+                    self.micro.get("ask_depth_20bp") or 0.0,
+                )
+        except Exception:  # noqa: BLE001 - telemetry must never break quoting
+            logger.debug("microstructure read failed %s", self.trading_pair, exc_info=True)
 
     # -- ladder (Phase 2) ------------------------------------------------------
     def _effective_step_bp(self, mid: Decimal) -> Decimal:
@@ -344,7 +729,59 @@ class MarketMakingController(Controller):
         tick_bp = (tick / mid) * Decimal(10000) if (tick > 0 and mid > 0) else Decimal(0)
         return max(tick_bp, _AUTO_LADDER_STEP_FLOOR_BP)
 
-    def _plan_side(self, mid: Decimal) -> List[LadderLevel]:
+    def _effective_levels(self) -> int:
+        """Ladder depth for this tick.
+
+        A degraded signal feed shortens the ladder by one level: the deep
+        levels are the ones that fill when the market runs, and running blind
+        is exactly when being deep is expensive. Never below one, and the
+        deployment per side is unchanged either way — ``plan_ladder``
+        redistributes, it never adds.
+        """
+        if self.alpha_enabled and self.signal_degraded and self.ladder_levels > 1:
+            return self.ladder_levels - 1
+        return self.ladder_levels
+
+    def _side_level_weights(
+        self, mid: Decimal, base_target: Decimal, is_bid: bool
+    ) -> Optional[List[Decimal]]:
+        """Phase 7: bias rung SIZE toward support (bids) / resistance (asks).
+
+        Reshaping only — ``plan_ladder`` divides by the weight total, so the
+        per-side deployment is identical. The asymmetry is the point: weighting
+        a bid toward a resistance level would put size exactly where sellers
+        are waiting.
+        """
+        if not self.level_weights_enabled or base_target <= 0 or mid <= 0:
+            return None
+        raw = (self._sr_levels or {}).get("support" if is_bid else "resistance")
+        if not isinstance(raw, (list, tuple)):
+            return None
+        # The payload is injected, so validate it here rather than trusting it:
+        # a NaN or a negative level would silently reshape the whole ladder.
+        refs: List[Decimal] = []
+        for value in raw:
+            try:
+                level = _dec(value)
+            except Exception:  # policy: degrade-ok(junk level -> rung keeps its curve weight)
+                continue
+            if level > 0:
+                refs.append(level)
+        if not refs:
+            return None
+        step = self._effective_step_bp(mid)
+        prices = [
+            self._level_price(base_target, step * Decimal(i), is_bid)
+            for i in range(self._effective_levels())
+        ]
+        return proximity_weights(
+            prices, refs,
+            tolerance_bp=self.level_tolerance_bp, boost=self.level_boost,
+        )
+
+    def _plan_side(
+        self, mid: Decimal, *, base_target: Decimal = Decimal(0), is_bid: bool = True
+    ) -> List[LadderLevel]:
         """Split this side's deployed notional into levels, clamped so every
         level clears the venue minimum (a sub-minimum level is simply rejected,
         which is how the ``levels`` input silently died the first time)."""
@@ -354,11 +791,12 @@ class MarketMakingController(Controller):
             min_notional = Decimal(0)
         return plan_ladder(
             self.order_amount_quote,
-            levels=self.ladder_levels,
+            levels=self._effective_levels(),
             step_bp=self._effective_step_bp(mid),
             first_offset_bp=0,
             curve=self.ladder_curve,
             min_notional=min_notional,
+            level_weights=self._side_level_weights(mid, base_target, is_bid),
         )
 
     @staticmethod
@@ -382,7 +820,10 @@ class MarketMakingController(Controller):
     ) -> None:
         """Reconcile the whole ladder on one side against ``base_target``."""
         is_bid = side is TradeType.BUY
-        plan = self._plan_side(mid) if base_target > 0 else []
+        plan = (
+            self._plan_side(mid, base_target=base_target, is_bid=is_bid)
+            if base_target > 0 else []
+        )
         if not plan:
             # Degenerate deployment/target: fall through to the single-quote path
             # so behaviour is exactly what it was before the ladder existed.
@@ -527,12 +968,34 @@ class MarketMakingController(Controller):
             if ex is not None and not ex.is_terminated:
                 if self._should_hold(is_bid, target, slot):
                     return  # leave the resting quote — see _should_hold
+                # Phase 8: FUSE the cancel+replace into ONE atomic request. We
+                # were going to cancel this live quote and place a fresh one
+                # anyway, so cancel_and_place does both in one signed request —
+                # no gap where the side is unquoted, one execute round trip
+                # instead of two. Gated (mid only), needs a known resting
+                # digest and a real target, and NEVER fires when _should_hold
+                # said hold (a replace resets queue position, so it must only
+                # happen when we were re-queuing regardless). A fused replace
+                # that fails is atomic — the old order is untouched — so we fall
+                # through to the classic stop-then-spawn with no double order.
+                if (self.cancel_and_place_enabled
+                        and target > 0 and order_quote > 0
+                        and not self._would_self_trade(is_bid, target)):
+                    old_order = getattr(ex, "order", None)
+                    old_digest = getattr(old_order, "id", None) if old_order else None
+                    if old_digest and await self._replace_quote(
+                        side, target, order_quote, cur_id, str(old_digest),
+                        level=level,
+                    ):
+                        return
                 await self.orchestrator.stop(cur_id)
                 self._set_quote(is_bid, None, None, level=level)
 
         # BUG-MM-3 fix: guard against ZeroDivisionError when target collapses
         # to 0 (e.g. mid feed returned 0 and spread_*_pct is 1).
         if target <= 0 or order_quote <= 0:
+            return
+        if self._would_self_trade(is_bid, target):
             return
         amount_base = order_quote / target
         cfg = OrderExecutorConfig(
@@ -547,6 +1010,120 @@ class MarketMakingController(Controller):
         )
         if ok:
             self._set_quote(is_bid, ex.id, target, level=level, size_quote=order_quote)
+
+    # -- Phase 8: atomic replace (cancel_and_place) ----------------------------
+    async def _replace_quote(
+        self, side: TradeType, target: Decimal, order_quote: Decimal,
+        old_ex_id: str, old_digest: str, *, level: int,
+    ) -> bool:
+        """Replace a resting quote with ONE atomic cancel_and_place.
+
+        Returns True when the fused path took ownership of the requote (whether
+        it fully succeeded or safely handled its own cleanup), so the caller
+        must NOT also run the classic stop-then-spawn. Returns False only when
+        the venue left the OLD order untouched (atomic failure) — then the
+        caller falls back, and the old order is cancelled and re-placed the
+        classic way with no double-order risk.
+        """
+        is_bid = side is TradeType.BUY
+        amount_base = order_quote / target
+        try:
+            new_order = await self.adapter.cancel_and_place(
+                old_digest, self.trading_pair, side, OrderType.LIMIT_MAKER,
+                amount_base, target, self.leverage_hint,
+            )
+        except Exception:  # noqa: BLE001 - atomic failure: OLD order untouched
+            logger.debug(
+                "cancel_and_place failed %s; falling back to stop+spawn",
+                self.trading_pair, exc_info=True,
+            )
+            return False
+        if new_order is None:
+            return False
+
+        # Venue state now: OLD cancelled, NEW resting. Settle the old executor
+        # (capturing any fill that raced the cancel) with NO second venue
+        # cancel, drop the old order's local bookkeeping, then ADOPT the new
+        # order into a fresh executor with NO second placement.
+        await self.orchestrator.settle_replaced(old_ex_id)
+        try:
+            self.adapter.forget_cancelled(old_digest)
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            logger.debug("forget_cancelled failed for %s", old_digest, exc_info=True)
+        new_ex = OrderExecutor(
+            OrderExecutorConfig(
+                self.trading_pair, side, amount_base,
+                ExecutionStrategy.LIMIT_MAKER, price=target,
+            ),
+            user_id=self.user_id, controller_id=self.id, adapter=self.adapter,
+            inventory=self.inventory,
+        )
+        adopted = await self.orchestrator.adopt(new_ex, new_order)
+        if not adopted:
+            # Kill switch flipped between the place and the adopt (rare). The new
+            # order is live but unowned — cancel it so we never leak a resting
+            # order. The old one is already gone, so we must NOT fall through to
+            # place yet another; report handled.
+            try:
+                await self.adapter.cancel_order(new_order.id)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "orphaned replace order cancel failed for %s",
+                    new_order.id, exc_info=True,
+                )
+            self._set_quote(is_bid, None, None, level=level)
+            return True
+        self._set_quote(is_bid, new_ex.id, target, level=level, size_quote=order_quote)
+        self._replace_count += 1
+        return True
+
+    # -- Phase 6: self-trade prevention ----------------------------------------
+    def _would_self_trade(self, is_bid: bool, target: Decimal) -> bool:
+        """Would this quote cross one of OUR OWN resting quotes?
+
+        The venue has no self-trade prevention, and the controller only had a
+        crossed-book bail plus an inclusive touch tolerance — neither of which
+        looks at our own ladder. A bid placed at or above one of our live asks
+        matches against it: we pay both sides of the fee to trade with
+        ourselves, the fill lands in History as a real trade, and on Nado it
+        also reads as wash trading. Cheap to check, so it is checked locally
+        against the slots we know are live.
+
+        Only the OPPOSITE side matters — two bids at the same price are just
+        two bids. Equality counts as a cross, because a post-only order that
+        would take is REJECTED by the venue, not converted.
+
+        Interaction with the queue hold: after a sharp drop the new ask can sit
+        below a bid that ``min_quote_lifetime_s`` is still holding, so the ask
+        is skipped for a few seconds. That is the right trade — the held bid is
+        about to fill anyway, and the alternative is trading with ourselves —
+        and it clears on its own, because BUY reconciles before SELL and the
+        bid moves down as soon as the hold expires.
+        """
+        if not self.self_trade_prevention or target <= 0:
+            return False
+        for (slot_is_bid, _lvl), slot in self._slots.items():
+            if slot_is_bid is is_bid or slot.ex_id is None or slot.price is None:
+                continue
+            ex = self.orchestrator.get(slot.ex_id)
+            if ex is None or ex.is_terminated:
+                continue
+            crosses = target >= slot.price if is_bid else target <= slot.price
+            if crosses:
+                self._stp_blocks += 1
+                # Throttled: a crossed anchor can block every rung on every
+                # tick, and a 3s cadence would turn one condition into a
+                # WARNING flood. The running count is on /mm_status either way.
+                if self._stp_blocks == 1 or self._stp_blocks % 50 == 0:
+                    logger.warning(
+                        "MM %s self-trade blocked (%s so far): %s at %s would "
+                        "cross our own %s at %s",
+                        self.trading_pair, self._stp_blocks,
+                        "BUY" if is_bid else "SELL", target,
+                        "ASK" if is_bid else "BID", slot.price,
+                    )
+                return True
+        return False
 
     # -- Phase 0: queue preservation -------------------------------------------
     def _holds_queue_position(self, is_bid: bool, target: Decimal, price: Decimal) -> bool:
@@ -655,4 +1232,17 @@ class MarketMakingController(Controller):
             "ladder_live_bids": live[True],
             "ladder_live_asks": live[False],
             "min_quote_lifetime_s": self.min_quote_lifetime_s,
+            # Phase 5 actuation state, for /mm_status. Empty profile == the
+            # selector is off (every strategy other than mid).
+            "profile": self.profile,
+            "half_spread_floor_bp": float(self.spread_floor_half_pct) * 10_000.0,
+            "reservation_offset_bp": float(self.reservation_offset_bp),
+            # Phase 6 state.
+            "alpha": self.alpha,
+            "alpha_confidence": self.alpha_confidence,
+            "alpha_offset_bp": float(self.alpha_offset_bp),
+            "signal_degraded": self.signal_degraded,
+            "markout_widen": float(self.markout_widen),
+            "self_trade_blocks": self._stp_blocks,
+            "atomic_replaces": self._replace_count,
         }
