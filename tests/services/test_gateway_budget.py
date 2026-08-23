@@ -215,3 +215,54 @@ def test_write_circuit_is_per_host(monkeypatch):
     assert mod.is_write_blocked(banned) is True
     assert mod.is_write_blocked(other) is False
     assert mod.try_acquire(other, kind="execute", wallet="0xabc", weight=1) is True
+
+
+# ---------------------------------------------------------------------------
+# GATEWAY-INFLIGHT-LEAK regression (2026-08)
+# ---------------------------------------------------------------------------
+# ``nado_client.get_market_liquidity`` charges the budget with the default
+# ``user_scoped=True``, which takes a per-user in-flight slot that only
+# ``release()`` frees — but the function had no ``finally: _gateway_release()``.
+# So four cache-missing depth polls pinned ``_user_inflight`` at
+# ``NADO_USER_MAX_INFLIGHT`` and EVERY later user-scoped query for that user
+# (mid price, open orders, balance) was denied for the life of the process.
+# Mid mode polls depth once per tick, so this bricked a user in ~12s. The test
+# asserts the user-visible symptom, not just that release() is called.
+
+class _EmptyMarket:
+    """Returns an empty book, which ``get_market_liquidity`` deliberately does
+    NOT cache — so every call is a real acquire/release round trip."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def get_market_liquidity(self, product_id, depth):
+        self.calls += 1
+        return type("Data", (), {"bids": [], "asks": []})()
+
+
+def test_depth_polls_do_not_exhaust_the_user_inflight_cap(monkeypatch):
+    mod = _fresh_module(monkeypatch)
+    monkeypatch.setattr(
+        "src.nadobro.core.http_session.throttle_host",
+        lambda _url, *, cost=1.0, max_wait=None: True,
+    )
+    from src.nadobro.venue import nado_client as nc
+
+    nc._liquidity_cache.clear()
+    market = _EmptyMarket()
+    client = nc.NadoClient(private_key="0xabc", network="mainnet")
+    client._initialized = True
+    client.client = type("SDK", (), {"market": market})()
+    client.acting_user_id = 4242
+
+    # More polls than the cap (4). Every one must reach the venue.
+    for _ in range(8):
+        client.get_market_liquidity(2)
+    assert market.calls == 8, "a leaked in-flight slot starves later polls"
+
+    # And the user must still be able to issue any other user-scoped query.
+    assert mod.snapshot()["user_inflight"].get(4242, 0) == 0
+    url = "https://gateway.mainnet.nado.xyz/query"
+    assert mod.try_acquire(url, user_id=4242) is True
+    mod.release(4242)
