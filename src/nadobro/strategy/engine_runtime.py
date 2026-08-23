@@ -980,6 +980,7 @@ def map_strategy_config(
         # the shared resolver so text and float biases mean the same thing
         # everywhere.
         from src.nadobro.quant.mm_quote_math import _resolve_directional_bias_value
+        from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
 
         _mid_bias = _resolve_directional_bias_value(settings.get("directional_bias"))
         # Directional bias intentionally builds one-sided inventory, which would
@@ -1047,6 +1048,39 @@ def map_strategy_config(
             # else, so the two controllers that INHERIT MarketMakingController
             # (fill-anchored Grid, R-Grid) keep their shipped behaviour exactly.
             "microstructure_log": Decimal(1) if _f(settings, "microstructure_log", 1.0) > 0 else Decimal(0),
+            # --- Mid Mode v3 Phase 5: objective profile + fee floor ----------
+            # Mid had ONE behaviour for every market, which is why spread
+            # capture on BTC loses by 25-45x: the one-tick book has no edge to
+            # capture, so quoting for one just pays the fee on every fill. The
+            # selector reads the live spread once at session start and runs
+            # VOLUME (queue priority, quoting inside the fee is the point) or
+            # SPREAD (delta* = f + edge, so a quote can never rest inside the
+            # fee). ``mid_objective`` = auto | volume | spread; auto is the
+            # default and an explicit choice always wins.
+            #
+            # Set in THIS branch only. FillAnchoredQuotingController and
+            # RGridController inherit MarketMakingController, so a default-on
+            # flag would silently re-price Grid and R-Grid.
+            "profile_enabled": (
+                Decimal(1) if _f(settings, "mid_profile_enabled", 1.0) > 0 else Decimal(0)
+            ),
+            "mid_objective": str(settings.get("mid_objective") or "auto"),
+            # Round-trip maker+builder fee in bp. The venue's per-product maker
+            # rate is signed and often a rebate, so the conservative shipped
+            # default (5.0bp) is used unless a setting overrides it.
+            "fee_round_trip_bp": Decimal(
+                str(_f(settings, "fee_round_trip_bp",
+                       float(MAKER_ROUND_TRIP_RATE) * 10_000.0))
+            ),
+            "min_edge_bp": Decimal(str(_f(settings, "min_edge_bp", 1.0))),
+            # Inventory reservation price. Long inventory shifts the quoting
+            # anchor DOWN so the ask works it off — bounded to half the
+            # half-spread, so the sides can never cross. Separate from
+            # directional_bias, which stays the user's field.
+            "inventory_skew_enabled": (
+                Decimal(1) if _f(settings, "inventory_skew_enabled", 1.0) > 0 else Decimal(0)
+            ),
+            "inventory_skew_gamma": Decimal(str(_f(settings, "inventory_skew_gamma", 0.1))),
             "price_distance_tolerance": (spread_frac / Decimal(2)) or Decimal("0.0005"),
             "leverage": int(eff_lev),
             # Regime gate + inventory cap + ATR auto-spread (2026-06 upgrade).

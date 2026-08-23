@@ -25,6 +25,7 @@ from src.nadobro.engine.executors.order_executor import OrderExecutor, OrderExec
 from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.types import ExecutionStrategy, TradeType, _dec
 from src.nadobro.quant import microstructure as _ms
+from src.nadobro.quant import mm_profile as _mp
 from src.nadobro.quant.ladder import FLAT, LadderLevel, describe as _describe_ladder, plan_ladder
 
 # Auto ladder spacing when ``ladder_step_bp`` is unset: one venue tick, floored
@@ -150,6 +151,26 @@ class MarketMakingController(Controller):
         self.microstructure_log = bool(_dec(self.cfg("microstructure_log", "0") or "0"))
         self.micro: Dict[str, object] = {}
         self._micro_last_hash: str = ""
+        # --- Mid Mode v3 Phase 5: objective profile, fee floor, reservation ---
+        # THE FIRST PHASE THAT ACTUATES. Everything here is off unless the
+        # ``mid`` mapping switches it on, because FillAnchoredQuotingController
+        # and RGridController inherit this class and must stay bit-for-bit
+        # identical — a default-on flag here silently re-prices Grid and R-Grid.
+        self.profile_enabled = bool(_dec(self.cfg("profile_enabled", "0") or "0"))
+        self.mid_objective = _mp.normalize_objective(self.cfg("mid_objective", ""))
+        # Round-trip maker+builder fee in bp. 0 => the pure module's default.
+        self.fee_round_trip_bp = _dec(self.cfg("fee_round_trip_bp", "0") or "0")
+        self.min_edge_bp = _dec(self.cfg("min_edge_bp", "1") or "1")
+        self.inventory_skew_enabled = bool(
+            _dec(self.cfg("inventory_skew_enabled", "0") or "0")
+        )
+        self.inventory_skew_gamma = _dec(self.cfg("inventory_skew_gamma", "0.1") or "0.1")
+        # Resolved ONCE per session (see _resolve_profile_once): the two
+        # profiles imply different requote and inventory behaviour, so flipping
+        # per tick would churn the book instead of running either playbook.
+        self.profile: str = ""
+        self._profile_resolved = False
+        self.reservation_offset_bp: Decimal = Decimal(0)
 
     # -- level-0 compatibility -------------------------------------------------
     # The ladder generalises what used to be two scalar pairs. Level 0 keeps the
@@ -282,6 +303,95 @@ class MarketMakingController(Controller):
             max(self.spread_floor_half_pct, self.spread_ask_pct * (Decimal(1) + skew)),
         )
 
+    # -- Phase 5: objective profile ------------------------------------------
+    async def _observed_spread_bp(self) -> Optional[float]:
+        """Live spread in bp, cheapest source first.
+
+        Touch mode already fetched the book this tick, so reuse it. Otherwise
+        this costs ONE weight-1 depth read — and only ever once per session,
+        because the profile is resolved once.
+        """
+        if self._touch_bid and self._touch_ask and self._touch_bid > 0:
+            mid = (self._touch_bid + self._touch_ask) / Decimal(2)
+            if mid > 0:
+                return float((self._touch_ask - self._touch_bid) / mid) * 10_000.0
+        try:
+            snap = await self.adapter.depth_book(self.trading_pair)
+            book = {
+                "bids": [[float(l.price), float(l.amount)] for l in snap.bids],
+                "asks": [[float(l.price), float(l.amount)] for l in snap.asks],
+            }
+        except Exception:  # noqa: BLE001 - an unreadable book resolves to VOLUME
+            return None
+        return _ms.spread_bp(book)
+
+    async def _resolve_profile_once(self) -> None:
+        """Pick VOLUME or SPREAD for this session and apply the fee floor.
+
+        Resolved once and then left alone. The SPREAD profile raises the
+        half-spread floor to ``δ* = f + edge`` so a quote can never rest inside
+        the fee; VOLUME deliberately keeps the shipped floor, because quoting
+        inside the fee to buy fill rate is that profile's entire purpose and it
+        is bounded by the session SL rail instead.
+        """
+        if not self.profile_enabled or self._profile_resolved:
+            return
+        spread_bp = await self._observed_spread_bp()
+        if spread_bp is None and self.mid_objective == _mp.AUTO:
+            # No reading and no explicit choice: try again next tick rather than
+            # committing the session to a playbook picked from nothing.
+            return
+        self._profile_resolved = True
+        self.profile = _mp.resolve_profile(
+            self.mid_objective,
+            spread_bp=spread_bp,
+            fee_round_trip_bp=float(self.fee_round_trip_bp) or None,
+        )
+        if self.profile == _mp.SPREAD:
+            floor_bp = _mp.half_spread_floor_bp(
+                fee_round_trip_bp=float(self.fee_round_trip_bp) or None,
+                min_edge_bp=float(self.min_edge_bp),
+            )
+            floor = _dec(str(floor_bp)) / Decimal(10000)
+            if floor > self.spread_floor_half_pct:
+                self.spread_floor_half_pct = floor
+                # Re-apply to the MANUAL spreads too: __init__ floored them at
+                # the old value, and a user spread under the fee is exactly what
+                # this profile exists to refuse.
+                self.spread_bid_pct = max(self.spread_bid_pct, floor)
+                self.spread_ask_pct = max(self.spread_ask_pct, floor)
+        logger.info(
+            "MM %s profile=%s (spread=%s bp, objective=%s, half-spread floor=%s bp)",
+            self.trading_pair, self.profile,
+            None if spread_bp is None else round(spread_bp, 2),
+            self.mid_objective, float(self.spread_floor_half_pct) * 10_000.0,
+        )
+
+    def _inventory_ratio(self, mid: Decimal) -> Decimal:
+        """Signed inventory as a fraction of the ceiling. +1 = fully long."""
+        cap = self.max_base_quote if (self.max_base_quote or 0) > 0 else self.order_amount_quote
+        if not cap or cap <= 0:
+            return Decimal(0)
+        return self._base_value(mid) / cap
+
+    def _reservation_price(self, mid: Decimal) -> Decimal:
+        """Quoting anchor after the inventory shift. ``mid`` unchanged when the
+        skew is off, so the disabled path is bit-for-bit the shipped one."""
+        self.reservation_offset_bp = Decimal(0)
+        if not self.inventory_skew_enabled or mid <= 0:
+            return mid
+        half_bp = float((self.spread_bid_pct + self.spread_ask_pct) / Decimal(2)) * 10_000.0
+        offset = _mp.reservation_offset_bp(
+            float(self._inventory_ratio(mid)),
+            sigma_bp=self.gate_atr_pct * 10_000.0,
+            half_spread_bp=half_bp,
+            gamma=float(self.inventory_skew_gamma),
+        )
+        if not offset:
+            return mid
+        self.reservation_offset_bp = _dec(str(offset))
+        return mid * (Decimal(1) + self.reservation_offset_bp / Decimal(10000))
+
     def _unrealized(self, mid: Decimal) -> Decimal:
         if self.inventory is None:
             return Decimal(0)
@@ -310,6 +420,9 @@ class MarketMakingController(Controller):
         self._touch_bid = self._touch_ask = None
         touch = await self._touch_targets() if self.quote_mode == "touch" else None
         mid = touch[2] if touch is not None else await self.adapter.mid_price(self.trading_pair)
+        # Phase 5: pick the playbook for this market. Once per session, and it
+        # can raise the half-spread floor before any spread is computed below.
+        await self._resolve_profile_once()
         base_value = self._base_value(mid)
         at_max = self.max_base_quote is not None and base_value >= self.max_base_quote
         at_min = self.min_base_quote is not None and base_value <= self.min_base_quote
@@ -344,8 +457,15 @@ class MarketMakingController(Controller):
 
         eff_bid_pct, eff_ask_pct = self.effective_spreads()
 
-        target_bid = mid * (Decimal(1) - eff_bid_pct)
-        target_ask = mid * (Decimal(1) + eff_ask_pct)
+        # Phase 5: quote around the RESERVATION price, not the raw mid. Long
+        # inventory shifts the anchor down so the ask works the position off;
+        # short mirrors it. Bounded to a fraction of the half-spread, so the
+        # two sides can never cross and neither can breach the fee floor.
+        # Kept out of ``directional_bias`` on purpose — that field is the
+        # user's, and two writers to one field is how dead-bands stop working.
+        theta = self._reservation_price(mid)
+        target_bid = theta * (Decimal(1) - eff_bid_pct)
+        target_ask = theta * (Decimal(1) + eff_ask_pct)
         # Touch mode (Turbo Volume): glue quotes to the live touch instead of
         # mid ± spread (targets computed once at the top of the tick).
         # Bias/auto-spread math above still ran — it provides the fallback
@@ -738,4 +858,9 @@ class MarketMakingController(Controller):
             "ladder_live_bids": live[True],
             "ladder_live_asks": live[False],
             "min_quote_lifetime_s": self.min_quote_lifetime_s,
+            # Phase 5 actuation state, for /mm_status. Empty profile == the
+            # selector is off (every strategy other than mid).
+            "profile": self.profile,
+            "half_spread_floor_bp": float(self.spread_floor_half_pct) * 10_000.0,
+            "reservation_offset_bp": float(self.reservation_offset_bp),
         }
