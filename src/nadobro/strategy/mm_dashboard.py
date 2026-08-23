@@ -590,6 +590,7 @@ def build_status_snapshot(
         "signal_degraded": bool(engine_metrics.get("signal_degraded")),
         "markout_widen": _safe_float(engine_metrics.get("markout_widen"), 1.0),
         "self_trade_blocks": int(_safe_float(engine_metrics.get("self_trade_blocks"), 0)),
+        "atomic_replaces": int(_safe_float(engine_metrics.get("atomic_replaces"), 0)),
         "ladder_live_bids": int(_safe_float(engine_metrics.get("ladder_live_bids"), 0)),
         "ladder_live_asks": int(_safe_float(engine_metrics.get("ladder_live_asks"), 0)),
         "has_engine_metrics": bool(engine_metrics),
@@ -748,6 +749,8 @@ def _render_mid_v3_lines(snapshot: dict) -> list[str]:
         shifts.append(f"mark-out widen {snapshot['markout_widen']:.2f}x")
     if snapshot.get("self_trade_blocks"):
         shifts.append(f"self-trade blocked {snapshot['self_trade_blocks']}")
+    if snapshot.get("atomic_replaces"):
+        shifts.append(f"atomic requotes {snapshot['atomic_replaces']}")
     if shifts:
         lines.append("Adjustments: " + " | ".join(shifts))
     return lines

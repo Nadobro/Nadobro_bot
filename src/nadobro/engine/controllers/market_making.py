@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Tuple
 from src.nadobro.engine.controllers.controller_base import Controller
 from src.nadobro.engine.executors.order_executor import OrderExecutor, OrderExecutorConfig
 from src.nadobro.engine.risk import ExecutorRequest
-from src.nadobro.engine.types import ExecutionStrategy, TradeType, _dec
+from src.nadobro.engine.types import ExecutionStrategy, OrderType, TradeType, _dec
 from src.nadobro.quant import alpha as _alpha
 from src.nadobro.quant import microstructure as _ms
 from src.nadobro.quant import mm_profile as _mp
@@ -197,6 +197,22 @@ class MarketMakingController(Controller):
         self.self_trade_prevention = bool(
             _dec(self.cfg("self_trade_prevention", "0") or "0")
         )
+        # Phase 8: fuse a requote's cancel+replace into ONE atomic venue request
+        # (no unquoted gap, one execute round trip). Off unless the mid mapping
+        # enables it — the base class is shared with Grid/R-Grid — and it always
+        # falls back to the classic stop-then-spawn on any failure.
+        self.cancel_and_place_enabled = bool(
+            _dec(self.cfg("cancel_and_place_enabled", "0") or "0")
+        )
+        # Leverage hint for the replace path's placement. Cross-margin perps
+        # ignore it (leverage is account-level on Nado), but isolated RWA perps
+        # size margin from it, so carry the configured value rather than a bare
+        # default. Read once; the value is fixed for the session.
+        try:
+            self.leverage_hint = int(_dec(self.cfg("leverage", "1") or "1"))
+        except Exception:  # noqa: BLE001 - a malformed leverage falls back to 1
+            self.leverage_hint = 1
+        self._replace_count = 0
         self.alpha: float = 0.0
         self.alpha_confidence: float = 0.0
         self.alpha_detail: Dict[str, object] = {}
@@ -952,6 +968,26 @@ class MarketMakingController(Controller):
             if ex is not None and not ex.is_terminated:
                 if self._should_hold(is_bid, target, slot):
                     return  # leave the resting quote — see _should_hold
+                # Phase 8: FUSE the cancel+replace into ONE atomic request. We
+                # were going to cancel this live quote and place a fresh one
+                # anyway, so cancel_and_place does both in one signed request —
+                # no gap where the side is unquoted, one execute round trip
+                # instead of two. Gated (mid only), needs a known resting
+                # digest and a real target, and NEVER fires when _should_hold
+                # said hold (a replace resets queue position, so it must only
+                # happen when we were re-queuing regardless). A fused replace
+                # that fails is atomic — the old order is untouched — so we fall
+                # through to the classic stop-then-spawn with no double order.
+                if (self.cancel_and_place_enabled
+                        and target > 0 and order_quote > 0
+                        and not self._would_self_trade(is_bid, target)):
+                    old_order = getattr(ex, "order", None)
+                    old_digest = getattr(old_order, "id", None) if old_order else None
+                    if old_digest and await self._replace_quote(
+                        side, target, order_quote, cur_id, str(old_digest),
+                        level=level,
+                    ):
+                        return
                 await self.orchestrator.stop(cur_id)
                 self._set_quote(is_bid, None, None, level=level)
 
@@ -974,6 +1010,72 @@ class MarketMakingController(Controller):
         )
         if ok:
             self._set_quote(is_bid, ex.id, target, level=level, size_quote=order_quote)
+
+    # -- Phase 8: atomic replace (cancel_and_place) ----------------------------
+    async def _replace_quote(
+        self, side: TradeType, target: Decimal, order_quote: Decimal,
+        old_ex_id: str, old_digest: str, *, level: int,
+    ) -> bool:
+        """Replace a resting quote with ONE atomic cancel_and_place.
+
+        Returns True when the fused path took ownership of the requote (whether
+        it fully succeeded or safely handled its own cleanup), so the caller
+        must NOT also run the classic stop-then-spawn. Returns False only when
+        the venue left the OLD order untouched (atomic failure) — then the
+        caller falls back, and the old order is cancelled and re-placed the
+        classic way with no double-order risk.
+        """
+        is_bid = side is TradeType.BUY
+        amount_base = order_quote / target
+        try:
+            new_order = await self.adapter.cancel_and_place(
+                old_digest, self.trading_pair, side, OrderType.LIMIT_MAKER,
+                amount_base, target, self.leverage_hint,
+            )
+        except Exception:  # noqa: BLE001 - atomic failure: OLD order untouched
+            logger.debug(
+                "cancel_and_place failed %s; falling back to stop+spawn",
+                self.trading_pair, exc_info=True,
+            )
+            return False
+        if new_order is None:
+            return False
+
+        # Venue state now: OLD cancelled, NEW resting. Settle the old executor
+        # (capturing any fill that raced the cancel) with NO second venue
+        # cancel, drop the old order's local bookkeeping, then ADOPT the new
+        # order into a fresh executor with NO second placement.
+        await self.orchestrator.settle_replaced(old_ex_id)
+        try:
+            self.adapter.forget_cancelled(old_digest)
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            logger.debug("forget_cancelled failed for %s", old_digest, exc_info=True)
+        new_ex = OrderExecutor(
+            OrderExecutorConfig(
+                self.trading_pair, side, amount_base,
+                ExecutionStrategy.LIMIT_MAKER, price=target,
+            ),
+            user_id=self.user_id, controller_id=self.id, adapter=self.adapter,
+            inventory=self.inventory,
+        )
+        adopted = await self.orchestrator.adopt(new_ex, new_order)
+        if not adopted:
+            # Kill switch flipped between the place and the adopt (rare). The new
+            # order is live but unowned — cancel it so we never leak a resting
+            # order. The old one is already gone, so we must NOT fall through to
+            # place yet another; report handled.
+            try:
+                await self.adapter.cancel_order(new_order.id)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "orphaned replace order cancel failed for %s",
+                    new_order.id, exc_info=True,
+                )
+            self._set_quote(is_bid, None, None, level=level)
+            return True
+        self._set_quote(is_bid, new_ex.id, target, level=level, size_quote=order_quote)
+        self._replace_count += 1
+        return True
 
     # -- Phase 6: self-trade prevention ----------------------------------------
     def _would_self_trade(self, is_bid: bool, target: Decimal) -> bool:
@@ -1142,4 +1244,5 @@ class MarketMakingController(Controller):
             "signal_degraded": self.signal_degraded,
             "markout_widen": float(self.markout_widen),
             "self_trade_blocks": self._stp_blocks,
+            "atomic_replaces": self._replace_count,
         }

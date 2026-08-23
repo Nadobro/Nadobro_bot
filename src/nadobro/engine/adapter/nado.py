@@ -553,6 +553,133 @@ class NadoAdapter(NadoAdapterBase):
                 )
         return order
 
+    async def cancel_and_place(
+        self,
+        cancel_order_id: str,
+        trading_pair: str,
+        side: TradeType,
+        order_type: OrderType,
+        amount_base: Decimal,
+        price: Decimal,
+        leverage: int = 1,
+        reduce_only: bool = False,
+    ) -> NadoOrder:
+        """Atomically cancel ``cancel_order_id`` and place a fresh resting order.
+
+        Mirrors :meth:`place_order`'s tagging, isolated-margin and registry
+        bookkeeping for the NEW order, but leaves the OLD order's local
+        bookkeeping ALONE: the caller settles the replaced executor first (to
+        capture any fill that raced the cancel while its ref still resolves),
+        then calls :meth:`forget_cancelled`. On ANY failure this raises
+        ``AdapterError`` with the OLD order untouched on the venue, so the
+        caller can fall back to cancel-then-place with no double-order risk.
+        """
+        if not cancel_order_id:
+            raise AdapterError("cancel_and_place requires the resting order id")
+        if price is None:
+            raise AdapterError("cancel_and_place requires a price (resting order)")
+        meta = self._meta(trading_pair)
+        is_buy = side is TradeType.BUY
+        amount = float(amount_base)
+
+        # A replace is never a reducing close in the MM path, but keep the same
+        # perp/spot reduce_only handling as place_order for correctness.
+        never_grow = bool(reduce_only)
+        if reduce_only and not bool(meta.is_perp):
+            reduce_only = False
+
+        isolated_only = bool(meta.isolated_only)
+        isolated_margin: Optional[float] = None
+        if isolated_only:
+            isolated_margin = compute_isolated_margin(amount, float(price), int(leverage) or 1)
+            if isolated_margin is None:
+                raise AdapterError(
+                    f"could not size isolated margin for {trading_pair} "
+                    f"(amount={amount}, price={price}, leverage={leverage})"
+                )
+
+        tag = order_tags.allocate_tag()
+        order_tags.register(
+            tag,
+            trading_pair=trading_pair,
+            product_id=meta.product_id,
+            side=side.name,
+            order_type=order_type.name,
+            amount_base=str(amount_base),
+            price=str(price),
+            replaces=str(cancel_order_id),
+        )
+        logger.info(
+            "engine cancel_and_place pair=%s pid=%s cancel=%s side=%s type=%s "
+            "amount_base=%s price=%s isolated_only=%s",
+            trading_pair, meta.product_id, cancel_order_id, side.name,
+            order_type.name, amount_base, price, isolated_only,
+        )
+        try:
+            resp = await _exec(
+                self._client.cancel_and_place,
+                product_id=meta.product_id,
+                cancel_digests=[cancel_order_id],
+                size=amount,
+                price=float(price),
+                is_buy=is_buy,
+                post_only=order_type is OrderType.LIMIT_MAKER,
+                isolated_only=isolated_only,
+                isolated_margin=isolated_margin,
+                reduce_only=reduce_only,
+                never_grow=never_grow,
+                client_id=tag,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize; OLD order untouched
+            order_tags.forget(tag=tag)
+            raise AdapterError(f"cancel_and_place failed: {exc}") from exc
+
+        ok, err = _client_call_succeeded(resp)
+        if not ok:
+            # Atomic failure: nothing placed, OLD order still resting. Forget the
+            # NEW tag; the caller falls back to cancel-then-place.
+            order_tags.forget(tag=tag)
+            raise AdapterError(f"cancel_and_place rejected by venue: {err}")
+
+        try:
+            order = self._order_from_response(
+                resp, trading_pair, side, order_type, amount_base, price
+            )
+        except Exception as exc:  # noqa: BLE001 - a malformed OK response must not leak the tag
+            order_tags.forget(tag=tag)
+            raise AdapterError(f"cancel_and_place response parse failed: {exc}") from exc
+        order_tags.bind_digest(tag, order.id)
+        order_lifecycle.seed(order.id, state=order.state, tag=tag)
+        if self._on_place is not None:
+            try:
+                await _db(self._on_place, order.id)
+            except Exception:  # noqa: BLE001 - placement link is best-effort
+                logger.debug("on_place link failed for %s", order.id, exc_info=True)
+        ref = _OrderRef(trading_pair, meta.product_id, side, order_type, amount_base, price)
+        self._orders[order.id] = ref
+        # The old resting order is gone and a new one arrived: the product's
+        # open-orders list changed, so drop the coalesced snapshot.
+        self._open_orders_snap.pop(int(meta.product_id), None)
+        try:
+            self._registry.record(order.id, ref)
+        except Exception:  # noqa: BLE001 - persistence must not break placement
+            logger.warning("order registry record failed for %s", order.id, exc_info=True)
+        return order
+
+    def forget_cancelled(self, order_id: str) -> None:
+        """Local cleanup for an order the venue cancelled inside a
+        cancel_and_place. No venue call — the cancel already happened."""
+        if not order_id:
+            return
+        ref = self._orders.pop(order_id, None) or self._registry.lookup(order_id)
+        order_tags.forget(digest=order_id)
+        try:
+            self._registry.forget(order_id)
+        except Exception:  # noqa: BLE001 - best-effort
+            logger.debug("registry forget failed for %s", order_id, exc_info=True)
+        if ref is not None:
+            self._open_orders_snap.pop(int(ref.product_id), None)
+
     def _order_from_response(
         self, resp: object, trading_pair: str, side: TradeType, order_type: OrderType,
         amount_base: Decimal, price: Optional[Decimal],

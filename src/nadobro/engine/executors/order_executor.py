@@ -289,6 +289,53 @@ class OrderExecutor(Executor):
                 return
             self.refreshes += 1
 
+    def adopt_order(self, order: NadoOrder) -> None:
+        """Wire an order that was ALREADY placed atomically (cancel_and_place)
+        into this executor WITHOUT issuing a second placement.
+
+        Mirrors the post-conditions of :meth:`_place` — activate, record the
+        order, reset the terminal flag, ingest any instantly-filled base — so
+        ``on_tick`` and fill accounting behave exactly as for a normally-placed
+        order. This is the half of a fused replace that avoids a double order:
+        the venue placement already happened, so we only adopt its result.
+        """
+        self._activate()
+        self.order = order
+        self.orders_placed += 1
+        self._terminal_counted = False
+        self._ingest(order)
+
+    async def settle_after_external_cancel(self) -> None:
+        """Terminate this executor whose resting order was cancelled EXTERNALLY,
+        as part of an atomic cancel_and_place. Issues NO venue cancel — the
+        cancel already happened — but refreshes once to capture a fill that
+        raced the cancel, exactly as :meth:`on_stop` would, so inventory is not
+        short a last-instant fill.
+        """
+        if self.is_terminated:
+            return
+        order = self.order
+        if order is not None:
+            try:
+                refreshed = await self._guard(
+                    lambda: self.adapter.order_status(order.id),
+                    label="settle_replaced_status",
+                )
+                self.order = refreshed
+                self._ingest(refreshed)
+            except Exception:  # noqa: BLE001 - the venue sync bridge also captures fills
+                logger.debug(
+                    "settle_after_external_cancel status refresh failed for %s",
+                    order.id, exc_info=True,
+                )
+        self._count_terminal_order()
+        # We KNOW the venue cancelled it; if the refresh could not confirm a
+        # terminal state, still count the cancel so /status stays honest.
+        if not self._terminal_counted:
+            self.orders_cancelled += 1
+            self._terminal_counted = True
+        self._terminate(CloseType.EARLY_STOP)
+
     async def on_stop(self, close_type: CloseType = CloseType.EARLY_STOP) -> None:
         order = self.order
         if order is None or order.state in (

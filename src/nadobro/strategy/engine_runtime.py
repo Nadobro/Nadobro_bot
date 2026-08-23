@@ -1122,6 +1122,17 @@ def map_strategy_config(
             "level_tolerance_bp": Decimal(str(_f(settings, "level_tolerance_bp", 25.0))),
             "level_boost": Decimal(str(_f(settings, "level_boost", 1.5))),
             "levels_provider": None,      # injected in run_engine_cycle
+            # --- Mid Mode v3 Phase 8: atomic cancel_and_place requote --------
+            # Fuse a requote's cancel+replace into ONE signed venue request: no
+            # gap where the side is unquoted, one execute round trip instead of
+            # two. Mid only (the controller base is shared with Grid/R-Grid),
+            # and it always falls back to the classic stop-then-spawn on any
+            # failure — a fused replace is atomic, so it can never leave a
+            # half-done state and can only ever be as good as the two separate
+            # calls it replaces.
+            "cancel_and_place_enabled": (
+                Decimal(1) if _f(settings, "cancel_and_place_enabled", 1.0) > 0 else Decimal(0)
+            ),
             "price_distance_tolerance": (spread_frac / Decimal(2)) or Decimal("0.0005"),
             "leverage": int(eff_lev),
             # Regime gate + inventory cap + ATR auto-spread (2026-06 upgrade).

@@ -2766,6 +2766,203 @@ class NadoClient:
                 return send_rest(params)
         return send_rest(params)
 
+    def _prepare_place_order_params(
+        self,
+        *,
+        product_id: int,
+        size: float,
+        price: float,
+        order_type: str,
+        is_buy: bool,
+        isolated_only: bool,
+        isolated_margin: Optional[float],
+        reduce_only: bool,
+        sender: Optional[str],
+        client_id: Optional[int],
+        never_grow: bool,
+    ):
+        """Assemble a signed-ready ``PlaceOrderParams`` with all venue alignment.
+
+        Returns ``(params, tag, size, price, error)``. ``error`` is ``None`` on
+        success; when set it is the exact result dict the caller must return
+        (increment-below-minimum, min-notional block, builder misconfig).
+
+        This is the SINGLE home of the fragile increment / min-notional-bump /
+        appendix / 20-bit-tag-nonce logic, shared by ``place_order`` and
+        ``cancel_and_place``. Two copies of it on a money path drift, and the
+        drift is a silent mis-size or a mis-tagged order — so it lives here once.
+        """
+        sender_hex = (sender or "").strip() or self.subaccount_hex
+        try:
+            builder_id, builder_fee_rate = get_nado_builder_routing_config(self.network)
+        except ValueError as cfg_err:
+            logger.error("Builder routing misconfiguration; rejecting order: %s", cfg_err)
+            return None, None, size, price, {
+                "success": False, "error": f"Builder routing misconfigured: {cfg_err}"}
+
+        self._warm_product_increment_cache(product_id)
+        size_increment = _size_increment_cache.get((self.network, product_id))
+        size_increment_x18 = _size_increment_x18_cache.get((self.network, product_id))
+        min_size_x18 = _min_size_x18_cache.get((self.network, product_id))
+        if size_increment and size_increment > 0:
+            aligned_size = self._align_size_to_increment(size, size_increment)
+            if aligned_size <= 0:
+                return None, None, size, price, {
+                    "success": False,
+                    "error": (
+                        f"Order size {size} is below minimum increment for product {product_id} "
+                        f"(size increment {size_increment})."
+                    ),
+                }
+            size = aligned_size
+
+        price_increment = _price_increment_cache.get((self.network, product_id))
+        price_increment_x18 = _price_increment_x18_cache.get((self.network, product_id))
+        if price_increment and price_increment > 0:
+            price = self._align_price_to_increment(price, price_increment, is_buy, order_type)
+
+        from nado_protocol.engine_client.types.execute import PlaceOrderParams, OrderParams
+        from nado_protocol.utils.expiration import get_expiration_timestamp
+        from nado_protocol.utils.nonce import gen_order_nonce
+
+        appendix_order_type_int = {
+            "default": 0,
+            "ioc": 1,
+            "fok": 2,
+            "post_only": 3,
+        }.get(order_type, 0)
+
+        amount = size if is_buy else -size
+        expiration_secs = 10 if order_type == "ioc" else _limit_order_expiration_seconds()
+
+        amount_x18 = self._to_x18_int(amount)
+        if size_increment_x18 and size_increment_x18 > 0:
+            amount_x18 = self._align_x18_to_increment(amount_x18, int(size_increment_x18))
+            if amount_x18 == 0:
+                return None, None, size, price, {
+                    "success": False,
+                    "error": (
+                        f"Order size {size} is below minimum increment for product {product_id} "
+                        f"(size increment {size_increment})."
+                    ),
+                }
+
+        price_x18 = self._to_x18_int(price)
+        if price_increment_x18 and price_increment_x18 > 0:
+            price_x18 = self._align_x18_to_increment(price_x18, int(price_increment_x18))
+
+        # Proactively enforce exchange minimum notional before submission.
+        # AUDIT 2026-07-29: this block must honour never_grow too. Gating only
+        # the POST-rejection retry (below) left THIS one growing a reducing
+        # order above the held balance BEFORE the order was ever signed — so
+        # the adapter's balance clamp was discarded one call later and the
+        # stranded-spot-leg incident was fully reproducible. A close must
+        # shrink or fail, never grow, on EVERY path.
+        pre_bump_size = float(size)
+        size_bumped = False
+        # Only a RESTING order is subject to the venue's minimum. place_market_order
+        # calls in with order_type="ioc" AND a real (slippage-bounded) price, so
+        # gating on never_grow alone refused the marketable exit that the adapter
+        # converts to precisely because market orders are exempt — the spot leg
+        # could then never be sold and DN parked in CLOSING forever. Audit round 3.
+        _marketable = str(order_type or "").lower() in ("ioc", "fok", "market")
+        if (never_grow and not _marketable
+                and min_size_x18 and min_size_x18 > 0 and price_x18 > 0
+                and amount_x18 != 0):
+            _notional_x36 = abs(int(amount_x18)) * int(price_x18)
+            if _notional_x36 < int(min_size_x18) * (10 ** 18):
+                logger.warning(
+                    "place_order: reducing order on product_id=%s is below the "
+                    "venue min notional and must NOT be grown (size=%s) — "
+                    "caller needs a marketable/aggregated exit",
+                    product_id, size,
+                )
+                return None, None, size, price, {
+                    "success": False,
+                    "error": "Order is below the venue minimum notional and "
+                             "cannot be increased because it reduces exposure.",
+                    "min_notional_block": True}
+        if (not never_grow) and min_size_x18 and min_size_x18 > 0 and price_x18 > 0 and amount_x18 != 0:
+            min_notional_x36 = int(min_size_x18) * (10 ** 18)
+            current_notional_x36 = abs(int(amount_x18)) * int(price_x18)
+            if current_notional_x36 < min_notional_x36:
+                required_abs_amount_x18 = (min_notional_x36 + int(price_x18) - 1) // int(price_x18)
+                bumped_amount_x18 = required_abs_amount_x18 if amount_x18 > 0 else -required_abs_amount_x18
+                if size_increment_x18 and size_increment_x18 > 0:
+                    bumped_amount_x18 = self._align_x18_up_to_increment(
+                        bumped_amount_x18,
+                        int(size_increment_x18),
+                    )
+                if abs(int(bumped_amount_x18)) > abs(int(amount_x18)):
+                    logger.info(
+                        "Bumping order amount for min notional product_id=%s amount_x18=%s->%s min_size_x18=%s",
+                        product_id,
+                        amount_x18,
+                        bumped_amount_x18,
+                        min_size_x18,
+                    )
+                    amount_x18 = int(bumped_amount_x18)
+                    size = abs(float(amount_x18) / 1e18)
+                    size_bumped = True
+
+        isolated_margin_x6 = 0
+        if isolated_only:
+            if isolated_margin is None:
+                isolated_margin = abs(float(size) * float(price))
+            elif size_bumped and pre_bump_size > 0:
+                # Caller computed isolated_margin against the pre-bump size.
+                # Scale it up by the same ratio so margin_x6 still covers the
+                # bumped notional — otherwise the venue rejects with
+                # error_code 2006 ("account health below threshold").
+                isolated_margin = float(isolated_margin) * (float(size) / pre_bump_size)
+            isolated_margin_x6 = max(0, self._to_x6_int(float(isolated_margin)))
+
+        # Unique-ID tagging (WS v2 / MM correlation): when a ``client_id`` is
+        # supplied, embed its low 20 bits in the order nonce — the docs are
+        # explicit that ``client_id`` is NOT part of the order digest, so the
+        # authoritative way to distinguish otherwise-identical orders (same
+        # grid level placed repeatedly) is the last 20 bits of the nonce.
+        # We ALSO pass it as ``PlaceOrderParams.id`` so it echoes back in the
+        # ``order_update`` / ``fill`` subscription events for fast lookup.
+        #   docs: .../api/gateway/executes/place-order (client id)
+        # The 20 is LOAD-BEARING, not a round number: the SDK builds the nonce
+        # as ``(recv_time_ms << 20) + random_int`` (nado_protocol/utils/nonce.py),
+        # so 0xFFFFF is exactly the space it leaves. Widening this mask would
+        # carry the tag into the timestamp bits and shift the order's expiry;
+        # narrowing it silently collides tags. Pinned by
+        # tests/test_nado_client_nonce_tag.py — keep them in step.
+        #
+        # Nonce unpredictability is deliberately NOT a security property here:
+        # authorization is the EIP-712 signature and replay is prevented by the
+        # venue rejecting a seen digest, so a fully deterministic tag is safe.
+        # Worst case is a self-inflicted duplicate digest on your own account
+        # (same sender/price/amount/expiration/nonce), which the venue no-ops.
+        tag: Optional[int] = None
+        if client_id is not None:
+            tag = int(client_id) & 0xFFFFF  # 20-bit space — see above
+            order_nonce = gen_order_nonce(random_int=tag)
+        else:
+            order_nonce = gen_order_nonce()
+
+        order = OrderParams(
+            sender=sender_hex,
+            priceX18=price_x18,
+            amount=amount_x18,
+            expiration=get_expiration_timestamp(expiration_secs),
+            nonce=order_nonce,
+            appendix=self._build_order_appendix(
+                appendix_order_type_int,
+                isolated=bool(isolated_only),
+                reduce_only=bool(reduce_only),
+                margin_x6=isolated_margin_x6,
+                builder_id=builder_id,
+                builder_fee_rate=builder_fee_rate,
+            ),
+        )
+
+        params = PlaceOrderParams(product_id=product_id, order=order, id=tag)
+        return params, tag, size, price, None
+
     def place_order(
         self,
         product_id: int,
@@ -2804,172 +3001,14 @@ class NadoClient:
 
         try:
             sender_hex = (sender or "").strip() or self.subaccount_hex
-            try:
-                builder_id, builder_fee_rate = get_nado_builder_routing_config(self.network)
-            except ValueError as cfg_err:
-                logger.error("Builder routing misconfiguration; rejecting order: %s", cfg_err)
-                return {"success": False, "error": f"Builder routing misconfigured: {cfg_err}"}
-
-            self._warm_product_increment_cache(product_id)
-            size_increment = _size_increment_cache.get((self.network, product_id))
-            size_increment_x18 = _size_increment_x18_cache.get((self.network, product_id))
-            min_size_x18 = _min_size_x18_cache.get((self.network, product_id))
-            if size_increment and size_increment > 0:
-                aligned_size = self._align_size_to_increment(size, size_increment)
-                if aligned_size <= 0:
-                    return {
-                        "success": False,
-                        "error": (
-                            f"Order size {size} is below minimum increment for product {product_id} "
-                            f"(size increment {size_increment})."
-                        ),
-                    }
-                size = aligned_size
-
-            price_increment = _price_increment_cache.get((self.network, product_id))
-            price_increment_x18 = _price_increment_x18_cache.get((self.network, product_id))
-            if price_increment and price_increment > 0:
-                price = self._align_price_to_increment(price, price_increment, is_buy, order_type)
-
-            from nado_protocol.engine_client.types.execute import PlaceOrderParams, OrderParams
-            from nado_protocol.utils.expiration import get_expiration_timestamp
-            from nado_protocol.utils.nonce import gen_order_nonce
-
-            appendix_order_type_int = {
-                "default": 0,
-                "ioc": 1,
-                "fok": 2,
-                "post_only": 3,
-            }.get(order_type, 0)
-
-            amount = size if is_buy else -size
-            expiration_secs = 10 if order_type == "ioc" else _limit_order_expiration_seconds()
-
-            amount_x18 = self._to_x18_int(amount)
-            if size_increment_x18 and size_increment_x18 > 0:
-                amount_x18 = self._align_x18_to_increment(amount_x18, int(size_increment_x18))
-                if amount_x18 == 0:
-                    return {
-                        "success": False,
-                        "error": (
-                            f"Order size {size} is below minimum increment for product {product_id} "
-                            f"(size increment {size_increment})."
-                        ),
-                    }
-
-            price_x18 = self._to_x18_int(price)
-            if price_increment_x18 and price_increment_x18 > 0:
-                price_x18 = self._align_x18_to_increment(price_x18, int(price_increment_x18))
-
-            # Proactively enforce exchange minimum notional before submission.
-            # AUDIT 2026-07-29: this block must honour never_grow too. Gating only
-            # the POST-rejection retry (below) left THIS one growing a reducing
-            # order above the held balance BEFORE the order was ever signed — so
-            # the adapter's balance clamp was discarded one call later and the
-            # stranded-spot-leg incident was fully reproducible. A close must
-            # shrink or fail, never grow, on EVERY path.
-            pre_bump_size = float(size)
-            size_bumped = False
-            # Only a RESTING order is subject to the venue's minimum. place_market_order
-            # calls in with order_type="ioc" AND a real (slippage-bounded) price, so
-            # gating on never_grow alone refused the marketable exit that the adapter
-            # converts to precisely because market orders are exempt — the spot leg
-            # could then never be sold and DN parked in CLOSING forever. Audit round 3.
-            _marketable = str(order_type or "").lower() in ("ioc", "fok", "market")
-            if (never_grow and not _marketable
-                    and min_size_x18 and min_size_x18 > 0 and price_x18 > 0
-                    and amount_x18 != 0):
-                _notional_x36 = abs(int(amount_x18)) * int(price_x18)
-                if _notional_x36 < int(min_size_x18) * (10 ** 18):
-                    logger.warning(
-                        "place_order: reducing order on product_id=%s is below the "
-                        "venue min notional and must NOT be grown (size=%s) — "
-                        "caller needs a marketable/aggregated exit",
-                        product_id, size,
-                    )
-                    return {"success": False,
-                            "error": "Order is below the venue minimum notional and "
-                                     "cannot be increased because it reduces exposure.",
-                            "min_notional_block": True}
-            if (not never_grow) and min_size_x18 and min_size_x18 > 0 and price_x18 > 0 and amount_x18 != 0:
-                min_notional_x36 = int(min_size_x18) * (10 ** 18)
-                current_notional_x36 = abs(int(amount_x18)) * int(price_x18)
-                if current_notional_x36 < min_notional_x36:
-                    required_abs_amount_x18 = (min_notional_x36 + int(price_x18) - 1) // int(price_x18)
-                    bumped_amount_x18 = required_abs_amount_x18 if amount_x18 > 0 else -required_abs_amount_x18
-                    if size_increment_x18 and size_increment_x18 > 0:
-                        bumped_amount_x18 = self._align_x18_up_to_increment(
-                            bumped_amount_x18,
-                            int(size_increment_x18),
-                        )
-                    if abs(int(bumped_amount_x18)) > abs(int(amount_x18)):
-                        logger.info(
-                            "Bumping order amount for min notional product_id=%s amount_x18=%s->%s min_size_x18=%s",
-                            product_id,
-                            amount_x18,
-                            bumped_amount_x18,
-                            min_size_x18,
-                        )
-                        amount_x18 = int(bumped_amount_x18)
-                        size = abs(float(amount_x18) / 1e18)
-                        size_bumped = True
-
-            isolated_margin_x6 = 0
-            if isolated_only:
-                if isolated_margin is None:
-                    isolated_margin = abs(float(size) * float(price))
-                elif size_bumped and pre_bump_size > 0:
-                    # Caller computed isolated_margin against the pre-bump size.
-                    # Scale it up by the same ratio so margin_x6 still covers the
-                    # bumped notional — otherwise the venue rejects with
-                    # error_code 2006 ("account health below threshold").
-                    isolated_margin = float(isolated_margin) * (float(size) / pre_bump_size)
-                isolated_margin_x6 = max(0, self._to_x6_int(float(isolated_margin)))
-
-            # Unique-ID tagging (WS v2 / MM correlation): when a ``client_id`` is
-            # supplied, embed its low 20 bits in the order nonce — the docs are
-            # explicit that ``client_id`` is NOT part of the order digest, so the
-            # authoritative way to distinguish otherwise-identical orders (same
-            # grid level placed repeatedly) is the last 20 bits of the nonce.
-            # We ALSO pass it as ``PlaceOrderParams.id`` so it echoes back in the
-            # ``order_update`` / ``fill`` subscription events for fast lookup.
-            #   docs: .../api/gateway/executes/place-order (client id)
-            # The 20 is LOAD-BEARING, not a round number: the SDK builds the nonce
-            # as ``(recv_time_ms << 20) + random_int`` (nado_protocol/utils/nonce.py),
-            # so 0xFFFFF is exactly the space it leaves. Widening this mask would
-            # carry the tag into the timestamp bits and shift the order's expiry;
-            # narrowing it silently collides tags. Pinned by
-            # tests/test_nado_client_nonce_tag.py — keep them in step.
-            #
-            # Nonce unpredictability is deliberately NOT a security property here:
-            # authorization is the EIP-712 signature and replay is prevented by the
-            # venue rejecting a seen digest, so a fully deterministic tag is safe.
-            # Worst case is a self-inflicted duplicate digest on your own account
-            # (same sender/price/amount/expiration/nonce), which the venue no-ops.
-            tag: Optional[int] = None
-            if client_id is not None:
-                tag = int(client_id) & 0xFFFFF  # 20-bit space — see above
-                order_nonce = gen_order_nonce(random_int=tag)
-            else:
-                order_nonce = gen_order_nonce()
-
-            order = OrderParams(
-                sender=sender_hex,
-                priceX18=price_x18,
-                amount=amount_x18,
-                expiration=get_expiration_timestamp(expiration_secs),
-                nonce=order_nonce,
-                appendix=self._build_order_appendix(
-                    appendix_order_type_int,
-                    isolated=bool(isolated_only),
-                    reduce_only=bool(reduce_only),
-                    margin_x6=isolated_margin_x6,
-                    builder_id=builder_id,
-                    builder_fee_rate=builder_fee_rate,
-                ),
+            params, tag, size, price, _prep_err = self._prepare_place_order_params(
+                product_id=product_id, size=size, price=price, order_type=order_type,
+                is_buy=is_buy, isolated_only=isolated_only, isolated_margin=isolated_margin,
+                reduce_only=reduce_only, sender=sender, client_id=client_id,
+                never_grow=never_grow,
             )
-
-            params = PlaceOrderParams(product_id=product_id, order=order, id=tag)
+            if _prep_err is not None:
+                return _prep_err
             result = self._dispatch_execute(params, "place_order", product_id=product_id)
 
             if hasattr(result, 'data') and result.data:
@@ -3244,6 +3283,150 @@ class NadoClient:
 
             logger.error("place_order failed: %s", err_str)
             return {"success": False, "error": self._friendly_error(err_str)}
+
+    def cancel_and_place(
+        self,
+        *,
+        product_id: int,
+        cancel_digests: list[str],
+        size: float,
+        price: float,
+        is_buy: bool = True,
+        post_only: bool = True,
+        isolated_only: bool = False,
+        isolated_margin: Optional[float] = None,
+        reduce_only: bool = False,
+        sender: Optional[str] = None,
+        client_id: Optional[int] = None,
+        never_grow: bool = False,
+    ) -> dict:
+        """Atomically cancel resting order(s) and place a new one in ONE signed
+        request. Used to REPLACE a resting maker quote without a gap between the
+        cancel and the re-place, and for one execute round trip instead of two.
+
+        Transport: REST/v1 ONLY, never ``/ws/v2``. A cancel_and_place is not
+        id-correlatable on the v2 action socket (its response keys off a single
+        op id, and this carries two), so ``_dispatch_execute`` — which only
+        knows "place_order"/"cancel_orders" — must not be used. The SDK's
+        ``market.cancel_and_place`` signs the cancel and the place separately
+        and submits them as one atomic engine request.
+
+        Failure is TOTAL, never partial: the venue processes the request
+        atomically, so a rejection places nothing and cancels nothing (the SDK
+        raises or returns a failure status). That is what lets the caller fall
+        back to the classic stop-then-spawn safely — this can never leave a
+        half-done state, so it can only ever be as good as, never worse than,
+        cancelling and placing separately.
+
+        Returns a dict shaped like :meth:`place_order` (``success`` / ``digest``
+        / ``client_id`` …) plus ``cancelled`` (the digests requested).
+        """
+        clean_digests = [str(d).strip() for d in (cancel_digests or []) if str(d).strip()]
+        if not clean_digests:
+            # Nothing to cancel — this is a plain placement; do NOT invent an
+            # empty-digest cancel_and_place (the venue would reject it).
+            return {"success": False, "error": "cancel_and_place requires at least one digest"}
+        if not self._initialized or not self.client:
+            return {"success": False, "error": "Client not initialized. Please try /start again."}
+
+        # One execute-budget charge for BOTH legs: cancel weight == #digests,
+        # place weight == 1. Charging them together is the honest cost, and it
+        # is cheaper than the separate cancel + place it replaces.
+        place_sender = (sender or "").strip() or self.subaccount_hex
+        weight = len(clean_digests) + 1
+        if not self._gateway_allowed(
+            weight=weight, kind="execute", wallet=place_sender, user_scoped=False
+        ):
+            logger.warning(
+                "cancel_and_place throttled by wallet execute budget sender=%s weight=%s",
+                _mask_address(place_sender), weight,
+            )
+            return {"success": False, "error": "Rate limited — please retry in a moment.",
+                    "rate_limited": True}
+
+        try:
+            sender_hex = place_sender
+            order_type = "post_only" if post_only else "default"
+            place_params, tag, size, price, _prep_err = self._prepare_place_order_params(
+                product_id=product_id, size=size, price=price, order_type=order_type,
+                is_buy=is_buy, isolated_only=isolated_only, isolated_margin=isolated_margin,
+                reduce_only=reduce_only, sender=sender, client_id=client_id,
+                never_grow=never_grow,
+            )
+            if _prep_err is not None:
+                return _prep_err
+
+            from nado_protocol.engine_client.types.execute import (
+                CancelAndPlaceParams,
+                CancelOrdersParams,
+            )
+
+            cancel_params = CancelOrdersParams(
+                sender=sender_hex,
+                productIds=[int(product_id)],
+                digests=clean_digests,
+            )
+            # REST directly — see the transport note above. Not _dispatch_execute.
+            result = self.client.market.cancel_and_place(
+                CancelAndPlaceParams(cancel_orders=cancel_params, place_order=place_params)
+            )
+
+            if hasattr(result, "data") and result.data:
+                if hasattr(result.data, "digest") and result.data.digest:
+                    try:
+                        from src.nadobro.venue.gateway_budget import clear_write_ban
+                        clear_write_ban(self._rest_url())
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "clear_write_ban failed after confirmed cancel_and_place: %s", e,
+                        )
+                    return {
+                        "success": True,
+                        "digest": result.data.digest,
+                        "product_id": product_id,
+                        "size": size,
+                        "price": price,
+                        "side": "LONG" if is_buy else "SHORT",
+                        "client_id": tag,
+                        "cancelled": clean_digests,
+                    }
+
+            # ip_query_only downgrade returned (not raised) — arm the write
+            # circuit and surface a transient error so the caller falls back.
+            if self._result_is_ip_query_only(result):
+                try:
+                    from src.nadobro.venue.gateway_budget import record_ip_query_only
+                    record_ip_query_only(self._rest_url())
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("record_ip_query_only failed after cancel_and_place: %s", e)
+                logger.warning(
+                    "cancel_and_place rejected ip_query_only product_id=%s host=%s raw=%s",
+                    product_id, self._rest_url(), _mask_payload(str(result)),
+                )
+                return {"success": False, "rate_limited": True, "ip_query_only": True,
+                        "error": self._friendly_error(str(result)), "cancelled": clean_digests}
+
+            return {"success": False, "cancelled": clean_digests,
+                    "error": self._friendly_error(str(result))}
+        except Exception as e:  # noqa: BLE001 - normalize venue errors for the caller
+            err_str = str(e)
+            compact_err = err_str.lower().replace("_", "").replace("-", "")
+            if "ipqueryonly" in compact_err:
+                try:
+                    from src.nadobro.venue.gateway_budget import record_ip_query_only
+                    record_ip_query_only(self._rest_url())
+                except Exception as e2:  # noqa: BLE001
+                    logger.warning("record_ip_query_only failed after cancel_and_place raise: %s", e2)
+                logger.warning(
+                    "cancel_and_place raised ip_query_only product_id=%s host=%s raw=%s",
+                    product_id, self._rest_url(), _mask_payload(err_str),
+                )
+                return {"success": False, "rate_limited": True, "ip_query_only": True,
+                        "error": "Venue temporarily blocked (ip_query_only). Retrying shortly.",
+                        "cancelled": clean_digests}
+            logger.error("cancel_and_place failed: %s", err_str)
+            return {"success": False, "error": self._friendly_error(err_str),
+                    "cancelled": clean_digests}
 
     def place_market_order(
         self,
