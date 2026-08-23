@@ -24,6 +24,7 @@ from src.nadobro.engine.controllers.controller_base import Controller
 from src.nadobro.engine.executors.order_executor import OrderExecutor, OrderExecutorConfig
 from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.types import ExecutionStrategy, TradeType, _dec
+from src.nadobro.quant import alpha as _alpha
 from src.nadobro.quant import microstructure as _ms
 from src.nadobro.quant import mm_profile as _mp
 from src.nadobro.quant.ladder import FLAT, LadderLevel, describe as _describe_ladder, plan_ladder
@@ -171,6 +172,32 @@ class MarketMakingController(Controller):
         self.profile: str = ""
         self._profile_resolved = False
         self.reservation_offset_bp: Decimal = Decimal(0)
+        # --- Mid Mode v3 Phase 6: alpha, mark-out defence, STP, failover -----
+        # Same gating rule as Phase 5: off unless the ``mid`` mapping says so.
+        self.alpha_enabled = bool(_dec(self.cfg("alpha_enabled", "0") or "0"))
+        self.alpha_max = _dec(self.cfg("alpha_max", "0.35") or "0.35")
+        self.alpha_strength = _dec(self.cfg("alpha_strength", "0.5") or "0.5")
+        # Injected async callable ``(pair) -> {"components": {...},
+        # "trusted": bool} | None``. None (or a None return) means the signal
+        # feed is unavailable, which is a DEGRADED MODE, not an outage: the
+        # controller keeps quoting off Nado's own anchor, just wider and
+        # shallower. Injected in engine_runtime beside candle_provider, because
+        # engine/ has no module-level edge to market_data/.
+        self.signal_provider = self.cfg("signal_provider")
+        # Injected sync callable ``() -> float`` in [1, 3]: how much measured
+        # adverse selection says to widen. 1.0 = no evidence of harm.
+        self.markout_provider = self.cfg("markout_provider")
+        self.degraded_spread_mult = _dec(self.cfg("degraded_spread_mult", "1.25") or "1.25")
+        self.self_trade_prevention = bool(
+            _dec(self.cfg("self_trade_prevention", "0") or "0")
+        )
+        self.alpha: float = 0.0
+        self.alpha_confidence: float = 0.0
+        self.alpha_detail: Dict[str, object] = {}
+        self.alpha_offset_bp: Decimal = Decimal(0)
+        self.signal_degraded = False
+        self.markout_widen: Decimal = Decimal(1)
+        self._stp_blocks = 0
 
     # -- level-0 compatibility -------------------------------------------------
     # The ladder generalises what used to be two scalar pairs. Level 0 keeps the
@@ -375,22 +402,121 @@ class MarketMakingController(Controller):
         return self._base_value(mid) / cap
 
     def _reservation_price(self, mid: Decimal) -> Decimal:
-        """Quoting anchor after the inventory shift. ``mid`` unchanged when the
-        skew is off, so the disabled path is bit-for-bit the shipped one."""
+        """Quoting anchor after the inventory and alpha shifts.
+
+        Both are displacements of the SAME quantity — the fair value the quotes
+        are built around — so they compose additively and share one bound. That
+        is also why neither touches ``directional_bias``: that field is a spread
+        skew the user owns, and a second writer would break its dead-band.
+
+        Returns ``mid`` unchanged when both are off, so the disabled path is
+        bit-for-bit the shipped one.
+        """
         self.reservation_offset_bp = Decimal(0)
-        if not self.inventory_skew_enabled or mid <= 0:
+        self.alpha_offset_bp = Decimal(0)
+        if mid <= 0:
             return mid
         half_bp = float((self.spread_bid_pct + self.spread_ask_pct) / Decimal(2)) * 10_000.0
-        offset = _mp.reservation_offset_bp(
-            float(self._inventory_ratio(mid)),
-            sigma_bp=self.gate_atr_pct * 10_000.0,
-            half_spread_bp=half_bp,
-            gamma=float(self.inventory_skew_gamma),
-        )
-        if not offset:
+        total = 0.0
+        if self.inventory_skew_enabled:
+            inv = _mp.reservation_offset_bp(
+                float(self._inventory_ratio(mid)),
+                sigma_bp=self.gate_atr_pct * 10_000.0,
+                half_spread_bp=half_bp,
+                gamma=float(self.inventory_skew_gamma),
+            )
+            self.reservation_offset_bp = _dec(str(inv))
+            total += inv
+        if self.alpha_enabled and self.alpha:
+            a_off = _alpha.anchor_offset_bp(
+                self.alpha, half_spread_bp=half_bp,
+                strength=float(self.alpha_strength),
+            )
+            self.alpha_offset_bp = _dec(str(a_off))
+            total += a_off
+        if not total:
             return mid
-        self.reservation_offset_bp = _dec(str(offset))
-        return mid * (Decimal(1) + self.reservation_offset_bp / Decimal(10000))
+        # ONE joint bound: each part is individually capped at half the
+        # half-spread, so their sum could still reach a full half-spread and
+        # push a quote onto the wrong side of the anchor. Cap the total too.
+        cap = half_bp * 0.5
+        total = max(-cap, min(cap, total))
+        return mid * (Decimal(1) + _dec(str(total)) / Decimal(10000))
+
+    # -- Phase 6: signal refresh, degraded mode, mark-out defence -------------
+    async def _refresh_alpha(self, mid: Decimal) -> None:
+        """Pull the forecast components and blend them. Never raises.
+
+        Three outcomes, and the middle one matters:
+
+        * no payload — the feed should have this market and is not answering.
+          DEGRADED: lean on nothing, quote wider and shallower. Still quoting,
+          off Nado's own book, which is strictly better than the blind
+          mid-quoting Mid shipped with.
+        * ``supported: False`` — Hyperliquid does not list this market at all
+          (every equity/RWA). Permanent and expected, so alpha is simply 0 and
+          nothing is widened; treating it as degradation would quote those
+          markets wide forever waiting for a feed that is never coming.
+        * components — blend them.
+        """
+        if not self.alpha_enabled:
+            return
+        payload = None
+        provider = self.signal_provider
+        if callable(provider):
+            try:
+                payload = await provider(self.trading_pair, mid)
+            except Exception:  # noqa: BLE001 - a dead feed must not stop quoting
+                logger.debug("signal provider failed %s", self.trading_pair, exc_info=True)
+                payload = None
+        if isinstance(payload, dict) and payload.get("supported") is False:
+            self.signal_degraded = False
+            self.alpha = 0.0
+            self.alpha_confidence = 0.0
+            self.alpha_detail = {"unsupported": True}
+            return
+        if not isinstance(payload, dict) or not payload.get("components"):
+            self.signal_degraded = True
+            self.alpha = 0.0
+            self.alpha_confidence = 0.0
+            self.alpha_detail = {}
+            return
+        self.signal_degraded = False
+        out = _alpha.blend(
+            payload.get("components") or {},
+            weights=payload.get("weights"),
+            trusted=bool(payload.get("trusted")),
+            max_alpha=float(self.alpha_max),
+        )
+        self.alpha = float(out.get("alpha") or 0.0)
+        self.alpha_confidence = float(out.get("confidence") or 0.0)
+        self.alpha_detail = out
+
+    async def _refresh_markout_widen(self) -> None:
+        """How much measured adverse selection says to widen. 1.0 = no harm.
+
+        The provider is async and TTL-cached on the other side; it must never
+        block the tick on a query.
+        """
+        self.markout_widen = Decimal(1)
+        if not self.alpha_enabled or not callable(self.markout_provider):
+            return
+        half_bp = float((self.spread_bid_pct + self.spread_ask_pct) / Decimal(2)) * 10_000.0
+        try:
+            factor = float(await self.markout_provider(half_bp))
+        except Exception:  # noqa: BLE001 - a grading outage must not move quotes
+            logger.debug("markout provider failed %s", self.trading_pair, exc_info=True)
+            return
+        # Never below 1: a mark-out series is evidence of harm, and never
+        # evidence that quoting TIGHTER is safe.
+        self.markout_widen = _dec(str(max(1.0, min(3.0, factor))))
+
+    def _defensive_spread_mult(self) -> Decimal:
+        """Combined widening from the mark-out ledger and feed degradation."""
+        mult = self.markout_widen
+        if self.alpha_enabled and self.signal_degraded:
+            mult *= self.degraded_spread_mult
+        return mult
 
     def _unrealized(self, mid: Decimal) -> Decimal:
         if self.inventory is None:
@@ -423,6 +549,10 @@ class MarketMakingController(Controller):
         # Phase 5: pick the playbook for this market. Once per session, and it
         # can raise the half-spread floor before any spread is computed below.
         await self._resolve_profile_once()
+        # Phase 6: refresh the forecast and the defensive widening. Both fail
+        # OPEN — no signal means alpha 0 and a wider quote, never a skipped tick.
+        await self._refresh_alpha(mid)
+        await self._refresh_markout_widen()
         base_value = self._base_value(mid)
         at_max = self.max_base_quote is not None and base_value >= self.max_base_quote
         at_min = self.min_base_quote is not None and base_value <= self.min_base_quote
@@ -456,6 +586,13 @@ class MarketMakingController(Controller):
             self.spread_ask_pct = half
 
         eff_bid_pct, eff_ask_pct = self.effective_spreads()
+        # Phase 6: widen for measured adverse selection and for a degraded
+        # signal feed. Widening only — the mark-out ledger can prove harm, it
+        # can never prove that quoting tighter is safe.
+        defensive = self._defensive_spread_mult()
+        if defensive != 1:
+            eff_bid_pct *= defensive
+            eff_ask_pct *= defensive
 
         # Phase 5: quote around the RESERVATION price, not the raw mid. Long
         # inventory shifts the anchor down so the ask works the position off;
@@ -547,6 +684,19 @@ class MarketMakingController(Controller):
         tick_bp = (tick / mid) * Decimal(10000) if (tick > 0 and mid > 0) else Decimal(0)
         return max(tick_bp, _AUTO_LADDER_STEP_FLOOR_BP)
 
+    def _effective_levels(self) -> int:
+        """Ladder depth for this tick.
+
+        A degraded signal feed shortens the ladder by one level: the deep
+        levels are the ones that fill when the market runs, and running blind
+        is exactly when being deep is expensive. Never below one, and the
+        deployment per side is unchanged either way — ``plan_ladder``
+        redistributes, it never adds.
+        """
+        if self.alpha_enabled and self.signal_degraded and self.ladder_levels > 1:
+            return self.ladder_levels - 1
+        return self.ladder_levels
+
     def _plan_side(self, mid: Decimal) -> List[LadderLevel]:
         """Split this side's deployed notional into levels, clamped so every
         level clears the venue minimum (a sub-minimum level is simply rejected,
@@ -557,7 +707,7 @@ class MarketMakingController(Controller):
             min_notional = Decimal(0)
         return plan_ladder(
             self.order_amount_quote,
-            levels=self.ladder_levels,
+            levels=self._effective_levels(),
             step_bp=self._effective_step_bp(mid),
             first_offset_bp=0,
             curve=self.ladder_curve,
@@ -737,6 +887,8 @@ class MarketMakingController(Controller):
         # to 0 (e.g. mid feed returned 0 and spread_*_pct is 1).
         if target <= 0 or order_quote <= 0:
             return
+        if self._would_self_trade(is_bid, target):
+            return
         amount_base = order_quote / target
         cfg = OrderExecutorConfig(
             self.trading_pair, side, amount_base, ExecutionStrategy.LIMIT_MAKER, price=target
@@ -750,6 +902,48 @@ class MarketMakingController(Controller):
         )
         if ok:
             self._set_quote(is_bid, ex.id, target, level=level, size_quote=order_quote)
+
+    # -- Phase 6: self-trade prevention ----------------------------------------
+    def _would_self_trade(self, is_bid: bool, target: Decimal) -> bool:
+        """Would this quote cross one of OUR OWN resting quotes?
+
+        The venue has no self-trade prevention, and the controller only had a
+        crossed-book bail plus an inclusive touch tolerance — neither of which
+        looks at our own ladder. A bid placed at or above one of our live asks
+        matches against it: we pay both sides of the fee to trade with
+        ourselves, the fill lands in History as a real trade, and on Nado it
+        also reads as wash trading. Cheap to check, so it is checked locally
+        against the slots we know are live.
+
+        Only the OPPOSITE side matters — two bids at the same price are just
+        two bids. Equality counts as a cross, because a post-only order that
+        would take is REJECTED by the venue, not converted.
+
+        Interaction with the queue hold: after a sharp drop the new ask can sit
+        below a bid that ``min_quote_lifetime_s`` is still holding, so the ask
+        is skipped for a few seconds. That is the right trade — the held bid is
+        about to fill anyway, and the alternative is trading with ourselves —
+        and it clears on its own, because BUY reconciles before SELL and the
+        bid moves down as soon as the hold expires.
+        """
+        if not self.self_trade_prevention or target <= 0:
+            return False
+        for (slot_is_bid, _lvl), slot in self._slots.items():
+            if slot_is_bid is is_bid or slot.ex_id is None or slot.price is None:
+                continue
+            ex = self.orchestrator.get(slot.ex_id)
+            if ex is None or ex.is_terminated:
+                continue
+            crosses = target >= slot.price if is_bid else target <= slot.price
+            if crosses:
+                self._stp_blocks += 1
+                logger.warning(
+                    "MM %s self-trade blocked: %s at %s would cross our own %s at %s",
+                    self.trading_pair, "BUY" if is_bid else "SELL", target,
+                    "ASK" if is_bid else "BID", slot.price,
+                )
+                return True
+        return False
 
     # -- Phase 0: queue preservation -------------------------------------------
     def _holds_queue_position(self, is_bid: bool, target: Decimal, price: Decimal) -> bool:
@@ -863,4 +1057,11 @@ class MarketMakingController(Controller):
             "profile": self.profile,
             "half_spread_floor_bp": float(self.spread_floor_half_pct) * 10_000.0,
             "reservation_offset_bp": float(self.reservation_offset_bp),
+            # Phase 6 state.
+            "alpha": self.alpha,
+            "alpha_confidence": self.alpha_confidence,
+            "alpha_offset_bp": float(self.alpha_offset_bp),
+            "signal_degraded": self.signal_degraded,
+            "markout_widen": float(self.markout_widen),
+            "self_trade_blocks": self._stp_blocks,
         }

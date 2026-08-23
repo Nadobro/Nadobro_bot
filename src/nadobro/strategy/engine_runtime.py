@@ -719,6 +719,13 @@ _LIVE_CONFIG_SIGNATURE_EXCLUDE = frozenset({
     "end_price",
     "limit_price",
     "candle_provider",
+    # Same reason as candle_provider: the mapper emits None and
+    # run_engine_cycle replaces it with a closure. ``None`` is not callable so
+    # it lands IN the signature, the closure is callable so it drops OUT — the
+    # key appearing and disappearing flips the signature once and recenters the
+    # whole ladder for nothing.
+    "signal_provider",
+    "markout_provider",
     # DN-only restore fields; excluded defensively if a future strategy shares
     # this helper.
     "restore_cycles_completed",
@@ -1081,6 +1088,28 @@ def map_strategy_config(
                 Decimal(1) if _f(settings, "inventory_skew_enabled", 1.0) > 0 else Decimal(0)
             ),
             "inventory_skew_gamma": Decimal(str(_f(settings, "inventory_skew_gamma", 0.1))),
+            # --- Mid Mode v3 Phase 6: alpha, mark-out defence, STP -----------
+            # The blended Hyperliquid forecast moves the quoting ANCHOR (never
+            # directional_bias, which the user owns) and is hard-clamped to
+            # +/-0.35 until per-component scoring earns better weights. The
+            # providers below are injected in run_engine_cycle, where the
+            # network and product are known; engine/ has no module-level edge
+            # to market_data/, so they arrive as callables.
+            "alpha_enabled": (
+                Decimal(1) if _f(settings, "mid_alpha_enabled", 1.0) > 0 else Decimal(0)
+            ),
+            "alpha_max": Decimal(str(_f(settings, "alpha_max", 0.35))),
+            "alpha_strength": Decimal(str(_f(settings, "alpha_strength", 0.5))),
+            "degraded_spread_mult": Decimal(
+                str(_f(settings, "degraded_spread_mult", 1.25))
+            ),
+            # The venue has no self-trade prevention and the controller only had
+            # a crossed-BOOK bail, which never looked at our own ladder.
+            "self_trade_prevention": (
+                Decimal(1) if _f(settings, "self_trade_prevention", 1.0) > 0 else Decimal(0)
+            ),
+            "signal_provider": None,      # injected in run_engine_cycle
+            "markout_provider": None,     # injected in run_engine_cycle
             "price_distance_tolerance": (spread_frac / Decimal(2)) or Decimal("0.0005"),
             "leverage": int(eff_lev),
             # Regime gate + inventory cap + ATR auto-spread (2026-06 upgrade).
@@ -2534,6 +2563,48 @@ async def _run_engine_cycle_locked(
                 return []
 
         configs["candle_provider"] = _candle_provider
+
+    # Mid Mode v3 Phase 6: the forecast and mark-out providers. Injected HERE
+    # for the same reason candle_provider is — this is where the network and
+    # product are known — and as callables because engine/ has no module-level
+    # import edge to market_data/. Mid only: FillAnchoredQuotingController and
+    # RGridController inherit the same controller class.
+    if strategy == "mid" and configs.get("signal_provider") is None:
+        _net = str(network)
+        _uid = int(telegram_id)
+        _prod = str(product or "")
+
+        async def _signal_provider(pair: str, nado_mid: object) -> object:
+            """Hyperliquid forecast components, or an absence marker.
+
+            Returns None when the feed should have this market and does not —
+            the controller reads that as DEGRADED and widens. Returns
+            ``{"supported": False}`` for a market HL never lists (equity/RWA),
+            which must NOT read as degradation.
+            """
+            try:
+                from src.nadobro.trading import hl_signals
+
+                hl_signals.ensure_registered()
+                return hl_signals.build_components(pair or _prod, nado_mid)
+            except Exception:  # noqa: BLE001 - never let the feed break a tick
+                logger.debug("signal_provider failed pair=%s", pair, exc_info=True)
+                return None
+
+        async def _markout_provider(half_spread_bp: float) -> float:
+            """Measured-adverse-selection widening. TTL-cached, never blocking."""
+            try:
+                from src.nadobro.trading import markout_defense
+
+                return await markout_defense.widen_factor(
+                    _uid, _net, _prod, half_spread_bp=float(half_spread_bp)
+                )
+            except Exception:  # noqa: BLE001 - a grading outage must not move quotes
+                logger.debug("markout_provider failed product=%s", _prod, exc_info=True)
+                return 1.0
+
+        configs["signal_provider"] = _signal_provider
+        configs["markout_provider"] = _markout_provider
 
     # BUG-TICK-1 recovery: if the local controller went terminal-FAILED (a
     # genuinely fatal error, or an exhausted transient-error streak), force a
