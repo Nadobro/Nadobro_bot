@@ -1,9 +1,11 @@
 """Ink airdrop allocation lookup (/airdrop).
 
-Archive doc: POST [ARCHIVE] {"ink_airdrop": {"address": "0x<20-byte>"}}
+Archive doc: POST [ARCHIVE REWARDS] {"ink_airdrop": {"address": "0x<20-byte>"}}
 returns {"amount": "<x18 string>"} with documented IP weight = 2.
-Verified live against archive.prod.nado.xyz/v1 and archive.test.nado.xyz/v1
-on 2026-07-18 (unallocated addresses answer {"amount":"0"}).
+The query lives on the Archive (Rewards) endpoint (.../rewards/v1), NOT the
+archive indexer (.../v1) — the indexer rejects it with HTTP 422 "unknown variant
+`ink_airdrop`". Verified live against archive.prod.nado.xyz/rewards/v1 on
+2026-08-24 (the zero address answers {"amount":"0"} HTTP 200).
 """
 import time
 from decimal import Decimal
@@ -101,16 +103,37 @@ def test_query_ink_airdrop_invalid_address_never_hits_archive():
     mock_post.assert_not_called()
 
 
-def test_query_ink_airdrop_sends_documented_payload():
+def test_query_ink_airdrop_posts_to_the_rewards_endpoint_not_the_indexer():
+    """REGRESSION GUARD (2026-08-24). The ``ink_airdrop`` query MUST go to the
+    Archive (Rewards) endpoint (``.../rewards/v1``), NOT the archive indexer
+    (``.../v1``). Posting it to the indexer returns HTTP 422 "unknown variant
+    `ink_airdrop`" (the indexer's request enum has no airdrop variant), which is
+    what made ``/airdrop`` always answer "Couldn't reach the Nado archive".
+    Verified live: the rewards endpoint returns ``{"amount": ...}`` HTTP 200."""
     import src.nadobro.venue.nado_archive as archive
-    from src.nadobro.config import NADO_MAINNET_ARCHIVE
+    from src.nadobro.config import (
+        NADO_MAINNET_ARCHIVE,
+        NADO_MAINNET_ARCHIVE_REWARDS,
+        NADO_TESTNET_ARCHIVE_REWARDS,
+    )
 
     _clear_airdrop_cache()
     checksummed = "0xAbCdEF1234567890123456789012345678901234"
     with patch.object(archive, "_post", return_value={"amount": "0"}) as mock_post:
         archive.query_ink_airdrop("mainnet", checksummed)
     mock_post.assert_called_once_with(
-        NADO_MAINNET_ARCHIVE,
+        NADO_MAINNET_ARCHIVE_REWARDS,
+        {"ink_airdrop": {"address": checksummed.lower()}},
+    )
+    # It must NOT be the indexer endpoint (the bug).
+    assert mock_post.call_args.args[0] != NADO_MAINNET_ARCHIVE
+    assert mock_post.call_args.args[0].endswith("/rewards/v1")
+
+    _clear_airdrop_cache()
+    with patch.object(archive, "_post", return_value={"amount": "0"}) as mock_post:
+        archive.query_ink_airdrop("testnet", checksummed)
+    mock_post.assert_called_once_with(
+        NADO_TESTNET_ARCHIVE_REWARDS,
         {"ink_airdrop": {"address": checksummed.lower()}},
     )
 

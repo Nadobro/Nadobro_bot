@@ -62,6 +62,14 @@ NADO_MAINNET_REST = "https://gateway.prod.nado.xyz/v1"
 NADO_TESTNET_ARCHIVE = "https://archive.test.nado.xyz/v1"
 NADO_MAINNET_ARCHIVE = "https://archive.prod.nado.xyz/v1"
 
+# Archive (Rewards) — a SEPARATE service/path from the archive indexer above.
+# The Ink airdrop allocation query (variant ``ink_airdrop``) is served HERE, not
+# on the indexer ``/v1`` (whose request enum has no such variant and rejects it
+# with HTTP 422 "unknown variant `ink_airdrop`"). Per the live Nado endpoints list
+# and https://docs.nado.xyz/developer-resources/api/rewards/ink-airdrop
+NADO_TESTNET_ARCHIVE_REWARDS = "https://archive.test.nado.xyz/rewards/v1"
+NADO_MAINNET_ARCHIVE_REWARDS = "https://archive.prod.nado.xyz/rewards/v1"
+
 PRODUCTS = {
     "USDT0": {"id": 0, "type": "spot"},
     "BTC": {"id": 2, "type": "perp", "symbol": "BTC-PERP"},
