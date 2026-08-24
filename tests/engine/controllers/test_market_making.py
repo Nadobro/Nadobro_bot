@@ -178,3 +178,86 @@ def test_risk_pretick_block_skips_quoting():
         assert orch.list(c.id, active_only=True) == []
 
     asyncio.run(body())
+
+
+def _mid_policy_cfg(**extra):
+    cfg = dict(BASE)
+    cfg.update({
+        "mid_policy_enabled": 1,
+        "mid_execution_mode": "normal",
+        "max_quote_lifetime_s": 12,
+        "inventory_soft_limit_quote": "60",
+        "inventory_hard_limit_quote": "75",
+        "max_base_quote": "75",
+        "min_base_quote": "-75",
+        "expected_budget_usd": "10",
+    })
+    cfg.update(extra)
+    return cfg
+
+
+def test_mid_soft_inventory_keeps_both_sides_and_rebalances_prices():
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100))
+        inv = InventoryRepository()
+        inv.apply_fill(1, "P", "CID", TradeType.BUY, Decimal("0.7"), Decimal("70"))
+        orch, c = _mm(adapter, inv, _mid_policy_cfg(), controller_id="CID")
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        assert c.inventory_state == "soft_long"
+        assert c._bid_id is not None and c._ask_id is not None
+        assert sorted(o.price for o in adapter.placed) == [Decimal("98.5"), Decimal("100.75")]
+
+    asyncio.run(body())
+
+
+def test_mid_hard_inventory_only_quotes_the_reducing_side():
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100))
+        inv = InventoryRepository()
+        inv.apply_fill(1, "P", "CID", TradeType.BUY, Decimal("0.8"), Decimal("80"))
+        orch, c = _mm(adapter, inv, _mid_policy_cfg(), controller_id="CID")
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        assert c.inventory_state == "hard_long"
+        assert c._bid_id is None and c._ask_id is not None
+
+    asyncio.run(body())
+
+
+def test_mid_expected_budget_stops_new_exposure_but_keeps_exit_quote():
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100))
+        inv = InventoryRepository()
+        # Fees alone exhaust the $5 loss-and-cost budget while the long remains
+        # open, so only its passive reducing ask may remain.
+        inv.apply_fill(
+            1, "P", "CID", TradeType.BUY, Decimal("0.1"), Decimal("10"), fee_quote=Decimal("6")
+        )
+        orch, c = _mm(
+            adapter, inv, _mid_policy_cfg(expected_budget_usd="5"), controller_id="CID"
+        )
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        assert c.budget_stop_reason == "expected_budget_exhausted"
+        assert c.expected_budget_used_usd == Decimal("6")
+        assert c._bid_id is None and c._ask_id is not None
+        assert c.ladder_metrics()["budget_stop_reason"] == "expected_budget_exhausted"
+
+    asyncio.run(body())
+
+
+def test_mid_profile_quote_ttl_forces_refresh_when_target_is_unchanged():
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100))
+        orch, c = _mm(adapter, InventoryRepository(), _mid_policy_cfg(max_quote_lifetime_s="1"))
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        first_bid = c._bid_id
+        c._slot(True, 0).placed_at = c._now() - 2
+        c._slot(False, 0).placed_at = c._now() - 2
+        await orch.tick_controller(c.id)
+        assert c._bid_id != first_bid
+        assert len(adapter.cancelled) >= 2
+
+    asyncio.run(body())

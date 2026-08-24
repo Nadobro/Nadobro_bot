@@ -556,12 +556,24 @@ class OverlayDisarmedBarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(closed.get("called"))
         self.assertTrue(res is None or res[0] is not True)
 
-    async def test_the_overlay_still_TIGHTENS_an_armed_barrier(self):
-        """The fix must not make the overlay inert on barriers the user DID arm —
-        SL stays tighten-only, which is the whole point of the rail integration."""
+    async def test_mid_stop_loss_is_not_tightened_by_the_overlay(self):
+        """Mid's selected stop is a session contract, not an overlay input.
+
+        The overlay may change Mid quoting behavior, but a 2% Mid stop must not
+        become a 0.5% stop merely because the current regime is choppy.
+        """
         snap = {"session_pnl": -0.7, "session_pnl_pct": -0.7,
                 "session_pnl_pct_net": -0.7, "margin": 100.0}
         res, closed = await self._run(sl=2.0, tp=50.0, overlay_sl=0.5, snap=snap)
+        self.assertIsNone(res)
+        self.assertFalse(closed.get("called"))
+
+    async def test_mid_take_profit_is_not_widened_by_the_overlay(self):
+        """Mid must close at the user's TP rather than waiting for a
+        regime-adjusted overlay target."""
+        snap = {"session_pnl": 1.5, "session_pnl_pct": 1.5,
+                "session_pnl_pct_net": 1.5, "margin": 100.0}
+        res, closed = await self._run(sl=50.0, tp=1.0, overlay_tp=3.0, snap=snap)
         self.assertEqual(res, (True, None))
         self.assertTrue(closed.get("called"))
 

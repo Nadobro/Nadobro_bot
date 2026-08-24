@@ -27,6 +27,7 @@ from src.nadobro.engine.types import ExecutionStrategy, OrderType, TradeType, _d
 from src.nadobro.quant import alpha as _alpha
 from src.nadobro.quant import microstructure as _ms
 from src.nadobro.quant import mm_profile as _mp
+from src.nadobro.quant.mid_market_making import normalize_mid_execution_mode
 from src.nadobro.quant.ladder import (
     FLAT,
     LadderLevel,
@@ -230,6 +231,25 @@ class MarketMakingController(Controller):
         self.level_tolerance_bp = _dec(self.cfg("level_tolerance_bp", "25") or "25")
         self.level_boost = _dec(self.cfg("level_boost", "1.5") or "1.5")
         self._sr_levels: Dict[str, object] = {}
+        # Arbital-style Mid policy. This is explicitly opt-in from Mid's runtime
+        # mapping; inherited Grid/RGrid users preserve their existing path.
+        self.mid_policy_enabled = bool(_dec(self.cfg("mid_policy_enabled", "0") or "0"))
+        self.execution_mode = normalize_mid_execution_mode(self.cfg("mid_execution_mode", "normal"))
+        self.max_quote_lifetime_s = float(
+            _dec(self.cfg("max_quote_lifetime_s", "0") or "0")
+        )
+        self.inventory_soft_limit_quote = _dec(
+            self.cfg("inventory_soft_limit_quote", "0") or "0"
+        )
+        self.inventory_hard_limit_quote = _dec(
+            self.cfg("inventory_hard_limit_quote", "0") or "0"
+        )
+        self.inventory_state = "neutral"
+        self.expected_budget_usd = _dec(self.cfg("expected_budget_usd", "0") or "0")
+        self.expected_budget_used_usd = max(
+            Decimal(0), _dec(self.cfg("restore_expected_budget_used_usd", "0") or "0")
+        )
+        self.budget_stop_reason = ""
 
     # -- level-0 compatibility -------------------------------------------------
     # The ladder generalises what used to be two scalar pairs. Level 0 keeps the
@@ -567,6 +587,52 @@ class MarketMakingController(Controller):
             return Decimal(0)
         return self.inventory.get(self.user_id, self.trading_pair, self.id).unrealized_pnl(mid)
 
+    def _refresh_expected_budget(self, mid: Decimal) -> bool:
+        """Update Mid's loss-and-cost budget and report whether it is exhausted.
+
+        Inventory provides realized PnL net of fees plus marked inventory PnL.
+        The high-water loss is retained for the session, so a temporary recovery
+        cannot re-open risk after the user-selected loss budget was hit.
+        """
+        if not self.mid_policy_enabled or self.expected_budget_usd <= 0 or self.inventory is None:
+            return False
+        hold = self.inventory.get(self.user_id, self.trading_pair, self.id)
+        net_after_costs = hold.realized_pnl_after_fees + hold.unrealized_pnl(mid)
+        self.expected_budget_used_usd = max(
+            self.expected_budget_used_usd, max(Decimal(0), -net_after_costs)
+        )
+        if self.expected_budget_used_usd >= self.expected_budget_usd:
+            self.budget_stop_reason = "expected_budget_exhausted"
+            return True
+        self.budget_stop_reason = ""
+        return False
+
+    def _apply_mid_inventory_policy(
+        self, base_value: Decimal, allow_buy: bool, allow_sell: bool
+    ) -> tuple[bool, bool, Decimal, Decimal]:
+        """Return Mid-only inventory-safe permissions and side widening factors."""
+        if not self.mid_policy_enabled:
+            return allow_buy, allow_sell, Decimal(1), Decimal(1)
+        soft = self.inventory_soft_limit_quote
+        hard = self.inventory_hard_limit_quote
+        if hard > 0 and abs(base_value) >= hard:
+            self.inventory_state = "hard_long" if base_value > 0 else "hard_short"
+            # Keep the reducing side active; only suppress increasing risk.
+            return (
+                allow_buy and base_value < 0,
+                allow_sell and base_value > 0,
+                Decimal(1), Decimal(1),
+            )
+        if soft > 0 and abs(base_value) >= soft:
+            self.inventory_state = "soft_long" if base_value > 0 else "soft_short"
+            # Widen the exposure-increasing side while making the reducing side
+            # more competitive. Both quotes remain active inside the hard zone.
+            if base_value > 0:
+                return allow_buy, allow_sell, Decimal("1.5"), Decimal("0.75")
+            return allow_buy, allow_sell, Decimal("0.75"), Decimal("1.5")
+        self.inventory_state = "neutral"
+        return allow_buy, allow_sell, Decimal(1), Decimal(1)
+
     async def on_tick(self) -> None:
         # BUG-MM-1 fix: tick all child OrderExecutors FIRST so fills are
         # absorbed into inventory before we read base_value for the
@@ -612,6 +678,14 @@ class MarketMakingController(Controller):
         exposure = self.exposure_allowed_sides(self.trading_pair, mid)
         allow_buy = allow_buy and exposure["buy"]
         allow_sell = allow_sell and exposure["sell"]
+        allow_buy, allow_sell, bid_inventory_mult, ask_inventory_mult = (
+            self._apply_mid_inventory_policy(base_value, allow_buy, allow_sell)
+        )
+        if self._refresh_expected_budget(mid):
+            # Budget exhaustion stops fresh exposure but preserves the only
+            # maker path that can reduce an existing position.
+            allow_buy = allow_buy and base_value < 0
+            allow_sell = allow_sell and base_value > 0
 
         # Regime gate (Phase 2): in PAUSE, place no NEW exposure — quote only
         # the side that reduces the current net position (the exit path); a
@@ -638,6 +712,8 @@ class MarketMakingController(Controller):
         if defensive != 1:
             eff_bid_pct *= defensive
             eff_ask_pct *= defensive
+        eff_bid_pct *= bid_inventory_mult
+        eff_ask_pct *= ask_inventory_mult
 
         # Phase 5: quote around the RESERVATION price, not the raw mid. Long
         # inventory shifts the anchor down so the ask works the position off;
@@ -1177,6 +1253,11 @@ class MarketMakingController(Controller):
         cur_price = slot.price
         if cur_price is None or cur_price <= 0:
             return False
+        # Mid profiles require a bounded quote lifetime. This check precedes the
+        # tolerance/queue holds so a selected cadence always eventually refreshes.
+        if self.max_quote_lifetime_s > 0 and slot.placed_at > 0:
+            if (self._now() - slot.placed_at) >= self.max_quote_lifetime_s:
+                return False
         if self._within_tolerance(target, cur_price):
             return True
         # Front of the queue at a price no worse than the new target.
@@ -1252,4 +1333,12 @@ class MarketMakingController(Controller):
             "markout_widen": float(self.markout_widen),
             "self_trade_blocks": self._stp_blocks,
             "atomic_replaces": self._replace_count,
+            "mid_execution_mode": self.execution_mode if self.mid_policy_enabled else "",
+            "max_quote_lifetime_s": self.max_quote_lifetime_s if self.mid_policy_enabled else 0.0,
+            "inventory_state": self.inventory_state if self.mid_policy_enabled else "",
+            "inventory_soft_limit_usd": float(self.inventory_soft_limit_quote),
+            "inventory_hard_limit_usd": float(self.inventory_hard_limit_quote),
+            "expected_budget_usd": float(self.expected_budget_usd),
+            "expected_budget_used_usd": float(self.expected_budget_used_usd),
+            "budget_stop_reason": self.budget_stop_reason,
         }

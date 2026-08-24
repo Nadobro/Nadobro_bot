@@ -26,6 +26,9 @@ _STRATEGY_SETTINGS_RUNTIME_BLOCKLIST = frozenset({
     "mm_duration_target_notified", "mm_cycle_notional_usd",
     # TWAP fast-move pause runtime telemetry (last mid baseline, paused flag).
     "twap_last_mid", "twap_paused",
+    # Mid expected-budget consumption is controller-derived state. It is passed
+    # back into the mapper on recovery, never read from user settings.
+    "mid_budget_used_usd",
     "dn_last_funding_rate", "dn_unfavorable_count",
     "dn_mode", "order_observability",
     "last_error_category", "vol_order_attempts", "vol_order_failures", "last_order_error", "last_order_ts",
@@ -1827,6 +1830,13 @@ def get_user_bot_status(telegram_id: int) -> dict:
         "inventory_skew_usd": (state.get("mm_last_metrics") or {}).get("inventory_skew_usd"),
         "inventory_source": (state.get("mm_last_metrics") or {}).get("inventory_source") or state.get("mm_last_inventory_source"),
         "session_notional_done_usd": (state.get("mm_last_metrics") or {}).get("session_notional_done_usd"),
+        "mid_execution_mode": (state.get("mm_engine_metrics") or {}).get("mid_execution_mode"),
+        "inventory_state": (state.get("mm_engine_metrics") or {}).get("inventory_state"),
+        "inventory_soft_limit_usd": (state.get("mm_engine_metrics") or {}).get("inventory_soft_limit_usd"),
+        "inventory_hard_limit_usd": (state.get("mm_engine_metrics") or {}).get("inventory_hard_limit_usd"),
+        "expected_budget_usd": (state.get("mm_engine_metrics") or {}).get("expected_budget_usd"),
+        "expected_budget_used_usd": (state.get("mm_engine_metrics") or {}).get("expected_budget_used_usd"),
+        "budget_stop_reason": (state.get("mm_engine_metrics") or {}).get("budget_stop_reason"),
         "worker_group": state.get("worker_group"),
         "worker_last_heartbeat": float(state.get("worker_last_heartbeat") or 0.0),
         "last_dispatch_ts": float(state.get("last_dispatch_ts") or 0.0),
@@ -2785,9 +2795,11 @@ async def _evaluate_session_pnl_rail(
     sl_pct, tp_pct = effective_sl_tp_pct(strategy, state)
     # Overlay-adaptive barriers: when the financial overlay steers this strategy
     # and has written regime-adjusted SL/TP (widen in a trend, tighten in chop),
-    # the rail uses them instead of the user's static config. Bounded upstream
-    # (the engine caps the widening at ~1.3x the user's base) and backstopped by
-    # the 10% overlay drawdown cap below.
+    # the rail uses them instead of the user's static config. Mid Mode is the
+    # exception: its SL and TP are the user's explicit session PnL contract, so
+    # an overlay may steer quote competitiveness but must never move either
+    # barrier. The separate overlay drawdown cap below remains an independent
+    # backstop.
     try:
         from src.nadobro.strategy.overlay_actuator import overlay_applies
         if overlay_applies(strategy):
@@ -2812,9 +2824,17 @@ async def _evaluate_session_pnl_rail(
             # DGRID-TP-DISARM-PHANTOM, so use the same discriminator: a key that is
             # PRESENT-AND-ZERO is a choice, not an absence.
             _sl_set, _tp_set = sltp_is_explicit(strategy, state)
-            if ov_sl is not None and not (_sl_set and sl_pct <= 0):
+            if (
+                str(strategy or "").lower() != "mid"
+                and ov_sl is not None
+                and not (_sl_set and sl_pct <= 0)
+            ):
                 sl_pct = min(float(ov_sl), sl_pct) if sl_pct > 0 else float(ov_sl)
-            if ov_tp is not None and not (_tp_set and tp_pct <= 0):
+            if (
+                str(strategy or "").lower() != "mid"
+                and ov_tp is not None
+                and not (_tp_set and tp_pct <= 0)
+            ):
                 tp_pct = max(float(ov_tp), tp_pct) if tp_pct > 0 else float(ov_tp)
     except Exception:  # noqa: BLE001 - fall back to the user's config barriers
         logger.debug("overlay barrier read failed", exc_info=True)
