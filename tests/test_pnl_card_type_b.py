@@ -52,6 +52,51 @@ def test_official_wordmark_asset_is_bundled():
     assert wm.exists() and wm.stat().st_size > 2_000, f"missing wordmark: {wm}"
 
 
+# The Type A/B renderers paint every dynamic stat at hard-coded ABSOLUTE pixel
+# coordinates (referral line at y=888, Mode at y=855, ...) calibrated to the
+# master's 1672×941 canvas. There is no size/aspect guard in the renderer, so a
+# wrong-size background silently mispositions text and clips the bottom
+# referral/mode lines off a shorter canvas — it renders a broken card with no
+# error. This bit prod once: commit 5a058d0 swapped all four live backgrounds
+# for 1600×900 placeholders. Pin the canvas size so an asset refresh that
+# changes it fails CI loudly instead of shipping a broken card.
+_CARD_CANVAS = (1672, 941)
+# Load-bearing: the four backgrounds the renderers actually open + draw onto.
+_BACKGROUND_ASSETS = (
+    "Background positive pnl.png",
+    "Background negative pnl.png",
+    "Background Positive PnL Type B.png",
+    "Background Negative PnL Type B.png",
+)
+# Design references the backgrounds are derived from; size drift here flags a
+# future refresh mistake before it reaches the live backgrounds.
+_MASTER_ASSETS = (
+    "Master positive pnl.png",
+    "Master negative pnl.png",
+    "Master Positive PnL Type B.png",
+    "Master Negative PnL Type B.png",
+)
+
+
+def test_card_backgrounds_are_master_canvas_size():
+    """Every live PnL-card background (Type A + Type B) must be exactly
+    1672×941 so the renderers' hard-coded text coordinates land correctly."""
+    from pathlib import Path
+
+    from PIL import Image
+
+    cards = Path(__file__).resolve().parents[1] / "assets" / "cards"
+    for name in _BACKGROUND_ASSETS + _MASTER_ASSETS:
+        path = cards / name
+        assert path.exists(), f"missing card asset: {path}"
+        with Image.open(path) as img:
+            assert img.size == _CARD_CANVAS, (
+                f"{name} is {img.size}, expected {_CARD_CANVAS} — the renderer "
+                f"draws stats at fixed coords for the master canvas; a resized "
+                f"background silently breaks the card."
+            )
+
+
 # ── renderer ────────────────────────────────────────────────────
 
 def test_renderer_produces_both_variants():
