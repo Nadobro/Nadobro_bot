@@ -876,6 +876,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "notional_usd", "spread_bp", "interval_seconds", "tp_pct", "sl_pct",
             "levels", "min_range_pct", "max_range_pct", "threshold_bp", "close_offset_bp",
             "cycle_notional_usd", "session_notional_cap_usd", "inventory_soft_limit_usd",
+            "inventory_hard_limit_usd", "expected_budget_usd",
             "quote_ttl_seconds", "min_spread_bp", "max_spread_bp", "vol_sensitivity",
             "grid_reset_threshold_pct", "grid_reset_timeout_seconds",
             "rgrid_spread_bp", "rgrid_stop_loss_pct", "rgrid_take_profit_pct",
@@ -943,6 +944,8 @@ async def _handle_strategy(query, data, context, telegram_id):
             "cycle_notional_usd": (1, 1000000),
             "session_notional_cap_usd": (0, 10000000),
             "inventory_soft_limit_usd": (1, 1000000),
+            "inventory_hard_limit_usd": (1, 1000000),
+            "expected_budget_usd": (0, 1000000),
             "quote_ttl_seconds": (5, 86400),
             "min_spread_bp": (0.1, 200),
             "max_spread_bp": (0.1, 500),
@@ -1038,6 +1041,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "funding_entry_mode": {"wait", "enter_anyway"},
             # Phase 2: Tread Fi POV / participation preset.
             "participation_preset": {"aggressive", "normal", "passive", "off"},
+            "mid_execution_mode": {"aggressive", "normal", "passive"},
             # Volume Bot execution algo (maker TWAP default / chase / taker).
             "vol_execution_algo": {"twap", "chase", "taker"},
             # Ladder size curve (Mid + fill-anchored Grid): how the side's
@@ -1054,6 +1058,8 @@ async def _handle_strategy(query, data, context, telegram_id):
             return
         # size_curve only drives the laddered quoters (Mid + fill-anchored Grid).
         if field == "size_curve" and strategy_id not in ("grid", "mid"):
+            return
+        if field == "mid_execution_mode" and strategy_id != "mid":
             return
 
         def _mutate(s):
@@ -1082,6 +1088,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "notional_usd", "spread_bp", "interval_seconds", "tp_pct", "sl_pct",
             "levels", "min_range_pct", "max_range_pct", "threshold_bp", "close_offset_bp",
             "cycle_notional_usd", "session_notional_cap_usd", "inventory_soft_limit_usd",
+            "inventory_hard_limit_usd", "expected_budget_usd",
             "quote_ttl_seconds", "min_spread_bp", "max_spread_bp", "vol_sensitivity",
             "rgrid_spread_bp", "rgrid_stop_loss_pct", "rgrid_take_profit_pct",
             "rgrid_reset_threshold_pct", "rgrid_reset_timeout_seconds", "rgrid_discretion",
@@ -1126,6 +1133,8 @@ async def _handle_strategy(query, data, context, telegram_id):
             "cycle_notional_usd": "Enter per\\-cycle budget in USD \\(usually same as margin\\)",
             "session_notional_cap_usd": "Enter optional session cap in USD \\(example: `5000`, or `0` to disable\\)",
             "inventory_soft_limit_usd": "Enter inventory soft limit in USD \\(example: `45`\\)",
+            "inventory_hard_limit_usd": "Enter inventory hard limit in USD \\(example: `60`\\)",
+            "expected_budget_usd": "Enter expected loss-and-cost budget in USD \\(example: `10`, or `0` to disable\\)",
             "quote_ttl_seconds": "Enter quote TTL seconds \\(example: `90`\\)",
             "min_spread_bp": "Enter minimum spread in bps \\(example: `2`\\)",
             "max_spread_bp": "Enter maximum spread in bps \\(example: `20`\\)",
@@ -2174,16 +2183,25 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
         else:
             bias_str = "NEUTRAL"
         if section == "risk":
+            soft_limit = float(conf.get("inventory_soft_limit_usd", notional * 0.6) or 0.0)
+            hard_limit = float(conf.get("inventory_hard_limit_usd", soft_limit * 1.25) or 0.0)
+            expected_budget = float(conf.get("expected_budget_usd", 0.0) or 0.0)
             return (
                 "⚙️ *MID MODE · Risk*\n\n"
                 f"PnL TP/SL: *{escape_md(f'{tp_pct:.2f}% / {sl_pct:.2f}%')}* of margin\n\n"
-                "Stops are applied to *margin* \\(notional / leverage\\), not to notional\\."
+                f"Inventory soft/hard: *{escape_md(f'${soft_limit:,.0f} / ${hard_limit:,.0f}')}*\n"
+                f"Expected budget: *{escape_md(f'${expected_budget:,.0f}')}*\n\n"
+                "Soft inventory widens and rebalances both sides\\. Hard inventory leaves only "
+                "the reducing quote\\. Expected budget stops new exposure after cumulative "
+                "loss and costs reach the limit\\."
             )
         pov_label = str(conf.get("participation_preset") or "OFF").upper()
+        execution_mode = str(conf.get("mid_execution_mode") or "normal").upper()
         return (
             "⚙️ *MID MODE · Core*\n\n"
             f"Margin: *{escape_md(f'${notional:,.0f}')}* \\| Interval: *{escape_md(f'{interval_seconds}s')}*\n"
             f"Spread: *{escape_md(f'{spread_bp:+.1f} bp')}* \\| Bias: *{escape_md(bias_str)}*\n"
+            f"Execution: *{escape_md(execution_mode)}* \\(cadence, width, size, quote life\\)\n"
             f"{_ladder_line(conf)}\n"
             f"POV: *{escape_md(pov_label)}* \\(per\\-cycle pacing from Nado 24h volume\\)\n"
             f"{_mm_sizing_line(conf)}\n\n"
@@ -2668,6 +2686,16 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                     InlineKeyboardButton("Custom TP", callback_data="strategy:input:mid:tp_pct"),
                     InlineKeyboardButton("Custom SL", callback_data="strategy:input:mid:sl_pct"),
                 ],
+                [
+                    InlineKeyboardButton("Soft $60", callback_data="strategy:set:mid:inventory_soft_limit_usd:60"),
+                    InlineKeyboardButton("Hard $75", callback_data="strategy:set:mid:inventory_hard_limit_usd:75"),
+                    InlineKeyboardButton("Budget $10", callback_data="strategy:set:mid:expected_budget_usd:10"),
+                ],
+                [
+                    InlineKeyboardButton("Custom Soft", callback_data="strategy:input:mid:inventory_soft_limit_usd"),
+                    InlineKeyboardButton("Custom Hard", callback_data="strategy:input:mid:inventory_hard_limit_usd"),
+                    InlineKeyboardButton("Custom Budget", callback_data="strategy:input:mid:expected_budget_usd"),
+                ],
             ]
         else:
             # Setup: Tiny Budget Preset, margin, spread (signed), levels, reference, bias.
@@ -2706,9 +2734,9 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                     InlineKeyboardButton("Geometric", callback_data="strategy:set_text:mid:size_curve:geometric"),
                 ],
                 [
-                    InlineKeyboardButton("30s", callback_data="strategy:set:mid:interval_seconds:30"),
-                    InlineKeyboardButton("60s", callback_data="strategy:set:mid:interval_seconds:60"),
-                    InlineKeyboardButton("120s", callback_data="strategy:set:mid:interval_seconds:120"),
+                    InlineKeyboardButton("⚡ Aggressive", callback_data="strategy:set_text:mid:mid_execution_mode:aggressive"),
+                    InlineKeyboardButton("Normal", callback_data="strategy:set_text:mid:mid_execution_mode:normal"),
+                    InlineKeyboardButton("Passive", callback_data="strategy:set_text:mid:mid_execution_mode:passive"),
                 ],
                 [
                     InlineKeyboardButton("Short −0.5", callback_data="strategy:set:mid:directional_bias:-0.5"),

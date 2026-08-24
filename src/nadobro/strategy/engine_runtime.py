@@ -441,6 +441,27 @@ def _apply_mid_controller_config(controller: Controller, configs: Dict[str, obje
     controller.ladder_step_bp = _dec(configs.get("ladder_step_bp", "0") or "0")  # type: ignore[attr-defined]
     controller.ladder_curve = str(configs.get("ladder_curve", "flat") or "flat").lower()  # type: ignore[attr-defined]
     controller.min_quote_lifetime_s = float(_dec(configs.get("min_quote_lifetime_s", "0") or "0"))  # type: ignore[attr-defined]
+    # Arbital-style Mid policy attributes are inert unless the Mid mapper set
+    # its explicit enable flag. This preserves inherited controller users.
+    if bool(_dec(configs.get("mid_policy_enabled", "0") or "0")):
+        from src.nadobro.quant.mid_market_making import normalize_mid_execution_mode
+
+        controller.mid_policy_enabled = True  # type: ignore[attr-defined]
+        controller.execution_mode = normalize_mid_execution_mode(  # type: ignore[attr-defined]
+            configs.get("mid_execution_mode")
+        )
+        controller.max_quote_lifetime_s = float(  # type: ignore[attr-defined]
+            _dec(configs.get("max_quote_lifetime_s", "0") or "0")
+        )
+        controller.inventory_soft_limit_quote = _dec(  # type: ignore[attr-defined]
+            configs.get("inventory_soft_limit_quote", "0") or "0"
+        )
+        controller.inventory_hard_limit_quote = _dec(  # type: ignore[attr-defined]
+            configs.get("inventory_hard_limit_quote", "0") or "0"
+        )
+        controller.expected_budget_usd = _dec(  # type: ignore[attr-defined]
+            configs.get("expected_budget_usd", "0") or "0"
+        )
 
 
 def _apply_orchestrator_risk_limits(orch: ExecutorOrchestrator, limits: RiskLimits) -> None:
@@ -744,6 +765,9 @@ _LIVE_CONFIG_SIGNATURE_EXCLUDE = frozenset({
     "signal_regime",
     "signal_bias",
     "signal_confidence",
+    # Controller-derived, persisted only to recover a Mid session after a
+    # worker restart. It must not force live quote resets every cycle.
+    "restore_expected_budget_used_usd",
 })
 
 
@@ -988,6 +1012,7 @@ def map_strategy_config(
         # the shared resolver so text and float biases mean the same thing
         # everywhere.
         from src.nadobro.quant.mm_quote_math import _resolve_directional_bias_value
+        from src.nadobro.quant.mid_market_making import resolve_mid_execution_profile
         from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
 
         _mid_bias = _resolve_directional_bias_value(settings.get("directional_bias"))
@@ -1005,6 +1030,16 @@ def map_strategy_config(
         _inv_cap = _f(settings, "inventory_soft_limit_usd", deployed)
         if _inv_cap <= 0:
             _inv_cap = deployed
+        _inv_hard = _f(settings, "inventory_hard_limit_usd", _inv_cap * 1.25)
+        if _inv_hard <= 0:
+            _inv_hard = _inv_cap * 1.25
+        _inv_hard = max(_inv_hard, _inv_cap)
+        _mid_execution = resolve_mid_execution_profile(settings.get("mid_execution_mode"))
+        spread_frac *= Decimal(str(_mid_execution.spread_multiplier))
+        _order_amount = (
+            (_chunk_dec or Decimal(str(deployed)))
+            * Decimal(str(_mid_execution.size_multiplier))
+        )
         return {
             "trading_pair": product,
             "spread_bid_pct": spread_frac,
@@ -1018,7 +1053,7 @@ def map_strategy_config(
             # the (previously dead) ``levels`` input changes the SHAPE of the
             # book, never its size. With a participation preset, the per-cycle
             # chunk replaces the full size.
-            "order_amount_quote": _chunk_dec or Decimal(str(deployed)),
+            "order_amount_quote": _order_amount,
             # LADDER (Phase 2, 2026-08-02): Mid used to place ONE bid + ONE ask
             # and then wait in position — ``levels`` was read here and thrown
             # away. Now the side's deployment is split across ``levels`` levels
@@ -1044,7 +1079,18 @@ def map_strategy_config(
             # fill rate. Hold each quote for ~2 cycles before a mere price
             # change may cancel it. Safety cancels are never delayed.
             "min_quote_lifetime_s": _min_quote_lifetime_s(strategy, settings),
-            "max_base_quote": Decimal(str(_inv_cap)),
+            "max_base_quote": Decimal(str(_inv_hard)),
+            "min_base_quote": Decimal(str(-_inv_hard)),
+            "mid_policy_enabled": Decimal(1),
+            "mid_execution_mode": _mid_execution.name,
+            "max_quote_lifetime_s": Decimal(str(_mid_execution.quote_ttl_seconds)),
+            "inventory_soft_limit_quote": Decimal(str(_inv_cap)),
+            "inventory_hard_limit_quote": Decimal(str(_inv_hard)),
+            "expected_budget_usd": Decimal(str(max(0.0, _f(settings, "expected_budget_usd", 0.0)))),
+            "restore_expected_budget_used_usd": Decimal(
+                str(max(0.0, _f(settings, "mid_budget_used_usd", 0.0)))
+            ),
+            "interval_seconds": _mid_execution.interval_seconds,
             # Quote mode: "mid" (default, mid ± spread) or "touch" (join the
             # best bid/ask — Turbo Volume). Unknown values fall back to "mid".
             # POLICY (2026-07-15): mid is MAKER-ONLY — the cross-on-deadline
@@ -2356,18 +2402,22 @@ async def _maybe_apply_overlay(
 
         # Surface the regime-adjusted barriers to the session SL/TP rail (which
         # reads state, not configs). Persisted with state at end of cycle, so
-        # the rail uses them from the next cycle. Bounded by the user's own
-        # config: SL is tighten-only (the user's session SL stays the
-        # kill-switch contract) and a barrier the user disarmed stays disarmed.
+        # the rail uses them from the next cycle. Mid owns both of its session
+        # barriers: the overlay can steer its quotes, but must not alter the
+        # user's configured SL/TP or leave stale barrier values in state.
         rail_sl, rail_tp = rail_barriers(base_sl, base_tp, signal)
-        if rail_sl is not None:
-            state["overlay_sl_pct"] = float(rail_sl)
-        else:
+        if str(strategy or "").lower() == "mid":
             state.pop("overlay_sl_pct", None)
-        if rail_tp is not None:
-            state["overlay_tp_pct"] = float(rail_tp)
-        else:
             state.pop("overlay_tp_pct", None)
+        else:
+            if rail_sl is not None:
+                state["overlay_sl_pct"] = float(rail_sl)
+            else:
+                state.pop("overlay_sl_pct", None)
+            if rail_tp is not None:
+                state["overlay_tp_pct"] = float(rail_tp)
+            else:
+                state.pop("overlay_tp_pct", None)
 
         # Persist the signal + applied action for Night HOWL / audit (off loop).
         # Throttled: only when the APPLIED action changed, plus a heartbeat —
@@ -3047,6 +3097,9 @@ async def _run_engine_cycle_locked(
                 lm_fn = getattr(controller, "ladder_metrics", None)
                 if callable(lm_fn):
                     state["mm_engine_metrics"] = lm_fn() or {}
+                    state["mid_budget_used_usd"] = float(
+                        state["mm_engine_metrics"].get("expected_budget_used_usd") or 0.0
+                    )
             if strategy == "vol":
                 vol_metrics_fn = getattr(controller, "volume_metrics", None)
                 if callable(vol_metrics_fn):

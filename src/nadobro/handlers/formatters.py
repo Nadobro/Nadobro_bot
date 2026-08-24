@@ -1755,6 +1755,22 @@ def fmt_status_overview(status: dict, onboarding: dict):
     elif gate_verdict == "QUOTE" and str(status.get("mm_gate_reason") or "") == "":
         # Quiet confirmation only — the pause state is the one that matters.
         lines.append(f"{_loc('Quoting')}: {_loc_md('active')} ✅")
+    if strategy == "MID":
+        mode = str(status.get("mid_execution_mode") or "").upper()
+        inv_state = str(status.get("inventory_state") or "")
+        budget = status.get("expected_budget_usd")
+        used = status.get("expected_budget_used_usd")
+        stop_reason = str(status.get("budget_stop_reason") or "")
+        if mode:
+            lines.append(f"Execution: *{escape_md(mode)}* · Inventory: *{escape_md(inv_state or 'neutral')}*")
+        if budget is not None and float(budget or 0) > 0:
+            budget_line = (
+                f"Expected budget: *{escape_md(_fmt_compact_usd(float(used or 0)))} / "
+                f"{escape_md(_fmt_compact_usd(float(budget)))}*"
+            )
+            if stop_reason:
+                budget_line += f" · *{escape_md(stop_reason.replace('_', ' '))}*"
+            lines.append(budget_line)
     lines.extend(readiness_lines)
 
     if strategy == "DN":

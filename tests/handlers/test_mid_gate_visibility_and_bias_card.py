@@ -65,6 +65,23 @@ def test_status_shows_quoting_active_when_gate_quotes():
     assert "active" in text
 
 
+def test_status_surfaces_mid_execution_inventory_and_budget_stop():
+    text = fmt_status_overview(
+        _mid_status(
+            mid_execution_mode="passive",
+            inventory_state="hard_long",
+            expected_budget_usd=10.0,
+            expected_budget_used_usd=10.0,
+            budget_stop_reason="expected_budget_exhausted",
+        ),
+        _ONBOARDING_OK,
+    )
+    assert "PASSIVE" in text
+    assert "hard\\_long" in text
+    assert "Expected budget" in text
+    assert "expected budget exhausted" in text
+
+
 def test_status_without_gate_keys_renders_no_quoting_line():
     text = fmt_status_overview(_mid_status(), _ONBOARDING_OK)
     assert "Quoting" not in text
