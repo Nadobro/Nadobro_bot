@@ -653,7 +653,7 @@ class RuntimeAndLeverageTests(unittest.TestCase):
         self.assertTrue(res["success"])
         self.assertEqual(spot_cleanup.call_args.kwargs["max_base_size"], 0.0)
 
-    def _run_grid_cycle_with_snapshot(self, *, strategy, sl_pct, snapshot):
+    def _run_grid_cycle_with_snapshot(self, *, strategy, sl_pct, snapshot, tp_pct=0.0):
         """Drive _run_cycle for a grid-family strategy with a mocked live
         session snapshot, returning the close_all_positions mock + result."""
         telegram_id = 7
@@ -664,7 +664,7 @@ class RuntimeAndLeverageTests(unittest.TestCase):
             "product": "BTC",
             "reference_price": 100.0,
             "sl_pct": sl_pct,
-            "tp_pct": 0.0,
+            "tp_pct": tp_pct,
             "notional_usd": 100.0,
             "interval_seconds": 1,
             "last_run_ts": 0.0,
@@ -744,6 +744,40 @@ class RuntimeAndLeverageTests(unittest.TestCase):
         )
         self.assertEqual(result, (True, None))
         self.assertTrue(close_mock.called)
+
+    def test_run_cycle_mid_stops_on_net_session_loss_at_user_threshold(self):
+        """Mid's live session rail closes after realized/unrealized PnL plus
+        fees crosses the user's selected percent-of-margin stop."""
+        result, close_mock = self._run_grid_cycle_with_snapshot(
+            strategy="mid", sl_pct=1.0,
+            # Gross loss is still inside the stop, but fees push net loss past
+            # the exact 1%-of-$100 threshold. This proves the Mid execution
+            # cycle reaches the rail and uses its fee-aware session PnL basis.
+            snapshot={
+                "session_pnl": -0.75,
+                "session_pnl_pct": -0.75,
+                "session_pnl_net": -1.05,
+                "session_pnl_pct_net": -1.05,
+                "margin": 100.0,
+            },
+        )
+        self.assertEqual(result, (True, None))
+        close_mock.assert_called_once()
+
+    def test_run_cycle_mid_stops_on_net_session_gain_at_user_threshold(self):
+        """Mid's live session rail also honors the user's TP and flattens."""
+        result, close_mock = self._run_grid_cycle_with_snapshot(
+            strategy="mid", sl_pct=50.0, tp_pct=1.0,
+            snapshot={
+                "session_pnl": 0.75,
+                "session_pnl_pct": 0.75,
+                "session_pnl_net": 1.05,
+                "session_pnl_pct_net": 1.05,
+                "margin": 100.0,
+            },
+        )
+        self.assertEqual(result, (True, None))
+        close_mock.assert_called_once()
 
     def test_mm_start_guard_uses_cycle_notional_without_leverage_multiplier(self):
         class FakeClient:

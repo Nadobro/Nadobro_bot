@@ -59,6 +59,17 @@ class MockNadoAdapter(NadoAdapterBase):
         self._fill_events: List[Fill] = []
         self.placed: List[NadoOrder] = []
         self.cancelled: List[str] = []
+        # Fused-replace bookkeeping (Phase 8): (old_digest, new_digest) pairs
+        # from cancel_and_place, and digests dropped via forget_cancelled.
+        self.replaced: List[tuple] = []
+        self.forgotten: List[str] = []
+        # Model a NON-ATOMIC venue: cancel_and_place places the new order but
+        # leaves the old one RESTING (partial success). Exercises the settle
+        # fallback that must then cancel it to avoid a double order.
+        self.cap_leaves_old_resting = False
+        # Leverage each path signs, so a test can prove classic == fused.
+        self.place_leverages: List[int] = []
+        self.cap_leverages: List[int] = []
         # Funding the short leg "earns" per call to funding_since (received-
         # positive). Tests can set this to simulate accrued funding.
         self.funding_quote: Decimal = Decimal(0)
@@ -124,6 +135,7 @@ class MockNadoAdapter(NadoAdapterBase):
         reduce_only: bool = False,
     ) -> NadoOrder:
         self._maybe_fail("place_order")
+        self.place_leverages.append(int(leverage))
         self._counter += 1
         oid = f"ord-{self._counter}"
         order = NadoOrder(
@@ -186,6 +198,42 @@ class MockNadoAdapter(NadoAdapterBase):
         if order is None:
             raise AdapterError(f"unknown order {order_id}")
         return copy.copy(order)
+
+    async def cancel_and_place(
+        self,
+        cancel_order_id: str,
+        trading_pair: str,
+        side: TradeType,
+        order_type: OrderType,
+        amount_base: Decimal,
+        price: Decimal,
+        leverage: int = 1,
+        reduce_only: bool = False,
+    ) -> NadoOrder:
+        # ATOMIC like the venue: _maybe_fail raises BEFORE any state change, so a
+        # failure leaves the OLD order resting and nothing new placed.
+        self._maybe_fail("cancel_and_place")
+        self.cap_leverages.append(int(leverage))
+        old = self._orders.get(cancel_order_id)
+        if old is not None and not old.state.is_terminal and not self.cap_leaves_old_resting:
+            # Atomic cancel — recorded in ``replaced`` below, NOT in ``cancelled``
+            # (which tracks classic cancel_order calls, so tests can tell the
+            # fused path from a stop-then-spawn).
+            old.state = OrderState.CANCELLED
+        self._counter += 1
+        oid = f"ord-{self._counter}"
+        order = NadoOrder(
+            id=oid, trading_pair=trading_pair, side=side, order_type=order_type,
+            amount_base=_dec(amount_base),
+            price=_dec(price) if price is not None else None,
+        )
+        self._orders[oid] = order
+        self.placed.append(order)
+        self.replaced.append((cancel_order_id, oid))
+        return copy.copy(order)
+
+    def forget_cancelled(self, order_id: str) -> None:
+        self.forgotten.append(order_id)
 
     async def fill_stream(self, trading_pair: str) -> AsyncIterator[Fill]:
         for fill in list(self._fill_events):

@@ -227,6 +227,9 @@ SETTINGS_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         # 0.0 == neutral; ±1.0 maxes the side tilt and triggers the +20% margin uplift.
         "directional_bias": 0.0,
         "inventory_soft_limit_usd": 60.0,
+        "inventory_hard_limit_usd": 75.0,
+        "expected_budget_usd": 10.0,
+        "mid_execution_mode": "normal",
     },
     "dn": {
         "notional_usd": 50.0, "spread_bp": 3.0, "interval_seconds": 90, "tp_pct": 0.8, "sl_pct": 0.6,
@@ -361,6 +364,9 @@ RUNTIME_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "quote_ttl_seconds": 90,
         "directional_bias": 0.0,
         "inventory_soft_limit_usd": 60.0,
+        "inventory_hard_limit_usd": 75.0,
+        "expected_budget_usd": 10.0,
+        "mid_execution_mode": "normal",
     },
     "dn": {
         "notional_usd": 50.0,

@@ -448,6 +448,27 @@ def _apply_mid_controller_config(controller: Controller, configs: Dict[str, obje
     controller.ladder_step_bp = _dec(configs.get("ladder_step_bp", "0") or "0")  # type: ignore[attr-defined]
     controller.ladder_curve = str(configs.get("ladder_curve", "flat") or "flat").lower()  # type: ignore[attr-defined]
     controller.min_quote_lifetime_s = float(_dec(configs.get("min_quote_lifetime_s", "0") or "0"))  # type: ignore[attr-defined]
+    # Arbital-style Mid policy attributes are inert unless the Mid mapper set
+    # its explicit enable flag. This preserves inherited controller users.
+    if bool(_dec(configs.get("mid_policy_enabled", "0") or "0")):
+        from src.nadobro.quant.mid_market_making import normalize_mid_execution_mode
+
+        controller.mid_policy_enabled = True  # type: ignore[attr-defined]
+        controller.execution_mode = normalize_mid_execution_mode(  # type: ignore[attr-defined]
+            configs.get("mid_execution_mode")
+        )
+        controller.max_quote_lifetime_s = float(  # type: ignore[attr-defined]
+            _dec(configs.get("max_quote_lifetime_s", "0") or "0")
+        )
+        controller.inventory_soft_limit_quote = _dec(  # type: ignore[attr-defined]
+            configs.get("inventory_soft_limit_quote", "0") or "0"
+        )
+        controller.inventory_hard_limit_quote = _dec(  # type: ignore[attr-defined]
+            configs.get("inventory_hard_limit_quote", "0") or "0"
+        )
+        controller.expected_budget_usd = _dec(  # type: ignore[attr-defined]
+            configs.get("expected_budget_usd", "0") or "0"
+        )
 
 
 def _apply_orchestrator_risk_limits(orch: ExecutorOrchestrator, limits: RiskLimits) -> None:
@@ -734,6 +755,14 @@ _LIVE_CONFIG_SIGNATURE_EXCLUDE = frozenset({
     "end_price",
     "limit_price",
     "candle_provider",
+    # Same reason as candle_provider: the mapper emits None and
+    # run_engine_cycle replaces it with a closure. ``None`` is not callable so
+    # it lands IN the signature, the closure is callable so it drops OUT — the
+    # key appearing and disappearing flips the signature once and recenters the
+    # whole ladder for nothing.
+    "signal_provider",
+    "markout_provider",
+    "levels_provider",
     # DN-only restore fields; excluded defensively if a future strategy shares
     # this helper.
     "restore_cycles_completed",
@@ -751,6 +780,9 @@ _LIVE_CONFIG_SIGNATURE_EXCLUDE = frozenset({
     "signal_regime",
     "signal_bias",
     "signal_confidence",
+    # Controller-derived, persisted only to recover a Mid session after a
+    # worker restart. It must not force live quote resets every cycle.
+    "restore_expected_budget_used_usd",
 })
 
 
@@ -995,6 +1027,8 @@ def map_strategy_config(
         # the shared resolver so text and float biases mean the same thing
         # everywhere.
         from src.nadobro.quant.mm_quote_math import _resolve_directional_bias_value
+        from src.nadobro.quant.mid_market_making import resolve_mid_execution_profile
+        from src.nadobro.quant.vol_fee_estimator import MAKER_ROUND_TRIP_RATE
 
         _mid_bias = _resolve_directional_bias_value(settings.get("directional_bias"))
         # Directional bias intentionally builds one-sided inventory, which would
@@ -1011,6 +1045,16 @@ def map_strategy_config(
         _inv_cap = _f(settings, "inventory_soft_limit_usd", deployed)
         if _inv_cap <= 0:
             _inv_cap = deployed
+        _inv_hard = _f(settings, "inventory_hard_limit_usd", _inv_cap * 1.25)
+        if _inv_hard <= 0:
+            _inv_hard = _inv_cap * 1.25
+        _inv_hard = max(_inv_hard, _inv_cap)
+        _mid_execution = resolve_mid_execution_profile(settings.get("mid_execution_mode"))
+        spread_frac *= Decimal(str(_mid_execution.spread_multiplier))
+        _order_amount = (
+            (_chunk_dec or Decimal(str(deployed)))
+            * Decimal(str(_mid_execution.size_multiplier))
+        )
         return {
             "trading_pair": product,
             "spread_bid_pct": spread_frac,
@@ -1024,7 +1068,7 @@ def map_strategy_config(
             # the (previously dead) ``levels`` input changes the SHAPE of the
             # book, never its size. With a participation preset, the per-cycle
             # chunk replaces the full size.
-            "order_amount_quote": _chunk_dec or Decimal(str(deployed)),
+            "order_amount_quote": _order_amount,
             # LADDER (Phase 2, 2026-08-02): Mid used to place ONE bid + ONE ask
             # and then wait in position — ``levels`` was read here and thrown
             # away. Now the side's deployment is split across ``levels`` levels
@@ -1050,12 +1094,106 @@ def map_strategy_config(
             # fill rate. Hold each quote for ~2 cycles before a mere price
             # change may cancel it. Safety cancels are never delayed.
             "min_quote_lifetime_s": _min_quote_lifetime_s(strategy, settings),
-            "max_base_quote": Decimal(str(_inv_cap)),
+            "max_base_quote": Decimal(str(_inv_hard)),
+            "min_base_quote": Decimal(str(-_inv_hard)),
+            "mid_policy_enabled": Decimal(1),
+            "mid_execution_mode": _mid_execution.name,
+            "max_quote_lifetime_s": Decimal(str(_mid_execution.quote_ttl_seconds)),
+            "inventory_soft_limit_quote": Decimal(str(_inv_cap)),
+            "inventory_hard_limit_quote": Decimal(str(_inv_hard)),
+            "expected_budget_usd": Decimal(str(max(0.0, _f(settings, "expected_budget_usd", 0.0)))),
+            "restore_expected_budget_used_usd": Decimal(
+                str(max(0.0, _f(settings, "mid_budget_used_usd", 0.0)))
+            ),
+            "interval_seconds": _mid_execution.interval_seconds,
             # Quote mode: "mid" (default, mid ± spread) or "touch" (join the
             # best bid/ask — Turbo Volume). Unknown values fall back to "mid".
             # POLICY (2026-07-15): mid is MAKER-ONLY — the cross-on-deadline
             # taker flatten was removed (fees + Nado wash-trading policy).
             "quote_mode": str(settings.get("mm_quote_mode") or "mid"),
+            # Mid Mode v3 Phase 2: read the SIZED book once per tick and record
+            # microprice / imbalance / spread. OBSERVATION ONLY — it does not
+            # price a quote or change a requote decision. Set here and nowhere
+            # else, so the two controllers that INHERIT MarketMakingController
+            # (fill-anchored Grid, R-Grid) keep their shipped behaviour exactly.
+            "microstructure_log": Decimal(1) if _f(settings, "microstructure_log", 1.0) > 0 else Decimal(0),
+            # --- Mid Mode v3 Phase 5: objective profile + fee floor ----------
+            # Mid had ONE behaviour for every market, which is why spread
+            # capture on BTC loses by 25-45x: the one-tick book has no edge to
+            # capture, so quoting for one just pays the fee on every fill. The
+            # selector reads the live spread once at session start and runs
+            # VOLUME (queue priority, quoting inside the fee is the point) or
+            # SPREAD (delta* = f + edge, so a quote can never rest inside the
+            # fee). ``mid_objective`` = auto | volume | spread; auto is the
+            # default and an explicit choice always wins.
+            #
+            # Set in THIS branch only. FillAnchoredQuotingController and
+            # RGridController inherit MarketMakingController, so a default-on
+            # flag would silently re-price Grid and R-Grid.
+            "profile_enabled": (
+                Decimal(1) if _f(settings, "mid_profile_enabled", 1.0) > 0 else Decimal(0)
+            ),
+            "mid_objective": str(settings.get("mid_objective") or "auto"),
+            # Round-trip maker+builder fee in bp. The venue's per-product maker
+            # rate is signed and often a rebate, so the conservative shipped
+            # default (5.0bp) is used unless a setting overrides it.
+            "fee_round_trip_bp": Decimal(
+                str(_f(settings, "fee_round_trip_bp",
+                       float(MAKER_ROUND_TRIP_RATE) * 10_000.0))
+            ),
+            "min_edge_bp": Decimal(str(_f(settings, "min_edge_bp", 1.0))),
+            # Inventory reservation price. Long inventory shifts the quoting
+            # anchor DOWN so the ask works it off — bounded to half the
+            # half-spread, so the sides can never cross. Separate from
+            # directional_bias, which stays the user's field.
+            "inventory_skew_enabled": (
+                Decimal(1) if _f(settings, "inventory_skew_enabled", 1.0) > 0 else Decimal(0)
+            ),
+            "inventory_skew_gamma": Decimal(str(_f(settings, "inventory_skew_gamma", 0.1))),
+            # --- Mid Mode v3 Phase 6: alpha, mark-out defence, STP -----------
+            # The blended Hyperliquid forecast moves the quoting ANCHOR (never
+            # directional_bias, which the user owns) and is hard-clamped to
+            # +/-0.35 until per-component scoring earns better weights. The
+            # providers below are injected in run_engine_cycle, where the
+            # network and product are known; engine/ has no module-level edge
+            # to market_data/, so they arrive as callables.
+            "alpha_enabled": (
+                Decimal(1) if _f(settings, "mid_alpha_enabled", 1.0) > 0 else Decimal(0)
+            ),
+            "alpha_max": Decimal(str(_f(settings, "alpha_max", 0.35))),
+            "alpha_strength": Decimal(str(_f(settings, "alpha_strength", 0.5))),
+            "degraded_spread_mult": Decimal(
+                str(_f(settings, "degraded_spread_mult", 1.25))
+            ),
+            # The venue has no self-trade prevention and the controller only had
+            # a crossed-BOOK bail, which never looked at our own ladder.
+            "self_trade_prevention": (
+                Decimal(1) if _f(settings, "self_trade_prevention", 1.0) > 0 else Decimal(0)
+            ),
+            "signal_provider": None,      # injected in run_engine_cycle
+            "markout_provider": None,     # injected in run_engine_cycle
+            # --- Mid Mode v3 Phase 7: support/resistance ladder shaping ------
+            # S/R is the ONE slow-timeframe object with quoting value, because
+            # it is a PRICE rather than a direction: EMA/RSI/MACD cannot change
+            # between two 3-8s quote decisions, so they can only set the
+            # envelope. Reshaping only — the per-side deployment is unchanged.
+            "level_weights_enabled": (
+                Decimal(1) if _f(settings, "level_weights_enabled", 1.0) > 0 else Decimal(0)
+            ),
+            "level_tolerance_bp": Decimal(str(_f(settings, "level_tolerance_bp", 25.0))),
+            "level_boost": Decimal(str(_f(settings, "level_boost", 1.5))),
+            "levels_provider": None,      # injected in run_engine_cycle
+            # --- Mid Mode v3 Phase 8: atomic cancel_and_place requote --------
+            # Fuse a requote's cancel+replace into ONE signed venue request: no
+            # gap where the side is unquoted, one execute round trip instead of
+            # two. Mid only (the controller base is shared with Grid/R-Grid),
+            # and it always falls back to the classic stop-then-spawn on any
+            # failure — a fused replace is atomic, so it can never leave a
+            # half-done state and can only ever be as good as the two separate
+            # calls it replaces.
+            "cancel_and_place_enabled": (
+                Decimal(1) if _f(settings, "cancel_and_place_enabled", 1.0) > 0 else Decimal(0)
+            ),
             "price_distance_tolerance": (spread_frac / Decimal(2)) or Decimal("0.0005"),
             "leverage": int(eff_lev),
             # Regime gate + inventory cap + ATR auto-spread (2026-06 upgrade).
@@ -2312,18 +2450,22 @@ async def _maybe_apply_overlay(
 
         # Surface the regime-adjusted barriers to the session SL/TP rail (which
         # reads state, not configs). Persisted with state at end of cycle, so
-        # the rail uses them from the next cycle. Bounded by the user's own
-        # config: SL is tighten-only (the user's session SL stays the
-        # kill-switch contract) and a barrier the user disarmed stays disarmed.
+        # the rail uses them from the next cycle. Mid owns both of its session
+        # barriers: the overlay can steer its quotes, but must not alter the
+        # user's configured SL/TP or leave stale barrier values in state.
         rail_sl, rail_tp = rail_barriers(base_sl, base_tp, signal)
-        if rail_sl is not None:
-            state["overlay_sl_pct"] = float(rail_sl)
-        else:
+        if str(strategy or "").lower() == "mid":
             state.pop("overlay_sl_pct", None)
-        if rail_tp is not None:
-            state["overlay_tp_pct"] = float(rail_tp)
-        else:
             state.pop("overlay_tp_pct", None)
+        else:
+            if rail_sl is not None:
+                state["overlay_sl_pct"] = float(rail_sl)
+            else:
+                state.pop("overlay_sl_pct", None)
+            if rail_tp is not None:
+                state["overlay_tp_pct"] = float(rail_tp)
+            else:
+                state.pop("overlay_tp_pct", None)
 
         # Persist the signal + applied action for Night HOWL / audit (off loop).
         # Throttled: only when the APPLIED action changed, plus a heartbeat —
@@ -2542,6 +2684,73 @@ async def _run_engine_cycle_locked(
                 return []
 
         configs["candle_provider"] = _candle_provider
+
+    # Mid Mode v3 Phase 6: the forecast and mark-out providers. Injected HERE
+    # for the same reason candle_provider is — this is where the network and
+    # product are known — and as callables because engine/ has no module-level
+    # import edge to market_data/. Mid only: FillAnchoredQuotingController and
+    # RGridController inherit the same controller class.
+    if strategy == "mid" and configs.get("signal_provider") is None:
+        _net = str(network)
+        _uid = int(telegram_id)
+        _prod = str(product or "")
+
+        async def _signal_provider(pair: str, nado_mid: object) -> object:
+            """Hyperliquid forecast components, or an absence marker.
+
+            Returns None when the feed should have this market and does not —
+            the controller reads that as DEGRADED and widens. Returns
+            ``{"supported": False}`` for a market HL never lists (equity/RWA),
+            which must NOT read as degradation.
+            """
+            try:
+                from src.nadobro.trading import hl_signals
+
+                hl_signals.ensure_registered()
+                return hl_signals.build_components(pair or _prod, nado_mid)
+            except Exception:  # noqa: BLE001 - never let the feed break a tick
+                logger.debug("signal_provider failed pair=%s", pair, exc_info=True)
+                return None
+
+        async def _markout_provider(half_spread_bp: float) -> float:
+            """Measured-adverse-selection widening. TTL-cached, never blocking."""
+            try:
+                from src.nadobro.trading import markout_defense
+
+                return await markout_defense.widen_factor(
+                    _uid, _net, _prod, half_spread_bp=float(half_spread_bp)
+                )
+            except Exception:  # noqa: BLE001 - a grading outage must not move quotes
+                logger.debug("markout_provider failed product=%s", _prod, exc_info=True)
+                return 1.0
+
+        async def _levels_provider() -> object:
+            """Support/resistance from HL 1m candles. TTL-cached, non-blocking."""
+            try:
+                from src.nadobro.trading import hl_levels, hl_signals
+
+                return await hl_levels.levels_for(hl_signals.coin_for(_prod))
+            except Exception:  # noqa: BLE001 - no levels just leaves the shape alone
+                logger.debug("levels_provider failed product=%s", _prod, exc_info=True)
+                return {}
+
+        configs["signal_provider"] = _signal_provider
+        configs["markout_provider"] = _markout_provider
+        configs["levels_provider"] = _levels_provider
+
+        # Phase 7 fast requote: announce interest so a material move on HL's
+        # pushed book wakes this session via the existing nudge path instead of
+        # waiting up to 8s for the next tick. The announcement EXPIRES, so a
+        # stopped session stops being nudged with nothing to unregister, and
+        # the listener is attached exactly once (module-level function, so the
+        # registry's equality dedupe fires).
+        try:
+            from src.nadobro.strategy import hl_fast_requote
+
+            hl_fast_requote.ensure_registered()
+            hl_fast_requote.note_active(_uid, _net, _prod)
+        except Exception:  # noqa: BLE001 - a missing feed just means slower ticks
+            logger.debug("hl fast requote registration failed", exc_info=True)
 
     # BUG-TICK-1 recovery: if the local controller went terminal-FAILED (a
     # genuinely fatal error, or an exhausted transient-error streak), force a
@@ -2928,6 +3137,17 @@ async def _run_engine_cycle_locked(
             counts_fn = getattr(controller, "order_counts", None)
             if callable(counts_fn):
                 order_counts = counts_fn() or {}
+            # Mid Mode v3: the resolved profile, the fee floor, alpha and the
+            # defensive state, for /mm_status. ``ladder_metrics`` had NO reader
+            # until now, so the dashboard could not say which playbook was
+            # running or whether the signal feed was alive.
+            if strategy == "mid":
+                lm_fn = getattr(controller, "ladder_metrics", None)
+                if callable(lm_fn):
+                    state["mm_engine_metrics"] = lm_fn() or {}
+                    state["mid_budget_used_usd"] = float(
+                        state["mm_engine_metrics"].get("expected_budget_used_usd") or 0.0
+                    )
             if strategy == "vol":
                 vol_metrics_fn = getattr(controller, "volume_metrics", None)
                 if callable(vol_metrics_fn):

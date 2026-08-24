@@ -42,29 +42,55 @@ logger = logging.getLogger(__name__)
 # Turbo Volume preset: one tap writes the COHERENT setting trio (leverage,
 # inventory allowance, session SL) plus fast cadence and tight/touch quoting.
 # These knobs interact — leverage scales uPnL as % of margin linearly, so the
-# session rail must widen with it, and the inventory/net-exposure caps must fit
+# session rail must scale with it, and the inventory/net-exposure caps must fit
 # at least one full-size fill or the book goes one-sided after every fill.
 # Values are written per strategy; the user can still tune any field after.
-_TURBO_LEVERAGE_DEFAULT = 10.0
-_TURBO_SESSION_SL_PCT = 10.0  # % of margin; at 10x = a 1% adverse price move
+#
+# Turbo deploys at per-asset PAIR MAX (product-owner directive 2026-08). Because
+# the session stop is a % of MARGIN, it is scaled with leverage to hold a fixed
+# adverse-move tolerance (a flat 10%-of-margin stop at 50x = a 0.2% move, which
+# auto-stops on noise), and clamped to the liquidation-safe ceiling so a
+# max-leverage Turbo always passes the pre-start liquidation guard.
+_TURBO_ADVERSE_MOVE_PCT = 1.0   # target adverse price-move tolerance (% price move)
+_TURBO_MIN_SL_PCT = 2.0         # never below this % of margin (unless the safe ceiling is lower)
 
 
-def _turbo_preset_settings(strategy_id: str, product_max_leverage: float) -> dict:
+def _turbo_session_sl_pct(leverage: float, mmf: float | None) -> float:
+    """Turbo's session stop as a % of margin: a fixed adverse-move tolerance
+    (``_TURBO_ADVERSE_MOVE_PCT × leverage``) floored at ``_TURBO_MIN_SL_PCT`` and
+    then clamped to the liquidation-safe ceiling ``S*`` so it can never sit
+    inside the liquidation buffer. Truncated (never rounded up) so the written
+    value stays at or below ``S*`` and the pre-start guard admits it."""
+    import math
+
+    lev = max(1.0, float(leverage or 1.0))
+    sl = max(_TURBO_MIN_SL_PCT, _TURBO_ADVERSE_MOVE_PCT * lev)
+    if mmf is not None and float(mmf) > 0:
+        from src.nadobro.quant.liquidation import safe_max_sl_pct
+        s_star = safe_max_sl_pct(lev, float(mmf))
+        if s_star > 0:
+            sl = min(sl, s_star)
+    return max(0.1, math.floor(sl * 10.0) / 10.0)
+
+
+def _turbo_preset_settings(
+    strategy_id: str, product_max_leverage: float, mmf: float | None = None,
+) -> dict:
     """Settings the Turbo Volume preset writes for ``strategy_id``.
 
-    Pure (unit-tested): leverage = min(10x, product max). Only ``mid`` gets
-    touch quoting, the auto inventory cap (0 = deployed), a 100% net-exposure
-    allowance (one full-size fill), and tp_pct=0 (no session profit-stop —
-    mid's exits are purely rail-driven, so this only removes an auto-stop).
-    grid/rgrid/dgrid keep their TP and level mechanics untouched — their
-    position exits flow through barriers this preset must not disturb.
+    Pure (unit-tested): leverage = per-asset PAIR MAX; the session stop scales
+    with leverage and is clamped to the liquidation-safe ceiling (pass the pair's
+    ``mmf`` so the clamp is real — without it the stop is uncapped but still
+    scaled). Only ``mid`` gets touch quoting, the auto inventory cap (0 =
+    deployed), a 100% net-exposure allowance (one full-size fill), and tp_pct=0
+    (no session profit-stop — mid's exits are purely rail-driven). grid ALSO gets
+    the validated VOLUME levers (a deeper ladder + aggressive recenter); its TP and
+    the %-of-margin SL rail stay untouched. rgrid/dgrid keep their TP and level
+    mechanics untouched (their position exits flow through barriers this preset must
+    not disturb).
     """
-    # NOTE (2026-08-24 volume engine): the grid branch DOES set level + recenter
-    # mechanics (levels + grid_reset_threshold_pct) — that is the validated volume
-    # lever. Its TP and the %-of-margin SL rail remain untouched. rgrid/dgrid keep
-    # their TP and level mechanics untouched (their position exits flow through
-    # barriers this preset must not disturb).
-    lev = max(1.0, min(_TURBO_LEVERAGE_DEFAULT, float(product_max_leverage or 1.0)))
+    lev = max(1.0, float(product_max_leverage or 1.0))
+    sl = _turbo_session_sl_pct(lev, mmf)
     base = {
         "mm_leverage_override": int(lev),
         "interval_seconds": 5,
@@ -77,12 +103,12 @@ def _turbo_preset_settings(strategy_id: str, product_max_leverage: float) -> dic
             "mm_quote_mode": "touch",
             "inventory_soft_limit_usd": 0.0,   # 0 = auto (deployed size)
             "max_net_exposure_pct": 100.0,     # allow one full-size fill
-            "sl_pct": _TURBO_SESSION_SL_PCT,
+            "sl_pct": sl,
             "tp_pct": 0.0,
         })
     elif sid == "grid":
         base.update({
-            "spread_bp": 3.0, "sl_pct": _TURBO_SESSION_SL_PCT,
+            "spread_bp": 3.0, "sl_pct": sl,
             # VOLUME ENGINE (2026-08-24, validated on real Aug BTC+ETH). The old
             # Turbo grid barely raised volume: it left ``levels`` at the sparse
             # default (2) and the recenter at the band-width auto-follow, which for
@@ -91,19 +117,20 @@ def _turbo_preset_settings(strategy_id: str, product_max_leverage: float) -> dic
             # ladder plus an AGGRESSIVE recenter (0.15% of price) tracks price and
             # harvested ~3x more fills at LOWER drawdown on both pairs, still net
             # profitable. The recenter is the load-bearing lever — without it more
-            # levels only widen the stale band and cut fills.
+            # levels only widen the stale band and cut fills. TP and the
+            # %-of-margin SL rail (``sl``) stay untouched.
             "levels": 8,
             "grid_reset_threshold_pct": 0.15,
         })
     elif sid == "rgrid":
         base.update({
             "spread_bp": 3.0, "rgrid_spread_bp": 3.0,
-            "rgrid_stop_loss_pct": _TURBO_SESSION_SL_PCT,
+            "rgrid_stop_loss_pct": sl,
         })
     elif sid == "dgrid":
         base.update({
             "spread_bp": 3.0, "dgrid_spread_bp": 3.0,
-            "rgrid_stop_loss_pct": _TURBO_SESSION_SL_PCT,
+            "rgrid_stop_loss_pct": sl,
         })
     return base
 
@@ -671,7 +698,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             query,
             _strategy_config_section_text(strategy_id, conf, network, section),
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=_strategy_config_section_kb(strategy_id, section),
+            reply_markup=_section_kb(strategy_id, section, context, telegram_id),
         )
     elif action == "preset" and len(parts) >= 4:
         # MM Tiny Budget / Standard preset.
@@ -691,13 +718,20 @@ async def _handle_strategy(query, data, context, telegram_id):
             context.user_data.get(f"strategy_pair:{strategy_id}", "BTC") or "BTC"
         ).upper()
         if preset_name == "turbo":
-            # Turbo Volume: coherent high-throughput quoting. Leverage capped
-            # at the pair max; margin is whatever the user configured.
+            # Turbo Volume: coherent high-throughput quoting at per-asset PAIR MAX
+            # leverage; margin is whatever the user configured. The session stop
+            # scales with leverage and is clamped to the pair's liquidation-safe
+            # ceiling (mmf), so a max-leverage Turbo passes the pre-start guard.
             try:
                 lev_cap_t = float(get_product_max_leverage(selected_product, network=network))
             except Exception:  # noqa: BLE001 - unknown pair -> conservative 1x cap
                 lev_cap_t = 1.0
-            turbo_cfg = _turbo_preset_settings(strategy_id, lev_cap_t)
+            try:
+                from src.nadobro.config import get_product_maintenance_margin_fraction as _gpmmf
+                mmf_t = _gpmmf(selected_product, network=network)
+            except Exception:  # noqa: BLE001 - stop stays scaled but uncapped
+                mmf_t = None
+            turbo_cfg = _turbo_preset_settings(strategy_id, lev_cap_t, mmf_t)
 
             def _mutate_turbo(s):
                 strategies = s.setdefault("strategies", {})
@@ -711,17 +745,23 @@ async def _handle_strategy(query, data, context, telegram_id):
             margin_t = float(conf.get("notional_usd", 100.0) or 0.0)
             lev_t = int(turbo_cfg["mm_leverage_override"])
             deployed_t = margin_t * lev_t
+            # The stop key differs by strategy (mid/grid: sl_pct; rgrid/dgrid:
+            # rgrid_stop_loss_pct) — surface whichever Turbo actually wrote.
+            sl_t = float(
+                turbo_cfg.get("sl_pct", turbo_cfg.get("rgrid_stop_loss_pct", 0.0)) or 0.0
+            )
+            move_t = sl_t / max(lev_t, 1)
             mode_note = (
                 "touch\\-joined quotes \\(fills at organic flow\\)" if strategy_id == "mid"
                 else "tight 3bp quoting"
             )
             turbo_note = (
                 f"*🚀 Turbo Volume preset applied for {escape_md(selected_product)}*\n"
-                f"⚡ {lev_t}x leverage: \\${escape_md(f'{margin_t:,.0f}')} margin quotes "
+                f"⚡ {lev_t}x leverage \\(pair max\\): \\${escape_md(f'{margin_t:,.0f}')} margin quotes "
                 f"*\\${escape_md(f'{deployed_t:,.0f}')}* per side, {mode_note}, 5s cycles\\.\n"
-                f"🛡 Session stop\\-loss set to *{escape_md(f'{_TURBO_SESSION_SL_PCT:.0f}%')} of margin* "
-                f"\\(at {lev_t}x that is a \\~{escape_md(f'{_TURBO_SESSION_SL_PCT / max(lev_t, 1):.1f}%')} "
-                f"adverse price move\\)\\.\n"
+                f"🛡 Session stop\\-loss set to *{escape_md(f'{sl_t:.1f}%')} of margin* "
+                f"\\(at {lev_t}x that is a \\~{escape_md(f'{move_t:.2f}%')} "
+                f"adverse price move; liquidation\\-safe\\)\\.\n"
                 f"⚠️ Volume mode trades per\\-fill edge for turnover — expect fees "
                 f"\\(\\~\\$180\\+ per \\$1M net of maker rebates\\) and watch Cost/\\$1M in Performance\\."
             )
@@ -730,7 +770,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 query,
                 f"{body_t}\n\n{turbo_note}",
                 parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=_strategy_config_section_kb(strategy_id, section),
+                reply_markup=_section_kb(strategy_id, section, context, telegram_id),
             )
             return
         if preset_name == "standard":
@@ -761,7 +801,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 query,
                 f"{body_std}\n\n{std_note}",
                 parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=_strategy_config_section_kb(strategy_id, section),
+                reply_markup=_section_kb(strategy_id, section, context, telegram_id),
             )
             return
 
@@ -785,7 +825,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 "⚠️ *Tiny Budget Preset*\n\nVenue minimum could not be resolved for "
                 f"`{escape_md(selected_product)}` from Nado catalog\\. Try again in a moment\\.",
                 parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=_strategy_config_section_kb(strategy_id, "setup"),
+                reply_markup=_section_kb(strategy_id, "setup", context, telegram_id),
             )
             return
         if collateral <= 0:
@@ -794,7 +834,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 "⚠️ *Tiny Budget Preset*\n\nSet your margin first \\(Custom Margin\\), "
                 "then press Tiny Budget Preset to fit leverage to the venue floor\\.",
                 parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=_strategy_config_section_kb(strategy_id, "setup"),
+                reply_markup=_section_kb(strategy_id, "setup", context, telegram_id),
             )
             return
         import math as _math
@@ -838,7 +878,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             query,
             f"{body}\n\n*Tiny Budget Preset applied for {escape_md(selected_product)}*\n{preflight_note}",
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=_strategy_config_section_kb(strategy_id, section),
+            reply_markup=_section_kb(strategy_id, section, context, telegram_id),
         )
         return
     elif action == "set" and len(parts) >= 5:
@@ -853,6 +893,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "notional_usd", "spread_bp", "interval_seconds", "tp_pct", "sl_pct",
             "levels", "min_range_pct", "max_range_pct", "threshold_bp", "close_offset_bp",
             "cycle_notional_usd", "session_notional_cap_usd", "inventory_soft_limit_usd",
+            "inventory_hard_limit_usd", "expected_budget_usd",
             "quote_ttl_seconds", "min_spread_bp", "max_spread_bp", "vol_sensitivity",
             "grid_reset_threshold_pct", "grid_reset_timeout_seconds",
             "rgrid_spread_bp", "rgrid_stop_loss_pct", "rgrid_take_profit_pct",
@@ -920,6 +961,8 @@ async def _handle_strategy(query, data, context, telegram_id):
             "cycle_notional_usd": (1, 1000000),
             "session_notional_cap_usd": (0, 10000000),
             "inventory_soft_limit_usd": (1, 1000000),
+            "inventory_hard_limit_usd": (1, 1000000),
+            "expected_budget_usd": (0, 1000000),
             "quote_ttl_seconds": (5, 86400),
             "min_spread_bp": (0.1, 200),
             "max_spread_bp": (0.1, 500),
@@ -963,7 +1006,21 @@ async def _handle_strategy(query, data, context, telegram_id):
             logger.error("strategy set: field %r whitelisted but has no limits entry", field)
             return
         lo, hi = _bounds
-        if value < lo or value > hi:
+        if field == "mm_leverage_override":
+            # Per-asset ceiling: the static (1, 50) bound accepted values above a
+            # pair's max (e.g. 45x on a 40x SOL) that the start guard then rejected.
+            _lev_product = str(
+                context.user_data.get(f"strategy_pair:{strategy_id}", "BTC") or "BTC"
+            ).upper()
+            _lev_user = get_user(telegram_id)
+            _lev_net = _lev_user.network_mode.value if _lev_user else "mainnet"
+            lo, hi = _leverage_bound(_lev_product, _lev_net)
+        mid_sltp_disabled = (
+            strategy_id == "mid"
+            and field in {"tp_pct", "sl_pct"}
+            and value == 0
+        )
+        if not mid_sltp_disabled and (value < lo or value > hi):
             return
         int_fields = {
             "interval_seconds", "levels", "max_open_orders",
@@ -991,7 +1048,7 @@ async def _handle_strategy(query, data, context, telegram_id):
         await _edit_loc(query, 
             _strategy_config_section_text(strategy_id, conf, network, section),
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=_strategy_config_section_kb(strategy_id, section),
+            reply_markup=_section_kb(strategy_id, section, context, telegram_id),
         )
     elif action == "set_text" and len(parts) >= 5:
         strategy_id = parts[2]
@@ -1006,6 +1063,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "funding_entry_mode": {"wait", "enter_anyway"},
             # Phase 2: Tread Fi POV / participation preset.
             "participation_preset": {"aggressive", "normal", "passive", "off"},
+            "mid_execution_mode": {"aggressive", "normal", "passive"},
             # Volume Bot execution algo (maker TWAP default / chase / taker).
             "vol_execution_algo": {"twap", "chase", "taker"},
             # Ladder size curve (Mid + fill-anchored Grid): how the side's
@@ -1023,6 +1081,8 @@ async def _handle_strategy(query, data, context, telegram_id):
         # size_curve only drives the laddered quoters (Mid + fill-anchored Grid).
         if field == "size_curve" and strategy_id not in ("grid", "mid"):
             return
+        if field == "mid_execution_mode" and strategy_id != "mid":
+            return
 
         def _mutate(s):
             strategies = s.setdefault("strategies", {})
@@ -1039,7 +1099,7 @@ async def _handle_strategy(query, data, context, telegram_id):
         await _edit_loc(query, 
             _strategy_config_section_text(strategy_id, conf, network, section),
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=_strategy_config_section_kb(strategy_id, section),
+            reply_markup=_section_kb(strategy_id, section, context, telegram_id),
         )
     elif action == "input" and len(parts) >= 4:
         strategy_id = parts[2]
@@ -1050,6 +1110,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "notional_usd", "spread_bp", "interval_seconds", "tp_pct", "sl_pct",
             "levels", "min_range_pct", "max_range_pct", "threshold_bp", "close_offset_bp",
             "cycle_notional_usd", "session_notional_cap_usd", "inventory_soft_limit_usd",
+            "inventory_hard_limit_usd", "expected_budget_usd",
             "quote_ttl_seconds", "min_spread_bp", "max_spread_bp", "vol_sensitivity",
             "rgrid_spread_bp", "rgrid_stop_loss_pct", "rgrid_take_profit_pct",
             "rgrid_reset_threshold_pct", "rgrid_reset_timeout_seconds", "rgrid_discretion",
@@ -1094,6 +1155,8 @@ async def _handle_strategy(query, data, context, telegram_id):
             "cycle_notional_usd": "Enter per\\-cycle budget in USD \\(usually same as margin\\)",
             "session_notional_cap_usd": "Enter optional session cap in USD \\(example: `5000`, or `0` to disable\\)",
             "inventory_soft_limit_usd": "Enter inventory soft limit in USD \\(example: `45`\\)",
+            "inventory_hard_limit_usd": "Enter inventory hard limit in USD \\(example: `60`\\)",
+            "expected_budget_usd": "Enter expected loss-and-cost budget in USD \\(example: `10`, or `0` to disable\\)",
             "quote_ttl_seconds": "Enter quote TTL seconds \\(example: `90`\\)",
             "min_spread_bp": "Enter minimum spread in bps \\(example: `2`\\)",
             "max_spread_bp": "Enter maximum spread in bps \\(example: `20`\\)",
@@ -1115,14 +1178,29 @@ async def _handle_strategy(query, data, context, telegram_id):
             "dgrid_long_window_points": "Enter DGRID long volatility window points \\(example: `12`\\)",
             "session_margin_usd": "Enter session margin in USD \\(per\\-cycle notional, example: `500`\\)",
             "target_volume_usd": "Enter target cumulative volume in USD \\(example: `25000`\\)",
-            "mm_leverage_override": "Enter leverage \\(1 – 50; position size \\= margin × leverage, example: `5`\\)",
+            "mm_leverage_override": "Enter leverage \\(1 – pair max; position size \\= margin × leverage, example: `5`\\)",
             "mm_duration_minutes": "Enter run duration in minutes \\(hard cap for Mid/D\\-Grid; a target for Grid/R\\-Grid, example: `60`\\)",
             "twap_pause_move_bp": "Enter fast\\-move pause threshold in bp per cycle \\(0 \\= off; pauses re\\-quoting when price jumps more, example: `200` \\= 2%\\)",
             "fixed_margin_usd": "Enter per\\-leg size in USD \\(example: `100`\\)",
             "dn_hold_seconds": "Enter *minimum* hold in seconds \\(60 – 86400; example: `3600` for 1h\\)\\. After this, the hedge stays open while funding is favorable and closes on a funding flip\\.",
             "dn_cycles": "Enter how many open→hold→close cycles to run \\(example: `3`\\)",
         }
-        await _edit_loc(query, 
+        if field == "mm_leverage_override":
+            _lev_product = str(
+                context.user_data.get(f"strategy_pair:{strategy_id}", "BTC") or "BTC"
+            ).upper()
+            _lev_user = get_user(telegram_id)
+            _lev_net = _lev_user.network_mode.value if _lev_user else "mainnet"
+            _lo, _hi = _leverage_bound(_lev_product, _lev_net)
+            help_text["mm_leverage_override"] = (
+                f"Enter leverage for {escape_md(_lev_product)} "
+                f"\\(1 – {_hi}; position size \\= margin × leverage, example: `5`\\)"
+            )
+        if strategy_id == "mid" and field == "tp_pct":
+            help_text[field] = "Enter take profit % \\(example: `1\\.2`, or `0` to disable\\)"
+        if strategy_id == "mid" and field == "sl_pct":
+            help_text[field] = "Enter stop loss % \\(example: `0\\.7`, or `0` to disable\\)"
+        await _edit_loc(query,
             f"✏️ *Custom {escape_md(field)}*\n\n"
             f"{help_text.get(field, 'Enter value')}\n\n"
             "Your next message will be used as this value\\.",
@@ -1188,16 +1266,26 @@ async def _handle_strategy(query, data, context, telegram_id):
             return
         settings = _get_user_settings(telegram_id, context)
         from src.nadobro.handlers.messages import execute_action_directly
+        strategy_conf = (settings.get("strategies", {}) or {}).get(strategy_id, {}) or {}
         strategy_leverage = 1 if strategy_id == "vol" else settings.get("default_leverage", 3)
         if strategy_id == "dn":
             strategy_leverage = max(1, min(float(strategy_leverage), 5))
-        if strategy_id in ("grid", "rgrid", "dgrid"):
+        if strategy_id in ("grid", "rgrid", "dgrid", "mid"):
             try:
                 from src.nadobro.config import get_product_max_leverage as _gpml
                 strategy_leverage = float(_gpml(product, network=network))
             except Exception:
                 strategy_leverage = float(settings.get("default_leverage", 3))
-        strategy_conf = (settings.get("strategies", {}) or {}).get(strategy_id, {}) or {}
+        if strategy_id == "mid":
+            try:
+                selected_leverage = float(strategy_conf.get("mm_leverage_override") or 0.0)
+            except (TypeError, ValueError):
+                selected_leverage = 0.0
+            if selected_leverage > 0:
+                # A saved setting may predate an asset change. Keep the live
+                # catalog ceiling authoritative even before the user revisits
+                # Mid Setup, where the button list is rebuilt for this asset.
+                strategy_leverage = min(strategy_leverage, selected_leverage)
         wallet_usdt_pf = None
         ro = get_user_readonly_client(telegram_id)
         if ro:
@@ -1543,7 +1631,11 @@ def _strategy_section_for_field(strategy: str, field: str) -> str:
             return "risk"
         return "setup"
     if strategy == "mid":
-        if field in {"tp_pct", "sl_pct", "rgrid_stop_loss_pct", "rgrid_take_profit_pct"}:
+        if field in {
+            "tp_pct", "sl_pct", "rgrid_stop_loss_pct", "rgrid_take_profit_pct",
+            "inventory_soft_limit_usd", "inventory_hard_limit_usd",
+            "expected_budget_usd",
+        }:
             return "risk"
         return "setup"
     if strategy == "dn":
@@ -1617,8 +1709,9 @@ def _start_leverage_for_card(
 
     Mirrors the resolution in the ``preview`` branch (the value that becomes
     ``state["leverage"]``, which is what ``_effective_leverage`` reads): vol is
-    always 1x, dn is clamped to 5x, grid/rgrid/dgrid deploy at the PAIR MAX, and
-    everything else takes the user's ``default_leverage``. Kept next to
+    always 1x, dn is clamped to 5x, grid/rgrid/dgrid/mid deploy at the PAIR MAX,
+    and Mid uses its explicit ``mm_leverage_override`` when selected; everything
+    else takes the user's ``default_leverage``. Kept next to
     ``_mm_effective_leverage`` so the two stay in step.
 
     Cache-first: ``get_product_max_leverage`` reads the product catalog, the same
@@ -1633,11 +1726,20 @@ def _start_leverage_for_card(
         default_lev = 3.0
     if strategy_id == "dn":
         return max(1.0, min(default_lev, 5.0))
-    if strategy_id in ("grid", "rgrid", "dgrid") and product:
+    if strategy_id in ("grid", "rgrid", "dgrid", "mid") and product:
         try:
             from src.nadobro.config import get_product_max_leverage as _gpml
 
-            return max(1.0, float(_gpml(str(product), network=network)))
+            pair_max = max(1.0, float(_gpml(str(product), network=network)))
+            if strategy_id == "mid":
+                strategy_cfg = settings.get("strategies", {}).get("mid", {}) or {}
+                try:
+                    selected = float(strategy_cfg.get("mm_leverage_override") or 0.0)
+                except (TypeError, ValueError):
+                    selected = 0.0
+                if selected > 0:
+                    return max(1.0, min(selected, pair_max))
+            return pair_max
         except Exception:  # noqa: BLE001  # policy: degrade-ok(card falls back to the user default)
             return max(1.0, default_lev)
     return max(1.0, default_lev)
@@ -2114,12 +2216,9 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
         )
 
     if strategy == "mid":
-        # Mid Mode: pure mid ± spread. No anchor / no soft-reset.
-        # AUDIT-MID-2026-07-30 #5 pulled "Levels" and "Reference" off this card
-        # because the mid mapping consumed neither. LADDER (2026-08-02) made
-        # Levels real — it now splits the side's deployment across levels
-        # stepping away from mid — so it is back, with the size curve beside it.
-        # "Reference" stays off: mid mode is always mid-referenced.
+        # Mid Mode: pure mid ± spread. Keep this card focused on the controls a
+        # normal user needs; legacy fields remain accepted by the handler and
+        # engine but are intentionally not exposed here.
         try:
             bias_val = float(conf.get("directional_bias", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -2131,23 +2230,33 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
         else:
             bias_str = "NEUTRAL"
         if section == "risk":
+            soft_limit = float(conf.get("inventory_soft_limit_usd", notional * 0.6) or 0.0)
+            hard_limit = float(conf.get("inventory_hard_limit_usd", soft_limit * 1.25) or 0.0)
+            expected_budget = float(conf.get("expected_budget_usd", 0.0) or 0.0)
             return (
                 "⚙️ *MID MODE · Risk*\n\n"
-                f"PnL TP/SL: *{escape_md(f'{tp_pct:.2f}% / {sl_pct:.2f}%')}* of margin\n\n"
-                "Stops are applied to *margin* \\(notional / leverage\\), not to notional\\."
+                f"Take profit: *{escape_md(f'{tp_pct:.2f}%')}* of margin\n"
+                f"Stop loss: *{escape_md(f'{sl_pct:.2f}%')}* of margin\n\n"
+                f"Inventory protection: *{escape_md(f'${soft_limit:,.0f} soft / ${hard_limit:,.0f} hard')}*\n"
+                f"Expected budget: *{escape_md(f'${expected_budget:,.0f}')}*\n\n"
+                "Soft inventory widens and rebalances both sides\\. Hard inventory leaves only "
+                "the reducing quote\\. Expected budget stops new exposure after cumulative "
+                "loss and costs reach the limit\\."
             )
-        pov_label = str(conf.get("participation_preset") or "OFF").upper()
+        execution_mode = str(conf.get("mid_execution_mode") or "normal").upper()
         return (
             "⚙️ *MID MODE · Core*\n\n"
-            f"Margin: *{escape_md(f'${notional:,.0f}')}* \\| Interval: *{escape_md(f'{interval_seconds}s')}*\n"
-            f"Spread: *{escape_md(f'{spread_bp:+.1f} bp')}* \\| Bias: *{escape_md(bias_str)}*\n"
+            f"Margin: *{escape_md(f'${notional:,.0f}')}*\n"
+            f"{_mm_sizing_line(conf)}\n"
+            f"Spread: *{escape_md(f'{spread_bp:+.1f} bp')}*\n"
             f"{_ladder_line(conf)}\n"
-            f"POV: *{escape_md(pov_label)}* \\(per\\-cycle pacing from Nado 24h volume\\)\n"
-            f"{_mm_sizing_line(conf)}\n\n"
-            "Pure mid ± spread\\. No anchor, no soft\\-reset\\. Levels split the same "
-            "margin into rungs stepping away from mid — more rungs scale in and out "
-            "of a move; they never add exposure\\. "
-            "Bias range −1\\.0 → \\+1\\.0 \\(short → long\\); \\|1\\.0\\| adds 20% margin\\."
+            f"Execution: *{escape_md(execution_mode)}*\n"
+            f"Bias: *{escape_md(bias_str)}*\n\n"
+            "Mid Mode keeps two\\-sided post\\-only quotes around the market mid\\. "
+            "Levels split the same margin into rungs stepping away from mid — more "
+            "rungs scale in and out of a move without adding exposure\\. "
+            "Execution controls quote cadence, width, size, and quote life\\. "
+            "Bias adjusts inventory while both buy and sell quotes remain active\\."
         )
 
     if strategy == "dn":
@@ -2174,7 +2283,57 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
     return _fmt_strategy_config_text(strategy, conf, network)
 
 
-def _strategy_config_section_kb(strategy: str, section: str):
+def _leverage_bound(product: str, network: str | None = None) -> tuple[int, int]:
+    """Per-asset ``(min, max)`` leverage bound for validating a tapped or typed
+    ``mm_leverage_override``. Max is the pair's catalog max (BTC 50x, SOL 40x,
+    QQQ 20x); degrades to the global 50 on lookup failure. Shared by the button
+    ``set`` path (this module) and the typed-input path (``messages``) so the two
+    can never disagree."""
+    try:
+        hi = int(get_product_max_leverage(product, network=network))
+    except Exception:  # noqa: BLE001 - degrade to the global cap, never crash the tap
+        hi = 50
+    return 1, max(1, hi)
+
+
+def _leverage_button_rows(strategy: str, product_max_leverage: int) -> list[list[InlineKeyboardButton]]:
+    """Per-asset leverage ladder for a strategy config card. Mirrors the manual
+    leverage keyboard (``keyboards.trade_leverage_reply_kb``): a fixed ladder
+    filtered by the pair's max, with the exact pair max always appended so it is
+    reachable (e.g. BTC 50x, SOL 40x, QQQ 20x). Buttons write
+    ``mm_leverage_override``; chunked to <=4 per row for Telegram."""
+    max_lev = max(1, int(product_max_leverage or 1))
+    ladder = (1, 2, 3, 5, 10, 20, 40, 50) if strategy == "mid" else (1, 3, 5, 10, 20, 40, 50)
+    choices = [lev for lev in ladder if lev <= max_lev]
+    if max_lev not in choices:
+        choices.append(max_lev)
+    buttons = [
+        InlineKeyboardButton(
+            (f"Lev {lev}x" if i == 0 else f"{lev}x"),
+            callback_data=f"strategy:set:{strategy}:mm_leverage_override:{lev}",
+        )
+        for i, lev in enumerate(choices)
+    ]
+    return [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+
+
+def _section_kb(strategy_id: str, section: str, context, telegram_id: int):
+    """Resolve the selected pair's per-asset max leverage and build the config
+    section keyboard whose leverage ladder reaches that max. Thin wrapper over
+    ``_strategy_config_section_kb`` so the ~8 call sites don't each repeat the
+    product/network/max resolution. Resolves the user's network itself (network
+    is not defined at function scope in ``_handle_strategy``)."""
+    product = str(context.user_data.get(f"strategy_pair:{strategy_id}", "BTC") or "BTC").upper()
+    try:
+        user = get_user(telegram_id)
+        network = user.network_mode.value if user else "mainnet"
+        max_lev = int(get_product_max_leverage(product, network=network))
+    except Exception:  # noqa: BLE001 - card must render; degrade to a safe global max
+        max_lev = 50
+    return _strategy_config_section_kb(strategy_id, section, max_lev)
+
+
+def _strategy_config_section_kb(strategy: str, section: str, product_max_leverage: int = 50):
     if strategy == "vol":
         # VOL-DIRECTION-TAB: this branch used to IGNORE `section` and return the
         # margin/TP/SL/target keyboard for BOTH tabs. Tapping "🎯 Direction"
@@ -2252,12 +2411,7 @@ def _strategy_config_section_kb(strategy: str, section: str):
                     InlineKeyboardButton("Margin $100", callback_data="strategy:set:grid:notional_usd:100"),
                     InlineKeyboardButton("Margin $250", callback_data="strategy:set:grid:notional_usd:250"),
                 ],
-                [
-                    InlineKeyboardButton("Lev 1x", callback_data="strategy:set:grid:mm_leverage_override:1"),
-                    InlineKeyboardButton("3x", callback_data="strategy:set:grid:mm_leverage_override:3"),
-                    InlineKeyboardButton("5x", callback_data="strategy:set:grid:mm_leverage_override:5"),
-                    InlineKeyboardButton("10x", callback_data="strategy:set:grid:mm_leverage_override:10"),
-                ],
+                *_leverage_button_rows("grid", product_max_leverage),
                 [
                     InlineKeyboardButton("Spread 2bp", callback_data="strategy:set:grid:spread_bp:2"),
                     InlineKeyboardButton("Spread 5bp", callback_data="strategy:set:grid:spread_bp:5"),
@@ -2384,12 +2538,7 @@ def _strategy_config_section_kb(strategy: str, section: str):
                     InlineKeyboardButton("Margin $100", callback_data="strategy:set:dgrid:notional_usd:100"),
                     InlineKeyboardButton("Margin $250", callback_data="strategy:set:dgrid:notional_usd:250"),
                 ],
-                [
-                    InlineKeyboardButton("Lev 1x", callback_data="strategy:set:dgrid:mm_leverage_override:1"),
-                    InlineKeyboardButton("3x", callback_data="strategy:set:dgrid:mm_leverage_override:3"),
-                    InlineKeyboardButton("5x", callback_data="strategy:set:dgrid:mm_leverage_override:5"),
-                    InlineKeyboardButton("10x", callback_data="strategy:set:dgrid:mm_leverage_override:10"),
-                ],
+                *_leverage_button_rows("dgrid", product_max_leverage),
                 [
                     InlineKeyboardButton("Levels 3", callback_data="strategy:set:dgrid:levels:3"),
                     InlineKeyboardButton("Levels 4", callback_data="strategy:set:dgrid:levels:4"),
@@ -2486,12 +2635,7 @@ def _strategy_config_section_kb(strategy: str, section: str):
                     InlineKeyboardButton("Margin $100", callback_data="strategy:set:rgrid:notional_usd:100"),
                     InlineKeyboardButton("Margin $250", callback_data="strategy:set:rgrid:notional_usd:250"),
                 ],
-                [
-                    InlineKeyboardButton("Lev 1x", callback_data="strategy:set:rgrid:mm_leverage_override:1"),
-                    InlineKeyboardButton("3x", callback_data="strategy:set:rgrid:mm_leverage_override:3"),
-                    InlineKeyboardButton("5x", callback_data="strategy:set:rgrid:mm_leverage_override:5"),
-                    InlineKeyboardButton("10x", callback_data="strategy:set:rgrid:mm_leverage_override:10"),
-                ],
+                *_leverage_button_rows("rgrid", product_max_leverage),
                 [
                     InlineKeyboardButton("Levels 3", callback_data="strategy:set:rgrid:levels:3"),
                     InlineKeyboardButton("Levels 5", callback_data="strategy:set:rgrid:levels:5"),
@@ -2583,45 +2727,64 @@ def _strategy_config_section_kb(strategy: str, section: str):
                     InlineKeyboardButton("TP 2.0%", callback_data="strategy:set:mid:tp_pct:2.0"),
                 ],
                 [
+                    InlineKeyboardButton("TP Off", callback_data="strategy:set:mid:tp_pct:0"),
+                ],
+                [
                     InlineKeyboardButton("SL 0.25%", callback_data="strategy:set:mid:sl_pct:0.25"),
                     InlineKeyboardButton("SL 0.5%", callback_data="strategy:set:mid:sl_pct:0.5"),
                     InlineKeyboardButton("SL 1.0%", callback_data="strategy:set:mid:sl_pct:1.0"),
                 ],
                 [
+                    InlineKeyboardButton("SL Off", callback_data="strategy:set:mid:sl_pct:0"),
+                ],
+                [
                     InlineKeyboardButton("Custom TP", callback_data="strategy:input:mid:tp_pct"),
                     InlineKeyboardButton("Custom SL", callback_data="strategy:input:mid:sl_pct"),
                 ],
+                [
+                    InlineKeyboardButton("Soft $60", callback_data="strategy:set:mid:inventory_soft_limit_usd:60"),
+                    InlineKeyboardButton("Hard $75", callback_data="strategy:set:mid:inventory_hard_limit_usd:75"),
+                    InlineKeyboardButton("Budget $10", callback_data="strategy:set:mid:expected_budget_usd:10"),
+                ],
+                [
+                    InlineKeyboardButton("Custom Soft", callback_data="strategy:input:mid:inventory_soft_limit_usd"),
+                    InlineKeyboardButton("Custom Hard", callback_data="strategy:input:mid:inventory_hard_limit_usd"),
+                    InlineKeyboardButton("Custom Budget", callback_data="strategy:input:mid:expected_budget_usd"),
+                ],
             ]
         else:
-            # Setup: Tiny Budget Preset, margin, spread (signed), levels, reference, bias.
+            # Mid setup exposes the core controls plus the wired ladder knobs.
+            # Levels/size_curve stay on the card because the mid mapping
+            # consumes them (engine_runtime maps levels->ladder_levels and
+            # size_curve->ladder_curve): removing the buttons would orphan a
+            # live feature, so they ship alongside the leverage controls.
             rows = [
-                [
-                    InlineKeyboardButton("🎯 Tiny Budget Preset", callback_data="strategy:preset:mid:tiny"),
-                    InlineKeyboardButton("Standard", callback_data="strategy:preset:mid:standard"),
-                ],
-                [
-                    InlineKeyboardButton("🚀 Turbo Volume", callback_data="strategy:preset:mid:turbo"),
-                ],
                 [
                     InlineKeyboardButton("Margin $50", callback_data="strategy:set:mid:notional_usd:50"),
                     InlineKeyboardButton("Margin $100", callback_data="strategy:set:mid:notional_usd:100"),
                     InlineKeyboardButton("Margin $250", callback_data="strategy:set:mid:notional_usd:250"),
                 ],
                 [
-                    InlineKeyboardButton("Lev 1x", callback_data="strategy:set:mid:mm_leverage_override:1"),
-                    InlineKeyboardButton("3x", callback_data="strategy:set:mid:mm_leverage_override:3"),
-                    InlineKeyboardButton("5x", callback_data="strategy:set:mid:mm_leverage_override:5"),
-                    InlineKeyboardButton("10x", callback_data="strategy:set:mid:mm_leverage_override:10"),
+                    InlineKeyboardButton("✍️ Custom Margin", callback_data="strategy:input:mid:notional_usd"),
+                ],
+                *_leverage_button_rows("mid", product_max_leverage),
+                [
+                    InlineKeyboardButton(
+                        "✍️ Custom Leverage",
+                        callback_data="strategy:input:mid:mm_leverage_override",
+                    ),
                 ],
                 [
                     InlineKeyboardButton("Tight 2bp", callback_data="strategy:set:mid:spread_bp:2"),
                     InlineKeyboardButton("Spread 5bp", callback_data="strategy:set:mid:spread_bp:5"),
                     InlineKeyboardButton("Spread 25bp", callback_data="strategy:set:mid:spread_bp:25"),
                 ],
-                # LADDER: restores the "Levels" control AUDIT-MID-2026-07-30 #5
-                # pulled off this card as dead. It is live now — levels split
-                # the side's margin into rungs stepping away from mid, same
-                # total. Curve controls how size is distributed across them.
+                [
+                    InlineKeyboardButton("✍️ Custom Spread", callback_data="strategy:input:mid:spread_bp"),
+                ],
+                # LADDER: levels split the side's margin into rungs stepping away
+                # from mid (same total deployment); size_curve shapes how the
+                # per-level size is distributed. Both are read by the mid mapping.
                 [
                     InlineKeyboardButton("Levels 1", callback_data="strategy:set:mid:levels:1"),
                     InlineKeyboardButton("2", callback_data="strategy:set:mid:levels:2"),
@@ -2634,42 +2797,14 @@ def _strategy_config_section_kb(strategy: str, section: str):
                     InlineKeyboardButton("Geometric", callback_data="strategy:set_text:mid:size_curve:geometric"),
                 ],
                 [
-                    InlineKeyboardButton("30s", callback_data="strategy:set:mid:interval_seconds:30"),
-                    InlineKeyboardButton("60s", callback_data="strategy:set:mid:interval_seconds:60"),
-                    InlineKeyboardButton("120s", callback_data="strategy:set:mid:interval_seconds:120"),
+                    InlineKeyboardButton("⚡ Aggressive", callback_data="strategy:set_text:mid:mid_execution_mode:aggressive"),
+                    InlineKeyboardButton("Normal", callback_data="strategy:set_text:mid:mid_execution_mode:normal"),
+                    InlineKeyboardButton("Passive", callback_data="strategy:set_text:mid:mid_execution_mode:passive"),
                 ],
                 [
                     InlineKeyboardButton("Short −0.5", callback_data="strategy:set:mid:directional_bias:-0.5"),
                     InlineKeyboardButton("Neutral", callback_data="strategy:set:mid:directional_bias:0"),
                     InlineKeyboardButton("Long +0.5", callback_data="strategy:set:mid:directional_bias:0.5"),
-                ],
-                [
-                    InlineKeyboardButton("Min Spread 2bp", callback_data="strategy:set:mid:min_spread_bp:2"),
-                    InlineKeyboardButton("Max 30bp", callback_data="strategy:set:mid:max_spread_bp:30"),
-                    InlineKeyboardButton("Max 50bp", callback_data="strategy:set:mid:max_spread_bp:50"),
-                ],
-                [
-                    InlineKeyboardButton("⚡ Aggressive", callback_data="strategy:set_text:mid:participation_preset:aggressive"),
-                    InlineKeyboardButton("Normal", callback_data="strategy:set_text:mid:participation_preset:normal"),
-                    InlineKeyboardButton("Passive", callback_data="strategy:set_text:mid:participation_preset:passive"),
-                ],
-                [
-                    InlineKeyboardButton("Duration 30m", callback_data="strategy:set:mid:mm_duration_minutes:30"),
-                    InlineKeyboardButton("2h", callback_data="strategy:set:mid:mm_duration_minutes:120"),
-                    InlineKeyboardButton("✍️ Custom Duration", callback_data="strategy:input:mid:mm_duration_minutes"),
-                ],
-                [
-                    InlineKeyboardButton("Pause: Off", callback_data="strategy:set:mid:twap_pause_move_bp:0"),
-                    InlineKeyboardButton("1%", callback_data="strategy:set:mid:twap_pause_move_bp:100"),
-                    InlineKeyboardButton("2%", callback_data="strategy:set:mid:twap_pause_move_bp:200"),
-                    InlineKeyboardButton("✍️", callback_data="strategy:input:mid:twap_pause_move_bp"),
-                ],
-                [
-                    InlineKeyboardButton("Custom Margin", callback_data="strategy:input:mid:notional_usd"),
-                    InlineKeyboardButton("Custom Spread", callback_data="strategy:input:mid:spread_bp"),
-                ],
-                [
-                    InlineKeyboardButton("Custom Bias", callback_data="strategy:input:mid:directional_bias"),
                 ],
             ]
     elif strategy == "dn":
@@ -2915,6 +3050,13 @@ def _build_strategy_preview_text(
             leverage = float(_gpml(product, network=network))
         except Exception:
             leverage = float(settings.get("default_leverage", 3))
+        if strategy_id == "mid":
+            try:
+                selected_leverage = float(conf.get("mm_leverage_override") or 0.0)
+            except (TypeError, ValueError):
+                selected_leverage = 0.0
+            if selected_leverage > 0:
+                leverage = min(leverage, selected_leverage)
     elif strategy_id == "vol":
         if (vol_market or "perp").lower() == "spot":
             leverage = 1.0

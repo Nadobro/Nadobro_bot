@@ -176,7 +176,16 @@ def fire_and_forget(coro, *, name: str | None = None) -> asyncio.Task:
     Pass ``name`` to make a failure identifiable in the log; without it asyncio's
     generic ``Task-N`` is all the warning can report.
     """
-    task = asyncio.get_running_loop().create_task(coro, name=name)
+    async def run_and_release():
+        """Release the registry entry before awaiters observe task completion."""
+        try:
+            return await coro
+        finally:
+            task = asyncio.current_task()
+            if task is not None:
+                _background_tasks.discard(task)
+
+    task = asyncio.get_running_loop().create_task(run_and_release(), name=name)
     _background_tasks.add(task)
     task.add_done_callback(_reap_background_task)
     return task
