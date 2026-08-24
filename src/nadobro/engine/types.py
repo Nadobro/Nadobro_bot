@@ -23,6 +23,21 @@ def _dec(value: object) -> Decimal:
     return Decimal(str(value))
 
 
+def _as_bool(value: object, default: bool = False) -> bool:
+    """Coerce a UI/config flag to bool. The UI stores flags as "1"/"0" STRINGS, so a
+    bare ``bool("0")`` (a non-empty string, hence True) is wrong — parse the value.
+    Shared by the engine controllers and the strategy mapper so the three call sites
+    cannot drift.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 class TradeType(Enum):
     BUY = "BUY"
     SELL = "SELL"

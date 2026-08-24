@@ -156,6 +156,36 @@ def test_spread_factor_also_widens_the_ladder_step():
     assert Decimal(cfg["ladder_step_bp"]) == Decimal("20")
 
 
+def test_rgrid_overlay_spread_widening_is_clamped_but_grid_is_not():
+    """PHASE-0 (2026-08-24). R-Grid derives its exit band from the quoted spread, so
+    the overlay widening it up to 3x swings the exit and destabilises the strategy
+    (measured strong_trend_down -188bp at x1.5 -> -442bp at x3.0). The WIDENING is
+    capped at _RGRID_SPREAD_FACTOR_CAP for rgrid ONLY; the risk-reducing narrowing
+    (<1.0x) passes through, and grid is left on the full range."""
+    from src.nadobro.strategy.overlay_actuator import _RGRID_SPREAD_FACTOR_CAP
+
+    def _base():
+        return {"spread_bid_pct": Decimal("0.001"), "spread_ask_pct": Decimal("0.001")}
+
+    # rgrid: a 3x widen is clamped to the cap.
+    rg = _base()
+    oa.apply_overrides_to_configs(
+        "rgrid", rg, {"spread_factor": 3.0, "suppress_new_entries": False})
+    assert Decimal(rg["spread_ask_pct"]) == Decimal("0.001") * Decimal(str(_RGRID_SPREAD_FACTOR_CAP))
+
+    # grid: the same 3x widen is NOT clamped (only rgrid's exit is spread-derived).
+    g = _base()
+    oa.apply_overrides_to_configs(
+        "grid", g, {"spread_factor": 3.0, "suppress_new_entries": False})
+    assert Decimal(g["spread_ask_pct"]) == Decimal("0.003")
+
+    # rgrid: narrowing (risk-reducing) passes through untouched.
+    rn = _base()
+    oa.apply_overrides_to_configs(
+        "rgrid", rn, {"spread_factor": 0.75, "suppress_new_entries": False})
+    assert Decimal(rn["spread_ask_pct"]) == Decimal("0.00075")
+
+
 def test_signal_barriers_reach_the_rail_and_never_the_executor_barrier():
     """OVERLAY-BARRIER-UNITS. ``Signal.sl_pct``/``tp_pct`` are % of MARGIN;
     ``TripleBarrierConfig`` holds a PRICE-return fraction from avg entry. Writing

@@ -93,6 +93,30 @@ def test_grid_keeps_tp_and_touch_mode_stays_mid_only():
     assert "inventory_soft_limit_usd" not in cfg
 
 
+def test_grid_turbo_writes_the_volume_levers():
+    """VOLUME ENGINE (2026-08-24). The grid Turbo preset must set a deeper ladder
+    AND an aggressive recenter — validated on real Aug BTC+ETH to harvest ~3x more
+    fills at lower drawdown. Without the recenter override the default band-width
+    auto-follow goes stale on a deep ladder and volume COLLAPSES, which is why the
+    old 'Volume' preset barely raised volume. A regression that drops either key
+    silently reverts the preset to that stale, low-volume state."""
+    cfg = _turbo_preset_settings("grid", 50.0)
+    assert cfg["levels"] == 8
+    assert cfg["grid_reset_threshold_pct"] == 0.15
+
+
+def test_standard_after_turbo_grid_clears_the_volume_levers():
+    """Switching away from Turbo must remove its owned keys (levels + recenter),
+    or a hybrid state leaves the deep ladder without the aggressive recenter."""
+    cfg = {"notional_usd": 100.0}
+    _replace_mm_preset(cfg, "grid", "turbo", _turbo_preset_settings("grid", 50.0))
+    assert cfg["levels"] == 8 and cfg["grid_reset_threshold_pct"] == 0.15
+    _replace_mm_preset(cfg, "grid", "standard")
+    assert "levels" not in cfg
+    assert "grid_reset_threshold_pct" not in cfg
+    assert cfg == {"notional_usd": 100.0, "mm_preset": "standard"}
+
+
 def test_tiny_after_turbo_removes_turbo_only_settings():
     cfg = {"notional_usd": 250.0}
     _replace_mm_preset(cfg, "mid", "turbo", _turbo_preset_settings("mid", 50.0))

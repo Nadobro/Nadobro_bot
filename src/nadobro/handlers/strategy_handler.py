@@ -83,8 +83,11 @@ def _turbo_preset_settings(
     ``mmf`` so the clamp is real — without it the stop is uncapped but still
     scaled). Only ``mid`` gets touch quoting, the auto inventory cap (0 =
     deployed), a 100% net-exposure allowance (one full-size fill), and tp_pct=0
-    (no session profit-stop — mid's exits are purely rail-driven). grid/rgrid/
-    dgrid keep their TP and level mechanics untouched.
+    (no session profit-stop — mid's exits are purely rail-driven). grid ALSO gets
+    the validated VOLUME levers (a deeper ladder + aggressive recenter); its TP and
+    the %-of-margin SL rail stay untouched. rgrid/dgrid keep their TP and level
+    mechanics untouched (their position exits flow through barriers this preset must
+    not disturb).
     """
     lev = max(1.0, float(product_max_leverage or 1.0))
     sl = _turbo_session_sl_pct(lev, mmf)
@@ -104,7 +107,21 @@ def _turbo_preset_settings(
             "tp_pct": 0.0,
         })
     elif sid == "grid":
-        base.update({"spread_bp": 3.0, "sl_pct": sl})
+        base.update({
+            "spread_bp": 3.0, "sl_pct": sl,
+            # VOLUME ENGINE (2026-08-24, validated on real Aug BTC+ETH). The old
+            # Turbo grid barely raised volume: it left ``levels`` at the sparse
+            # default (2) and the recenter at the band-width auto-follow, which for
+            # a deep ladder waits ``step x (levels-1)`` (~70bp at 8 levels) before
+            # re-quoting, so the grid goes stale and stops harvesting. A DEEPER
+            # ladder plus an AGGRESSIVE recenter (0.15% of price) tracks price and
+            # harvested ~3x more fills at LOWER drawdown on both pairs, still net
+            # profitable. The recenter is the load-bearing lever — without it more
+            # levels only widen the stale band and cut fills. TP and the
+            # %-of-margin SL rail (``sl``) stay untouched.
+            "levels": 8,
+            "grid_reset_threshold_pct": 0.15,
+        })
     elif sid == "rgrid":
         base.update({
             "spread_bp": 3.0, "rgrid_spread_bp": 3.0,

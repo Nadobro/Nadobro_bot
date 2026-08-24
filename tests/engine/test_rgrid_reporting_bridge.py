@@ -72,6 +72,10 @@ def _controller(adapter, recorder, extra=None):
         "spread_ask_pct": SPREAD,
         "order_amount_quote": Decimal(10),
         "price_distance_tolerance": Decimal("0.0001"),
+        # PHASE-1 (2026-08-24): these tests verify fills reach the reporting bridge
+        # via price-path walks (no classification candles). The chop stand-down gate
+        # defaults ON and would stand the book down with no candles; disable it here.
+        "rgrid_chop_stand_down": False,
     }
     configs.update(extra or {})
     orch = ExecutorOrchestrator(trade_recorder=recorder)

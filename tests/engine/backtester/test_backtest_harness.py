@@ -264,8 +264,11 @@ def test_dgrid_rides_an_uptrend_instead_of_shorting_it():
     from src.nadobro.engine.backtester.engine import BacktestEngine
     from src.nadobro.strategy.engine_runtime import map_strategy_config
 
+    # PHASE-0 (2026-08-24): the trend delegate is opt-in now; this test exercises
+    # the trend phase, so enable it explicitly.
     cfg = map_strategy_config(
-        "dgrid", {"notional_usd": 100, "leverage": 5}, Decimal("100"), product="BTC-PERP"
+        "dgrid", {"notional_usd": 100, "leverage": 5, "dgrid_trend_follow": 1},
+        Decimal("100"), product="BTC-PERP",
     )
     prices = [100.0 * (1.0 + 0.003) ** i for i in range(80)]
     candles = candles_from_prices(prices, interval_s=60)
