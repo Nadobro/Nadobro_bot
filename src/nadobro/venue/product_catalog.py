@@ -195,6 +195,49 @@ def _derive_max_leverage_from_weight_x18(weight_x18) -> Optional[int]:
     return max(1, int(lev))
 
 
+# Networks for which we've already logged that no venue maintenance weight was
+# found (so the conservative-fallback WARN fires once per network, not hourly).
+_mmf_fallback_warned: set[str] = set()
+
+
+def _margin_fractions_from_weights(
+    long_init_x18, long_maint_x18, short_init_x18, short_maint_x18, max_lev: int,
+) -> tuple[float, float, bool]:
+    """Worst-case ``(imf, mmf, used_fallback)`` for a product a grid can hold net
+    long OR net short. Fractions per side:
+
+        long  side: imf = 1 - long_weight_initial,   mmf = 1 - long_weight_maintenance
+        short side: imf = short_weight_initial - 1,  mmf = short_weight_maintenance - 1
+
+    A filled grid ladder sits on one side, so we persist the larger (more
+    demanding) of the two sides. When the venue omits a maintenance weight, fall
+    back to a conservative estimate from imf (over-estimates mmf ⇒ smaller
+    liquidation buffer ⇒ the guard fires earlier, never later). ``imf`` degrades
+    to ``1/max_leverage`` (= 1 - long_weight_initial) when no weight is present.
+    """
+    lw_i = _x18_to_float(long_init_x18)
+    lw_m = _x18_to_float(long_maint_x18)
+    sw_i = _x18_to_float(short_init_x18)
+    sw_m = _x18_to_float(short_maint_x18)
+    imfs: list[float] = []
+    mmfs: list[float] = []
+    if lw_i is not None and 0.0 < lw_i < 1.0:
+        imfs.append(1.0 - lw_i)
+    if sw_i is not None and sw_i > 1.0:
+        imfs.append(sw_i - 1.0)
+    if lw_m is not None and 0.0 < lw_m < 1.0:
+        mmfs.append(1.0 - lw_m)
+    if sw_m is not None and sw_m > 1.0:
+        mmfs.append(sw_m - 1.0)
+    imf = max(imfs) if imfs else (1.0 / max(1, int(max_lev)))
+    if mmfs:
+        return imf, max(mmfs), False
+    # Lazy import keeps the single fallback source of truth in quant/ without a
+    # module-level venue→quant edge (tests/lint/test_architecture_layers).
+    from src.nadobro.quant.liquidation import fallback_mmf
+    return imf, fallback_mmf(imf), True
+
+
 def _build_static_catalog() -> dict:
     perps: dict[str, dict] = {}
     by_id: dict[int, str] = {}
@@ -206,14 +249,20 @@ def _build_static_catalog() -> dict:
         symbol = str(info.get("symbol") or f"{name}-PERP").upper()
         base, norm_symbol = _normalize_symbol(symbol, pid)
         key = name.upper().strip()
+        static_max_lev = int(PRODUCT_MAX_LEVERAGE.get(key, _DYNAMIC_DEFAULT_MAX_LEVERAGE))
+        static_imf, static_mmf, _ = _margin_fractions_from_weights(
+            None, None, None, None, static_max_lev
+        )
         perps[key] = {
             "id": pid,
             "type": "perp",
             "symbol": norm_symbol,
             "base": key,
             "dynamic": False,
-            "max_leverage": int(PRODUCT_MAX_LEVERAGE.get(key, _DYNAMIC_DEFAULT_MAX_LEVERAGE)),
+            "max_leverage": static_max_lev,
             "isolated_only": False,
+            "imf": static_imf,
+            "mmf": static_mmf,
         }
         by_id[pid] = key
         aliases[key.lower()] = key
@@ -583,6 +632,40 @@ def _build_dynamic_catalog(network: str, client=None) -> Optional[dict]:
             or product_book.get("isolated_only")
         )
 
+        # Initial + MAINTENANCE asset weights (x18). The initial weight already
+        # drives max leverage (1/(1-w)); the maintenance weight is the liquidation
+        # buffer the strategy leverage guard needs and was never read before. Read
+        # across the same four sources as the other fields; ``mmf`` falls back to a
+        # conservative estimate from imf when the venue omits a maintenance weight.
+        long_weight_initial_x18 = _first_present(
+            row.get("long_weight_initial_x18"), book_info.get("long_weight_initial_x18"),
+            product_row.get("long_weight_initial_x18"), product_book.get("long_weight_initial_x18"),
+        )
+        long_weight_maintenance_x18 = _first_present(
+            row.get("long_weight_maintenance_x18"), book_info.get("long_weight_maintenance_x18"),
+            product_row.get("long_weight_maintenance_x18"), product_book.get("long_weight_maintenance_x18"),
+        )
+        short_weight_initial_x18 = _first_present(
+            row.get("short_weight_initial_x18"), book_info.get("short_weight_initial_x18"),
+            product_row.get("short_weight_initial_x18"), product_book.get("short_weight_initial_x18"),
+        )
+        short_weight_maintenance_x18 = _first_present(
+            row.get("short_weight_maintenance_x18"), book_info.get("short_weight_maintenance_x18"),
+            product_row.get("short_weight_maintenance_x18"), product_book.get("short_weight_maintenance_x18"),
+        )
+        imf, mmf, used_mmf_fallback = _margin_fractions_from_weights(
+            long_weight_initial_x18, long_weight_maintenance_x18,
+            short_weight_initial_x18, short_weight_maintenance_x18, int(max_lev),
+        )
+        if used_mmf_fallback and network not in _mmf_fallback_warned:
+            _mmf_fallback_warned.add(network)
+            logger.warning(
+                "product_catalog[%s]: no venue maintenance weight found for %s; using "
+                "conservative fallback mmf=%.4f (imf=%.4f). Strategy leverage guard runs on "
+                "the fallback — confirm the venue payload's maintenance-weight field.",
+                network, base, mmf, imf,
+            )
+
         # Venue trading floors / increments. min_size is x18-scaled USDT0
         # notional per Nado docs and is the canonical hard venue floor on order
         # value (it is NOT divided by leverage — leverage lets a small wallet
@@ -634,6 +717,12 @@ def _build_dynamic_catalog(network: str, client=None) -> Optional[dict]:
             "dynamic": True,
             "max_leverage": int(max_lev),
             "isolated_only": isolated_only,
+            "imf": imf,
+            "mmf": mmf,
+            "long_weight_initial_x18": str(long_weight_initial_x18) if long_weight_initial_x18 is not None else None,
+            "long_weight_maintenance_x18": str(long_weight_maintenance_x18) if long_weight_maintenance_x18 is not None else None,
+            "short_weight_initial_x18": str(short_weight_initial_x18) if short_weight_initial_x18 is not None else None,
+            "short_weight_maintenance_x18": str(short_weight_maintenance_x18) if short_weight_maintenance_x18 is not None else None,
             "min_size_x18": str(min_size_x18_raw) if min_size_x18_raw is not None else None,
             "size_increment_x18": str(size_increment_x18_raw) if size_increment_x18_raw is not None else None,
             "price_increment_x18": str(price_increment_x18_raw) if price_increment_x18_raw is not None else None,
@@ -1065,6 +1154,47 @@ def get_product_taker_fee_rate(
     if not row:
         return None
     return _x18_to_float(row.get("taker_fee_rate_x18"))
+
+
+def get_product_initial_margin_fraction(
+    product: str,
+    network: str = "mainnet",
+    client=None,
+    refresh: bool = False,
+) -> float:
+    """Initial-margin fraction (``1/max_leverage`` = ``1 - long_weight_initial``).
+
+    Reads the value persisted at catalog build; degrades to ``1/max_leverage``
+    for a row that predates the field. Never returns 0 (a divide-by-zero risk in
+    the liquidation math)."""
+    row = _resolve_perp_row(product, network, client, refresh)
+    if row:
+        imf = row.get("imf")
+        if isinstance(imf, (int, float)) and imf > 0:
+            return float(imf)
+    max_lev = get_product_max_leverage(product, network=network, client=client, refresh=refresh)
+    return 1.0 / max(1, int(max_lev))
+
+
+def get_product_maintenance_margin_fraction(
+    product: str,
+    network: str = "mainnet",
+    client=None,
+    refresh: bool = False,
+) -> float:
+    """Maintenance-margin fraction — the liquidation buffer the strategy leverage
+    guard checks against. Reads the value persisted at catalog build (venue
+    maintenance weight when available, else a conservative fallback derived from
+    imf). Degrades to the same conservative fallback for a row that predates the
+    field. Always ``> 0`` and ``< imf``."""
+    row = _resolve_perp_row(product, network, client, refresh)
+    if row:
+        mmf = row.get("mmf")
+        if isinstance(mmf, (int, float)) and mmf > 0:
+            return float(mmf)
+    imf = get_product_initial_margin_fraction(product, network=network, client=client, refresh=refresh)
+    from src.nadobro.quant.liquidation import fallback_mmf
+    return fallback_mmf(imf)
 
 
 def get_spot_maker_fee_rate(

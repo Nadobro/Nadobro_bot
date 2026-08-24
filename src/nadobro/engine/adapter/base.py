@@ -183,6 +183,41 @@ class NadoAdapterBase(abc.ABC):
         """
         raise NotImplementedError
 
+    async def cancel_and_place(
+        self,
+        cancel_order_id: str,
+        trading_pair: str,
+        side: TradeType,
+        order_type: OrderType,
+        amount_base: Decimal,
+        price: Decimal,
+        leverage: int = 1,
+        reduce_only: bool = False,
+    ) -> NadoOrder:
+        """Atomically cancel a resting order and place a new one; return the NEW
+        order. Replaces a resting quote with NO gap between the cancel and the
+        re-place, and for ONE execute round trip instead of two.
+
+        Failure is atomic and TOTAL: on any error this raises
+        :class:`AdapterError`, and because the venue processes the request as
+        one unit, a failure means the OLD order is still resting and nothing new
+        was placed. That invariant is what lets a caller fall back to the
+        classic cancel-then-place safely — a fused replace can never leave a
+        half-done state, so it is never worse than doing the two separately.
+
+        Concrete default raises ``NotImplementedError``: only the live adapter
+        (and the test doubles that exercise replace) implement it, and no
+        controller may hard-depend on it — it is gated and always has a
+        cancel-then-place fallback.
+        """
+        raise NotImplementedError
+
+    def forget_cancelled(self, order_id: str) -> None:
+        """Drop local bookkeeping for an order the VENUE already cancelled as
+        part of an atomic :meth:`cancel_and_place` (so NO cancel is issued for
+        it). Best-effort no-op by default."""
+        return None
+
     async def held_base(self, trading_pair: str) -> Optional[Decimal]:
         """Base units of ``trading_pair`` the account ACTUALLY holds, per the
         VENUE — the spot balance for a spot product, the signed position size for

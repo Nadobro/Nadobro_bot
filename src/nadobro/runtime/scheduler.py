@@ -409,6 +409,30 @@ async def tick_signal_scorer():
         logger.error("Signal scorer ticker failed: %s", e)
 
 
+async def tick_markout_scorer():
+    """Grade strategy fills whose mark-out horizon has elapsed.
+
+    Same posture as the signal scorer: it reads Hyperliquid candles and writes
+    ``fill_markouts``, places no orders and touches no strategy state. Both
+    per-network trade tables exist from boot, so both are graded; a network
+    with no strategy fills simply returns nothing.
+
+    Without this job the mark-out ledger stays empty, and "are we being picked
+    off?" remains the unanswerable question it has always been.
+    """
+    try:
+        from src.nadobro.trading.markout_scorer import grade_pending_markouts
+    except Exception as e:  # noqa: BLE001
+        logger.error("Markout scorer unavailable: %s", e)
+        return
+    # Per network, so one network's outage cannot skip the other's grading.
+    for network in ("mainnet", "testnet"):
+        try:
+            await run_blocking(grade_pending_markouts, network)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Markout scorer failed network=%s: %s", network, e)
+
+
 async def poll_lowiqpts_relay():
     global _bot_app
     if not _bot_app:
@@ -871,6 +895,11 @@ _NEWS_WARMUP_MINUTES = env_int("NEWS_WARMUP_MINUTES", 12)
 # to disable grading entirely.
 _SIGNAL_SCORER_SECONDS = env_int("SIGNAL_SCORER_INTERVAL_SECONDS", 300)
 
+# Mark-out grading interval. Matches the shortest horizon (60s) plus its one
+# bar of reference tolerance, so a fill is graded on the first pass after it
+# becomes gradeable rather than sitting in the backlog. Set to 0 to disable.
+_MARKOUT_SCORER_SECONDS = env_int("MARKOUT_SCORER_INTERVAL_SECONDS", 120)
+
 
 async def tick_news_warmup() -> None:
     """Pre-warm the news bundle cache so user-facing /brief calls hit warm data.
@@ -962,6 +991,13 @@ def start_scheduler():
         scheduler.add_job(
             tick_signal_scorer, "interval", seconds=_SIGNAL_SCORER_SECONDS,
             id="signal_scorer", replace_existing=True, **_LONG_TICK,
+        )
+    # Grade elapsed fill mark-outs. Read-only against the venue; writes only to
+    # fill_markouts, so no trading side effects.
+    if _MARKOUT_SCORER_SECONDS > 0:
+        scheduler.add_job(
+            tick_markout_scorer, "interval", seconds=_MARKOUT_SCORER_SECONDS,
+            id="markout_scorer", replace_existing=True, **_LONG_TICK,
         )
     if lowiqpts_relay_poll_enabled():
         scheduler.add_job(

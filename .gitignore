@@ -81,3 +81,6 @@ relay/.fly-bootstrap.env
 # Cached pytest-only venv used by scripts/self_review.sh to mirror the
 # "SL/TP & config invariants" CI job (which installs pytest and nothing else).
 .self_review_ci_venv/
+
+# Backtest tapes — large, regenerable via scripts/fetch_public_candles.py
+*_perp_*_1m.csv

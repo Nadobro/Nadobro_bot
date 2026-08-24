@@ -60,6 +60,12 @@ OVERLAY_DRAWDOWN_CAP_PCT = 10.0
 # leverage/exposure caps + session rails remain the hard limits downstream.
 _SIZE_LO, _SIZE_HI = 0.5, 1.25
 _SPREAD_LO, _SPREAD_HI = 0.75, 3.0
+# PHASE-0 EMERGENCY REVERT (2026-08-24): R-Grid derives its exit band from the
+# quoted spread, so the overlay widening the spread up to 3.0x swings the exit and
+# destabilises the strategy (measured strong_trend_down -188bp at x1.5 -> -442bp at
+# x3.0, commit 5be3b9b). Cap R-Grid's overlay WIDENING (the risk-reducing narrowing
+# below 1.0x is kept) until the Phase-1 exit rework makes the geometry robust to it.
+_RGRID_SPREAD_FACTOR_CAP = 1.25
 # Per-SIDE spread can never quote through this fee-clearing floor. A round trip
 # captures two half-spreads and pays the maker round trip (builder included), so the
 # per-side floor is half of it. The old 1.5bp literal predated the MANDATORY 1bp
@@ -266,6 +272,9 @@ def apply_overrides_to_configs(
                 changed[key] = str(configs[key])
 
     spread_factor = float(overrides.get("spread_factor", 1.0) or 1.0)
+    if strategy == "rgrid" and spread_factor > _RGRID_SPREAD_FACTOR_CAP:
+        # Cap the widening only; narrowing (<1.0x, risk-reducing) passes through.
+        spread_factor = _RGRID_SPREAD_FACTOR_CAP
     if abs(spread_factor - 1.0) > 1e-9:
         # Each key gets the floor for ITS OWN quantity: the bid/ask keys are HALF
         # spreads, min_spread_between_orders is a whole per-level round trip. Prefer

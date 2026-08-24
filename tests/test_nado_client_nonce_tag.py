@@ -70,11 +70,20 @@ def test_masking_is_what_stops_a_large_client_id_shifting_the_expiry():
 
 
 def test_place_order_uses_the_pinned_mask_literal():
-    """Guard against the source drifting away from this pin."""
+    """Guard against the source drifting away from this pin.
+
+    The tag/nonce assembly was extracted into ``_prepare_place_order_params``
+    so ``place_order`` and ``cancel_and_place`` share ONE copy of it (two
+    copies of a money-path mask drift). The pin follows the logic to its new
+    home.
+    """
     import inspect
 
     from src.nadobro.venue import nado_client
 
-    src = inspect.getsource(nado_client.NadoClient.place_order)
-    assert "& 0xFFFFF" in src, "place_order must mask client_id to 20 bits"
+    src = inspect.getsource(nado_client.NadoClient._prepare_place_order_params)
+    assert "& 0xFFFFF" in src, "the shared param builder must mask client_id to 20 bits"
     assert "gen_order_nonce(random_int=tag)" in src
+    # place_order must actually route through the shared builder.
+    place_src = inspect.getsource(nado_client.NadoClient.place_order)
+    assert "_prepare_place_order_params" in place_src

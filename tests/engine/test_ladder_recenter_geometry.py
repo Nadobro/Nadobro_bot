@@ -168,8 +168,10 @@ def test_recenter_is_not_starved_by_an_unconfirmed_phase_flip():
         c = DynamicGridController(
             user_id=1, orchestrator=orch, adapter=adapter,
             inventory=InventoryRepository(),
+            # PHASE-0 (2026-08-24): the trend delegate is opt-in; enable it so the
+            # classifier can want RGRID and leave a flip pending.
             configs=dict(_PROD_CFG, candle_provider=lambda p: _range_candles(),
-                         dgrid_flip_confirm_ticks=2),
+                         dgrid_flip_confirm_ticks=2, dgrid_trend_follow=1),
         )
         await orch.spawn_controller(c)
         await orch.tick_controller(c.id)

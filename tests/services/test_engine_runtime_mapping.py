@@ -125,7 +125,31 @@ def test_map_mid_config():
     # way, so this number does not move when levels change.
     assert cfg["order_amount_quote"] == Decimal("100")
     assert cfg["ladder_levels"] == 2
-    assert cfg["max_base_quote"] == Decimal("60")
+    assert cfg["max_base_quote"] == Decimal("75")
+    assert cfg["min_base_quote"] == Decimal("-75")
+    assert cfg["mid_policy_enabled"] == Decimal(1)
+
+
+def test_mid_execution_profiles_change_only_mid_quote_policy():
+    base = {"notional_usd": 100.0, "spread_bp": 10.0}
+    aggressive = er.map_strategy_config(
+        "mid", {**base, "mid_execution_mode": "aggressive"}, Decimal(100), product="BTC-USDC",
+    )
+    normal = er.map_strategy_config(
+        "mid", {**base, "mid_execution_mode": "normal"}, Decimal(100), product="BTC-USDC",
+    )
+    passive = er.map_strategy_config(
+        "mid", {**base, "mid_execution_mode": "passive"}, Decimal(100), product="BTC-USDC",
+    )
+    assert aggressive["interval_seconds"] < normal["interval_seconds"] < passive["interval_seconds"]
+    assert aggressive["spread_bid_pct"] < normal["spread_bid_pct"] < passive["spread_bid_pct"]
+    assert aggressive["order_amount_quote"] > normal["order_amount_quote"] > passive["order_amount_quote"]
+    assert aggressive["max_quote_lifetime_s"] < normal["max_quote_lifetime_s"] < passive["max_quote_lifetime_s"]
+
+    for strategy in ("grid", "rgrid", "dgrid"):
+        cfg = er.map_strategy_config(strategy, dict(base), Decimal(100), product="BTC-USDC")
+        assert "mid_policy_enabled" not in cfg, strategy
+        assert "expected_budget_usd" not in cfg, strategy
 
 
 def test_mid_regime_gate_defaults_off_and_is_rearmable():
@@ -432,6 +456,18 @@ def test_deployed_notional_is_margin_times_leverage():
         Decimal(100), product="BTC-PERP", leverage=10,
     )
     assert over["total_amount_quote"] == Decimal("300")   # override 3x beats 10x
+
+    # Mid uses the same margin × selected-leverage contract for each side's
+    # deployed quote budget, even when the session was started at pair max.
+    mid = er.map_strategy_config(
+        "mid",
+        {"notional_usd": 100.0, "mm_leverage_override": 5, "mid_execution_mode": "normal"},
+        Decimal(100),
+        product="BTC-PERP",
+        leverage=50,
+    )
+    assert mid["leverage"] == 5
+    assert mid["order_amount_quote"] == Decimal("500")
 
 
 def test_map_risk_limits_scale_with_leverage():
@@ -996,13 +1032,15 @@ def test_map_mid_inventory_cap_zero_means_auto_deployed():
         Decimal(100), product="BTC-USDC",
     )
     assert cfg["order_amount_quote"] == Decimal("1000")   # 100 x 10
-    assert cfg["max_base_quote"] == Decimal("1000")       # auto = deployed
+    assert cfg["inventory_soft_limit_quote"] == Decimal("1000")  # auto = deployed
+    assert cfg["max_base_quote"] == Decimal("1250")       # default hard = 1.25x soft
     cfg_explicit = er.map_strategy_config(
         "mid", {"notional_usd": 100.0, "spread_bp": 5.0,
                 "inventory_soft_limit_usd": 60.0},
         Decimal(100), product="BTC-USDC",
     )
-    assert cfg_explicit["max_base_quote"] == Decimal("60")
+    assert cfg_explicit["inventory_soft_limit_quote"] == Decimal("60")
+    assert cfg_explicit["max_base_quote"] == Decimal("75")
 
 
 def test_apply_mid_controller_config_syncs_quote_mode():

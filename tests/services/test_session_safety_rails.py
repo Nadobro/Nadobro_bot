@@ -556,11 +556,100 @@ class OverlayDisarmedBarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(closed.get("called"))
         self.assertTrue(res is None or res[0] is not True)
 
-    async def test_the_overlay_still_TIGHTENS_an_armed_barrier(self):
-        """The fix must not make the overlay inert on barriers the user DID arm —
-        SL stays tighten-only, which is the whole point of the rail integration."""
+    async def test_mid_stop_loss_is_not_tightened_by_the_overlay(self):
+        """Mid's selected stop is a session contract, not an overlay input.
+
+        The overlay may change Mid quoting behavior, but a 2% Mid stop must not
+        become a 0.5% stop merely because the current regime is choppy.
+        """
         snap = {"session_pnl": -0.7, "session_pnl_pct": -0.7,
                 "session_pnl_pct_net": -0.7, "margin": 100.0}
         res, closed = await self._run(sl=2.0, tp=50.0, overlay_sl=0.5, snap=snap)
+        self.assertIsNone(res)
+        self.assertFalse(closed.get("called"))
+
+    async def test_mid_take_profit_is_not_widened_by_the_overlay(self):
+        """Mid must close at the user's TP rather than waiting for a
+        regime-adjusted overlay target."""
+        snap = {"session_pnl": 1.5, "session_pnl_pct": 1.5,
+                "session_pnl_pct_net": 1.5, "margin": 100.0}
+        res, closed = await self._run(sl=50.0, tp=1.0, overlay_tp=3.0, snap=snap)
         self.assertEqual(res, (True, None))
         self.assertTrue(closed.get("called"))
+
+
+class LiqProximityRailTests(unittest.IsolatedAsyncioTestCase):
+    """Live protective-flatten guard (per-asset leverage, 2026-08).
+
+    The rail must protectively flatten when the position approaches venue
+    liquidation, and — crucially — that check must run EVEN WHEN the user
+    disarmed SL/TP (the reorder that moved the snapshot fetch ahead of the
+    ``sl<=0 and tp<=0`` short-circuit: LIQ-GUARD-PROXIMITY-ALWAYS-ON).
+    """
+
+    async def _run(self, snap, *, sl=0.0, tp=0.0, strategy="grid"):
+        state = {
+            "sl_pct": sl, "tp_pct": tp, "strategy": strategy,
+            "strategy_session_id": 11, "running": True,
+        }
+        closed = {}
+
+        async def close_coro():
+            closed["called"] = True
+            return {"success": True}
+
+        sess = {"id": 11, "product_id": 2, "status": "running",
+                "started_at": None, "stopped_at": None}
+        with patch.object(bot_runtime, "run_blocking", _fake_run_blocking), \
+             patch("src.nadobro.models.database.get_strategy_session_by_id", return_value=sess), \
+             patch("src.nadobro.trading.live_session.get_live_session_snapshot", return_value=snap), \
+             patch.object(engine_runtime.RUNTIME, "stop", new=AsyncMock()), \
+             patch.object(bot_runtime, "_finalize_session") as fin, \
+             patch.object(bot_runtime, "_save_state"), \
+             patch.object(bot_runtime, "_notify", new=AsyncMock()), \
+             patch.object(bot_runtime, "_strategy_display_name", return_value="GRID"):
+            res = await bot_runtime._evaluate_session_pnl_rail(
+                42, "mainnet", state, strategy, "BTC",
+                client=None, close_coro=close_coro,
+            )
+        return res, closed, fin
+
+    def _near_liq_snap(self):
+        # long: entry 100, liq 98 (runway 2), mark 98.4 -> 0.8 consumed (>= 0.75).
+        return {
+            "session_pnl": -80.0, "session_pnl_pct": -80.0, "session_pnl_pct_net": -80.0,
+            "margin": 100.0, "entry_price": 100.0, "mark": 98.4, "liq_price": 98.0,
+            "net_base": 1.0, "leverage": 50.0,
+        }
+
+    async def test_flattens_near_liquidation_even_with_sltp_disarmed(self):
+        res, closed, fin = await self._run(self._near_liq_snap(), sl=0.0, tp=0.0)
+        self.assertEqual(res, (True, None))
+        self.assertTrue(closed.get("called"))
+        self.assertEqual(fin.call_args.kwargs.get("stop_reason"), "liq_guard")
+
+    async def test_does_not_flatten_when_runway_remains(self):
+        snap = self._near_liq_snap()
+        snap["mark"] = 99.0            # 0.5 consumed (< 0.75), SL/TP disarmed
+        res, closed, fin = await self._run(snap, sl=0.0, tp=0.0)
+        self.assertIsNone(res)
+        self.assertFalse(closed.get("called"))
+        fin.assert_not_called()
+
+    async def test_skips_on_missing_or_wrong_side_liq(self):
+        for bad in ({"liq_price": 0.0}, {"liq_price": 101.0}):   # missing; wrong-side (above mark on long)
+            snap = self._near_liq_snap()
+            snap.update(bad)
+            res, closed, _fin = await self._run(snap, sl=0.0, tp=0.0)
+            self.assertIsNone(res, bad)
+            self.assertFalse(closed.get("called"), bad)
+
+    async def test_disabled_by_env_kill_switch(self):
+        import os
+        os.environ["NADO_LIQ_GUARD_ENABLED"] = "false"
+        try:
+            res, closed, _fin = await self._run(self._near_liq_snap(), sl=0.0, tp=0.0)
+            self.assertIsNone(res)
+            self.assertFalse(closed.get("called"))
+        finally:
+            del os.environ["NADO_LIQ_GUARD_ENABLED"]

@@ -1609,6 +1609,11 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         "notional_usd", "spread_bp", "interval_seconds", "tp_pct", "sl_pct",
         "levels", "min_range_pct", "max_range_pct", "threshold_bp", "close_offset_bp",
         "cycle_notional_usd", "session_notional_cap_usd", "inventory_soft_limit_usd",
+        # Mid Risk custom inputs. Without the hard limit and budget here, the
+        # "Custom Hard" / "Custom Budget" buttons opened a pending input whose
+        # typed reply was rejected, the pending state cleared, and the number
+        # fell through to the LOWIQPTS points relay (same class of bug as DN).
+        "inventory_hard_limit_usd", "expected_budget_usd",
         "quote_ttl_seconds", "min_spread_bp", "max_spread_bp", "vol_sensitivity",
         "dgrid_trend_on_variance_ratio", "dgrid_range_on_variance_ratio",
         "dgrid_spread_bp", "dgrid_min_spread_bp", "dgrid_max_spread_bp",
@@ -1676,6 +1681,11 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         "cycle_notional_usd": (1, 1000000),
         "session_notional_cap_usd": (0, 10000000),
         "inventory_soft_limit_usd": (1, 1000000),
+        # Mirror the set-path bounds in strategy_handler (hard limit is a real
+        # USD ceiling; expected budget allows 0 = disabled) so the typed and
+        # tapped paths agree.
+        "inventory_hard_limit_usd": (1, 1000000),
+        "expected_budget_usd": (0, 1000000),
         "quote_ttl_seconds": (5, 86400),
         "min_spread_bp": (0.1, 200),
         "max_spread_bp": (0.1, 500),
@@ -1721,9 +1731,31 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         return True
 
     lo, hi = limits[field]
+    _lev_product = None
+    if field == "mm_leverage_override":
+        # Per-asset ceiling (was a static 1..50 that accepted e.g. 45x on a 40x
+        # SOL, then the start guard rejected it). Mirror strategy_handler's
+        # _leverage_bound so the typed and tapped paths agree.
+        _lev_product = str(
+            context.user_data.get(f"strategy_pair:{strategy}", "BTC") or "BTC"
+        ).upper()
+        _lev_user = get_user(telegram_id)
+        _lev_net = _lev_user.network_mode.value if _lev_user else "mainnet"
+        try:
+            hi = int(get_product_max_leverage(_lev_product, network=_lev_net))
+        except Exception:  # noqa: BLE001 - degrade to the global cap
+            hi = 50
+        lo = 1
     if value < lo or value > hi:
-        await _reply_loc(update.message, 
-            f"⚠️ Value out of range\\. Allowed: {escape_md(str(lo))} to {escape_md(str(hi))}",
+        if field == "mm_leverage_override" and _lev_product:
+            msg = (
+                f"⚠️ Max leverage for {escape_md(_lev_product)} is {hi}x\\. "
+                f"Enter 1–{hi}\\."
+            )
+        else:
+            msg = f"⚠️ Value out of range\\. Allowed: {escape_md(str(lo))} to {escape_md(str(hi))}"
+        await _reply_loc(update.message,
+            msg,
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return True

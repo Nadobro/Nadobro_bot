@@ -124,26 +124,26 @@ def test_overlay_noop_without_client_candles():
     assert cfg == before
 
 
-def test_overlay_writes_barrier_state_for_rail():
+def test_mid_overlay_does_not_write_session_barriers():
     cfg = {"order_amount_quote": Decimal("500"), "directional_bias": 0.0}
     state = {"strategy": "mid", "strategy_session_id": 1, "sl_pct": 0.5, "tp_pct": 1.0}
     asyncio.run(er._maybe_apply_overlay(
         7, "mainnet", "mid", "BTC", 2, cfg, state, client=_FakeClient(), mid=131.6,
     ))
-    # Regime-adjusted barriers surfaced to state for the session rail.
-    assert "overlay_sl_pct" in state and state["overlay_sl_pct"] > 0
-    assert "overlay_tp_pct" in state and state["overlay_tp_pct"] > 0
+    # Mid's user-selected SL/TP are exact session contracts. The overlay only
+    # changes quoting inputs and must not write alternate barriers to state.
+    assert "overlay_sl_pct" not in state
+    assert "overlay_tp_pct" not in state
 
 
-def test_overlay_rail_sl_never_widens_past_user_stop():
-    """The uptrend fixture reads as a trend (signal SL = base x 1.3), but the
-    rail barrier must stay clamped at the user's configured stop."""
+def test_mid_overlay_does_not_write_a_wider_session_stop():
+    """Mid does not publish an overlay SL even when the signal is a trend."""
     cfg = {"order_amount_quote": Decimal("500"), "directional_bias": 0.0}
     state = {"strategy": "mid", "strategy_session_id": 1, "sl_pct": 0.5, "tp_pct": 1.0}
     asyncio.run(er._maybe_apply_overlay(
         7, "mainnet", "mid", "BTC", 2, cfg, state, client=_FakeClient(), mid=131.6,
     ))
-    assert state["overlay_sl_pct"] <= 0.5
+    assert "overlay_sl_pct" not in state
 
 
 def test_overlay_rail_stays_disarmed_when_user_has_no_sl_tp():
