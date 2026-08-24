@@ -33,6 +33,13 @@ _LOGO_CANDIDATES = (
     _CARDS / "Nadobro Logo trans v2.png",
     _LOGOS / "nadobro logo v2.png",
 )
+# The official "NADOBRO" wordmark, white on transparent for dark cards (the real
+# brand logotype — custom letterforms + green accents — not typeset text). Same
+# asset the Type B card uses, so both share cards render identical branding.
+_WORDMARK_CANDIDATES = (
+    _LOGOS / "nadobro_wordmark_white.png",
+    _CARDS / "nadobro_wordmark_white.png",
+)
 
 # Palette measured from the masters.
 _WHITE = (255, 255, 255)
@@ -104,6 +111,24 @@ def _load_logo(px: int) -> Optional[Image.Image]:
             return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
         except Exception:
             logger.debug("type-a logo load failed for %s", cand, exc_info=True)
+    return None
+
+
+def _load_wordmark(px_height: int) -> Optional[Image.Image]:
+    """The official NADOBRO wordmark scaled to ``px_height`` tall."""
+    for cand in _WORDMARK_CANDIDATES:
+        if not cand.exists():
+            continue
+        try:
+            img = Image.open(cand).convert("RGBA")
+            bbox = img.getbbox()
+            if bbox:
+                img = img.crop(bbox)
+            w, h = img.size
+            scale = px_height / h
+            return img.resize((max(1, int(w * scale)), px_height), Image.LANCZOS)
+        except Exception:
+            logger.debug("type-a wordmark load failed for %s", cand, exc_info=True)
     return None
 
 
@@ -200,21 +225,28 @@ def generate_type_a_card(data: dict) -> bytes:
     draw.rounded_rectangle((14, 14, W - 14, H - 14), radius=42,
                            outline=(60, 84, 118), width=2)
 
-    # ── header: monogram + NADOBRO wordmark ─────────────────────
+    # ── header: monogram + official NADOBRO wordmark ────────────
     logo = _load_logo(118)
     lx, ly = 88, 62
+    logo_cy = ly + 118 // 2          # monogram vertical centre
     if logo is not None:
         canvas.alpha_composite(logo, (lx, ly + max(0, (118 - logo.height) // 2)))
         word_x = lx + logo.width + 34
     else:
         word_x = lx
-    word_font = _font(70, bold=True)
-    # Letter-spaced wordmark to match the master.
-    wx = word_x
-    wy = ly + 20
-    for ch in "NADOBRO":
-        draw.text((wx, wy), ch, font=word_font, fill=_WHITE)
-        wx += _text_w(draw, ch, word_font) + 8
+    # Prefer the official brand wordmark; scaled to match the monogram (same
+    # 38/82 monogram→wordmark ratio the Type B card uses → 54px here).
+    wordmark = _load_wordmark(54)
+    if wordmark is not None:
+        canvas.alpha_composite(wordmark, (word_x, logo_cy - wordmark.height // 2))
+    else:
+        # Fallback only if the brand asset is missing: typeset the name.
+        word_font = _font(70, bold=True)
+        wx = word_x
+        wy = ly + 20
+        for ch in "NADOBRO":
+            draw.text((wx, wy), ch, font=word_font, fill=_WHITE)
+            wx += _text_w(draw, ch, word_font) + 8
 
     # ── badge pill (COPY TRADE / DESK TRADE) ────────────────────
     badge = str(data.get("badge") or "TRADE").upper()
