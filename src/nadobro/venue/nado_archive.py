@@ -15,7 +15,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from src.nadobro.utils.env import env_float, env_int
-from src.nadobro.config import NADO_TESTNET_ARCHIVE, NADO_MAINNET_ARCHIVE
+from src.nadobro.config import (
+    NADO_TESTNET_ARCHIVE,
+    NADO_MAINNET_ARCHIVE,
+    NADO_TESTNET_ARCHIVE_REWARDS,
+    NADO_MAINNET_ARCHIVE_REWARDS,
+)
 from src.nadobro.core.log_redaction import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -168,6 +173,14 @@ def _get_session() -> requests.Session:
 
 def archive_url_for_network(network: str) -> str:
     return NADO_MAINNET_ARCHIVE if network == "mainnet" else NADO_TESTNET_ARCHIVE
+
+
+def archive_rewards_url_for_network(network: str) -> str:
+    """Archive (Rewards) endpoint — a SEPARATE service from the indexer
+    (:func:`archive_url_for_network`). The ``ink_airdrop`` allocation query is
+    served here; posting it to the indexer ``/v1`` returns HTTP 422 "unknown
+    variant `ink_airdrop`" because the indexer's request enum has no such variant."""
+    return NADO_MAINNET_ARCHIVE_REWARDS if network == "mainnet" else NADO_TESTNET_ARCHIVE_REWARDS
 
 
 def _from_x18(value) -> float:
@@ -889,9 +902,16 @@ def query_ink_airdrop(
 ) -> Optional[Decimal]:
     """Ink token airdrop allocation for a wallet address, in whole INK.
 
-    ``POST [ARCHIVE] {"ink_airdrop": {"address": ...}}`` returns
+    ``POST [ARCHIVE REWARDS] {"ink_airdrop": {"address": ...}}`` returns
     ``{"amount": "<x18 string>"}`` (documented IP weight = 2). The venue keys
     the airdrop off the plain 20-byte wallet address, not a subaccount.
+
+    ENDPOINT: this query lives on the Archive (Rewards) service
+    (:func:`archive_rewards_url_for_network`, ``.../rewards/v1``), NOT the archive
+    INDEXER (``.../v1``). The indexer's request enum has no ``ink_airdrop`` variant
+    and answers HTTP 422 "unknown variant `ink_airdrop`" — the bug that made
+    ``/airdrop`` always report "Couldn't reach the Nado archive" (verified against
+    the live endpoints list, 2026-08-24).
 
     Returns ``None`` when the archive is unreachable / rate-limited or the
     response is malformed — callers must not render that as "0 INK"; only
@@ -902,7 +922,7 @@ def query_ink_airdrop(
     2026-07-18: nonzero allocations exist only for a sparse set of wallets,
     none registered after early Feb 2026).
 
-    https://docs.nado.xyz/developer-resources/api/archive-indexer/ink-airdrop
+    https://docs.nado.xyz/developer-resources/api/rewards/ink-airdrop
     """
     addr = normalize_evm_address(address)
     if not addr:
@@ -915,7 +935,7 @@ def query_ink_airdrop(
         if cached and (now - cached[0] < _AIRDROP_CACHE_TTL_SECONDS):
             return cached[1]
 
-    url = archive_url_for_network(network)
+    url = archive_rewards_url_for_network(network)
     result = _post(url, {"ink_airdrop": {"address": addr}})
     if not isinstance(result, dict):
         return None
