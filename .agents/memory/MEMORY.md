@@ -1,0 +1,1 @@
+- [Space Grotesk asset weights](space-grotesk-asset-weights.md) — upstream static files omit semibold; maintain the renderer’s semibold path with the closest official face.

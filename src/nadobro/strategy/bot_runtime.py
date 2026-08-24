@@ -1103,6 +1103,19 @@ def start_user_bot(
         # NOTE (CEO directive 2026-05): Volume Perp now uses per-asset MAX leverage
         # rather than being pinned to 1x. The strategy itself overwrites
         # state["leverage"] at cycle start (volume_bot._resolve_max_leverage).
+    _, strat_cfg = get_strategy_settings(telegram_id, strategy)
+    mid_override_selected = False
+    if strategy == "mid":
+        try:
+            requested_mid_leverage = float(strat_cfg.get("mm_leverage_override") or 0.0)
+        except (TypeError, ValueError):
+            requested_mid_leverage = 0.0
+        if requested_mid_leverage > 0:
+            # The selected asset's live catalog ceiling always wins. This also
+            # protects a legacy saved Mid setting after the user switches from
+            # a high-cap asset to one with a lower safe limit.
+            leverage = min(requested_mid_leverage, float(max_leverage))
+            mid_override_selected = True
     # CEO directive: MM and Volume Perp coerce to MAX leverage internally — accept
     # the user's stale UI value silently rather than rejecting; the strategies
     # overwrite state["leverage"] at cycle start (mm_bot.py:~686, volume_bot.py:~884).
@@ -1151,7 +1164,6 @@ def start_user_bot(
             )
 
     _mark_previous_sessions_superseded(telegram_id, network)
-    _, strat_cfg = get_strategy_settings(telegram_id, strategy)
     state = _default_state()
     state.update(_strategy_defaults(strategy))
     state.update(strat_cfg)
@@ -1177,6 +1189,11 @@ def start_user_bot(
             "mm_gate_since_ts": 0.0,
         }
     )
+    if strategy == "mid" and mid_override_selected:
+        # The engine resolves this field before session leverage. Persist the
+        # capped value into this session state so an old cross-asset setting
+        # cannot bypass the safety ceiling after start.
+        state["mm_leverage_override"] = float(leverage)
     if strategy in ("grid", "rgrid", "dgrid", "mid"):
         mm_ok, mm_msg = _run_mm_start_guard(telegram_id, network, product.upper(), float(state.get("leverage") or leverage or 1.0), state, strategy)
         if not mm_ok:

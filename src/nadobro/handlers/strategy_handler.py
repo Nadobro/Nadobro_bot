@@ -998,7 +998,12 @@ async def _handle_strategy(query, data, context, telegram_id):
             _lev_user = get_user(telegram_id)
             _lev_net = _lev_user.network_mode.value if _lev_user else "mainnet"
             lo, hi = _leverage_bound(_lev_product, _lev_net)
-        if value < lo or value > hi:
+        mid_sltp_disabled = (
+            strategy_id == "mid"
+            and field in {"tp_pct", "sl_pct"}
+            and value == 0
+        )
+        if not mid_sltp_disabled and (value < lo or value > hi):
             return
         int_fields = {
             "interval_seconds", "levels", "max_open_orders",
@@ -1174,6 +1179,10 @@ async def _handle_strategy(query, data, context, telegram_id):
                 f"Enter leverage for {escape_md(_lev_product)} "
                 f"\\(1 – {_hi}; position size \\= margin × leverage, example: `5`\\)"
             )
+        if strategy_id == "mid" and field == "tp_pct":
+            help_text[field] = "Enter take profit % \\(example: `1\\.2`, or `0` to disable\\)"
+        if strategy_id == "mid" and field == "sl_pct":
+            help_text[field] = "Enter stop loss % \\(example: `0\\.7`, or `0` to disable\\)"
         await _edit_loc(query,
             f"✏️ *Custom {escape_md(field)}*\n\n"
             f"{help_text.get(field, 'Enter value')}\n\n"
@@ -1240,6 +1249,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             return
         settings = _get_user_settings(telegram_id, context)
         from src.nadobro.handlers.messages import execute_action_directly
+        strategy_conf = (settings.get("strategies", {}) or {}).get(strategy_id, {}) or {}
         strategy_leverage = 1 if strategy_id == "vol" else settings.get("default_leverage", 3)
         if strategy_id == "dn":
             strategy_leverage = max(1, min(float(strategy_leverage), 5))
@@ -1249,7 +1259,16 @@ async def _handle_strategy(query, data, context, telegram_id):
                 strategy_leverage = float(_gpml(product, network=network))
             except Exception:
                 strategy_leverage = float(settings.get("default_leverage", 3))
-        strategy_conf = (settings.get("strategies", {}) or {}).get(strategy_id, {}) or {}
+        if strategy_id == "mid":
+            try:
+                selected_leverage = float(strategy_conf.get("mm_leverage_override") or 0.0)
+            except (TypeError, ValueError):
+                selected_leverage = 0.0
+            if selected_leverage > 0:
+                # A saved setting may predate an asset change. Keep the live
+                # catalog ceiling authoritative even before the user revisits
+                # Mid Setup, where the button list is rebuilt for this asset.
+                strategy_leverage = min(strategy_leverage, selected_leverage)
         wallet_usdt_pf = None
         ro = get_user_readonly_client(telegram_id)
         if ro:
@@ -1595,7 +1614,11 @@ def _strategy_section_for_field(strategy: str, field: str) -> str:
             return "risk"
         return "setup"
     if strategy == "mid":
-        if field in {"tp_pct", "sl_pct", "rgrid_stop_loss_pct", "rgrid_take_profit_pct"}:
+        if field in {
+            "tp_pct", "sl_pct", "rgrid_stop_loss_pct", "rgrid_take_profit_pct",
+            "inventory_soft_limit_usd", "inventory_hard_limit_usd",
+            "expected_budget_usd",
+        }:
             return "risk"
         return "setup"
     if strategy == "dn":
@@ -1670,7 +1693,8 @@ def _start_leverage_for_card(
     Mirrors the resolution in the ``preview`` branch (the value that becomes
     ``state["leverage"]``, which is what ``_effective_leverage`` reads): vol is
     always 1x, dn is clamped to 5x, grid/rgrid/dgrid/mid deploy at the PAIR MAX,
-    and everything else takes the user's ``default_leverage``. Kept next to
+    and Mid uses its explicit ``mm_leverage_override`` when selected; everything
+    else takes the user's ``default_leverage``. Kept next to
     ``_mm_effective_leverage`` so the two stay in step.
 
     Cache-first: ``get_product_max_leverage`` reads the product catalog, the same
@@ -1689,7 +1713,16 @@ def _start_leverage_for_card(
         try:
             from src.nadobro.config import get_product_max_leverage as _gpml
 
-            return max(1.0, float(_gpml(str(product), network=network)))
+            pair_max = max(1.0, float(_gpml(str(product), network=network)))
+            if strategy_id == "mid":
+                strategy_cfg = settings.get("strategies", {}).get("mid", {}) or {}
+                try:
+                    selected = float(strategy_cfg.get("mm_leverage_override") or 0.0)
+                except (TypeError, ValueError):
+                    selected = 0.0
+                if selected > 0:
+                    return max(1.0, min(selected, pair_max))
+            return pair_max
         except Exception:  # noqa: BLE001  # policy: degrade-ok(card falls back to the user default)
             return max(1.0, default_lev)
     return max(1.0, default_lev)
@@ -2166,12 +2199,9 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
         )
 
     if strategy == "mid":
-        # Mid Mode: pure mid ± spread. No anchor / no soft-reset.
-        # AUDIT-MID-2026-07-30 #5 pulled "Levels" and "Reference" off this card
-        # because the mid mapping consumed neither. LADDER (2026-08-02) made
-        # Levels real — it now splits the side's deployment across levels
-        # stepping away from mid — so it is back, with the size curve beside it.
-        # "Reference" stays off: mid mode is always mid-referenced.
+        # Mid Mode: pure mid ± spread. Keep this card focused on the controls a
+        # normal user needs; legacy fields remain accepted by the handler and
+        # engine but are intentionally not exposed here.
         try:
             bias_val = float(conf.get("directional_bias", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -2188,27 +2218,25 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             expected_budget = float(conf.get("expected_budget_usd", 0.0) or 0.0)
             return (
                 "⚙️ *MID MODE · Risk*\n\n"
-                f"PnL TP/SL: *{escape_md(f'{tp_pct:.2f}% / {sl_pct:.2f}%')}* of margin\n\n"
-                f"Inventory soft/hard: *{escape_md(f'${soft_limit:,.0f} / ${hard_limit:,.0f}')}*\n"
+                f"Take profit: *{escape_md(f'{tp_pct:.2f}%')}* of margin\n"
+                f"Stop loss: *{escape_md(f'{sl_pct:.2f}%')}* of margin\n\n"
+                f"Inventory protection: *{escape_md(f'${soft_limit:,.0f} soft / ${hard_limit:,.0f} hard')}*\n"
                 f"Expected budget: *{escape_md(f'${expected_budget:,.0f}')}*\n\n"
                 "Soft inventory widens and rebalances both sides\\. Hard inventory leaves only "
                 "the reducing quote\\. Expected budget stops new exposure after cumulative "
                 "loss and costs reach the limit\\."
             )
-        pov_label = str(conf.get("participation_preset") or "OFF").upper()
         execution_mode = str(conf.get("mid_execution_mode") or "normal").upper()
         return (
             "⚙️ *MID MODE · Core*\n\n"
-            f"Margin: *{escape_md(f'${notional:,.0f}')}* \\| Interval: *{escape_md(f'{interval_seconds}s')}*\n"
-            f"Spread: *{escape_md(f'{spread_bp:+.1f} bp')}* \\| Bias: *{escape_md(bias_str)}*\n"
-            f"Execution: *{escape_md(execution_mode)}* \\(cadence, width, size, quote life\\)\n"
-            f"{_ladder_line(conf)}\n"
-            f"POV: *{escape_md(pov_label)}* \\(per\\-cycle pacing from Nado 24h volume\\)\n"
-            f"{_mm_sizing_line(conf)}\n\n"
-            "Pure mid ± spread\\. No anchor, no soft\\-reset\\. Levels split the same "
-            "margin into rungs stepping away from mid — more rungs scale in and out "
-            "of a move; they never add exposure\\. "
-            "Bias range −1\\.0 → \\+1\\.0 \\(short → long\\); \\|1\\.0\\| adds 20% margin\\."
+            f"Margin: *{escape_md(f'${notional:,.0f}')}*\n"
+            f"{_mm_sizing_line(conf)}\n"
+            f"Spread: *{escape_md(f'{spread_bp:+.1f} bp')}*\n"
+            f"Execution: *{escape_md(execution_mode)}*\n"
+            f"Bias: *{escape_md(bias_str)}*\n\n"
+            "Mid Mode keeps two\\-sided post\\-only quotes around the market mid\\. "
+            "Execution controls quote cadence, width, size, and quote life\\. "
+            "Bias adjusts inventory while both buy and sell quotes remain active\\."
         )
 
     if strategy == "dn":
@@ -2255,7 +2283,8 @@ def _leverage_button_rows(strategy: str, product_max_leverage: int) -> list[list
     reachable (e.g. BTC 50x, SOL 40x, QQQ 20x). Buttons write
     ``mm_leverage_override``; chunked to <=4 per row for Telegram."""
     max_lev = max(1, int(product_max_leverage or 1))
-    choices = [lev for lev in (1, 3, 5, 10, 20, 40, 50) if lev <= max_lev]
+    ladder = (1, 2, 3, 5, 10, 20, 40, 50) if strategy == "mid" else (1, 3, 5, 10, 20, 40, 50)
+    choices = [lev for lev in ladder if lev <= max_lev]
     if max_lev not in choices:
         choices.append(max_lev)
     buttons = [
@@ -2678,9 +2707,15 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                     InlineKeyboardButton("TP 2.0%", callback_data="strategy:set:mid:tp_pct:2.0"),
                 ],
                 [
+                    InlineKeyboardButton("TP Off", callback_data="strategy:set:mid:tp_pct:0"),
+                ],
+                [
                     InlineKeyboardButton("SL 0.25%", callback_data="strategy:set:mid:sl_pct:0.25"),
                     InlineKeyboardButton("SL 0.5%", callback_data="strategy:set:mid:sl_pct:0.5"),
                     InlineKeyboardButton("SL 1.0%", callback_data="strategy:set:mid:sl_pct:1.0"),
+                ],
+                [
+                    InlineKeyboardButton("SL Off", callback_data="strategy:set:mid:sl_pct:0"),
                 ],
                 [
                     InlineKeyboardButton("Custom TP", callback_data="strategy:input:mid:tp_pct"),
@@ -2698,40 +2733,32 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                 ],
             ]
         else:
-            # Setup: Tiny Budget Preset, margin, spread (signed), levels, reference, bias.
+            # Mid setup intentionally exposes only the user-facing core
+            # controls. The engine still honors legacy settings and callbacks
+            # for saved configurations and older links.
             rows = [
-                [
-                    InlineKeyboardButton("🎯 Tiny Budget Preset", callback_data="strategy:preset:mid:tiny"),
-                    InlineKeyboardButton("Standard", callback_data="strategy:preset:mid:standard"),
-                ],
-                [
-                    InlineKeyboardButton("🚀 Turbo Volume", callback_data="strategy:preset:mid:turbo"),
-                ],
                 [
                     InlineKeyboardButton("Margin $50", callback_data="strategy:set:mid:notional_usd:50"),
                     InlineKeyboardButton("Margin $100", callback_data="strategy:set:mid:notional_usd:100"),
                     InlineKeyboardButton("Margin $250", callback_data="strategy:set:mid:notional_usd:250"),
                 ],
+                [
+                    InlineKeyboardButton("✍️ Custom Margin", callback_data="strategy:input:mid:notional_usd"),
+                ],
                 *_leverage_button_rows("mid", product_max_leverage),
+                [
+                    InlineKeyboardButton(
+                        "✍️ Custom Leverage",
+                        callback_data="strategy:input:mid:mm_leverage_override",
+                    ),
+                ],
                 [
                     InlineKeyboardButton("Tight 2bp", callback_data="strategy:set:mid:spread_bp:2"),
                     InlineKeyboardButton("Spread 5bp", callback_data="strategy:set:mid:spread_bp:5"),
                     InlineKeyboardButton("Spread 25bp", callback_data="strategy:set:mid:spread_bp:25"),
                 ],
-                # LADDER: restores the "Levels" control AUDIT-MID-2026-07-30 #5
-                # pulled off this card as dead. It is live now — levels split
-                # the side's margin into rungs stepping away from mid, same
-                # total. Curve controls how size is distributed across them.
                 [
-                    InlineKeyboardButton("Levels 1", callback_data="strategy:set:mid:levels:1"),
-                    InlineKeyboardButton("2", callback_data="strategy:set:mid:levels:2"),
-                    InlineKeyboardButton("4", callback_data="strategy:set:mid:levels:4"),
-                    InlineKeyboardButton("✍️", callback_data="strategy:input:mid:levels"),
-                ],
-                [
-                    InlineKeyboardButton("Curve Flat", callback_data="strategy:set_text:mid:size_curve:flat"),
-                    InlineKeyboardButton("Linear", callback_data="strategy:set_text:mid:size_curve:linear"),
-                    InlineKeyboardButton("Geometric", callback_data="strategy:set_text:mid:size_curve:geometric"),
+                    InlineKeyboardButton("✍️ Custom Spread", callback_data="strategy:input:mid:spread_bp"),
                 ],
                 [
                     InlineKeyboardButton("⚡ Aggressive", callback_data="strategy:set_text:mid:mid_execution_mode:aggressive"),
@@ -2742,34 +2769,6 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                     InlineKeyboardButton("Short −0.5", callback_data="strategy:set:mid:directional_bias:-0.5"),
                     InlineKeyboardButton("Neutral", callback_data="strategy:set:mid:directional_bias:0"),
                     InlineKeyboardButton("Long +0.5", callback_data="strategy:set:mid:directional_bias:0.5"),
-                ],
-                [
-                    InlineKeyboardButton("Min Spread 2bp", callback_data="strategy:set:mid:min_spread_bp:2"),
-                    InlineKeyboardButton("Max 30bp", callback_data="strategy:set:mid:max_spread_bp:30"),
-                    InlineKeyboardButton("Max 50bp", callback_data="strategy:set:mid:max_spread_bp:50"),
-                ],
-                [
-                    InlineKeyboardButton("⚡ Aggressive", callback_data="strategy:set_text:mid:participation_preset:aggressive"),
-                    InlineKeyboardButton("Normal", callback_data="strategy:set_text:mid:participation_preset:normal"),
-                    InlineKeyboardButton("Passive", callback_data="strategy:set_text:mid:participation_preset:passive"),
-                ],
-                [
-                    InlineKeyboardButton("Duration 30m", callback_data="strategy:set:mid:mm_duration_minutes:30"),
-                    InlineKeyboardButton("2h", callback_data="strategy:set:mid:mm_duration_minutes:120"),
-                    InlineKeyboardButton("✍️ Custom Duration", callback_data="strategy:input:mid:mm_duration_minutes"),
-                ],
-                [
-                    InlineKeyboardButton("Pause: Off", callback_data="strategy:set:mid:twap_pause_move_bp:0"),
-                    InlineKeyboardButton("1%", callback_data="strategy:set:mid:twap_pause_move_bp:100"),
-                    InlineKeyboardButton("2%", callback_data="strategy:set:mid:twap_pause_move_bp:200"),
-                    InlineKeyboardButton("✍️", callback_data="strategy:input:mid:twap_pause_move_bp"),
-                ],
-                [
-                    InlineKeyboardButton("Custom Margin", callback_data="strategy:input:mid:notional_usd"),
-                    InlineKeyboardButton("Custom Spread", callback_data="strategy:input:mid:spread_bp"),
-                ],
-                [
-                    InlineKeyboardButton("Custom Bias", callback_data="strategy:input:mid:directional_bias"),
                 ],
             ]
     elif strategy == "dn":
@@ -3015,6 +3014,13 @@ def _build_strategy_preview_text(
             leverage = float(_gpml(product, network=network))
         except Exception:
             leverage = float(settings.get("default_leverage", 3))
+        if strategy_id == "mid":
+            try:
+                selected_leverage = float(conf.get("mm_leverage_override") or 0.0)
+            except (TypeError, ValueError):
+                selected_leverage = 0.0
+            if selected_leverage > 0:
+                leverage = min(leverage, selected_leverage)
     elif strategy_id == "vol":
         if (vol_market or "perp").lower() == "spot":
             leverage = 1.0
