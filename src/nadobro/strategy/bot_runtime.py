@@ -1103,9 +1103,10 @@ def start_user_bot(
         # NOTE (CEO directive 2026-05): Volume Perp now uses per-asset MAX leverage
         # rather than being pinned to 1x. The strategy itself overwrites
         # state["leverage"] at cycle start (volume_bot._resolve_max_leverage).
-    _, strat_cfg = get_strategy_settings(telegram_id, strategy)
+    strat_cfg = {}
     mid_override_selected = False
     if strategy == "mid":
+        _, strat_cfg = get_strategy_settings(telegram_id, strategy)
         try:
             requested_mid_leverage = float(strat_cfg.get("mm_leverage_override") or 0.0)
         except (TypeError, ValueError):
@@ -1163,6 +1164,10 @@ def start_user_bot(
                 f"Raise margin to at least ${float(min_notional_usd):,.0f}."
             )
 
+    if strategy != "mid":
+        # Preserve the original lazy settings lookup for non-Mid strategies:
+        # leverage validation above must be able to return without a database.
+        _, strat_cfg = get_strategy_settings(telegram_id, strategy)
     _mark_previous_sessions_superseded(telegram_id, network)
     state = _default_state()
     state.update(_strategy_defaults(strategy))
