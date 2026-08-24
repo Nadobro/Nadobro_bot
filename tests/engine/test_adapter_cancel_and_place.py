@@ -157,3 +157,47 @@ def test_forget_cancelled_is_a_safe_noop_for_unknown_ids():
     a = _adapter(_FakeClient())
     a.forget_cancelled("never-seen")      # must not raise
     a.forget_cancelled("")
+
+
+# --- settle fallback against a non-atomic venue (audit finding 2) -----------
+
+def test_settle_cancels_the_old_order_if_the_venue_left_it_resting():
+    """The no-orphan guarantee assumes cancel_and_place cancelled the old order.
+    If a refresh shows it STILL RESTING, settle must issue an explicit cancel
+    rather than terminate and forget a live resting order."""
+    import copy
+
+    from src.nadobro.engine.adapter.base import NadoOrder, OrderState
+    from src.nadobro.engine.executors.order_executor import (
+        OrderExecutor, OrderExecutorConfig,
+    )
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.types import ExecutionStrategy
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    async def body():
+        # order_status reports the old order STILL OPEN (the venue kept it alive
+        # after a non-atomic cancel_and_place); cancel_order then flips it to
+        # CANCELLED, as a real cancel would.
+        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        # A resting order the executor "owns".
+        resting = NadoOrder(
+            id="old1", trading_pair="P", side=TradeType.BUY,
+            order_type=OrderType.LIMIT_MAKER, amount_base=Decimal("1"),
+            price=Decimal("99"), state=OrderState.OPEN,
+        )
+        adapter._orders["old1"] = resting
+        ex = OrderExecutor(
+            OrderExecutorConfig("P", TradeType.BUY, Decimal("1"),
+                                ExecutionStrategy.LIMIT_MAKER, price=Decimal("99")),
+            user_id=1, controller_id="c", adapter=adapter,
+            inventory=InventoryRepository(),
+        )
+        ex.adopt_order(copy.copy(resting))     # executor now tracks old1, OPEN
+        await ex.settle_after_external_cancel()
+        # The still-resting order was rescued by an explicit cancel.
+        assert "old1" in adapter.cancelled
+        assert adapter._orders["old1"].state is OrderState.CANCELLED
+        assert ex.is_terminated
+
+    asyncio.run(body())
