@@ -43,12 +43,26 @@ def test_mid_setup_exposes_only_user_facing_controls():
         "strategy:set:mid:directional_bias:-0.5",
         "strategy:set:mid:directional_bias:0",
         "strategy:set:mid:directional_bias:0.5",
+        # The ladder knobs stay on the card: the mid mapping consumes levels
+        # (-> ladder_levels) and size_curve (-> ladder_curve), so removing the
+        # buttons would orphan a live feature. Guarded end-to-end by
+        # tests/handlers/test_ladder_ui_wiring.py.
+        "strategy:set:mid:levels:1",
+        "strategy:set:mid:levels:2",
+        "strategy:set:mid:levels:4",
+        "strategy:input:mid:levels",
+        "strategy:set_text:mid:size_curve:flat",
+        "strategy:set_text:mid:size_curve:linear",
+        "strategy:set_text:mid:size_curve:geometric",
     }
     assert set(callbacks[:-1]) == expected
     assert callbacks[-1] == "strategy:config:mid"
 
+    # Still intentionally off the mid card (the mapping ignores them or they are
+    # engine-internal): min/max spread bounds, POV participation, MM duration,
+    # TWAP pause, and the old margin presets.
     obsolete_fields = (
-        "levels", "size_curve", "min_spread_bp", "max_spread_bp",
+        "min_spread_bp", "max_spread_bp",
         "participation_preset", "mm_duration_minutes",
         "twap_pause_move_bp",
     )

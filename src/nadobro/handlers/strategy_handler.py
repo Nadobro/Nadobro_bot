@@ -2232,9 +2232,12 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             f"Margin: *{escape_md(f'${notional:,.0f}')}*\n"
             f"{_mm_sizing_line(conf)}\n"
             f"Spread: *{escape_md(f'{spread_bp:+.1f} bp')}*\n"
+            f"{_ladder_line(conf)}\n"
             f"Execution: *{escape_md(execution_mode)}*\n"
             f"Bias: *{escape_md(bias_str)}*\n\n"
             "Mid Mode keeps two\\-sided post\\-only quotes around the market mid\\. "
+            "Levels split the same margin into rungs stepping away from mid — more "
+            "rungs scale in and out of a move without adding exposure\\. "
             "Execution controls quote cadence, width, size, and quote life\\. "
             "Bias adjusts inventory while both buy and sell quotes remain active\\."
         )
@@ -2733,9 +2736,11 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                 ],
             ]
         else:
-            # Mid setup intentionally exposes only the user-facing core
-            # controls. The engine still honors legacy settings and callbacks
-            # for saved configurations and older links.
+            # Mid setup exposes the core controls plus the wired ladder knobs.
+            # Levels/size_curve stay on the card because the mid mapping
+            # consumes them (engine_runtime maps levels->ladder_levels and
+            # size_curve->ladder_curve): removing the buttons would orphan a
+            # live feature, so they ship alongside the leverage controls.
             rows = [
                 [
                     InlineKeyboardButton("Margin $50", callback_data="strategy:set:mid:notional_usd:50"),
@@ -2759,6 +2764,20 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                 ],
                 [
                     InlineKeyboardButton("✍️ Custom Spread", callback_data="strategy:input:mid:spread_bp"),
+                ],
+                # LADDER: levels split the side's margin into rungs stepping away
+                # from mid (same total deployment); size_curve shapes how the
+                # per-level size is distributed. Both are read by the mid mapping.
+                [
+                    InlineKeyboardButton("Levels 1", callback_data="strategy:set:mid:levels:1"),
+                    InlineKeyboardButton("2", callback_data="strategy:set:mid:levels:2"),
+                    InlineKeyboardButton("4", callback_data="strategy:set:mid:levels:4"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:mid:levels"),
+                ],
+                [
+                    InlineKeyboardButton("Curve Flat", callback_data="strategy:set_text:mid:size_curve:flat"),
+                    InlineKeyboardButton("Linear", callback_data="strategy:set_text:mid:size_curve:linear"),
+                    InlineKeyboardButton("Geometric", callback_data="strategy:set_text:mid:size_curve:geometric"),
                 ],
                 [
                     InlineKeyboardButton("⚡ Aggressive", callback_data="strategy:set_text:mid:mid_execution_mode:aggressive"),

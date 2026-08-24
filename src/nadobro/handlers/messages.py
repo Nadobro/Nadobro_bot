@@ -1609,6 +1609,11 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         "notional_usd", "spread_bp", "interval_seconds", "tp_pct", "sl_pct",
         "levels", "min_range_pct", "max_range_pct", "threshold_bp", "close_offset_bp",
         "cycle_notional_usd", "session_notional_cap_usd", "inventory_soft_limit_usd",
+        # Mid Risk custom inputs. Without the hard limit and budget here, the
+        # "Custom Hard" / "Custom Budget" buttons opened a pending input whose
+        # typed reply was rejected, the pending state cleared, and the number
+        # fell through to the LOWIQPTS points relay (same class of bug as DN).
+        "inventory_hard_limit_usd", "expected_budget_usd",
         "quote_ttl_seconds", "min_spread_bp", "max_spread_bp", "vol_sensitivity",
         "dgrid_trend_on_variance_ratio", "dgrid_range_on_variance_ratio",
         "dgrid_spread_bp", "dgrid_min_spread_bp", "dgrid_max_spread_bp",
@@ -1676,6 +1681,11 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         "cycle_notional_usd": (1, 1000000),
         "session_notional_cap_usd": (0, 10000000),
         "inventory_soft_limit_usd": (1, 1000000),
+        # Mirror the set-path bounds in strategy_handler (hard limit is a real
+        # USD ceiling; expected budget allows 0 = disabled) so the typed and
+        # tapped paths agree.
+        "inventory_hard_limit_usd": (1, 1000000),
+        "expected_budget_usd": (0, 1000000),
         "quote_ttl_seconds": (5, 86400),
         "min_spread_bp": (0.1, 200),
         "max_spread_bp": (0.1, 500),
