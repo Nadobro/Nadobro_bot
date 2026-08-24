@@ -457,6 +457,18 @@ def test_deployed_notional_is_margin_times_leverage():
     )
     assert over["total_amount_quote"] == Decimal("300")   # override 3x beats 10x
 
+    # Mid uses the same margin × selected-leverage contract for each side's
+    # deployed quote budget, even when the session was started at pair max.
+    mid = er.map_strategy_config(
+        "mid",
+        {"notional_usd": 100.0, "mm_leverage_override": 5, "mid_execution_mode": "normal"},
+        Decimal(100),
+        product="BTC-PERP",
+        leverage=50,
+    )
+    assert mid["leverage"] == 5
+    assert mid["order_amount_quote"] == Decimal("500")
+
 
 def test_map_risk_limits_scale_with_leverage():
     """The per-order and position caps must follow the DEPLOYED notional or the

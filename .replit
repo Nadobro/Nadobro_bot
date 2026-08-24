@@ -1,43 +1,24 @@
-modules = ["nodejs-20", "python-3.11"]
-[agent]
-expertMode = true
-integrations = ["github:1.0.0"]
+modules = ["nodejs-24", "python-base-3.13"]
+
+[deployment]
+router = "application"
+deploymentTarget = "autoscale"
+
+[deployment.postBuild]
+args = ["pnpm", "store", "prune"]
+env = { "CI" = "true" }
 
 [workflows]
 runButton = "Project"
 
-[[workflows.workflow]]
-name = "Project"
-mode = "parallel"
-author = "agent"
+[agent]
+stack = "PNPM_WORKSPACE"
+expertMode = true
 
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "Nadobro Bot"
-
-[[workflows.workflow]]
-name = "Nadobro Bot"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python main.py"
-waitForPort = 8080
-
-[workflows.workflow.metadata]
-outputType = "console"
-
-[[ports]]
-localPort = 8080
-externalPort = 8080
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 20000
 
 [nix]
 channel = "stable-25_05"
 packages = ["cargo", "libiconv", "libxcrypt", "openssl", "pkg-config", "rustc"]
-
-[userenv]
-
-[userenv.shared]
-TELEGRAM_TRANSPORT = "webhook"
-TELEGRAM_WEBHOOK_URL = "https://nadobro-bot.fly.dev/telegram/webhook"
-TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"

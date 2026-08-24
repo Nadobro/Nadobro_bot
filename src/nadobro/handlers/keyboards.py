@@ -887,7 +887,13 @@ def strategy_action_kb(
             ],
             [
                 InlineKeyboardButton("🎯 Choose Asset", callback_data=f"strategy:custom:{strategy_id}:0"),
-                InlineKeyboardButton("⚙️ Advanced", callback_data=f"strategy:config:{strategy_id}"),
+                # Mid's config card is a plain setup card (margin/leverage/spread/
+                # ladder), so it reads "Setup" rather than "Advanced"; the route
+                # is unchanged. Other strategies keep the "Advanced" label.
+                InlineKeyboardButton(
+                    "⚙️ Setup" if strategy_id == "mid" else "⚙️ Advanced",
+                    callback_data=f"strategy:config:{strategy_id}",
+                ),
             ],
             [*pair_buttons],
         ]
