@@ -59,6 +59,11 @@ def _turbo_preset_settings(strategy_id: str, product_max_leverage: float) -> dic
     grid/rgrid/dgrid keep their TP and level mechanics untouched — their
     position exits flow through barriers this preset must not disturb.
     """
+    # NOTE (2026-08-24 volume engine): the grid branch DOES set level + recenter
+    # mechanics (levels + grid_reset_threshold_pct) — that is the validated volume
+    # lever. Its TP and the %-of-margin SL rail remain untouched. rgrid/dgrid keep
+    # their TP and level mechanics untouched (their position exits flow through
+    # barriers this preset must not disturb).
     lev = max(1.0, min(_TURBO_LEVERAGE_DEFAULT, float(product_max_leverage or 1.0)))
     base = {
         "mm_leverage_override": int(lev),
@@ -76,7 +81,20 @@ def _turbo_preset_settings(strategy_id: str, product_max_leverage: float) -> dic
             "tp_pct": 0.0,
         })
     elif sid == "grid":
-        base.update({"spread_bp": 3.0, "sl_pct": _TURBO_SESSION_SL_PCT})
+        base.update({
+            "spread_bp": 3.0, "sl_pct": _TURBO_SESSION_SL_PCT,
+            # VOLUME ENGINE (2026-08-24, validated on real Aug BTC+ETH). The old
+            # Turbo grid barely raised volume: it left ``levels`` at the sparse
+            # default (2) and the recenter at the band-width auto-follow, which for
+            # a deep ladder waits ``step x (levels-1)`` (~70bp at 8 levels) before
+            # re-quoting, so the grid goes stale and stops harvesting. A DEEPER
+            # ladder plus an AGGRESSIVE recenter (0.15% of price) tracks price and
+            # harvested ~3x more fills at LOWER drawdown on both pairs, still net
+            # profitable. The recenter is the load-bearing lever — without it more
+            # levels only widen the stale band and cut fills.
+            "levels": 8,
+            "grid_reset_threshold_pct": 0.15,
+        })
     elif sid == "rgrid":
         base.update({
             "spread_bp": 3.0, "rgrid_spread_bp": 3.0,

@@ -50,6 +50,11 @@ def _controller(adapter, extra=None):
         "spread_ask_pct": SPREAD,
         "order_amount_quote": Decimal(10),
         "price_distance_tolerance": Decimal("0.0001"),
+        # PHASE-1 (2026-08-24): the chop stand-down gate defaults ON, but these
+        # tests exercise the raw entry/exit MECHANICS and feed no candles (which
+        # the gate would read as "no trend -> stand down"). Disable it here; the
+        # gate has its own tests (TestChopStandDownGate) that feed candles.
+        "rgrid_chop_stand_down": False,
     }
     configs.update(extra or {})
     orch = ExecutorOrchestrator()
@@ -934,6 +939,11 @@ def test_the_configured_pyramid_fits_inside_its_own_exposure_ceiling():
     default of 30% admitted 1.0-1.4 steps: R-Grid took its entry and then had every
     add refused by _projected_order_within_exposure. It could not pyramid at all,
     which is the entire strategy.
+
+    PHASE-0 (2026-08-24): full-notional pyramiding is now an explicit OPT-IN
+    (``max_net_exposure_pct=100``) — the default is the conservative 30% ceiling
+    while the trend geometry is still net-losing in chop. This test opts in to prove
+    the pyramid MECHANICS still fit once enabled (Phase-1 re-enables it validated).
     """
     from src.nadobro.strategy.engine_runtime import map_strategy_config
 
@@ -941,7 +951,8 @@ def test_the_configured_pyramid_fits_inside_its_own_exposure_ceiling():
         cfg = map_strategy_config(
             "rgrid",
             {"notional_usd": margin, "leverage": lev, "levels": levels,
-             "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 5.0},
+             "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 5.0,
+             "max_net_exposure_pct": 100},
             Decimal(2000), product="ETH-PERP", leverage=lev,
         )
         step = Decimal(str(cfg["order_amount_quote"]))
@@ -1070,6 +1081,12 @@ def test_a_winner_can_add_past_the_first_rung():
         "notional_usd": 100, "leverage": 5, "levels": 4,
         "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 1.0,
         "rgrid_reset_threshold_pct": 0.2,
+        # PHASE-0: opt in to the full pyramid (default is now the 30% ceiling).
+        "max_net_exposure_pct": 100,
+        # PHASE-1: this test exercises the pyramid exposure mechanics on a grind
+        # tape, not the chop gate — disable the gate so the comparison is apples to
+        # apples (the gate has its own tests).
+        "rgrid_chop_stand_down": 0,
     }
     cfg = map_strategy_config(
         "rgrid", settings, Decimal(100), product="ETH-PERP", leverage=5,
@@ -1101,11 +1118,14 @@ def test_a_tight_stop_admits_the_full_deployed_pyramid():
     from src.nadobro.quant.rgrid_sizing import exit_cost_frac
     from src.nadobro.strategy.engine_runtime import map_strategy_config
 
-    # The 29% case: 1% stop, 5x, 4 levels, 10bp band.
+    # The 29% case: 1% stop, 5x, 4 levels, 10bp band. PHASE-0: opt in to the full
+    # pyramid explicitly (the default ceiling is now 30%); the property under test
+    # is that the stop-budget min() no longer silently caps an opted-in book to 29%.
     cfg = map_strategy_config(
         "rgrid",
         {"notional_usd": 100, "leverage": 5, "levels": 4,
-         "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 1.0},
+         "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 1.0,
+         "max_net_exposure_pct": 100},
         Decimal(2000), product="ETH-PERP", leverage=5,
     )
     deployed = Decimal(str(cfg["margin_quote"]))
@@ -1225,17 +1245,23 @@ def test_the_exit_widens_past_the_cap_so_winners_are_not_capped():
     assert c._exit_band() == Decimal("0.003")
 
 def test_a_disarmed_stop_does_not_unlock_the_full_pyramid():
-    """SLTP-F4. The 100% exposure default is only safe with a rail behind it.
+    """SLTP-F4. The 100% exposure setting is only safe with a rail behind it.
     With the stop disarmed there is no budget, so the conservative 30%
     ceiling stays — a 100% pyramid with no rail is 3.3x the old book and
-    nothing to flatten it."""
+    nothing to flatten it.
+
+    PHASE-0 (2026-08-24): 100% is now an explicit OPT-IN (default 30%), so both
+    cases set it explicitly. The safety property is unchanged and is the point of
+    this test: even an opted-in 100% is clamped to 30% when the stop is disarmed.
+    """
     from src.nadobro.strategy.engine_runtime import map_strategy_config
 
     armed, disarmed = (
         map_strategy_config(
             "rgrid",
             {"notional_usd": 100, "leverage": 20, "levels": 4,
-             "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": sl},
+             "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": sl,
+             "max_net_exposure_pct": 100},
             Decimal(2000), product="ETH-PERP", leverage=20,
         )
         for sl in (2.0, 0.0)
@@ -1243,7 +1269,9 @@ def test_a_disarmed_stop_does_not_unlock_the_full_pyramid():
     assert float(disarmed["max_net_exposure_pct"]) <= 30.0, (
         "a disarmed stop lifted the exposure ceiling instead of holding it"
     )
-    assert float(armed["max_net_exposure_pct"]) == 100.0
+    assert float(armed["max_net_exposure_pct"]) == 100.0, (
+        "an explicit max_net_exposure_pct=100 with an armed stop must be honoured"
+    )
     # No budget to size against means no exit ceiling either.
     assert Decimal(str(disarmed["exit_band_cap"])) == 0
 
@@ -1252,6 +1280,10 @@ def test_a_zero_exposure_setting_does_not_disable_the_cap():
     """cap_frac <= 0 is INACTIVE in exposure_allowed_sides. A leftover 0
     (the overlay used to write this) must remap to the armed/disarmed
     default, not unlock an unbounded pyramid.
+
+    PHASE-0 (2026-08-24): the armed default is the conservative 30% ceiling again
+    (full pyramiding is opt-in), so a leftover 0 remaps to 30% in BOTH cases — the
+    safe default, never an unbounded book.
     """
     from src.nadobro.strategy.engine_runtime import map_strategy_config
 
@@ -1269,8 +1301,190 @@ def test_a_zero_exposure_setting_does_not_disable_the_cap():
          "max_net_exposure_pct": 0},
         Decimal(2000), product="ETH-PERP", leverage=5,
     )
-    assert float(armed["max_net_exposure_pct"]) == 100.0
+    assert float(armed["max_net_exposure_pct"]) == 30.0
     assert float(disarmed["max_net_exposure_pct"]) == 30.0
+
+
+def test_phase0_default_rgrid_exposure_is_the_conservative_ceiling():
+    """PHASE-0 EMERGENCY REVERT (2026-08-24) guardrail. The DEFAULT R-Grid — no
+    explicit ``max_net_exposure_pct`` — must NOT build a full-notional pyramid. The
+    ecea1a2 change made the armed default 100%; the honest backtester then measured
+    that geometry net-losing in every regime (chop -2673bp / range -393bp at overlay
+    x1.5, commit 5be3b9b). The default is 30% again until the Phase-1 rework re-enables
+    pyramiding behind a real trend gate and validated exit geometry. An EXPLICIT
+    opt-in to 100% (armed) is still honoured — see the tests above.
+    """
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    for lev in (5, 20, 49):
+        cfg = map_strategy_config(
+            "rgrid",
+            {"notional_usd": 100, "leverage": lev, "levels": 4,
+             "rgrid_spread_bp": 10.0, "rgrid_stop_loss_pct": 1.0},
+            Decimal(2000), product="ETH-PERP", leverage=lev,
+        )
+        assert float(cfg["max_net_exposure_pct"]) == 30.0, (
+            f"lev={lev}: the DEFAULT R-Grid exposure is {cfg['max_net_exposure_pct']}%"
+            " — the full-notional pyramid must be opt-in, not the default"
+        )
+
+
+# ==========================================================================
+# 10b. Chop stand-down trend gate (Phase 1, 2026-08-24)
+# ==========================================================================
+def _trend_candles(direction, n=40, base=100.0, step_pct=0.4):
+    """A monotonic tape steep enough to clear the drift threshold."""
+    sign = 1 if direction == "up" else -1
+    return [{"time": i, "close": base * (1 + sign * step_pct / 100) ** i} for i in range(n)]
+
+
+def _chop_candles(n=40, base=100.0, amp_pct=0.05):
+    import math
+    return [{"time": i, "close": base + base * amp_pct / 100 * math.sin(i / 2.0)}
+            for i in range(n)]
+
+
+def test_chop_gate_stands_down_when_flat_and_no_trend():
+    """PHASE-1: a trend follower must not trade chop. Flat + no confirmed trend =>
+    NO resting entry, even when a leg WOULD be postable. This is the fix for the
+    dominant August bleed."""
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter, extra={
+            "rgrid_chop_stand_down": True,
+            "candle_provider": lambda _p: _chop_candles(),
+        })
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)          # anchor := 100
+        adapter.set_mid(Decimal("101"))           # the long bid would now be postable
+        await orch.tick_controller(c.id)
+        assert _resting(adapter) == [], (
+            "R-Grid quoted an entry in chop — the stand-down gate failed"
+        )
+    asyncio.run(body())
+
+
+def test_chop_gate_admits_only_the_long_side_in_an_uptrend():
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter, extra={
+            "rgrid_chop_stand_down": True,
+            "rgrid_trend_confirm_ticks": 1,       # side-selection test, not the debounce
+            "candle_provider": lambda _p: _trend_candles("up"),
+        })
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)          # anchor := 100
+        adapter.set_mid(Decimal("101"))           # price rose past the long bid
+        await orch.tick_controller(c.id)
+        assert _resting(adapter, TradeType.BUY), "an uptrend must rest the long entry"
+        assert _resting(adapter, TradeType.SELL) == [], (
+            "an uptrend must not rest a short entry"
+        )
+    asyncio.run(body())
+
+
+def test_chop_gate_admits_only_the_short_side_in_a_downtrend():
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter, extra={
+            "rgrid_chop_stand_down": True,
+            "rgrid_trend_confirm_ticks": 1,       # side-selection test, not the debounce
+            "candle_provider": lambda _p: _trend_candles("down"),
+        })
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)          # anchor := 100
+        adapter.set_mid(Decimal("99"))            # price fell past the short offer
+        await orch.tick_controller(c.id)
+        assert _resting(adapter, TradeType.SELL), "a downtrend must rest the short entry"
+        assert _resting(adapter, TradeType.BUY) == [], (
+            "a downtrend must not rest a long entry"
+        )
+    asyncio.run(body())
+
+
+def test_chop_gate_debounce_requires_sustained_drift():
+    """PHASE-1: a single swing must not open a trend position. With the default
+    confirm ticks, the gate admits only after drift has held one direction for the
+    full debounce — the filter that keeps high-vol swing-chop from being traded."""
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter, extra={
+            "rgrid_chop_stand_down": True,
+            "rgrid_trend_confirm_ticks": 3,
+            "candle_provider": lambda _p: _trend_candles("up"),
+        })
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)          # anchor := 100, streak 1
+        adapter.set_mid(Decimal("101"))
+        await orch.tick_controller(c.id)          # streak 2 — not yet confirmed
+        assert _resting(adapter, TradeType.BUY) == [], (
+            "the gate admitted a long before the drift was confirmed"
+        )
+        await orch.tick_controller(c.id)          # streak 3 — confirmed
+        assert _resting(adapter, TradeType.BUY), (
+            "the gate never admitted the long after sustained drift"
+        )
+    asyncio.run(body())
+
+
+def test_chop_gate_never_blocks_an_exit():
+    """The gate only suppresses NEW/ADD exposure. A position opened before chop set
+    in must still exit — the band exit and the trail are triggers, never gated."""
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter, extra={
+            "rgrid_chop_stand_down": True,
+            "candle_provider": lambda _p: _chop_candles(),
+            "reset_threshold_pct": Decimal("0.002"), "trail_enabled": True,
+        })
+        await orch.spawn_controller(c)
+        # A live long, opened before chop.
+        c.inventory.apply_fill(1, PAIR, c.id, TradeType.BUY, Decimal(1),
+                               Decimal(100), Decimal(0))
+        _seed_leg(c, "buy", 100)
+        # Price falls to the loss-only band exit level; it must still cross despite
+        # the gate standing new entries down.
+        adapter.set_mid(Decimal("99.0"))
+        await orch.tick_controller(c.id)
+        assert _crossings(adapter), "the chop gate blocked an exit — it must never"
+    asyncio.run(body())
+
+
+def test_chop_gate_disabled_trades_regardless_of_regime():
+    async def body():
+        adapter = MockNadoAdapter(fill_marketable_limits=True, mid=Decimal(100),
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter, extra={
+            "rgrid_chop_stand_down": False,
+            "candle_provider": lambda _p: _chop_candles(),
+        })
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)          # anchor := 100
+        adapter.set_mid(Decimal("101"))           # the long bid is now postable
+        await orch.tick_controller(c.id)
+        assert _resting(adapter), (
+            "with the gate OFF R-Grid should quote entries even in chop"
+        )
+    asyncio.run(body())
+
+
+def test_mapper_defaults_chop_stand_down_on():
+    """PHASE-1 guardrail: the DEFAULT R-Grid stands down in chop. A regression that
+    drops this key or defaults it off silently re-arms the chop bleed."""
+    from src.nadobro.strategy.engine_runtime import map_strategy_config
+
+    cfg = map_strategy_config(
+        "rgrid",
+        {"notional_usd": 100, "leverage": 5, "rgrid_spread_bp": 10.0,
+         "rgrid_stop_loss_pct": 1.0},
+        Decimal(2000), product="ETH-PERP", leverage=5,
+    )
+    assert cfg["rgrid_chop_stand_down"] is True
 
 
 # ==========================================================================

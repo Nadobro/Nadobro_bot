@@ -89,12 +89,14 @@ waiting for the full threshold. Both reduce risk without abandoning the book.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 from collections import deque
 from decimal import ROUND_DOWN, Decimal
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 from src.nadobro.engine.controllers.market_making import MarketMakingController
+from src.nadobro.engine.routines import variance_regime
 from src.nadobro.engine.executors.rgrid_maker_executor import (
     LEG_ENTRY,
     LEG_ENTRY_CROSS,
@@ -106,7 +108,7 @@ from src.nadobro.engine.executors.rgrid_maker_executor import (
     build_trail_stop,
 )
 from src.nadobro.engine.risk import ExecutorRequest
-from src.nadobro.engine.types import TradeType, _dec
+from src.nadobro.engine.types import TradeType, _as_bool, _dec
 from src.nadobro.quant.rgrid_sizing import (
     EXIT_CROSS_RATE,
     TAKER_ROUND_TRIP_RATE,
@@ -195,9 +197,49 @@ class RGridController(MarketMakingController):
         self.add_mode = str(self.cfg("add_mode", "maker") or "maker").strip().lower()
         self._add_cross_bp = _dec(self.cfg("add_cross_bp", _ADD_CROSS_BP_DEFAULT))
         self._add_cushion_bp = _dec(self.cfg("add_cushion_bp", _ADD_CUSHION_BP_DEFAULT))
-        # Trend gate: in cross mode, only OPEN/ADD in a confirmed trend (exits are
-        # never gated). Taker adds in chop are a guaranteed per-false-break bleed.
-        self.trend_gate = bool(self.cfg("trend_gate", self.add_mode == "cross"))
+        # Trend gate: only OPEN/ADD in a confirmed trend (exits are never gated).
+        # Taker adds in chop are a guaranteed per-false-break bleed. PHASE-0
+        # (2026-08-24): default ON regardless of add_mode — a trend follower must
+        # never add against the overlay's trend read. The FULL variance-regime
+        # gate (stand down in chop) is wired in Phase 1; today this vetoes adds the
+        # overlay opposes and is the safe default while that lands.
+        self.trend_gate = bool(self.cfg("trend_gate", True))
+        # PHASE-1 (2026-08-24): the REAL trend gate. R-Grid is a trend follower, so
+        # it must STAND DOWN when there is no trend — trading chop is where it bled
+        # all August (measured -2673bp chop at overlay x1.5, commit 5be3b9b). Each
+        # tick it classifies the regime from candles (variance_regime, the same
+        # routine D-Grid uses) and, unless a directional trend is CONFIRMED, quotes
+        # no new entries or adds. Exits are never gated. This can only PREVENT
+        # trades (never add risk), so it defaults ON. Owner ruling 2026-08-24:
+        # "stand down in chop". Set ``rgrid_chop_stand_down=0`` to disable.
+        self.chop_stand_down: bool = _as_bool(self.cfg("rgrid_chop_stand_down", True), True)
+        # Regime-classifier params (same DEFAULTS as D-Grid so the two strategies
+        # agree on what "a trend" is, but R-Grid-namespaced so no D-Grid phase-
+        # switcher key leaks into an R-Grid config).
+        self._regime_short_window = int(max(2, int(self.cfg("rgrid_regime_short_window", 4) or 4)))
+        self._regime_long_window = int(max(self._regime_short_window + 1,
+                                           int(self.cfg("rgrid_regime_long_window", 12) or 12)))
+        self._regime_trend_on_vr = float(self.cfg("rgrid_regime_trend_on_vr", 1.25) or 1.25)
+        self._regime_range_on_vr = float(self.cfg("rgrid_regime_range_on_vr", 1.15) or 1.15)
+        self._regime_trend_drift_pct = float(self.cfg("rgrid_regime_trend_drift_pct", 0.30) or 0.30)
+        # Hysteresis state (GRID = ranging/chop = stand down; RGRID = trending).
+        self._regime_phase: str = variance_regime.GRID
+        # CONFIRMATION DEBOUNCE. A single swing in high-vol chop can show one tick of
+        # directional drift; a real trend sustains it. Require N consecutive
+        # same-direction drift ticks before the gate admits entries, so swing-chop
+        # (drift that flips direction tick-to-tick) never clears the bar. The signal
+        # itself is the drift over the long candle WINDOW (~12 bars), not a per-tick
+        # read, so even where the venue's ~30s candle cache serves identical candles
+        # across ticks (short intervals) the bar still requires a sustained multi-bar
+        # move; at normal rgrid intervals each tick also re-reads fresh candles.
+        self._trend_confirm_ticks = int(max(1, int(self.cfg("rgrid_trend_confirm_ticks", 3) or 3)))
+        self._trend_streak = 0
+        self._trend_streak_dir = variance_regime.FLAT
+        self._confirmed_trend_dir = variance_regime.FLAT
+        # Consecutive ticks the gate has stood the book down purely because the
+        # candle feed is empty (insufficient_history), so an operator can tell
+        # "no candle data" apart from "no trend" — see _classify_regime.
+        self._no_candle_streak = 0
         self._add_id: Optional[str] = None
         self._add_age = 0
         # Exposure-price window as a fraction of each leg's recent fill VOLUME.
@@ -856,6 +898,105 @@ class RGridController(MarketMakingController):
             await self.orchestrator.stop(add_id)
         return False
 
+    async def _candles(self) -> List[dict]:
+        """Fetch classification candles from the injected provider (run_engine_cycle
+        and the backtester both wire one for rgrid). Empty when none is available —
+        the classifier then reports insufficient history and the gate stands down."""
+        provider = self.cfg("candle_provider")
+        if provider is None:
+            return []
+        try:
+            result = provider(self.trading_pair)  # type: ignore[operator]
+            if inspect.isawaitable(result):
+                result = await result
+            return list(result or [])
+        except Exception:  # noqa: BLE001  # policy: degrade-ok(no candles -> stand down)
+            return []
+
+    async def _classify_regime(self) -> Dict[str, object]:
+        """Classify the regime for the chop stand-down gate. Holds the prior phase
+        on insufficient history (never flips on noise) and caches the verdict for
+        the tick. Returns the ``variance_regime.run`` dict."""
+        candles = await self._candles()
+        info = await variance_regime.run(
+            self.trading_pair, candles,
+            short_window=self._regime_short_window,
+            long_window=self._regime_long_window,
+            trend_on=self._regime_trend_on_vr,
+            range_on=self._regime_range_on_vr,
+            trend_drift_pct=self._regime_trend_drift_pct,
+            current_phase=self._regime_phase,
+        )
+        # Only advance the hysteresis state on a real verdict; insufficient history
+        # holds the prior phase (and, on a fresh start with no candles yet, GRID =
+        # stand down, which is the safe default for a trend follower).
+        if not info.get("insufficient_history"):
+            self._regime_phase = str(info.get("phase") or self._regime_phase)
+            self._no_candle_streak = 0
+        else:
+            # No candle data (feed down / gateway-budget throttle). The gate stands
+            # the book DOWN — safe (it cannot bleed), but a strategy that silently
+            # never trades looks identical to "no trend". Log once per window so an
+            # operator can tell the two apart and chase the candle feed.
+            self._no_candle_streak += 1
+            if self._no_candle_streak % 30 == 1:
+                logger.warning(
+                    "rgrid chop gate standing down for %s ticks — NO candle data "
+                    "(insufficient_history), not 'no trend'; check the candle feed "
+                    "(user=%s pair=%s)",
+                    self._no_candle_streak, self.user_id, self.trading_pair,
+                )
+        # Confirmation debounce: count consecutive same-direction SUSTAINED-DRIFT
+        # ticks (VR burstiness is deliberately excluded — see _trend_gate_sides).
+        d = str(info.get("direction") or variance_regime.FLAT)
+        if (not info.get("insufficient_history") and bool(info.get("trend_by_drift"))
+                and d in (variance_regime.UP, variance_regime.DOWN)):
+            if d == self._trend_streak_dir:
+                self._trend_streak += 1
+            else:
+                self._trend_streak_dir = d
+                self._trend_streak = 1
+        else:
+            self._trend_streak = 0
+            self._trend_streak_dir = variance_regime.FLAT
+        self._confirmed_trend_dir = (
+            self._trend_streak_dir if self._trend_streak >= self._trend_confirm_ticks
+            else variance_regime.FLAT
+        )
+        return info
+
+    def _trend_gate_sides(self, allow_buy: bool, allow_sell: bool) -> Tuple[bool, bool]:
+        """Apply the chop stand-down gate to the ENTRY/ADD side permissions.
+
+        Reduces are triggers (the trail and the exposure band), never routed through
+        ``allow_buy``/``allow_sell``, so gating these only ever suppresses NEW or
+        ADD exposure — it can never block an exit. In chop (no confirmed trend) both
+        entry sides are refused (stand down). In a trend only the trend-aligned side
+        may open/add (a long in an uptrend, a short in a downtrend), which is also
+        how a reversal flips the book: the old side stops adding and exits, then the
+        new side is the only one the gate admits.
+
+        CONFIRMATION IS BY SUSTAINED DIRECTIONAL DRIFT, NOT VARIANCE RATIO. The
+        variance-regime classifier calls a high VR a "trend", but a high VR fires on
+        BURSTY chop — exactly the high-vol chop R-Grid bled in. A trend follower only
+        wants a sustained one-way move, so the gate admits ONLY on ``trend_by_drift``
+        held for ``rgrid_trend_confirm_ticks`` consecutive same-direction ticks
+        (``_confirmed_trend_dir``, computed in :meth:`_classify_regime`). The
+        classifier ``phase`` and ``holding_trend`` can both be set by VR alone, so
+        they are deliberately NOT consulted here.
+        """
+        # Confirmation is by SUSTAINED directional drift held for
+        # ``rgrid_trend_confirm_ticks`` consecutive ticks (computed in
+        # _classify_regime). ``holding_trend`` and the classifier phase can be set by
+        # a high variance ratio (bursty chop), so they are deliberately NOT used — a
+        # trend follower must not read burstiness as a trend.
+        direction = self._confirmed_trend_dir
+        if direction == variance_regime.UP:
+            return allow_buy, False      # confirmed uptrend: longs only
+        if direction == variance_regime.DOWN:
+            return False, allow_sell     # confirmed downtrend: shorts only
+        return False, False              # no confirmed trend -> stand down
+
     def _add_gate_admits(self, side: TradeType) -> bool:
         """Trend gate for cross-mode opens/adds. Exits are NEVER gated (they do not
         route through here). When the gate is off, always admit.
@@ -1056,6 +1197,14 @@ class RGridController(MarketMakingController):
         if self.gate_paused:
             allow_buy = allow_buy and net < 0     # only reduce a short
             allow_sell = allow_sell and net > 0   # only reduce a long
+
+        # PHASE-1 chop stand-down: unless a directional trend is CONFIRMED, quote no
+        # new entries or adds (exits below are unaffected — they are triggers, not
+        # gated by these flags). This is the fix for the dominant August bleed: a
+        # trend follower must not trade chop.
+        if self.chop_stand_down:
+            await self._classify_regime()
+            allow_buy, allow_sell = self._trend_gate_sides(allow_buy, allow_sell)
 
         # Flat and holding stale entries: the closed position's prices still
         # anchor us, and their average sits far from the new mid. Re-anchor so a

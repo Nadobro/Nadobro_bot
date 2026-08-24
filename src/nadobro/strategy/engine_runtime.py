@@ -36,7 +36,14 @@ from src.nadobro.engine.risk import RiskEngine
 # engine — see tests/lint/test_architecture_layers.py): the human-readable
 # quote-gate pause reasons rendered on /status and in gate notifications.
 from src.nadobro.engine.routines.regime_gate import GATE_REASON_HUMAN as GATE_REASON_HUMAN  # noqa: F401
-from src.nadobro.engine.types import RiskLimits, RiskState, TradeType, TripleBarrierConfig, _dec
+from src.nadobro.engine.types import (
+    RiskLimits,
+    RiskState,
+    TradeType,
+    TripleBarrierConfig,
+    _as_bool,
+    _dec,
+)
 from src.nadobro.utils.env import env_float
 
 logger = logging.getLogger(__name__)
@@ -513,6 +520,11 @@ def _apply_dgrid_controller_config(controller: Controller, configs: Dict[str, ob
     # THIS cycle's signal, not the one the controller was built with.
     controller.signal_regime = str(configs.get("signal_regime", "") or "")  # type: ignore[attr-defined]
     controller.signal_confidence = _num("signal_confidence", controller.signal_confidence)  # type: ignore[attr-defined]
+    # PHASE-0: the pyramiding trend delegate is an explicit opt-in (default OFF).
+    # Live-editable so a user can toggle it without a restart.
+    _tf = configs.get("dgrid_trend_follow")
+    if _tf is not None:
+        controller.trend_follow_enabled = _as_bool(_tf)  # type: ignore[attr-defined]
     packed = configs.get("trend_rgrid")
     trend = getattr(controller, "_trend", None)
     if trend is not None and isinstance(packed, dict):
@@ -531,6 +543,9 @@ def _apply_rgrid_controller_config(controller: Controller, configs: Dict[str, ob
     controller.reset_threshold_pct = _dec(configs.get("reset_threshold_pct", "0.002"))  # type: ignore[attr-defined]
     controller.trail_enabled = bool(configs.get("trail_enabled", True))  # type: ignore[attr-defined]
     controller.vwap_volume_fraction = _dec(configs.get("vwap_volume_fraction", "0") or "0")  # type: ignore[attr-defined]
+    # PHASE-1: the chop stand-down gate is live-editable (risk-reducing, default ON).
+    if "rgrid_chop_stand_down" in configs:
+        controller.chop_stand_down = _as_bool(configs.get("rgrid_chop_stand_down"), True)  # type: ignore[attr-defined]
     # (signal_regime / signal_confidence are pushed every cycle before RUNTIME.tick,
     # not here — they must never take part in the live-config signature.)
 
@@ -1334,8 +1349,17 @@ def map_strategy_config(
         #
         # A DISARMED stop still holds the conservative 30% ceiling. There is no
         # rail behind a 100% pyramid if the user turned the stop off.
+        #
+        # PHASE-0 EMERGENCY REVERT (2026-08-24): the DEFAULT ceiling is 30% again
+        # (undo ecea1a2's 100% pyramid default). The default R-Grid must not build a
+        # full-notional book whose only backstop is the loose session rail while the
+        # trend geometry is still net-losing in chop (measured -2673bp chop /
+        # -393bp range at overlay x1.5, commit 5be3b9b). Full-notional pyramiding
+        # returns in the Phase-1 rework as a GATED, backtest-validated behaviour,
+        # not a silent default. An explicit user ``max_net_exposure_pct`` is still
+        # honoured (up to 100% with an armed stop) for opt-in / testing.
         _rg_budget = _dec(str(_rg_margin * _rg_sl_pct / 100.0))
-        _rg_default_pct = 100.0 if _rg_budget > 0 else 30.0
+        _rg_default_pct = 30.0
         _rg_exposure_pct = _f(settings, "max_net_exposure_pct", _rg_default_pct)
         if _rg_exposure_pct <= 0:
             _rg_exposure_pct = _rg_default_pct
@@ -1425,10 +1449,13 @@ def map_strategy_config(
             **_quote_defense_defaults(settings, deployed, auto_spread=spread_frac <= 0),
             # After the defaults on purpose, so this wins the dict literal.
             # R-Grid has no break counter: it adds one step per break until this
-            # cap stops it. Armed: 100% of deployed (the controller docstring's
-            # requirement). That can exceed the stop-capped ``levels x step``
-            # plan; the session rail is the backstop. A disarmed stop keeps 30%
-            # so that book cannot run without a rail.
+            # cap stops it. PHASE-0 (2026-08-24): the DEFAULT is the conservative
+            # 30% ceiling (armed or disarmed) — see ``_rg_default_pct`` above. Full
+            # 100%-of-deployed pyramiding is now an EXPLICIT opt-in (a user
+            # ``max_net_exposure_pct`` up to 100%, honoured only with an armed stop;
+            # a disarmed stop still clamps to 30% so the book cannot run without a
+            # rail). When an opted-in 100% book exceeds the stop-capped
+            # ``levels x step`` plan, the session rail is the backstop.
             "max_net_exposure_pct": _rg_exposure_pct,
             # The regime gate would pause momentum exactly when it must act. OFF
             # unless the user (or the overlay's suppress posture) re-arms it; the
@@ -1449,12 +1476,27 @@ def map_strategy_config(
             # MARGINAL add is net-of-fee positive. Add-trigger pricing only; the exit
             # geometry (exit_band>arm) is untouched.
             "add_cushion_bp": _f(settings, "rgrid_add_cushion_bp", 13.0),
-            # Trend gate for cross-mode opens/adds (exits never gated). Default ON in
-            # cross mode, OFF in maker mode.
-            "trend_gate": bool(_f(
-                settings, "rgrid_trend_gate",
-                1.0 if str(settings.get("rgrid_add_mode") or "maker").strip().lower() == "cross" else 0.0,
-            )),
+            # Trend gate for cross-mode opens/adds (exits never gated). PHASE-0:
+            # default ON regardless of add_mode — a trend follower must never add
+            # against the trend read.
+            "trend_gate": _as_bool(settings.get("rgrid_trend_gate"), True),
+            # PHASE-1 chop stand-down: R-Grid quotes NO new entries or adds unless a
+            # directional trend is confirmed by the variance-regime classifier. This
+            # is the fix for the dominant August bleed (a trend follower must not
+            # trade chop). Risk-reducing (can only PREVENT trades), so default ON.
+            # Set rgrid_chop_stand_down=0 to disable.
+            "rgrid_chop_stand_down": _as_bool(settings.get("rgrid_chop_stand_down"), True),
+            # Regime-classifier windows/thresholds (same DEFAULTS as D-Grid so the
+            # two strategies agree on what "a trend" is, but R-Grid-namespaced so no
+            # D-Grid phase-switcher key leaks into an R-Grid config).
+            "rgrid_regime_short_window": int(max(2, _f(settings, "dgrid_short_window_points", 4))),
+            "rgrid_regime_long_window": int(max(4, _f(settings, "dgrid_long_window_points", 12))),
+            "rgrid_regime_trend_on_vr": _f(settings, "dgrid_trend_on_variance_ratio", 1.25),
+            "rgrid_regime_range_on_vr": _f(settings, "dgrid_range_on_variance_ratio", 1.15),
+            "rgrid_regime_trend_drift_pct": _f(settings, "dgrid_trend_drift_pct", 0.30),
+            # Consecutive same-direction sustained-drift ticks required before the
+            # chop gate admits entries (debounces high-vol swing-chop).
+            "rgrid_trend_confirm_ticks": int(max(1, _f(settings, "rgrid_trend_confirm_ticks", 3))),
         }
     #
     # GRID's fill-anchored maker mode (FillAnchoredQuotingController) — opt-in via
@@ -1649,6 +1691,12 @@ def map_strategy_config(
         # and an embedded R-Grid trend follower on a clear directional signal
         # (both directions). Standalone R-Grid never reaches this branch.
         cfg["candle_provider"] = None
+        # PHASE-0 EMERGENCY REVERT (2026-08-24): the R-Grid trend delegate pyramids
+        # to 100% of deployed and is net-losing in every regime on the honest
+        # backtester, so it is OFF by default — D-Grid runs its mean-reversion GRID
+        # ladder (profitable in range/chop) until the Phase-2 rework. Opt back in
+        # with dgrid_trend_follow=1.
+        cfg["dgrid_trend_follow"] = _as_bool(settings.get("dgrid_trend_follow"), False)
         # (recycle_levels is set for the whole GridExecutor family above.)
         cfg["dgrid_short_window"] = int(max(2, _f(settings, "dgrid_short_window_points", 4)))
         cfg["dgrid_long_window"] = int(max(4, _f(settings, "dgrid_long_window_points", 12)))

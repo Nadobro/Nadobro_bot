@@ -14,7 +14,13 @@ CFG = {"trading_pair": "P", "start_price": "98", "end_price": "102", "limit_pric
        # step/levels make _rebuild_bounds_for_side produce side-correct bounds
        # around the live mid (as the real engine config does), so a flipped
        # SELL grid places sells ABOVE mid rather than reusing long-grid bounds.
-       "step_pct": "0.002", "levels_count": 3}
+       "step_pct": "0.002", "levels_count": 3,
+       # PHASE-0 EMERGENCY REVERT (2026-08-24): the pyramiding trend delegate is now
+       # OFF by default (net-losing in every regime on the honest backtester). These
+       # tests exercise the switcher MECHANICS, so they opt in explicitly. The
+       # Phase-0 DEFAULT (delegate off, holds GRID) is pinned by
+       # test_phase0_default_holds_grid_and_never_spawns_the_trend_follower below.
+       "dgrid_trend_follow": 1}
 
 
 def _candles(closes):
@@ -31,6 +37,35 @@ def _up(n=60):
 
 def _range(n=60, base=100.0, amp=0.12, period=7.0):
     return _candles([base + amp * math.sin(2 * math.pi * i / period) for i in range(n)])
+
+
+def test_phase0_default_holds_grid_and_never_spawns_the_trend_follower():
+    """PHASE-0 EMERGENCY REVERT (2026-08-24) guardrail. Without
+    ``dgrid_trend_follow`` set, D-Grid must NEVER enter the RGRID pyramiding phase
+    — even on a strong, sustained trend — and must hold its mean-reversion GRID
+    ladder. The trend delegate pyramids to 100% of deployed and is net-losing in
+    every regime on the honest backtester (a6dac02); it is opt-in only until the
+    Phase-2 rework. A regression here silently re-arms the losing default.
+    """
+    async def body():
+        for provider in (_down, _up):
+            adapter = MockNadoAdapter(mid=Decimal(100))
+            orch = ExecutorOrchestrator()
+            # CFG minus the opt-in flag = the real Phase-0 default.
+            cfg = {k: v for k, v in CFG.items() if k != "dgrid_trend_follow"}
+            cfg["candle_provider"] = lambda p, _pv=provider: _pv()
+            c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
+                                      inventory=InventoryRepository(), configs=cfg)
+            assert c.trend_follow_enabled is False
+            await orch.spawn_controller(c)
+            await orch.tick_controller(c.id)
+            assert c.current_phase == "grid", (
+                "the default D-Grid entered the pyramiding trend phase — the "
+                "emergency revert has regressed"
+            )
+            assert c._trend is None, "the trend delegate must not spawn by default"
+
+    asyncio.run(body())
 
 
 def test_trending_down_selects_the_rgrid_follower():

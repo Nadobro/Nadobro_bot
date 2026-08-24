@@ -326,6 +326,10 @@ def _dgrid(adapter, candle_box):
             "limit_price": Decimal(0),
             "step_pct": Decimal("0.002"), "levels_count": 3,
             "regime_gate_enabled": True,
+            # PHASE-0 (2026-08-24): the pyramiding trend delegate is opt-in now;
+            # these tests exercise the switcher, so enable it. Range/grid-phase
+            # tests are unaffected (the classifier returns GRID there regardless).
+            "dgrid_trend_follow": 1,
             "candle_provider": lambda _p: candle_box["data"],
         },
         controller_id="DG",
@@ -380,6 +384,77 @@ def test_dgrid_reversal_flip_locks_profit_and_switches_side():
         await orch.tick_controller(c.id)
         assert c.current_phase == "rgrid"
         assert c._trend is not None, "reversal in range arms the R-Grid follower"
+
+    asyncio.run(body())
+
+
+def test_dgrid_reversal_flip_cannot_spawn_the_trend_delegate_when_disabled():
+    """PHASE-0 guardrail (audit 2026-08-24, CONFIRMED money bug). With
+    dgrid_trend_follow OFF (the default), a green-then-retrace reversal on the GRID
+    ladder must NEVER spawn the 100% pyramiding RGrid delegate. The reversal-flip
+    path picks its target (RGRID) independently of the on_tick classifier guard, so
+    without a guard it reached _spawn_phase with phase=RGRID and pyramided at 100%
+    for the debounce window — the exact August bleed the flag exists to stop.
+    current_phase must stay 'grid' and _trend must stay None."""
+    from src.nadobro.engine.executors.grid_executor import GridExecutor
+
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        orch = ExecutorOrchestrator()
+        c = DynamicGridController(
+            user_id=1, orchestrator=orch, adapter=adapter,
+            inventory=InventoryRepository(),
+            configs={
+                "trading_pair": PAIR, "total_amount_quote": Decimal(100),
+                "min_spread_between_orders": Decimal("0.002"),
+                "start_price": Decimal("99"), "end_price": Decimal("100"),
+                "limit_price": Decimal(0), "step_pct": Decimal("0.002"),
+                "levels_count": 3, "regime_gate_enabled": True,
+                # the Phase-0 default — the trend delegate is OFF.
+                "dgrid_trend_follow": 0,
+                "candle_provider": lambda _p: ranging_candles(),
+            },
+            controller_id="DG",
+        )
+        c.trail_arm_pct = 1.0
+        c.reversal_flip_pct = 0.4
+        c.flip_confirm_ticks = 1
+        assert c.trend_follow_enabled is False
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        assert isinstance(c.my_executors()[0], GridExecutor), "starts long GRID"
+        adapter.set_mid(Decimal("102"))          # run up -> arms the trail
+        await orch.tick_controller(c.id)
+        adapter.set_mid(Decimal("101.2"))        # retrace >= reversal_flip_pct
+        await orch.tick_controller(c.id)
+        assert c.current_phase == "grid", (
+            "the reversal flip spawned the RGRID trend phase despite trend_follow OFF"
+        )
+        assert c._trend is None, "the 100% pyramiding delegate must never spawn when disabled"
+
+    asyncio.run(body())
+
+
+def test_dgrid_tears_down_the_delegate_when_trend_follow_toggled_off_midsession():
+    """PHASE-0 (audit follow-up 2026-08-24). If an operator toggles dgrid_trend_follow
+    OFF (live reconfig) while D-Grid is ALREADY running the RGRID pyramiding phase,
+    the next ticks must flip back to the mean-reversion GRID ladder — flatten the
+    delegate and re-arm GRID — not keep pyramiding at 100%."""
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        # _dgrid enables the delegate (dgrid_trend_follow=1); a downtrend spawns it.
+        orch, c = _dgrid(adapter, {"data": trending_candles(step=-0.4)})
+        c.flip_confirm_ticks = 1
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        assert c.current_phase == "rgrid" and c._trend is not None, "starts in the trend phase"
+
+        # Operator toggles the delegate OFF mid-session (as _apply_dgrid_controller_config does).
+        c.trend_follow_enabled = False
+        for _ in range(3):
+            await orch.tick_controller(c.id)
+        assert c.current_phase == "grid", "must flip back to GRID when trend_follow is toggled off"
+        assert c._trend is None, "the pyramiding delegate must be torn down"
 
     asyncio.run(body())
 

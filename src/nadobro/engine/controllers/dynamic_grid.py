@@ -47,7 +47,7 @@ from src.nadobro.engine.controllers.rgrid import RGridController
 from src.nadobro.engine.executors.grid_executor import GridExecutor
 from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.routines import variance_regime
-from src.nadobro.engine.types import TradeType, _dec
+from src.nadobro.engine.types import TradeType, _as_bool, _dec
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,14 @@ class DynamicGridController(Controller):
         self.current_phase: str = variance_regime.GRID
         self.last_regime: Optional[str] = None  # back-compat: "TRENDING_*"/"RANGING"
         self.variance_ratio: float = 0.0
+        # PHASE-0 EMERGENCY REVERT (2026-08-24): the trend phase (03eebe9) delegates
+        # to the RGridController, which pyramids to 100% of deployed (see
+        # ``_trend_mapped_config``) and is measured net-losing in every regime once
+        # the backtester is honest (a6dac02). Default the trend delegate OFF so
+        # D-Grid runs its mean-reversion GRID ladder — profitable in range/chop,
+        # which is its home regime — until the Phase-2 rework fixes the classifier
+        # and the trend phase. Opt back in with ``dgrid_trend_follow=1``.
+        self.trend_follow_enabled: bool = _as_bool(self.cfg("dgrid_trend_follow", False), False)
         self.realized_move_bp: float = 0.0
         self.last_direction: str = variance_regime.FLAT
         # Did the last classification actually declare a trend (vs a flat/ranging
@@ -378,6 +386,16 @@ class DynamicGridController(Controller):
         ``flip_confirm_ticks``. ``_flip_to`` flattens the held position
         reduce-only (in profit, since price only retraced the trail) and arms the
         opposite grid. Returns True when a flip fired."""
+        # PHASE-0 (2026-08-24): with the pyramiding trend delegate disabled, a
+        # reversal flip OUT OF the GRID ladder has no valid target — its only
+        # target is the RGRID delegate (see the target line below), which is off.
+        # Firing it would flatten the ladder reduce-only and immediately re-arm
+        # GRID again (churn), and on a green-then-retrace in chop it is exactly the
+        # August pyramiding bleed the flag exists to stop. Stand the flip down; the
+        # hard guard in _spawn_phase is the belt-and-suspenders backstop.
+        if not self.trend_follow_enabled:
+            self._reversal_streak = 0
+            return False
         if (self.reversal_flip_pct <= 0 or not self._run_armed or mid is None or mid <= 0
                 or not self._run_extreme or self._run_extreme <= 0):
             return False
@@ -421,6 +439,12 @@ class DynamicGridController(Controller):
         await self.evaluate_quote_gate(pair, pause_on_trend=False, pause_on_breakout=False)
 
         desired = await self._classify()
+        # PHASE-0: when the trend delegate is disabled, D-Grid never enters the
+        # RGRID (pyramiding) phase — it holds the mean-reversion GRID ladder in
+        # every regime. A session already in RGRID flips back to GRID via the
+        # normal debounced path below (flatten the delegate, re-arm the ladder).
+        if not self.trend_follow_enabled:
+            desired = variance_regime.GRID
         mid = await self._mid()
         self._last_mid = mid
         self._update_realized_move(mid)
@@ -888,6 +912,15 @@ class DynamicGridController(Controller):
                 phase, self.trading_pair, net, self.id,
             )
             return False
+        # PHASE-0 HARD GUARD (2026-08-24): the pyramiding RGrid trend delegate
+        # (100% exposure, the measured August bleed) must NEVER spawn while
+        # dgrid_trend_follow is off — from the classifier, a trailing-reversal
+        # flip, a rebuild, or any future caller. This single choke point coerces
+        # the phase back to the mean-reversion GRID ladder so no path can bypass
+        # the flag. (Audit finding, 2026-08-24: the reversal flip did bypass the
+        # on_tick classifier guard and reached here with phase=RGRID.)
+        if phase == variance_regime.RGRID and not self.trend_follow_enabled:
+            phase = variance_regime.GRID
         if phase == variance_regime.RGRID:
             return await self._spawn_trend(mid)
         side, cls = (TradeType.BUY, GridExecutor)

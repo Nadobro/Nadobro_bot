@@ -53,6 +53,9 @@ def _cfg(add_mode="maker"):
         notional_usd=100, leverage=1, levels=4, rgrid_discretion=0.06,
         rgrid_reset_threshold_pct=0.2, rgrid_stop_loss_pct=0.8, rgrid_take_profit_pct=1.2,
         rgrid_spread_bp=10.0, min_spread_bp=1.5, max_spread_bp=50.0,
+        # PHASE-0 (2026-08-24): full pyramiding is opt-in now (default 30%). These
+        # cross-mode tests exercise multi-rung add mechanics, so opt in explicitly.
+        max_net_exposure_pct=100,
     )
     if add_mode != "maker":
         settings["rgrid_add_mode"] = add_mode
@@ -66,9 +69,16 @@ def test_maker_mode_gets_zero_fills_in_a_clean_uptrend():
 
 
 def test_cross_mode_fills_and_profits_where_maker_cannot():
-    """Cross mode fires marketable adds on momentum, so it participates in a trend."""
-    rep = run_backtest("rgrid", dict(_cfg("cross")), _uptrend(), costs=SimCosts())
-    assert rep.fills >= 2, f"cross mode should add into a trend, got {rep.fills} fills"
+    """Cross mode fires marketable adds on momentum, so it participates in a trend.
+
+    This ALSO pins that the PHASE-1 chop stand-down gate (ON by default — asserted
+    below) does NOT prevent the R-Grid pyramid from functioning in a CONFIRMED
+    trend: the gate admits the trend-aligned side, so a clean uptrend still opens
+    and adds (>=2 fills) and profits. The gate stops chop, not trends."""
+    cfg = _cfg("cross")
+    assert cfg["rgrid_chop_stand_down"] is True, "the gate must be ON for this to be meaningful"
+    rep = run_backtest("rgrid", dict(cfg), _uptrend(), costs=SimCosts())
+    assert rep.fills >= 2, f"cross mode should add into a trend with the gate ON, got {rep.fills} fills"
     # Net-of-fee positive on a clean trend (the whole point).
     assert rep.net_pnl > 0, f"cross mode should profit on a clean trend, got {rep.net_pnl}"
 
