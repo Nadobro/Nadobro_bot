@@ -428,7 +428,11 @@ async def tick_sltp_safety():
 
     interval = max(1, env_int("NADO_SLTP_POLL_SECONDS", 15))
     bucket = int(_time.time() // interval)
-    _skip = {"dn", "bro", ""}
+    # Skip: DN (two-leg hedge, no single-product rail), bro (not a perp session),
+    # and vol (SPOT — no leverage, so no SL-overshoot to catch between ticks; the
+    # fast cadence only added chances to trip vol's flat-in-cycle_gap spot-sweep
+    # while giving no overshoot benefit). vol keeps its own per-cycle rail.
+    _skip = {"dn", "bro", "vol", ""}
     enqueued = 0
     for row in rows:
         try:

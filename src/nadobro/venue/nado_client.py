@@ -1671,7 +1671,7 @@ class NadoClient:
                    (``mid_price_above``).
 
         The underlying close is priced ``slippage_pct`` past the stop so it
-        crosses when triggered. Reuses ``_build_place_order_params`` for the exact
+        crosses when triggered. Reuses ``_prepare_place_order_params`` for the exact
         increment / min-notional / reduce-only alignment the engine order path
         uses, then hands the aligned x18 amount+price to the SDK's
         ``place_price_trigger_order`` (which owns the trigger appendix + signing).
@@ -1696,7 +1696,7 @@ class NadoClient:
 
         # Reuse the single order-construction home for aligned, reduce-only x18
         # amount+price (increment alignment, min-notional, never-grow all applied).
-        params, _tag, _size, _price, err = self._build_place_order_params(
+        params, _tag, _size, _price, err = self._prepare_place_order_params(
             product_id=int(product_id),
             size=float(close_size),
             price=float(order_price),

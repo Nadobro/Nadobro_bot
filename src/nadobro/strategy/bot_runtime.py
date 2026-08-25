@@ -300,6 +300,14 @@ def _merge_vol_order_counters(state: dict, result: dict) -> None:
         "vol_entry_price",
         "vol_entry_fill_ts",
         "vol_close_size",
+        # VOL-OPEN-BASE-MERGE: the controller publishes vol_open_base
+        # (entry_base - sold_base; 0 when flat) so the spot-sweep sizer
+        # (_managed_volume_spot_size) sells the EXACT still-held base and 0 when
+        # flat — but it was never in this whitelist, so it never reached state and
+        # the guard was dead: a stop firing while the vol bot was flat in
+        # cycle_gap fell through to the legacy sizer and could market-sell the
+        # user's OWN pre-existing spot. Merge it so the guard actually engages.
+        "vol_open_base",
         "vol_last_order_digest",
         "vol_last_order_kind",
     ):
@@ -2950,7 +2958,17 @@ async def _evaluate_session_pnl_rail(
         from src.nadobro.utils.env import env_bool
         if sl_pct > 0 and env_bool("NADO_SLTP_BUFFER_ENABLED", True):
             from src.nadobro.quant.sltp_overshoot import effective_sl_trigger
-            sl_trigger = effective_sl_trigger(sl_pct, float(snap.get("leverage") or 0.0))
+            # Effective leverage = the run's notional over the rail's OWN margin
+            # basis (both from this snapshot) — the quantity that actually drives
+            # uPnL as a %-of-margin, so the buffer is sized against the same basis
+            # the SL is measured in. Preferred over snap["leverage"] because the
+            # stale-DB -> fresh-venue position fallback hard-codes leverage 0
+            # (which no-ops the buffer exactly when the read is freshest), and the
+            # venue position leverage can diverge from the config margin basis.
+            _mg = float(snap.get("margin") or 0.0)
+            _pv = float(snap.get("position_value") or 0.0)
+            _eff_lev = (_pv / _mg) if (_mg > 0 and _pv > 0) else float(snap.get("leverage") or 0.0)
+            sl_trigger = effective_sl_trigger(sl_pct, _eff_lev)
     except Exception:  # noqa: BLE001 - never let the buffer math disarm the stop
         logger.debug("sltp overshoot buffer skipped", exc_info=True)
         sl_trigger = sl_pct

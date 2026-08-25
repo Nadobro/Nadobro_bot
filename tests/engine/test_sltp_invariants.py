@@ -232,11 +232,30 @@ def test_sltp_fast_poll_is_wired_into_the_cycle_and_scheduler():
     assert "not safety_only and last_run > 0" in br
     assert "_run_sltp_safety_rails(" in br
     assert '"safety_only": _safety' in br            # threaded to the worker path
-    # Scheduler: the poll is registered, kill-switchable, and skips DN/bro.
+    # Scheduler: the poll is registered, kill-switchable, and skips DN/bro/vol.
     assert "tick_sltp_safety" in sched
     assert "NADO_SLTP_FAST_POLL_ENABLED" in sched
     assert '"safety_only": True' in sched
-    assert '{"dn", "bro", ""}' in sched
+    # vol is SPOT (no leverage overshoot) and its high-cadence poll amplified the
+    # flat-in-cycle_gap spot-sweep risk — it must be skipped by the fast poll.
+    assert '{"dn", "bro", "vol", ""}' in sched
+
+
+def test_vol_open_base_reaches_state_so_the_spot_sweep_guard_is_live():
+    """VOL-OPEN-BASE-MERGE: the vol controller publishes ``vol_open_base``
+    (still-held base; 0 when flat) so the spot-sweep sizer sells the exact held
+    amount and 0 when flat. If it never reaches ``state`` the guard is dead and a
+    stop firing while vol is flat can market-sell the user's OWN spot. Pin that
+    the merge whitelist carries it (source read; no import for the pytest-only
+    CI job)."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    br = (repo / "src" / "nadobro" / "strategy" / "bot_runtime.py").read_text()
+    # It must be inside the _merge_vol_order_counters whitelist.
+    start = br.index("def _merge_vol_order_counters")
+    end = br.index("def ", start + 1)
+    assert '"vol_open_base"' in br[start:end], "vol_open_base missing from the merge whitelist"
 
 
 def test_venue_stop_is_gated_off_and_wired_as_a_reduce_only_backstop():

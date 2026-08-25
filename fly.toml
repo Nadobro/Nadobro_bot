@@ -45,11 +45,14 @@ kill_timeout = 60
   # I/O-bound pool is widened from its 12-worker default to absorb bursts.
   NADO_SDK_POOL_WORKERS = "24"
   # Venue-side reduce-only stop backstop (PR #251): exchange-enforced stop that
-  # fires even if the bot lags/disconnects. reduce_only means the venue
-  # guarantees it can only SHRINK a position, never grow/flip it. Enabled
-  # globally per owner decision; the software session rail (buffer + fast poll)
-  # remains the primary stop. Kill-switch: set to "0" to disarm instantly.
-  NADO_VENUE_STOP_ENABLED = "1"
+  # fires even if the bot lags/disconnects. Kept OFF pending testnet validation:
+  # the self-review (2026-08-25) found the placement call was 100% dead (fixed)
+  # AND that a placed stop orphans on non-SL exits (duration cap / manual stop /
+  # stale-session close) — a stale reduce-only trigger can clip a future
+  # position. Re-enable ("1") only after those are fixed and validated on
+  # testnet. The software session rail (leverage buffer + fast poll) is the
+  # primary, validated stop and stays on regardless.
+  NADO_VENUE_STOP_ENABLED = "0"
 
 [http_service]
   internal_port = 8080

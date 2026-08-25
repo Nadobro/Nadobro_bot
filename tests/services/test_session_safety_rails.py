@@ -104,6 +104,20 @@ class SessionPnlRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(res)
         fin.assert_not_called()
 
+    async def test_buffer_uses_effective_leverage_when_venue_leverage_is_zero(self):
+        # SLTP-tracer MED: the stale-DB -> fresh-venue position fallback hard-codes
+        # leverage 0, which would no-op the buffer exactly when the read is
+        # freshest. The rail now derives effective leverage = position_value /
+        # margin ($5,000 / $100 = 50x), so the buffered ~5% trigger still fires on
+        # a -6% draw even though snap["leverage"] is 0.
+        snap = {
+            "session_pnl": -6.0, "session_pnl_pct": -6.0, "margin": 100.0,
+            "leverage": 0.0, "position_value": 5000.0,
+        }
+        res, _closed, _state, fin = await self._run_rail(snap, sl=10.0, tp=50.0)
+        self.assertEqual(res, (True, None))
+        self.assertEqual(fin.call_args.kwargs.get("stop_reason"), "sl_hit")
+
     async def test_safety_rails_dispatch_runs_duration_then_session_rail(self):
         # SLTP-FAST-POLL: _run_sltp_safety_rails runs the MM duration rail then
         # the %-of-margin session rail for an engine strategy and returns the
