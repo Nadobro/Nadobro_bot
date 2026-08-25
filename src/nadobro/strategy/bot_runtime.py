@@ -2923,6 +2923,24 @@ async def _evaluate_session_pnl_rail(
     # gross figure (``pnl``/``pct``) for continuity.
     pct_net = float(snap.get("session_pnl_pct_net", pct) or 0.0)
 
+    # SLTP-OVERSHOOT-BUFFER (2026-08-25 incident: a 10%-of-$100 stop realized
+    # > -$20 at high leverage): a bare ``pct_net <= -sl_pct`` reserves nothing
+    # for the loss that keeps accruing between polls and during the flatten
+    # round-trip, so at high leverage the realized exit lands well past the
+    # user's number. Tighten the SL trigger by a leverage-scaled reserve so the
+    # realized loss lands at/under sl_pct. TP is never buffered. Fail-safe: any
+    # error falls back to the raw sl_pct (the user's exact number) — the buffer
+    # can only ever TIGHTEN the stop, never loosen or disarm it.
+    sl_trigger = sl_pct
+    try:
+        from src.nadobro.utils.env import env_bool
+        if sl_pct > 0 and env_bool("NADO_SLTP_BUFFER_ENABLED", True):
+            from src.nadobro.quant.sltp_overshoot import effective_sl_trigger
+            sl_trigger = effective_sl_trigger(sl_pct, float(snap.get("leverage") or 0.0))
+    except Exception:  # noqa: BLE001 - never let the buffer math disarm the stop
+        logger.debug("sltp overshoot buffer skipped", exc_info=True)
+        sl_trigger = sl_pct
+
     reason = ""
     # Live liquidation-proximity guard — HIGHEST priority, and evaluated even
     # when the user disarmed SL/TP. Protectively flatten before the venue
@@ -2933,7 +2951,7 @@ async def _evaluate_session_pnl_rail(
     # Both barriers disarmed AND not near liquidation -> nothing to enforce.
     if not reason and sl_pct <= 0 and tp_pct <= 0:
         return None
-    if not reason and sl_pct > 0 and pct_net <= -sl_pct:
+    if not reason and sl_pct > 0 and pct_net <= -sl_trigger:
         reason = "sl_hit"
     elif not reason and tp_pct > 0 and pct_net >= tp_pct:
         reason = "tp_hit"

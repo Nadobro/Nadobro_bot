@@ -171,6 +171,50 @@ def test_classic_ladder_does_not_turn_a_margin_percent_into_a_level_barrier():
     assert effective_sl_tp_pct("grid", {"sl_pct": 0.5, "tp_pct": 1.0}) == (0.5, 1.0)
 
 
+# --------------------------------------------------------------------------- #
+# SLTP-OVERSHOOT-BUFFER (2026-08-25 incident: a 10%-of-$100 session stop        #
+# realized > -$20 at ~20-50x leverage). The session rail fired on a bare        #
+# `pct_net <= -sl_pct`, reserving nothing for the loss that accrues between      #
+# polls and during the flatten round-trip, so the realized exit overshot the    #
+# user's number under leverage. The rail now tightens the SL trigger by a        #
+# leverage-scaled reserve (`quant/sltp_overshoot.effective_sl_trigger`), gated   #
+# by NADO_SLTP_BUFFER_ENABLED and fail-safe back to the raw sl_pct. The buffer   #
+# only ever TIGHTENS the stop — it can never loosen, invert, or disarm it, and   #
+# never touches TP.                                                              #
+# --------------------------------------------------------------------------- #
+
+def test_sltp_overshoot_buffer_only_ever_tightens_the_stop():
+    """SLTP-OVERSHOOT-BUFFER: the effective SL trigger is <= the user's sl_pct at
+    every leverage (fires at/before the user's number, never after), and equals
+    it exactly when disarmed. High leverage fires meaningfully earlier so the
+    realized loss lands at/under the configured %."""
+    from src.nadobro.quant.sltp_overshoot import effective_sl_trigger
+
+    for lev in (1, 5, 10, 20, 50, 100):
+        eff = effective_sl_trigger(10.0, float(lev))
+        assert 0.0 < eff <= 10.0, (lev, eff)          # only tightens, never disarms
+    # Disarmed stays disarmed (buffer must not manufacture a stop).
+    assert effective_sl_trigger(0.0, 50.0) == 0.0
+    # The incident leverage band trips well before the raw -10% barrier.
+    assert effective_sl_trigger(10.0, 50.0) <= 6.0
+    # Low leverage stays effectively at the user's number.
+    assert effective_sl_trigger(10.0, 2.0) >= 9.0
+
+
+def test_sltp_overshoot_buffer_never_fires_a_take_profit_early():
+    """The buffer is SL-only: the rail applies the buffered trigger to the SL
+    branch but still fires TP at the exact user tp_pct (tightening a take-profit
+    would leave profit on the table). Asserted by reading the rail source as text
+    (no import) so this stays runnable in the pytest-only CI invariant job."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    src = (repo / "src" / "nadobro" / "strategy" / "bot_runtime.py").read_text()
+    # SL compare uses the buffered trigger; TP compare uses the raw user tp_pct.
+    assert "pct_net <= -sl_trigger" in src
+    assert "pct_net >= tp_pct" in src
+
+
 # Note on DN-RAIL (Critical) and SLTP-GROSS / GRID-TP-DEAD:
 # These live in bot_runtime/live_session/grid_executor and need a running
 # session to assert directly. They are tracked as checklist items in
