@@ -1017,16 +1017,23 @@ def reduce_copy_position(
     """Shrink an open copy position after mirroring a leader's partial close.
 
     ``size`` is the follower's remaining base size, ``leader_size`` becomes the
-    new baseline the next partial-close comparison measures against, and the
-    realized PnL of the closed slice accumulates on the row (the final
-    close_copy_position pnl then only carries the LAST slice, so dashboards
-    sum row pnl rather than overwrite it).
+    new baseline the next partial-close comparison measures against, the closed
+    slice's realized PnL accumulates on the row, and ``closed_size`` accumulates
+    the base just closed (old ``size`` − ``new_size``). Both accumulators are
+    read back by the card + History for the WHOLE trade; ``close_copy_position``
+    adds the final slice to them at close. All right-hand ``size`` references
+    evaluate the OLD row value (Postgres UPDATE semantics), so the slice size is
+    correct regardless of SET order.
     """
     execute(
         """UPDATE copy_positions
-           SET size = %s, leader_size = %s, pnl = COALESCE(pnl, 0) + %s
+           SET size = %s,
+               leader_size = %s,
+               pnl = COALESCE(pnl, 0) + %s,
+               closed_size = COALESCE(closed_size, 0) + (size - %s)
            WHERE id = %s AND status = 'open'""",
-        (float(new_size), float(new_leader_size), float(pnl_delta), int(position_id)),
+        (float(new_size), float(new_leader_size), float(pnl_delta),
+         float(new_size), int(position_id)),
     )
 
 
@@ -1051,8 +1058,26 @@ def grow_copy_position(
 
 
 def close_copy_position(position_id: int, pnl: float = 0.0, reason: str = "leader_closed"):
+    """Close a copy position, folding the final slice into the whole-trade
+    accumulators.
+
+    ``pnl`` (the final slice's realized PnL) ADDS to the row's accumulated pnl
+    from any prior partial closes — it does NOT overwrite (the old overwrite
+    discarded earlier slices, so partially-closed positions showed last-slice
+    PnL). ``closed_size`` likewise adds the final remaining ``size``. The
+    ``status = 'open'`` guard makes the close idempotent: a re-close (e.g. two
+    racing sync paths) matches 0 rows instead of double-counting. The separate
+    mirror ledger (``copy_mirrors.cumulative_pnl``) already booked this slice via
+    ``_settle_copy_close`` and is untouched here.
+    """
     execute(
-        "UPDATE copy_positions SET status = 'closed', pnl = %s, closed_at = %s, close_reason = %s WHERE id = %s",
+        """UPDATE copy_positions
+           SET status = 'closed',
+               pnl = COALESCE(pnl, 0) + %s,
+               closed_size = COALESCE(closed_size, 0) + COALESCE(size, 0),
+               closed_at = %s,
+               close_reason = %s
+           WHERE id = %s AND status = 'open'""",
         (pnl, datetime.now(timezone.utc).isoformat(), reason, position_id),
     )
 

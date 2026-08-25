@@ -723,6 +723,10 @@ def init_db():
             );
             ALTER TABLE copy_positions ADD COLUMN IF NOT EXISTS tp_order_digest TEXT;
             ALTER TABLE copy_positions ADD COLUMN IF NOT EXISTS sl_order_digest TEXT;
+            -- migrations/0021_copy_closed_size.sql: total base closed across all
+            -- slices, so partially-closed copy positions show whole-trade
+            -- Size/PnL/Exit on the card + History instead of last-slice-only.
+            ALTER TABLE copy_positions ADD COLUMN IF NOT EXISTS closed_size DOUBLE PRECISION;
             CREATE INDEX IF NOT EXISTS idx_copy_positions_mirror ON copy_positions (mirror_id, status);
             CREATE INDEX IF NOT EXISTS idx_copy_positions_user ON copy_positions (user_id, status);
             CREATE INDEX IF NOT EXISTS idx_copy_positions_tp_digest
