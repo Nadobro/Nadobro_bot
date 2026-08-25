@@ -44,6 +44,18 @@ kill_timeout = 60
   # wait_for calls leave their thread running until the socket timeout, so the
   # I/O-bound pool is widened from its 12-worker default to absorb bursts.
   NADO_SDK_POOL_WORKERS = "24"
+  # Venue-side reduce-only stop backstop (PR #251): exchange-enforced stop that
+  # fires even if the bot lags/disconnects. Lifecycle code complete + unit-tested
+  # (dead-call, orphan cleanup, re-entry alignment, churn all fixed in the
+  # 2026-08-25 self-review). ENABLED per owner decision BEFORE the live
+  # trigger-service round-trip has been validated on testnet — WATCH on first
+  # deploy: confirm get_trigger_orders shows reduce-only stops at the expected
+  # mid_price_{below,above} + size; watch logs for `place_reduce_only_stop failed`
+  # and orphan accumulation if _extract_digest/_row_is_reduce_only_stop don't
+  # match the real payloads. reduce_only bounds the worst case to premature/no-op
+  # closes (never grows/flips). Kill-switch: set to "0" + redeploy. The software
+  # rail (buffer + fast poll) is the primary stop and stays on regardless.
+  NADO_VENUE_STOP_ENABLED = "1"
 
 [http_service]
   internal_port = 8080

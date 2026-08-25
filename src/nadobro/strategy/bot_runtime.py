@@ -300,6 +300,14 @@ def _merge_vol_order_counters(state: dict, result: dict) -> None:
         "vol_entry_price",
         "vol_entry_fill_ts",
         "vol_close_size",
+        # VOL-OPEN-BASE-MERGE: the controller publishes vol_open_base
+        # (entry_base - sold_base; 0 when flat) so the spot-sweep sizer
+        # (_managed_volume_spot_size) sells the EXACT still-held base and 0 when
+        # flat — but it was never in this whitelist, so it never reached state and
+        # the guard was dead: a stop firing while the vol bot was flat in
+        # cycle_gap fell through to the legacy sizer and could market-sell the
+        # user's OWN pre-existing spot. Merge it so the guard actually engages.
+        "vol_open_base",
         "vol_last_order_digest",
         "vol_last_order_kind",
     ):
@@ -1521,7 +1529,11 @@ def run_cycle_job_sync(payload: dict) -> dict:
                 "completed_at": time.time(),
             }
         ok, error_msg = asyncio.run(
-            _run_cycle(telegram_id, network, state, nudge=bool(payload.get("nudge")))
+            _run_cycle(
+                telegram_id, network, state,
+                nudge=bool(payload.get("nudge")),
+                safety_only=bool(payload.get("safety_only")),
+            )
         )
         return {
             "ok": bool(ok),
@@ -2286,7 +2298,14 @@ async def handle_strategy_job(payload: dict):
         pass
     key = _task_key(telegram_id, network)
     lock = _job_locks.setdefault(key, asyncio.Lock())
+    _safety = bool(payload.get("safety_only"))
     if lock.locked():
+        if _safety:
+            # A real cycle (or another safety pass) already holds this user's job
+            # lock and will run the rail itself — drop this redundant safety tick
+            # rather than coalescing, so a safety pass can never displace a
+            # pending trading tick.
+            return
         payload_strategy = str(payload.get("strategy") or "").lower().strip()
         if payload_strategy == "vol" and key in _job_pending_payloads:
             # A fill nudge upgrades the already-pending Volume cycle even
@@ -2369,6 +2388,9 @@ async def handle_strategy_job(payload: dict):
                                     # AUDIT-MM-2026-07-14 #4: nudged cycles keep
                                     # their gate bypass in the worker too.
                                     "nudge": bool(payload.get("nudge")),
+                                    # SLTP-FAST-POLL: a safety-only pass runs just
+                                    # the rails (no trading tick) in the worker.
+                                    "safety_only": _safety,
                                 }
                             ),
                             timeout=timeout_sec,
@@ -2416,11 +2438,11 @@ async def handle_strategy_job(payload: dict):
                     try:
                         if timeout_sec:
                             ok, error_msg = await asyncio.wait_for(
-                                _run_cycle(telegram_id, network, state, nudge=_nudged),
+                                _run_cycle(telegram_id, network, state, nudge=_nudged, safety_only=_safety),
                                 timeout=timeout_sec,
                             )
                         else:
-                            ok, error_msg = await _run_cycle(telegram_id, network, state, nudge=_nudged)
+                            ok, error_msg = await _run_cycle(telegram_id, network, state, nudge=_nudged, safety_only=_safety)
                     except asyncio.TimeoutError:
                         _job_stats["cycle_timeouts"] += 1
                         tsec = timeout_sec or 180.0
@@ -2744,6 +2766,14 @@ async def _evaluate_mm_duration_rail(
         market=_market_label_for_strategy(strategy, product, state),
         network=network, mins=dur,
     )
+    # VENUE-STOP-ORPHAN: the duration cap flattens without going through the SL
+    # rail, so cancel any resting venue-side reduce-only stop here too (gated OFF;
+    # best-effort) — a stale trigger left on the product could clip a later run.
+    try:
+        from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
+        await cancel_session_venue_stop(client, state)
+    except Exception:  # noqa: BLE001 - cleanup is best-effort; never mask the duration result
+        logger.debug("venue stop cancel on duration cap failed", exc_info=True)
     return True, None
 
 
@@ -2904,6 +2934,13 @@ async def _evaluate_session_pnl_rail(
             "so orders were cleaned up to prevent untracked fills.",
             strategy=_strategy_display_name(strategy), network=network,
         )
+        # VENUE-STOP-ORPHAN: stale-session teardown also flattens outside the SL
+        # rail — clear any resting venue-side reduce-only stop (gated OFF).
+        try:
+            from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
+            await cancel_session_venue_stop(client, state)
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            logger.debug("venue stop cancel on stale session failed", exc_info=True)
         return True, None
 
     from src.nadobro.trading.live_session import get_live_session_snapshot
@@ -2923,6 +2960,34 @@ async def _evaluate_session_pnl_rail(
     # gross figure (``pnl``/``pct``) for continuity.
     pct_net = float(snap.get("session_pnl_pct_net", pct) or 0.0)
 
+    # SLTP-OVERSHOOT-BUFFER (2026-08-25 incident: a 10%-of-$100 stop realized
+    # > -$20 at high leverage): a bare ``pct_net <= -sl_pct`` reserves nothing
+    # for the loss that keeps accruing between polls and during the flatten
+    # round-trip, so at high leverage the realized exit lands well past the
+    # user's number. Tighten the SL trigger by a leverage-scaled reserve so the
+    # realized loss lands at/under sl_pct. TP is never buffered. Fail-safe: any
+    # error falls back to the raw sl_pct (the user's exact number) — the buffer
+    # can only ever TIGHTEN the stop, never loosen or disarm it.
+    sl_trigger = sl_pct
+    try:
+        from src.nadobro.utils.env import env_bool
+        if sl_pct > 0 and env_bool("NADO_SLTP_BUFFER_ENABLED", True):
+            from src.nadobro.quant.sltp_overshoot import effective_sl_trigger
+            # Effective leverage = the run's notional over the rail's OWN margin
+            # basis (both from this snapshot) — the quantity that actually drives
+            # uPnL as a %-of-margin, so the buffer is sized against the same basis
+            # the SL is measured in. Preferred over snap["leverage"] because the
+            # stale-DB -> fresh-venue position fallback hard-codes leverage 0
+            # (which no-ops the buffer exactly when the read is freshest), and the
+            # venue position leverage can diverge from the config margin basis.
+            _mg = float(snap.get("margin") or 0.0)
+            _pv = float(snap.get("position_value") or 0.0)
+            _eff_lev = (_pv / _mg) if (_mg > 0 and _pv > 0) else float(snap.get("leverage") or 0.0)
+            sl_trigger = effective_sl_trigger(sl_pct, _eff_lev)
+    except Exception:  # noqa: BLE001 - never let the buffer math disarm the stop
+        logger.debug("sltp overshoot buffer skipped", exc_info=True)
+        sl_trigger = sl_pct
+
     reason = ""
     # Live liquidation-proximity guard — HIGHEST priority, and evaluated even
     # when the user disarmed SL/TP. Protectively flatten before the venue
@@ -2933,7 +2998,7 @@ async def _evaluate_session_pnl_rail(
     # Both barriers disarmed AND not near liquidation -> nothing to enforce.
     if not reason and sl_pct <= 0 and tp_pct <= 0:
         return None
-    if not reason and sl_pct > 0 and pct_net <= -sl_pct:
+    if not reason and sl_pct > 0 and pct_net <= -sl_trigger:
         reason = "sl_hit"
     elif not reason and tp_pct > 0 and pct_net >= tp_pct:
         reason = "tp_hit"
@@ -2955,6 +3020,16 @@ async def _evaluate_session_pnl_rail(
         except Exception:  # noqa: BLE001 - overlay cap is best-effort; user SL still governs
             logger.debug("overlay drawdown check failed", exc_info=True)
     if not reason:
+        # VENUE-STOP (gated OFF by NADO_VENUE_STOP_ENABLED): keep an exchange-
+        # enforced reduce-only stop in sync with the live position so it protects
+        # even if the bot lags/disconnects. Idempotent + best-effort; persist only
+        # when it actually changed, so a steady position adds no per-poll DB write.
+        try:
+            from src.nadobro.strategy.venue_stop import sync_session_venue_stop
+            if await sync_session_venue_stop(client, snap, sl_pct, state):
+                await _save_state_async(telegram_id, network, state)
+        except Exception:  # noqa: BLE001 - backstop must never break the rail
+            logger.debug("venue stop sync failed", exc_info=True)
         return None
 
     _finalize_session(state, stop_reason=reason)
@@ -3034,11 +3109,60 @@ async def _evaluate_session_pnl_rail(
             ),
             market=label, network=network, error=close_res.get("error", "unknown"),
         )
+    # The position is being flattened, so any venue-side reduce-only stop is now
+    # stale — cancel it (gated OFF; best-effort). A lingering reduce-only trigger
+    # can only reduce, but a stale one could clip a future position, so clear it.
+    try:
+        from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
+        await cancel_session_venue_stop(client, state)
+    except Exception:  # noqa: BLE001 - cleanup is best-effort; never mask the stop result
+        logger.debug("venue stop cancel on session stop failed", exc_info=True)
     return True, None
 
 
+async def _run_sltp_safety_rails(
+    telegram_id: int, network: str, state: dict, strategy: str, product: str, client,
+) -> tuple[bool, str | None]:
+    """Fast decoupled SL/TP safety pass: the SAME session rails a normal cycle
+    runs at its tail (the MM run-duration rail + the %-of-margin session PnL
+    rail), WITHOUT the trading tick. Enqueued by the scheduler's
+    ``tick_sltp_safety`` and dispatched through the normal per-user job lock, so
+    it is serialized with real cycles and never races a concurrent close.
+
+    The per-strategy close_coro / rail set mirrors ``_run_cycle`` exactly
+    (grid/rgrid/dgrid/mid + legacy → ``close_all_positions``; vol →
+    ``cleanup_strategy_positions``; DN has no single-product price-move rail).
+    Returns the rail's ``(True, ...)`` when a stop fired, else
+    ``(True, "safety_noop")`` — a clean, no-op safety pass."""
+    if strategy == "dn":
+        # DN is a two-leg hedge on two products; the single-product rail would
+        # misread it (see the DN note in _run_cycle). Nothing to enforce here.
+        return True, "safety_noop"
+    if strategy == "vol":
+        rail = await _evaluate_session_pnl_rail(
+            telegram_id, network, state, strategy, product,
+            client=client,
+            close_coro=lambda: run_blocking(cleanup_strategy_positions, telegram_id, network, state),
+            market_label=_market_label_for_strategy(strategy, product, state),
+        )
+        return rail if rail is not None else (True, "safety_noop")
+    if strategy in ("grid", "rgrid", "dgrid", "mid"):
+        dur_rail = await _evaluate_mm_duration_rail(
+            telegram_id, network, state, strategy, product, client=client,
+        )
+        if dur_rail is not None:
+            return dur_rail
+    rail = await _evaluate_session_pnl_rail(
+        telegram_id, network, state, strategy, product,
+        client=client,
+        close_coro=lambda: run_blocking(close_all_positions, telegram_id, network, strategy_session_id=int(state.get("strategy_session_id") or 0) or None),
+    )
+    return rail if rail is not None else (True, "safety_noop")
+
+
 async def _run_cycle(
-    telegram_id: int, network: str, state: dict, *, nudge: bool = False
+    telegram_id: int, network: str, state: dict, *, nudge: bool = False,
+    safety_only: bool = False,
 ) -> tuple[bool, str | None]:
     try:
         from src.nadobro.strategy.strategy_fsm import PHASE_SCANNING, apply_phase
@@ -3128,7 +3252,11 @@ async def _run_cycle(
     # per-user job lock upstream serializes cycles).
     interval = effective_interval_seconds(strategy, int(state.get("interval_seconds") or 60))
     gate_seconds = 1.0 if nudge else interval
-    if last_run > 0 and time.time() - last_run < gate_seconds:
+    # A safety-only pass (the decoupled fast SL/TP poll) must bypass the trading
+    # interval gate — its whole purpose is to check the rail BETWEEN normal
+    # cycles — and it must not update last_run_ts (it returns before the trading
+    # tick), so the strategy's own cadence is unchanged.
+    if not safety_only and last_run > 0 and time.time() - last_run < gate_seconds:
         return True, "skipped_interval"
 
     product = state.get("product", "BTC")
@@ -3251,6 +3379,17 @@ async def _run_cycle(
         client = await run_blocking_sdk(get_user_readonly_client, telegram_id)
     if not client:
         raise RuntimeError("Wallet client unavailable")
+
+    if safety_only:
+        # Decoupled fast SL/TP safety poll (SLTP-FAST-POLL): run ONLY the session
+        # rails — no engine tick, no re-quote — so a high-leverage drawdown is
+        # caught between the strategy's normal (slower) cycles. Dispatched through
+        # the same per-user job lock as real cycles, so it never races a
+        # concurrent close, and it left last_run_ts untouched above so trading
+        # cadence is unchanged.
+        return await _run_sltp_safety_rails(
+            telegram_id, network, state, strategy, product, client
+        )
 
     # Option 7: overlap the two independent per-cycle reads (mid + open orders)
     # so cycle latency is the slower of the two, not their sum. Engine strategies

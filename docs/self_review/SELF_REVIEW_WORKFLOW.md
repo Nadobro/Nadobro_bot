@@ -195,6 +195,31 @@ Answered, and the answer is a naming collision rather than a defect:
 | `RAIL-GROSS-VS-NET` | Low | `bot_runtime.py:2795` shows GROSS PnL in a stop message whose trigger is NET, so users read a stop as having fired early. |
 | `GRID-NO-FEE-FLOOR` | Low | `engine_runtime.py:1532` floors only when `spread_frac <= 0`; the UI allows `spread_bp` down to 0.1, where a round trip is a guaranteed net loss. |
 
+## Open findings — self-review audit 2026-08-25 (SL/TP overshoot strengthening: buffer + fast poll + venue stop)
+
+### Fixed in the same PR
+| ID | Sev | What |
+|---|---|---|
+| `VENUE-STOP-DEAD-METHOD` | **Critical** | `nado_client.py:1699` called a non-existent `_build_place_order_params` → `AttributeError` swallowed by two `except` wrappers → the venue stop was 100% dead while enabled in prod. Renamed to `_prepare_place_order_params`; guarded by `tests/test_place_reduce_only_stop.py` (drives the real method — a wrong name AttributeErrors there). |
+| `VOL-OPEN-BASE-MERGE` | **High** | `bot_runtime.py::_merge_vol_order_counters` omitted `vol_open_base`, so the spot-sweep sizer's "sell exact held / 0 when flat" guard was dead — a stop firing while vol was flat in `cycle_gap` could market-sell the user's OWN spot. Added to the whitelist; guarded in `test_sltp_invariants.py`. Pre-existing on all vol close paths; the fast poll amplified it. |
+| `SLTP-FAST-POLL-VOL-SCOPE` | Med | The fast poll enqueued vol (spot, no leverage → no overshoot benefit) every 15s, multiplying the `VOL-OPEN-BASE-MERGE` exposure. vol added to the scheduler `_skip` set; its per-cycle rail remains the backstop. |
+| `SLTP-BUFFER-LEV-ZERO` | Med | The buffer read `snap["leverage"]`, which the stale-DB→fresh-venue position fallback hard-codes to 0 (no-oping the buffer when the read is freshest) and which can diverge from the config-margin basis. Now derives effective leverage = `position_value / margin` (the true %-of-margin driver); guarded in `test_session_safety_rails.py`. |
+| `VENUE-STOP-REENTRY` | Med | The venue stop priced off the venue-reported position leverage, so a fire realized `sl_pct` of a DIFFERENT margin than the rail measures → on recovery from a bot outage the rail might not re-fire and the strategy re-opened. Now `venue_stop._effective_leverage` prices off `position_value / margin` (the SAME basis the rail uses), so a venue-stop fire lands where the rail also stands the session down. |
+| `VENUE-STOP-ORPHAN` | **High** | The venue stop was cancelled only on the SL/TP-fired path; duration-cap / manual-stop / stale-session flattens left it resting. Now `cancel_session_venue_stop` is called on the fired + duration-cap + stale-session paths, and `sync_session_venue_stop` runs a one-time per-session `reconcile_venue_stops` (list + cancel our resting reduce-only stops on the product) on first manage — sweeping any left by a prior run (start wipes the in-state tracker). Guarded in `test_venue_stop.py` + `test_sltp_invariants.py`. |
+| `VENUE-STOP-CHURN` | Low | Cancel-then-place fired on every >1% size change. Now a `NADO_VENUE_STOP_MIN_REPRICE_SECONDS` (20s) interval defers non-urgent refreshes — EXCEPT a side flip or position *increase*, which always re-cover immediately (never under-cover a growing position). Guarded in `test_venue_stop.py`. |
+
+### Remaining before enabling (`NADO_VENUE_STOP_ENABLED=1`) — testnet validation only
+The lifecycle code is fixed + unit-tested against a mock client. The live trigger-service round-trip **cannot be validated off-venue** and is the sole remaining gate:
+- [ ] `place_price_trigger_order` actually rests a reduce-only trigger (confirm via `get_trigger_orders` at the expected `mid_price_{below,above}` + size).
+- [ ] `_extract_digest` matches the real place-response shape (else replace/cancel-by-digest is a no-op — refine the key list).
+- [ ] `_row_is_reduce_only_stop` matches the real `get_trigger_orders` row shape (else the orphan sweep can't identify our stops).
+- [ ] A crossed trigger flattens reduce-only (never grows/flips) and the software rail reconciles.
+
+### Recorded (intended / low)
+| ID | Sev | Where / what |
+|---|---|---|
+| `SLTP-BUFFER-CALM-TIGHTEN` | Low (intended) | The leverage buffer tightens the SL up to `cap_frac` (0.5) even in a calm market at high leverage (leverage term is a floor, not gated on live volatility). Only ever TIGHTENS (honors the user's cap); a deliberate safety tradeoff worth a conscious product sign-off. To make it volatility-adaptive, feed `recent_move_bp` and let the leverage term cap rather than floor. |
+
 ---
 
 ## Product decision — D-Grid trend phase should pyramid (2026-08-12)

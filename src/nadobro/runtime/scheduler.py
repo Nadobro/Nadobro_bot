@@ -392,6 +392,77 @@ async def tick_night_howl():
         logger.error("Night HOWL ticker failed: %s", e)
 
 
+async def tick_sltp_safety():
+    """Decoupled fast SL/TP safety poll (SLTP-FAST-POLL, 2026-08-25 incident).
+
+    A lightweight sweep that enqueues a *safety-only* cycle (session rails only,
+    no trading tick) for every running perp strategy session, independent of each
+    strategy's slower trading interval (grid/rgrid = 60s). A high-leverage
+    drawdown otherwise overshoots the stop between trading ticks; this shrinks
+    the detection latency to NADO_SLTP_POLL_SECONDS.
+
+    Enqueue-only — no venue reads happen here. The safety cycle runs in the
+    strategy worker under the SAME per-user job lock as real cycles, so it is
+    serialized with them (never races a close) and drops itself if a real cycle
+    is already running. Feature-gated (NADO_SLTP_FAST_POLL_ENABLED, default on);
+    the per-cycle rail remains the backstop when disabled. DN has no
+    single-product rail and ``bro`` is not a perp session — both are skipped."""
+    from src.nadobro.utils.env import env_bool
+    if not env_bool("NADO_SLTP_FAST_POLL_ENABLED", True):
+        return
+    import json
+    import time as _time
+
+    from src.nadobro.db import query_all
+    from src.nadobro.trading.execution_queue import enqueue_strategy
+
+    try:
+        rows = await run_blocking(
+            query_all,
+            "SELECT key, value FROM bot_state WHERE key LIKE %s",
+            ("strategy_bot:%",),
+        )
+    except Exception as e:
+        logger.error("SLTP safety poll: failed to load running sessions: %s", e)
+        return
+
+    interval = max(1, env_int("NADO_SLTP_POLL_SECONDS", 15))
+    bucket = int(_time.time() // interval)
+    # Skip: DN (two-leg hedge, no single-product rail), bro (not a perp session),
+    # and vol (SPOT — no leverage, so no SL-overshoot to catch between ticks; the
+    # fast cadence only added chances to trip vol's flat-in-cycle_gap spot-sweep
+    # while giving no overshoot benefit). vol keeps its own per-cycle rail.
+    _skip = {"dn", "bro", "vol", ""}
+    enqueued = 0
+    for row in rows:
+        try:
+            key = str(row.get("key", ""))
+            state = json.loads(row.get("value") or "{}")
+            if not state.get("running"):
+                continue
+            strategy = str(state.get("strategy") or "").lower().strip()
+            if strategy in _skip:
+                continue
+            user_network = key.replace("strategy_bot:", "")
+            user_id_str, network = user_network.split(":", 1)
+            telegram_id = int(user_id_str)
+            ok = await enqueue_strategy(
+                {
+                    "telegram_id": telegram_id,
+                    "network": network,
+                    "strategy": strategy,
+                    "safety_only": True,
+                },
+                dedupe_key=f"{key}:sltpsafety:{bucket}",
+            )
+            if ok:
+                enqueued += 1
+        except Exception as e:
+            logger.debug("SLTP safety poll skip for row: %s", e)
+    if enqueued:
+        logger.debug("SLTP safety poll enqueued %s safety cycle(s)", enqueued)
+
+
 async def tick_signal_scorer():
     """Grade overlay signals whose horizon has elapsed.
 
@@ -978,6 +1049,16 @@ def start_scheduler():
             kwargs={"reason": "poll"},
             **_LONG_TICK,
         )
+    # Decoupled fast SL/TP safety poll — enqueues rails-only "safety" cycles for
+    # running sessions between their slower trading ticks, so a high-leverage
+    # drawdown is caught quickly (SLTP-FAST-POLL). Enqueue-only here; the rail
+    # runs in the worker under the per-user job lock. Kill-switch:
+    # NADO_SLTP_FAST_POLL_ENABLED (checked inside the tick).
+    _sltp_poll_seconds = max(1, env_int("NADO_SLTP_POLL_SECONDS", 15))
+    scheduler.add_job(
+        tick_sltp_safety, "interval", seconds=_sltp_poll_seconds,
+        id="sltp_safety_poll", replace_existing=True, **_SHORT_TICK,
+    )
     scheduler.add_job(tick_howl, "cron", hour=2, minute=0, id="howl_nightly", replace_existing=True, **_LONG_TICK)
     # Night HOWL: runs every hour on the hour and delivers to users for whom it's
     # now their local 8am (per-user UTC offset), de-duped per local day.

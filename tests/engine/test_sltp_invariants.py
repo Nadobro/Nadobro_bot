@@ -171,6 +171,129 @@ def test_classic_ladder_does_not_turn_a_margin_percent_into_a_level_barrier():
     assert effective_sl_tp_pct("grid", {"sl_pct": 0.5, "tp_pct": 1.0}) == (0.5, 1.0)
 
 
+# --------------------------------------------------------------------------- #
+# SLTP-OVERSHOOT-BUFFER (2026-08-25 incident: a 10%-of-$100 session stop        #
+# realized > -$20 at ~20-50x leverage). The session rail fired on a bare        #
+# `pct_net <= -sl_pct`, reserving nothing for the loss that accrues between      #
+# polls and during the flatten round-trip, so the realized exit overshot the    #
+# user's number under leverage. The rail now tightens the SL trigger by a        #
+# leverage-scaled reserve (`quant/sltp_overshoot.effective_sl_trigger`), gated   #
+# by NADO_SLTP_BUFFER_ENABLED and fail-safe back to the raw sl_pct. The buffer   #
+# only ever TIGHTENS the stop — it can never loosen, invert, or disarm it, and   #
+# never touches TP.                                                              #
+# --------------------------------------------------------------------------- #
+
+def test_sltp_overshoot_buffer_only_ever_tightens_the_stop():
+    """SLTP-OVERSHOOT-BUFFER: the effective SL trigger is <= the user's sl_pct at
+    every leverage (fires at/before the user's number, never after), and equals
+    it exactly when disarmed. High leverage fires meaningfully earlier so the
+    realized loss lands at/under the configured %."""
+    from src.nadobro.quant.sltp_overshoot import effective_sl_trigger
+
+    for lev in (1, 5, 10, 20, 50, 100):
+        eff = effective_sl_trigger(10.0, float(lev))
+        assert 0.0 < eff <= 10.0, (lev, eff)          # only tightens, never disarms
+    # Disarmed stays disarmed (buffer must not manufacture a stop).
+    assert effective_sl_trigger(0.0, 50.0) == 0.0
+    # The incident leverage band trips well before the raw -10% barrier.
+    assert effective_sl_trigger(10.0, 50.0) <= 6.0
+    # Low leverage stays effectively at the user's number.
+    assert effective_sl_trigger(10.0, 2.0) >= 9.0
+
+
+def test_sltp_overshoot_buffer_never_fires_a_take_profit_early():
+    """The buffer is SL-only: the rail applies the buffered trigger to the SL
+    branch but still fires TP at the exact user tp_pct (tightening a take-profit
+    would leave profit on the table). Asserted by reading the rail source as text
+    (no import) so this stays runnable in the pytest-only CI invariant job."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    src = (repo / "src" / "nadobro" / "strategy" / "bot_runtime.py").read_text()
+    # SL compare uses the buffered trigger; TP compare uses the raw user tp_pct.
+    assert "pct_net <= -sl_trigger" in src
+    assert "pct_net >= tp_pct" in src
+
+
+def test_sltp_fast_poll_is_wired_into_the_cycle_and_scheduler():
+    """SLTP-FAST-POLL: a decoupled safety poll enqueues rails-only "safety"
+    cycles so a drawdown is caught between the strategy's slower trading ticks.
+    Verified by reading source (no import) so it runs in the pytest-only CI job:
+    the cycle honours safety_only (bypasses the interval gate, runs only the
+    rails via _run_sltp_safety_rails, threads the flag to the worker), and the
+    scheduler registers the poll, gates it, and skips DN/bro."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    br = (repo / "src" / "nadobro" / "strategy" / "bot_runtime.py").read_text()
+    sched = (repo / "src" / "nadobro" / "runtime" / "scheduler.py").read_text()
+    # Cycle: safety_only bypasses the trading interval gate and runs only rails.
+    assert "safety_only: bool = False" in br
+    assert "not safety_only and last_run > 0" in br
+    assert "_run_sltp_safety_rails(" in br
+    assert '"safety_only": _safety' in br            # threaded to the worker path
+    # Scheduler: the poll is registered, kill-switchable, and skips DN/bro/vol.
+    assert "tick_sltp_safety" in sched
+    assert "NADO_SLTP_FAST_POLL_ENABLED" in sched
+    assert '"safety_only": True' in sched
+    # vol is SPOT (no leverage overshoot) and its high-cadence poll amplified the
+    # flat-in-cycle_gap spot-sweep risk — it must be skipped by the fast poll.
+    assert '{"dn", "bro", "vol", ""}' in sched
+
+
+def test_vol_open_base_reaches_state_so_the_spot_sweep_guard_is_live():
+    """VOL-OPEN-BASE-MERGE: the vol controller publishes ``vol_open_base``
+    (still-held base; 0 when flat) so the spot-sweep sizer sells the exact held
+    amount and 0 when flat. If it never reaches ``state`` the guard is dead and a
+    stop firing while vol is flat can market-sell the user's OWN spot. Pin that
+    the merge whitelist carries it (source read; no import for the pytest-only
+    CI job)."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    br = (repo / "src" / "nadobro" / "strategy" / "bot_runtime.py").read_text()
+    # It must be inside the _merge_vol_order_counters whitelist.
+    start = br.index("def _merge_vol_order_counters")
+    end = br.index("def ", start + 1)
+    assert '"vol_open_base"' in br[start:end], "vol_open_base missing from the merge whitelist"
+
+
+def test_venue_stop_is_gated_off_and_wired_as_a_reduce_only_backstop():
+    """VENUE-STOP: an exchange-enforced reduce-only trigger order backstops the
+    software rail (fires even if the bot lags/disconnects). Verified by reading
+    source (no import) so it runs in the pytest-only CI job: the feature defaults
+    OFF, the client wrapper is reduce-only with the correct per-side trigger, the
+    price geometry puts a long stop below entry / short above, and the rail syncs
+    it on the no-stop path and cancels it on the fired path."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    vs = (repo / "src" / "nadobro" / "strategy" / "venue_stop.py").read_text()
+    nc = (repo / "src" / "nadobro" / "venue" / "nado_client.py").read_text()
+    br = (repo / "src" / "nadobro" / "strategy" / "bot_runtime.py").read_text()
+    geo = (repo / "src" / "nadobro" / "quant" / "stop_geometry.py").read_text()
+    # Default OFF until testnet-validated.
+    assert 'env_bool("NADO_VENUE_STOP_ENABLED", False)' in vs
+    # Wrapper: reduce-only order + per-side trigger direction (long below, short above).
+    assert "reduce_only=True" in nc
+    assert '"mid_price_below" if position_is_long else "mid_price_above"' in nc
+    # Geometry: long stop below entry, short above.
+    assert "e * (1.0 - move) if is_long else e * (1.0 + move)" in geo
+    # Rail wiring: sync on the no-stop path, cancel on the fired path.
+    assert "sync_session_venue_stop(" in br
+    assert "cancel_session_venue_stop(" in br
+    # Lifecycle hardening (self-review 2026-08-25):
+    #  - prices off effective leverage (rail margin basis) so a venue-stop fire
+    #    lands where the rail also stands down (VENUE-STOP-REENTRY);
+    #  - reconciles orphaned reduce-only stops by product (VENUE-STOP-ORPHAN);
+    #  - min-reprice interval bounds churn (VENUE-STOP-CHURN);
+    #  - cancelled on the fired + duration-cap + stale-session exits (>=3 sites).
+    assert "_effective_leverage(" in vs
+    assert "reconcile_venue_stops(" in vs
+    assert "NADO_VENUE_STOP_MIN_REPRICE_SECONDS" in vs
+    assert br.count("cancel_session_venue_stop(") >= 3
+
+
 # Note on DN-RAIL (Critical) and SLTP-GROSS / GRID-TP-DEAD:
 # These live in bot_runtime/live_session/grid_executor and need a running
 # session to assert directly. They are tracked as checklist items in
