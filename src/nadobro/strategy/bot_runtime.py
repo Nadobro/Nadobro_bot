@@ -2987,6 +2987,16 @@ async def _evaluate_session_pnl_rail(
         except Exception:  # noqa: BLE001 - overlay cap is best-effort; user SL still governs
             logger.debug("overlay drawdown check failed", exc_info=True)
     if not reason:
+        # VENUE-STOP (gated OFF by NADO_VENUE_STOP_ENABLED): keep an exchange-
+        # enforced reduce-only stop in sync with the live position so it protects
+        # even if the bot lags/disconnects. Idempotent + best-effort; persist only
+        # when it actually changed, so a steady position adds no per-poll DB write.
+        try:
+            from src.nadobro.strategy.venue_stop import sync_session_venue_stop
+            if await sync_session_venue_stop(client, snap, sl_pct, state):
+                await _save_state_async(telegram_id, network, state)
+        except Exception:  # noqa: BLE001 - backstop must never break the rail
+            logger.debug("venue stop sync failed", exc_info=True)
         return None
 
     _finalize_session(state, stop_reason=reason)
@@ -3066,6 +3076,14 @@ async def _evaluate_session_pnl_rail(
             ),
             market=label, network=network, error=close_res.get("error", "unknown"),
         )
+    # The position is being flattened, so any venue-side reduce-only stop is now
+    # stale — cancel it (gated OFF; best-effort). A lingering reduce-only trigger
+    # can only reduce, but a stale one could clip a future position, so clear it.
+    try:
+        from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
+        await cancel_session_venue_stop(client, state)
+    except Exception:  # noqa: BLE001 - cleanup is best-effort; never mask the stop result
+        logger.debug("venue stop cancel on session stop failed", exc_info=True)
     return True, None
 
 

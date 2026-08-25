@@ -1649,6 +1649,102 @@ class NadoClient:
             logger.error("cancel_trigger_orders failed: %s", e)
             return {"success": False, "error": str(e), "digests": clean_digests}
 
+    async def place_reduce_only_stop(
+        self,
+        *,
+        product_id: int,
+        close_size: float,
+        stop_price: float,
+        position_is_long: bool,
+        slippage_pct: float = 0.5,
+        isolated: bool = False,
+        client_id: Optional[int] = None,
+    ) -> dict:
+        """Place a **reduce-only** stop-loss trigger order that flattens the open
+        position when the mark crosses ``stop_price``. A venue-enforced backstop
+        to the software session rail — ``reduce_only`` means the venue guarantees
+        the order can only *shrink* the position, never grow or flip it.
+
+          long  -> SELL close, fires when the mid falls BELOW stop_price
+                   (``mid_price_below``);
+          short -> BUY  close, fires when the mid rises ABOVE stop_price
+                   (``mid_price_above``).
+
+        The underlying close is priced ``slippage_pct`` past the stop so it
+        crosses when triggered. Reuses ``_build_place_order_params`` for the exact
+        increment / min-notional / reduce-only alignment the engine order path
+        uses, then hands the aligned x18 amount+price to the SDK's
+        ``place_price_trigger_order`` (which owns the trigger appendix + signing).
+
+        Returns ``{"success": bool, ...}``; never raises.
+        """
+        if not self._ensure_sdk_client():
+            return {"success": False, "error": "Client not initialized"}
+        trigger_client = getattr(getattr(self.client, "context", None), "trigger_client", None)
+        if not trigger_client:
+            return {"success": False, "error": "Trigger client not initialized"}
+        if not (product_id and close_size and close_size > 0 and stop_price and stop_price > 0):
+            return {"success": False, "error": "invalid stop parameters"}
+
+        # Close direction: closing a long is a SELL, a short is a BUY. Price the
+        # limit aggressively PAST the stop so it fills on trigger.
+        close_is_buy = not bool(position_is_long)
+        slip = max(0.0, float(slippage_pct)) / 100.0
+        order_price = stop_price * (1.0 + slip) if close_is_buy else stop_price * (1.0 - slip)
+        if order_price <= 0:
+            return {"success": False, "error": "invalid stop order price"}
+
+        # Reuse the single order-construction home for aligned, reduce-only x18
+        # amount+price (increment alignment, min-notional, never-grow all applied).
+        params, _tag, _size, _price, err = self._build_place_order_params(
+            product_id=int(product_id),
+            size=float(close_size),
+            price=float(order_price),
+            order_type="default",
+            is_buy=close_is_buy,
+            isolated_only=bool(isolated),
+            isolated_margin=None,
+            reduce_only=True,
+            sender=None,
+            client_id=client_id,
+            never_grow=True,
+        )
+        if err is not None:
+            return err
+        amount_x18 = int(params.order.amount)
+        price_x18 = int(params.order.priceX18)
+        trigger_price_x18 = self._to_x18_int(float(stop_price))
+        price_increment_x18 = _price_increment_x18_cache.get((self.network, int(product_id)))
+        if price_increment_x18 and price_increment_x18 > 0:
+            trigger_price_x18 = self._align_x18_to_increment(trigger_price_x18, int(price_increment_x18))
+        trigger_type = "mid_price_below" if position_is_long else "mid_price_above"
+
+        if not self._gateway_allowed(
+            weight=5, kind="execute", wallet=self.subaccount_hex, user_scoped=False
+        ):
+            return {"success": False, "error": "Rate limited — please retry in a moment.", "rate_limited": True}
+        try:
+            resp = await run_blocking_exec(
+                trigger_client.place_price_trigger_order,
+                product_id=int(product_id),
+                price_x18=str(price_x18),
+                amount_x18=str(amount_x18),
+                trigger_price_x18=str(trigger_price_x18),
+                trigger_type=trigger_type,
+                reduce_only=True,
+                sender=self.subaccount_hex,
+            )
+            return {
+                "success": True,
+                "trigger_type": trigger_type,
+                "stop_price": float(stop_price),
+                "amount_x18": str(amount_x18),
+                "response": self._to_plain(resp),
+            }
+        except Exception as e:  # noqa: BLE001 - venue-write guard: never raise into a rail
+            logger.error("place_reduce_only_stop failed: %s", _format_sdk_error(e))
+            return {"success": False, "error": _format_sdk_error(e)}
+
     @staticmethod
     def _from_x18_dynamic(value) -> float:
         if value is None:

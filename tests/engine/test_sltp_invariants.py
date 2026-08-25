@@ -239,6 +239,32 @@ def test_sltp_fast_poll_is_wired_into_the_cycle_and_scheduler():
     assert '{"dn", "bro", ""}' in sched
 
 
+def test_venue_stop_is_gated_off_and_wired_as_a_reduce_only_backstop():
+    """VENUE-STOP: an exchange-enforced reduce-only trigger order backstops the
+    software rail (fires even if the bot lags/disconnects). Verified by reading
+    source (no import) so it runs in the pytest-only CI job: the feature defaults
+    OFF, the client wrapper is reduce-only with the correct per-side trigger, the
+    price geometry puts a long stop below entry / short above, and the rail syncs
+    it on the no-stop path and cancels it on the fired path."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    vs = (repo / "src" / "nadobro" / "strategy" / "venue_stop.py").read_text()
+    nc = (repo / "src" / "nadobro" / "venue" / "nado_client.py").read_text()
+    br = (repo / "src" / "nadobro" / "strategy" / "bot_runtime.py").read_text()
+    geo = (repo / "src" / "nadobro" / "quant" / "stop_geometry.py").read_text()
+    # Default OFF until testnet-validated.
+    assert 'env_bool("NADO_VENUE_STOP_ENABLED", False)' in vs
+    # Wrapper: reduce-only order + per-side trigger direction (long below, short above).
+    assert "reduce_only=True" in nc
+    assert '"mid_price_below" if position_is_long else "mid_price_above"' in nc
+    # Geometry: long stop below entry, short above.
+    assert "e * (1.0 - move) if is_long else e * (1.0 + move)" in geo
+    # Rail wiring: sync on the no-stop path, cancel on the fired path.
+    assert "sync_session_venue_stop(" in br
+    assert "cancel_session_venue_stop(" in br
+
+
 # Note on DN-RAIL (Critical) and SLTP-GROSS / GRID-TP-DEAD:
 # These live in bot_runtime/live_session/grid_executor and need a running
 # session to assert directly. They are tracked as checklist items in
