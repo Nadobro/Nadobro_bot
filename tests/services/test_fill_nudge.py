@@ -182,7 +182,7 @@ def _install_coalescing_fakes(monkeypatch, strategy):
     monkeypatch.setattr(user_circuit, "is_open", lambda *_args: False)
     monkeypatch.setattr(user_circuit, "record_success", lambda *_args: None)
 
-    async def _fake_run(_uid, _net, _state, *, nudge=False):
+    async def _fake_run(_uid, _net, _state, *, nudge=False, safety_only=False):
         calls.append(bool(nudge))
         if len(calls) == 1:
             started.set()

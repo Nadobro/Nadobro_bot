@@ -1521,7 +1521,11 @@ def run_cycle_job_sync(payload: dict) -> dict:
                 "completed_at": time.time(),
             }
         ok, error_msg = asyncio.run(
-            _run_cycle(telegram_id, network, state, nudge=bool(payload.get("nudge")))
+            _run_cycle(
+                telegram_id, network, state,
+                nudge=bool(payload.get("nudge")),
+                safety_only=bool(payload.get("safety_only")),
+            )
         )
         return {
             "ok": bool(ok),
@@ -2286,7 +2290,14 @@ async def handle_strategy_job(payload: dict):
         pass
     key = _task_key(telegram_id, network)
     lock = _job_locks.setdefault(key, asyncio.Lock())
+    _safety = bool(payload.get("safety_only"))
     if lock.locked():
+        if _safety:
+            # A real cycle (or another safety pass) already holds this user's job
+            # lock and will run the rail itself — drop this redundant safety tick
+            # rather than coalescing, so a safety pass can never displace a
+            # pending trading tick.
+            return
         payload_strategy = str(payload.get("strategy") or "").lower().strip()
         if payload_strategy == "vol" and key in _job_pending_payloads:
             # A fill nudge upgrades the already-pending Volume cycle even
@@ -2369,6 +2380,9 @@ async def handle_strategy_job(payload: dict):
                                     # AUDIT-MM-2026-07-14 #4: nudged cycles keep
                                     # their gate bypass in the worker too.
                                     "nudge": bool(payload.get("nudge")),
+                                    # SLTP-FAST-POLL: a safety-only pass runs just
+                                    # the rails (no trading tick) in the worker.
+                                    "safety_only": _safety,
                                 }
                             ),
                             timeout=timeout_sec,
@@ -2416,11 +2430,11 @@ async def handle_strategy_job(payload: dict):
                     try:
                         if timeout_sec:
                             ok, error_msg = await asyncio.wait_for(
-                                _run_cycle(telegram_id, network, state, nudge=_nudged),
+                                _run_cycle(telegram_id, network, state, nudge=_nudged, safety_only=_safety),
                                 timeout=timeout_sec,
                             )
                         else:
-                            ok, error_msg = await _run_cycle(telegram_id, network, state, nudge=_nudged)
+                            ok, error_msg = await _run_cycle(telegram_id, network, state, nudge=_nudged, safety_only=_safety)
                     except asyncio.TimeoutError:
                         _job_stats["cycle_timeouts"] += 1
                         tsec = timeout_sec or 180.0
@@ -3055,8 +3069,49 @@ async def _evaluate_session_pnl_rail(
     return True, None
 
 
+async def _run_sltp_safety_rails(
+    telegram_id: int, network: str, state: dict, strategy: str, product: str, client,
+) -> tuple[bool, str | None]:
+    """Fast decoupled SL/TP safety pass: the SAME session rails a normal cycle
+    runs at its tail (the MM run-duration rail + the %-of-margin session PnL
+    rail), WITHOUT the trading tick. Enqueued by the scheduler's
+    ``tick_sltp_safety`` and dispatched through the normal per-user job lock, so
+    it is serialized with real cycles and never races a concurrent close.
+
+    The per-strategy close_coro / rail set mirrors ``_run_cycle`` exactly
+    (grid/rgrid/dgrid/mid + legacy → ``close_all_positions``; vol →
+    ``cleanup_strategy_positions``; DN has no single-product price-move rail).
+    Returns the rail's ``(True, ...)`` when a stop fired, else
+    ``(True, "safety_noop")`` — a clean, no-op safety pass."""
+    if strategy == "dn":
+        # DN is a two-leg hedge on two products; the single-product rail would
+        # misread it (see the DN note in _run_cycle). Nothing to enforce here.
+        return True, "safety_noop"
+    if strategy == "vol":
+        rail = await _evaluate_session_pnl_rail(
+            telegram_id, network, state, strategy, product,
+            client=client,
+            close_coro=lambda: run_blocking(cleanup_strategy_positions, telegram_id, network, state),
+            market_label=_market_label_for_strategy(strategy, product, state),
+        )
+        return rail if rail is not None else (True, "safety_noop")
+    if strategy in ("grid", "rgrid", "dgrid", "mid"):
+        dur_rail = await _evaluate_mm_duration_rail(
+            telegram_id, network, state, strategy, product, client=client,
+        )
+        if dur_rail is not None:
+            return dur_rail
+    rail = await _evaluate_session_pnl_rail(
+        telegram_id, network, state, strategy, product,
+        client=client,
+        close_coro=lambda: run_blocking(close_all_positions, telegram_id, network, strategy_session_id=int(state.get("strategy_session_id") or 0) or None),
+    )
+    return rail if rail is not None else (True, "safety_noop")
+
+
 async def _run_cycle(
-    telegram_id: int, network: str, state: dict, *, nudge: bool = False
+    telegram_id: int, network: str, state: dict, *, nudge: bool = False,
+    safety_only: bool = False,
 ) -> tuple[bool, str | None]:
     try:
         from src.nadobro.strategy.strategy_fsm import PHASE_SCANNING, apply_phase
@@ -3146,7 +3201,11 @@ async def _run_cycle(
     # per-user job lock upstream serializes cycles).
     interval = effective_interval_seconds(strategy, int(state.get("interval_seconds") or 60))
     gate_seconds = 1.0 if nudge else interval
-    if last_run > 0 and time.time() - last_run < gate_seconds:
+    # A safety-only pass (the decoupled fast SL/TP poll) must bypass the trading
+    # interval gate — its whole purpose is to check the rail BETWEEN normal
+    # cycles — and it must not update last_run_ts (it returns before the trading
+    # tick), so the strategy's own cadence is unchanged.
+    if not safety_only and last_run > 0 and time.time() - last_run < gate_seconds:
         return True, "skipped_interval"
 
     product = state.get("product", "BTC")
@@ -3269,6 +3328,17 @@ async def _run_cycle(
         client = await run_blocking_sdk(get_user_readonly_client, telegram_id)
     if not client:
         raise RuntimeError("Wallet client unavailable")
+
+    if safety_only:
+        # Decoupled fast SL/TP safety poll (SLTP-FAST-POLL): run ONLY the session
+        # rails — no engine tick, no re-quote — so a high-leverage drawdown is
+        # caught between the strategy's normal (slower) cycles. Dispatched through
+        # the same per-user job lock as real cycles, so it never races a
+        # concurrent close, and it left last_run_ts untouched above so trading
+        # cadence is unchanged.
+        return await _run_sltp_safety_rails(
+            telegram_id, network, state, strategy, product, client
+        )
 
     # Option 7: overlap the two independent per-cycle reads (mid + open orders)
     # so cycle latency is the slower of the two, not their sum. Engine strategies

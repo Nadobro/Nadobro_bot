@@ -85,6 +85,54 @@ class SessionPnlRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(closed.get("called"))
         fin.assert_not_called()
 
+    async def test_buffer_tightens_sl_at_high_leverage(self):
+        # SLTP-OVERSHOOT-BUFFER (2026-08-25 incident): sl 10%, 50x -> buffered
+        # trigger ~5%. A -6% draw (between the buffered 5% and the raw 10%) MUST
+        # fire under leverage, so the realized loss lands near the user's number
+        # instead of overshooting it.
+        snap = {"session_pnl": -6.0, "session_pnl_pct": -6.0, "margin": 100.0, "leverage": 50.0}
+        res, _closed, _state, fin = await self._run_rail(snap, sl=10.0, tp=50.0)
+        self.assertEqual(res, (True, None))
+        self.assertEqual(fin.call_args.kwargs.get("stop_reason"), "sl_hit")
+
+    async def test_buffer_absent_at_low_leverage_same_draw_holds(self):
+        # The SAME -6% draw does NOT fire without leverage (buffer ~0, raw -10%
+        # barrier governs) — proving it's the leverage-scaled buffer that fired
+        # above, not a blanket tightening of every stop.
+        snap = {"session_pnl": -6.0, "session_pnl_pct": -6.0, "margin": 100.0, "leverage": 1.0}
+        res, _closed, _state, fin = await self._run_rail(snap, sl=10.0, tp=50.0)
+        self.assertIsNone(res)
+        fin.assert_not_called()
+
+    async def test_safety_rails_dispatch_runs_duration_then_session_rail(self):
+        # SLTP-FAST-POLL: _run_sltp_safety_rails runs the MM duration rail then
+        # the %-of-margin session rail for an engine strategy and returns the
+        # session rail's stop result — the same rails a normal cycle runs, minus
+        # the trading tick.
+        state = {"sl_pct": 10.0, "tp_pct": 50.0, "strategy": "dgrid",
+                 "strategy_session_id": 11, "running": True}
+        with patch.object(bot_runtime, "_evaluate_mm_duration_rail", new=AsyncMock(return_value=None)) as dur, \
+             patch.object(bot_runtime, "_evaluate_session_pnl_rail", new=AsyncMock(return_value=(True, None))) as rail:
+            res = await bot_runtime._run_sltp_safety_rails(42, "mainnet", state, "dgrid", "BTC", None)
+        self.assertEqual(res, (True, None))
+        dur.assert_awaited_once()
+        rail.assert_awaited_once()
+
+    async def test_safety_rails_noop_when_nothing_trips(self):
+        state = {"sl_pct": 10.0, "strategy": "grid", "strategy_session_id": 11, "running": True}
+        with patch.object(bot_runtime, "_evaluate_mm_duration_rail", new=AsyncMock(return_value=None)), \
+             patch.object(bot_runtime, "_evaluate_session_pnl_rail", new=AsyncMock(return_value=None)):
+            res = await bot_runtime._run_sltp_safety_rails(42, "mainnet", state, "grid", "BTC", None)
+        self.assertEqual(res, (True, "safety_noop"))
+
+    async def test_safety_rails_skip_dn(self):
+        # DN is a two-leg hedge; the single-product rail would misread it, so the
+        # safety pass is a no-op for DN (matches _run_cycle's DN handling).
+        with patch.object(bot_runtime, "_evaluate_session_pnl_rail", new=AsyncMock()) as rail:
+            res = await bot_runtime._run_sltp_safety_rails(42, "mainnet", {"strategy": "dn"}, "dn", "BTC", None)
+        self.assertEqual(res, (True, "safety_noop"))
+        rail.assert_not_awaited()
+
     async def _run_rail_with_state(self, snap, state):
         closed = {}
 

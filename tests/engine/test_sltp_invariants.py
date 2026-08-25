@@ -215,6 +215,30 @@ def test_sltp_overshoot_buffer_never_fires_a_take_profit_early():
     assert "pct_net >= tp_pct" in src
 
 
+def test_sltp_fast_poll_is_wired_into_the_cycle_and_scheduler():
+    """SLTP-FAST-POLL: a decoupled safety poll enqueues rails-only "safety"
+    cycles so a drawdown is caught between the strategy's slower trading ticks.
+    Verified by reading source (no import) so it runs in the pytest-only CI job:
+    the cycle honours safety_only (bypasses the interval gate, runs only the
+    rails via _run_sltp_safety_rails, threads the flag to the worker), and the
+    scheduler registers the poll, gates it, and skips DN/bro."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    br = (repo / "src" / "nadobro" / "strategy" / "bot_runtime.py").read_text()
+    sched = (repo / "src" / "nadobro" / "runtime" / "scheduler.py").read_text()
+    # Cycle: safety_only bypasses the trading interval gate and runs only rails.
+    assert "safety_only: bool = False" in br
+    assert "not safety_only and last_run > 0" in br
+    assert "_run_sltp_safety_rails(" in br
+    assert '"safety_only": _safety' in br            # threaded to the worker path
+    # Scheduler: the poll is registered, kill-switchable, and skips DN/bro.
+    assert "tick_sltp_safety" in sched
+    assert "NADO_SLTP_FAST_POLL_ENABLED" in sched
+    assert '"safety_only": True' in sched
+    assert '{"dn", "bro", ""}' in sched
+
+
 # Note on DN-RAIL (Critical) and SLTP-GROSS / GRID-TP-DEAD:
 # These live in bot_runtime/live_session/grid_executor and need a running
 # session to assert directly. They are tracked as checklist items in
