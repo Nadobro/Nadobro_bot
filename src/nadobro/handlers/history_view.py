@@ -84,10 +84,14 @@ def render_history_view(
         )
         is_long = str(pos.get("side") or "").lower() in ("long", "buy")
         side = "📈 long" if is_long else "📉 short"
-        size = _dec(pos.get("size"))
+        # Whole-trade base closed across all slices (partial + final); falls back
+        # to the remaining `size` for legacy rows without closed_size. Keeps the
+        # exit reconstruction in sync with the accumulated pnl. See
+        # build_copy_trade_card_data.
+        closed_size = _dec(pos.get("closed_size"))
+        size = closed_size if closed_size > 0 else _dec(pos.get("size"))
         entry = _dec(pos.get("entry_price"))
         pnl = _dec(pos.get("pnl"))
-        # Recover the effective exit from the gross pnl (see build_copy_trade_card_data).
         direction = Decimal(1) if is_long else Decimal(-1)
         exit_px = entry + (pnl / (size * direction)) if size > 0 else entry
         closed_at = _fmt_ts(pos.get("closed_at"))

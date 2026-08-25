@@ -282,10 +282,18 @@ def build_copy_trade_card_data(
 ) -> dict:
     """Type A card data for a CLOSED copy position (badge ``COPY TRADE``).
 
-    Exit price is not persisted on ``copy_positions`` but the stored ``pnl`` is
-    the gross ``(exit-entry)*size*dir``, so ``exit = entry + pnl/(size*dir)``
-    recovers the exact effective exit (a size-weighted average across partial
-    closes) — Entry/Exit/Size therefore always reconcile with the shown PnL.
+    Whole-trade numbers even for positions the leader trimmed before fully
+    closing: ``closed_size`` is the total base closed across all slices and the
+    row ``pnl`` accumulates every slice (see ``reduce_copy_position`` /
+    ``close_copy_position``). Exit price is not stored, but the accumulated pnl
+    is the gross ``(exit-entry)*total_size*dir``, so ``exit = entry +
+    pnl/(size*dir)`` recovers the size-weighted effective exit — Entry / Exit /
+    Size therefore reconcile with the shown PnL over the whole trade.
+
+    Legacy rows closed before ``closed_size`` existed have it NULL and fall back
+    to the remaining ``size``; their pnl was overwritten to last-slice-only and
+    can't be recovered, so those old cards stay last-slice (new closes are
+    correct).
     """
     from src.nadobro.models.database import get_closed_copy_position
 
@@ -295,7 +303,8 @@ def build_copy_trade_card_data(
 
     base, display, _is_perp = _type_a_product(pos.get("product_name"))
     entry = float(_to_decimal(pos.get("entry_price")))
-    size = float(_to_decimal(pos.get("size")))
+    closed_size = float(_to_decimal(pos.get("closed_size")))
+    size = closed_size if closed_size > 0 else float(_to_decimal(pos.get("size")))
     pnl = float(_to_decimal(pos.get("pnl")))
     is_long = str(pos.get("side") or "").lower() in ("long", "buy")
     direction = 1.0 if is_long else -1.0
