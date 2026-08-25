@@ -2766,6 +2766,14 @@ async def _evaluate_mm_duration_rail(
         market=_market_label_for_strategy(strategy, product, state),
         network=network, mins=dur,
     )
+    # VENUE-STOP-ORPHAN: the duration cap flattens without going through the SL
+    # rail, so cancel any resting venue-side reduce-only stop here too (gated OFF;
+    # best-effort) — a stale trigger left on the product could clip a later run.
+    try:
+        from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
+        await cancel_session_venue_stop(client, state)
+    except Exception:  # noqa: BLE001 - cleanup is best-effort; never mask the duration result
+        logger.debug("venue stop cancel on duration cap failed", exc_info=True)
     return True, None
 
 
@@ -2926,6 +2934,13 @@ async def _evaluate_session_pnl_rail(
             "so orders were cleaned up to prevent untracked fills.",
             strategy=_strategy_display_name(strategy), network=network,
         )
+        # VENUE-STOP-ORPHAN: stale-session teardown also flattens outside the SL
+        # rail — clear any resting venue-side reduce-only stop (gated OFF).
+        try:
+            from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
+            await cancel_session_venue_stop(client, state)
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            logger.debug("venue stop cancel on stale session failed", exc_info=True)
         return True, None
 
     from src.nadobro.trading.live_session import get_live_session_snapshot

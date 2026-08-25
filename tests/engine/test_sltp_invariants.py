@@ -282,6 +282,16 @@ def test_venue_stop_is_gated_off_and_wired_as_a_reduce_only_backstop():
     # Rail wiring: sync on the no-stop path, cancel on the fired path.
     assert "sync_session_venue_stop(" in br
     assert "cancel_session_venue_stop(" in br
+    # Lifecycle hardening (self-review 2026-08-25):
+    #  - prices off effective leverage (rail margin basis) so a venue-stop fire
+    #    lands where the rail also stands down (VENUE-STOP-REENTRY);
+    #  - reconciles orphaned reduce-only stops by product (VENUE-STOP-ORPHAN);
+    #  - min-reprice interval bounds churn (VENUE-STOP-CHURN);
+    #  - cancelled on the fired + duration-cap + stale-session exits (>=3 sites).
+    assert "_effective_leverage(" in vs
+    assert "reconcile_venue_stops(" in vs
+    assert "NADO_VENUE_STOP_MIN_REPRICE_SECONDS" in vs
+    assert br.count("cancel_session_venue_stop(") >= 3
 
 
 # Note on DN-RAIL (Critical) and SLTP-GROSS / GRID-TP-DEAD:
