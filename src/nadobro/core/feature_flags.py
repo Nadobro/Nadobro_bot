@@ -32,6 +32,18 @@ def portfolio_ws_enabled() -> bool:
     return env_flag("NADO_PORTFOLIO_WS", False)
 
 
+def match_ledger_backfill_enabled() -> bool:
+    """Whether nado_sync backfills OLDER fills so the account realized-PnL replay
+    has complete per-product history.
+
+    ``get_matches`` only returns the newest 200 fills; a truncated ledger makes
+    the avg-cost replay fabricate PnL from a phantom entry basis. This pages
+    backward a few pages per heavy sync (bounded, one-time per account). Default
+    ON; operators can disable with the env flag if it strains venue rate limits.
+    """
+    return env_flag("NADO_MATCH_LEDGER_BACKFILL", True)
+
+
 def fill_nudge_enabled() -> bool:
     """Whether venue fills should wake engine strategy cycles immediately.
 

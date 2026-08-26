@@ -40,7 +40,7 @@ class _SpyRecorder:
 
     def record(self, controller_id, trading_pair, side, amount_base, price,
                fee_quote, order_id=None, timestamp=None, *,
-               realized_pnl=None, is_taker=False):
+               realized_pnl=None, is_taker=False, leverage=None):
         self.rows.append({
             "controller_id": controller_id, "trading_pair": trading_pair,
             "side": side, "amount_base": amount_base, "price": price,

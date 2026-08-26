@@ -289,8 +289,45 @@ class NadoSyncTests(unittest.IsolatedAsyncioTestCase):
         # x18 fields still persisted (authoritative venue values):
         assert params[12] == str(to_x18("0.5"))     # fee_x18
         assert params[13] == str(to_x18("1.25"))    # base_filled_x18
+        # leverage appended last; no open position row here → NULL, not 1x.
+        assert params[-1] is None
 
-    def test_write_matches_enriches_manual_recorder_row_no_dupe(self):
+    def test_write_matches_backfills_leverage_from_positions_for_venue_only_fill(self):
+        # A venue-only fill (no bot recorder row) must record the REAL leverage
+        # from the positions table (written earlier this pass) so the History /
+        # Type A card show "49x", not the trades-table default 1x.
+        execute_calls = []
+
+        def _q(sql, *params):
+            # Only the positions leverage lookup returns a row; every other
+            # query_one (recorder row, open_orders, session, intent) misses so
+            # the fill takes the fresh-INSERT path.
+            if "FROM positions" in sql:
+                return {"leverage": 49.0}
+            return None
+
+        with patch.object(nado_sync, "query_one", side_effect=_q), patch.object(
+            nado_sync, "execute", side_effect=lambda *a, **k: execute_calls.append(a)
+        ):
+            inserted = nado_sync._write_matches(
+                42,
+                "testnet",
+                [
+                    {
+                        "submission_idx": "3",
+                        "product_id": 1,
+                        "product_name": "BTC",
+                        "base_filled": str(to_x18("0.03")),
+                        "quote_filled": str(to_x18("-2400")),
+                        "fee": str(to_x18("0.5")),
+                    }
+                ],
+            )
+
+        assert inserted == 1
+        params = execute_calls[0][1]
+        assert params[-1] == 49.0            # leverage (appended last) from positions
+        assert params[10] is False           # isolated flag drove the lookup
         # A manual OPEN recorder row (which carries product_id) must be ENRICHED,
         # not duplicated as a product_id=0 'match' row.
         execute_calls = []
@@ -314,6 +351,10 @@ class NadoSyncTests(unittest.IsolatedAsyncioTestCase):
         assert inserted == 1
         sql = execute_calls[0][0]
         assert "UPDATE" in sql and "INSERT INTO" not in sql  # enriched, not duplicated
+        # The enriched bot recorder row must be stamped via_nadobro so it counts
+        # toward "Nadobro Vol" (reaching this branch proves bot origin). Without
+        # this it landed in Nado Vol only. Literal TRUE → no param shift.
+        assert "via_nadobro = COALESCE(via_nadobro, TRUE)" in sql
 
     def test_write_matches_resolves_productid_from_open_orders_when_missing(self):
         # IndexerMatch has no product_id; for a fill with no recorder row (desk),

@@ -412,7 +412,7 @@ def test_the_price_of_a_close_fill_after_a_partial_booking_is_real():
         class _Spy:
             def record(self, cid, pair, side, amount_base, price, fee_quote,
                        order_id=None, timestamp=None, *, realized_pnl=None,
-                       is_taker=False):
+                       is_taker=False, leverage=None):
                 rec.append((side, Decimal(str(amount_base)), Decimal(str(price))))
 
             def link_placement(self, *a):

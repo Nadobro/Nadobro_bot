@@ -266,6 +266,7 @@ class DbTradeRecorder:
         *,
         realized_pnl: object = None,
         is_taker: bool = False,
+        leverage: Optional[float] = None,
     ) -> None:
         """Best-effort: persist one engine fill. Never raises — fill recording
         must not break execution (same policy as the inventory/registry writes).
@@ -274,6 +275,7 @@ class DbTradeRecorder:
             self._record(
                 controller_id, trading_pair, side, amount_base, price, fee_quote,
                 order_id, timestamp, realized_pnl=realized_pnl, is_taker=is_taker,
+                leverage=leverage,
             )
         except Exception:  # noqa: BLE001 - persistence must never break a fill
             _recorder_logger.warning(
@@ -295,6 +297,7 @@ class DbTradeRecorder:
         *,
         realized_pnl: object,
         is_taker: bool,
+        leverage: Optional[float] = None,
     ) -> None:
         from datetime import datetime, timezone
 
@@ -362,10 +365,25 @@ class DbTradeRecorder:
             "builder_fee": str(builder_fee),
             "status": "filled",
             "source": source,
+            # Every engine/desk fill is routed through Nadobro by construction, so
+            # it counts toward "Nadobro Vol". Stamp it at record time (the venue
+            # match's enrichment UPDATE also COALESCEs this to TRUE) — desk fills
+            # record as source='manual', so `source` can't carry this.
+            "via_nadobro": True,
             "is_taker": bool(is_taker),
             "created_at": when,
             "filled_at": when,
         }
+        # Real leverage of the position this fill belongs to (perps). Recorded so
+        # the History round-trip + Type A PnL card show the true "Nx" instead of
+        # the trades table's misleading ``leverage DEFAULT 1.0`` — the desk-fill
+        # bug that rendered a 49x trade as "LONG 1x". None (spot, or an executor
+        # without config leverage) leaves the column unset.
+        try:
+            if leverage is not None and float(leverage) > 0:
+                data["leverage"] = float(leverage)
+        except (TypeError, ValueError):
+            pass
         if session_id is not None:
             data["strategy_session_id"] = int(session_id)
         if order_id:
