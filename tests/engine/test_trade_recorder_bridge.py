@@ -30,7 +30,7 @@ class _RecordingRecorder:
 
     def record(self, controller_id, trading_pair, side, amount_base, price,
                fee_quote, order_id=None, timestamp=None, *,
-               realized_pnl=None, is_taker=False):
+               realized_pnl=None, is_taker=False, leverage=None):
         self.calls.append({
             "controller_id": controller_id,
             "trading_pair": trading_pair,

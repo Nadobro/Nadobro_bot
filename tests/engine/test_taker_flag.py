@@ -47,9 +47,10 @@ class _SpyRecorder:
 
     def record(self, controller_id, trading_pair, side, amount_base, price,
                fee_quote, order_id=None, timestamp=None, *,
-               realized_pnl=None, is_taker=False):
+               realized_pnl=None, is_taker=False, leverage=None):
         self.rows.append({"side": side, "amount_base": amount_base,
-                          "order_id": order_id, "is_taker": is_taker})
+                          "order_id": order_id, "is_taker": is_taker,
+                          "leverage": leverage})
 
     def link_placement(self, controller_id, order_id):
         pass

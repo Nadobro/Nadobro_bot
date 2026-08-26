@@ -7,7 +7,7 @@ import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
 
 from src.nadobro.utils.env import env_float
 # Blocking work goes to the purpose-built pools, never to the event loop's
@@ -290,6 +290,92 @@ async def sync_active_users(reason: str = "poll") -> None:
         synced += 1
 
 
+# ── match-ledger backfill (complete history for the realized-PnL replay) ──
+# get_matches only returns the newest 200 fills; the account avg-cost realized
+# replay needs the COMPLETE per-product history or it fabricates PnL from a
+# phantom entry basis. Page backward a few pages per heavy sync, one-time per
+# account, with a persisted bot_state cursor.
+_BACKFILL_PAGES_PER_SYNC = 4
+_BACKFILL_PAGE_LIMIT = 200
+_BACKFILL_MAX_STALLS = 3       # empty pages (throttle/boundary) before concluding done
+
+
+def _safe_idx(value: Any) -> Optional[int]:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _backfill_older_matches(
+    client: Any, user_id: int, network: str, newest_matches: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Bounded backward catch-up of the match history so the account realized-PnL
+    replay has full basis. Returns the OLDER matches to persist (deduped by the
+    caller's ``_write_matches``); ``[]`` in steady state. Best-effort: never
+    raises — a hiccup must not break the sync.
+    """
+    from src.nadobro.core.feature_flags import match_ledger_backfill_enabled
+    from src.nadobro.models.database import get_bot_state, set_bot_state
+
+    if not match_ledger_backfill_enabled():
+        return []
+    key = f"match_backfill:{network}:{int(user_id)}"
+    try:
+        state = await run_blocking_db(get_bot_state, key) or {}
+    except Exception:  # policy: degrade-ok(cursor read best-effort)
+        state = {}
+    if state.get("done"):
+        return []
+
+    cursor = _safe_idx(state.get("oldest_idx"))
+    stalls = int(state.get("stalls") or 0)
+    if cursor is None:
+        seed = [i for i in (_safe_idx(m.get("submission_idx")) for m in (newest_matches or [])) if i is not None]
+        if not seed:
+            return []                       # nothing to page from yet
+        cursor = min(seed)
+
+    collected: list[dict[str, Any]] = []
+    done = False
+    for _ in range(_BACKFILL_PAGES_PER_SYNC):
+        next_idx = cursor - 1
+        if next_idx < 0:
+            done = True
+            break
+        try:
+            page = await client.get_matches(limit=_BACKFILL_PAGE_LIMIT, idx=str(next_idx))
+        except Exception:  # policy: degrade-ok(one page failure; retry next sync)
+            break
+        page_idxs = [i for i in (_safe_idx(m.get("submission_idx")) for m in (page or [])) if i is not None]
+        if not page_idxs:
+            # Empty page: a transient gateway throttle OR the true start. Count a
+            # stall so a throttle merely delays us; only conclude "done" after a
+            # few (or on a partial page below).
+            stalls += 1
+            if stalls >= _BACKFILL_MAX_STALLS:
+                done = True
+            break
+        stalls = 0
+        collected.extend(page)
+        new_cursor = min(page_idxs)
+        if new_cursor >= cursor:            # no progress (all deduped) → stop
+            done = True
+            break
+        cursor = new_cursor
+        if len(page) < _BACKFILL_PAGE_LIMIT:  # partial page → earliest fill reached
+            done = True
+            break
+
+    try:
+        await run_blocking_db(
+            set_bot_state, key, {"oldest_idx": cursor, "done": done, "stalls": stalls}
+        )
+    except Exception:  # policy: degrade-ok(cursor write best-effort)
+        pass
+    return collected
+
+
 async def sync_user(
     user_id: int,
     *,
@@ -446,6 +532,18 @@ async def sync_user(
                     client.get_interest_and_funding_payments(limit=200),
                 )
                 last_heavy_monotonic = time.time()
+                # Complete the fill ledger: page backward beyond the newest 200 so
+                # the account realized-PnL replay has full per-product basis (a
+                # truncated history fabricates PnL from a phantom entry). Written
+                # straight to trades (not into the cached snapshot, which stays the
+                # newest-200 view). Bounded per sync + best-effort.
+                try:
+                    older = await _backfill_older_matches(client, int(user_id), network, matches)
+                    if older:
+                        await run_blocking_db(_write_matches, int(user_id), network, older)
+                except Exception:  # a backfill hiccup must never break the sync
+                    logger.debug("match ledger backfill skipped user=%s network=%s",
+                                 user_id, network, exc_info=True)
             else:
                 matches = list(prior.get("matches") or [])
                 funding = list(prior.get("funding_payments") or [])
@@ -945,6 +1043,17 @@ def _write_matches(user_id: int, network: str, matches: list[dict[str, Any]]) ->
                     f"""
                     UPDATE {table} SET
                       submission_idx = %s,
+                      -- This branch is reached ONLY when a bot recorder row
+                      -- exists for the digest (submission_idx IS NULL, not a
+                      -- close) — and ONLY bot paths (engine_persistence /
+                      -- trade_service / copy_service) ever write recorder rows;
+                      -- a Nado-UI trade only ever fresh-inserts. So reaching
+                      -- here is itself proof the fill was routed through
+                      -- Nadobro. The recorder rows omit via_nadobro (=> NULL),
+                      -- so without this the enriched fill counts in Nado Vol but
+                      -- NOT Nadobro Vol. COALESCE keeps it idempotent; TRUE is a
+                      -- literal so the positional params below don't shift.
+                      via_nadobro = COALESCE(via_nadobro, TRUE),
                       realized_pnl_x18 = %s,
                       fee_x18 = %s,
                       base_filled_x18 = %s,
@@ -1010,6 +1119,14 @@ def _write_matches(user_id: int, network: str, matches: list[dict[str, Any]]) ->
                 pass
         insert_pname = insert_pname or f"ID:{insert_pid}"
 
+        # Venue-only fill (no bot recorder row to enrich): source the real
+        # leverage from the positions table written earlier this pass, so the
+        # History round-trip + Type A PnL card show the true "Nx" instead of the
+        # ``leverage DEFAULT 1.0`` a bare INSERT would take. None => leave it
+        # NULL (unknown) rather than a misleading 1x.
+        fill_leverage = _fill_leverage_from_positions(
+            int(user_id), network, insert_pid, bool(match.get("isolated"))
+        )
         execute(
             f"""
             INSERT INTO {table} (
@@ -1017,9 +1134,9 @@ def _write_matches(user_id: int, network: str, matches: list[dict[str, Any]]) ->
               fill_size, price, fill_price, fill_fee, status,
               submission_idx, isolated, realized_pnl_x18, fee_x18, base_filled_x18, quote_filled_x18,
               order_digest, strategy_session_id, source, via_nadobro,
-              filled_at, created_at
+              filled_at, created_at, leverage
             )
-            VALUES (%s, %s, %s, 'match', %s, %s, %s, %s, %s, %s, 'filled', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            VALUES (%s, %s, %s, 'match', %s, %s, %s, %s, %s, %s, 'filled', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s)
             """,
             (
                 user_id,
@@ -1049,6 +1166,10 @@ def _write_matches(user_id: int, network: str, matches: list[dict[str, Any]]) ->
                 # 'manual', conflating bot trades with Nado-UI trades.
                 bool(intent_found),
                 _timestamp_or_now(match.get("timestamp")),
+                # Appended last so the existing positional params keep their
+                # indices (nado_sync tests assert by position). Real venue
+                # leverage from the positions table, or NULL when unknown.
+                fill_leverage,
             ),
         )
         inserted += 1
@@ -1340,6 +1461,46 @@ def _resolve_leverage(pos: dict[str, Any]) -> str:
     except Exception:  # policy: degrade-ok(malformed venue fields; defaults to 1x)
         pass
     return "1"
+
+
+def _fill_leverage_from_positions(
+    user_id: int, network: str, product_id: int, isolated: bool
+) -> Optional[float]:
+    """Real venue leverage for a just-synced fill, read from the ``positions``
+    table written EARLIER in this same snapshot pass (``_write_positions`` runs
+    before ``_write_matches`` in ``_write_snapshot``).
+
+    Used only for venue-only fills (no bot recorder row) so their trades row —
+    and the History round-trip / Type A PnL card that read it — show the true
+    leverage instead of the ``leverage DEFAULT 1.0`` a bare INSERT would take.
+    Matches the position's ``isolated`` flag so an isolated child's leverage is
+    not read off the cross row. Returns ``None`` when no open position exists
+    (e.g. a fill that fully closed the position), so the caller leaves leverage
+    unset rather than guessing 1x.
+    """
+    if not product_id:
+        return None
+    try:
+        row = query_one(
+            """
+            SELECT leverage FROM positions
+            WHERE user_id = %s AND network = %s AND product_id = %s
+              AND isolated = %s AND status = 'open' AND closed_at IS NULL
+              AND leverage IS NOT NULL AND leverage > 0
+            ORDER BY synced_at DESC
+            LIMIT 1
+            """,
+            (int(user_id), str(network), int(product_id), bool(isolated)),
+        )
+    except Exception:  # policy: degrade-ok(best-effort leverage backfill)
+        return None
+    if not row:
+        return None
+    try:
+        lev = float(row.get("leverage"))
+    except (TypeError, ValueError):
+        return None
+    return lev if lev > 0 else None
 
 
 def _timestamp_or_now(value: Any) -> datetime:

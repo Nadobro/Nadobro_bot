@@ -41,6 +41,7 @@ class TradeRecorder(Protocol):
         timestamp: Optional[float] = ...,
         *,
         is_taker: bool = ...,
+        leverage: Optional[float] = ...,
     ) -> None:
         ...
 
@@ -208,6 +209,29 @@ class Executor(abc.ABC):
         except Exception:  # noqa: BLE001  # policy: degrade-ok(unknown shape ⇒ prior behaviour)
             return False
 
+    def _config_leverage(self) -> Optional[float]:
+        """Best-effort leverage of the position this fill belongs to.
+
+        Read from the executor config, or its nested ``order_config`` — desk / DN
+        (``PositionExecutorConfig``) keep leverage ONLY on the inner order, so we
+        prefer that when present (same nesting the taker check hops through).
+        Returns ``None`` when unknown so the recorder omits it rather than let the
+        trade row fall to the misleading ``leverage DEFAULT 1.0`` and render as a
+        wrong "1x" on the History / PnL cards.
+        """
+        cfg = getattr(self, "config", None)
+        for candidate in (getattr(cfg, "order_config", None), cfg):
+            lev = getattr(candidate, "leverage", None)
+            if lev is None:
+                continue
+            try:
+                f = float(lev)
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                return f
+        return None
+
     def _record_fill(
         self, fill: Fill, order: Optional[NadoOrder] = None, *,
         crossed: Optional[bool] = None,
@@ -251,6 +275,7 @@ class Executor(abc.ABC):
                     fill.timestamp,
                     is_taker=(self._fill_was_taker(order) if crossed is None
                               else bool(crossed)),
+                    leverage=self._config_leverage(),
                 )
             except Exception:  # noqa: BLE001  # policy: degrade-ok(trade-recording is best-effort; the recorder logs its own failures — a fill must never be lost to a reporting-bridge error)
                 pass
