@@ -36,6 +36,7 @@ from src.nadobro.engine.adapter.base import (
     OrderState,
 )
 from src.nadobro.engine.backtester.candle_ingest import Candle
+from src.nadobro.engine.inventory import InventoryRepository
 from src.nadobro.engine.types import OrderType, TradeType, _dec
 
 
@@ -86,6 +87,9 @@ class SimNadoAdapter(NadoAdapterBase):
         costs: Optional[SimCosts] = None,
         meta: Optional[Dict[str, SimMeta]] = None,
         default_meta: Optional[SimMeta] = None,
+        inventory: Optional[InventoryRepository] = None,
+        user_id: int = 1,
+        controller_id: str = "bt",
     ) -> None:
         self.costs = costs or SimCosts()
         self._meta = meta or {}
@@ -94,13 +98,22 @@ class SimNadoAdapter(NadoAdapterBase):
         self._counter = 0
         self._fills: List[Fill] = []
         self._candle: Optional[Candle] = None
-        # Per-pair running net base (signed) from fills — drives funding accrual.
+        # Per-pair running net base (signed) from fills — drives funding accrual
+        # AND is the position poll (held_base) the trigger controllers read.
         self._net_base: Dict[str, Decimal] = {}
         # Funding events (ts, received_quote) so funding_since can window them.
         self._funding_events: List[tuple] = []
         # Aggregate cost telemetry for the report.
         self.total_fees_quote: Decimal = Decimal(0)
         self.total_funding_quote: Decimal = Decimal(0)
+        # VENUE PRICE-TRIGGER orders (Reverse Grid). A trigger-driven controller
+        # runs NO executor, so its fills never reach inventory the executor way.
+        # The sim books them here directly (given the reporting handles below) so
+        # the report's PnL/fees — read from inventory — see them. digest -> dict.
+        self._triggers: Dict[str, dict] = {}
+        self._inventory = inventory
+        self._user_id = user_id
+        self._controller_id = controller_id
 
     # -- engine controls --------------------------------------------------
     def set_candle(self, candle: Candle) -> None:
@@ -158,6 +171,71 @@ class SimNadoAdapter(NadoAdapterBase):
                 continue
             fee = remaining * order.price * maker
             self._record_fill(order, remaining, order.price, fee)
+
+    def match_triggers(self) -> None:
+        """Fire armed PRICE-TRIGGER orders crossed by the current bar, then apply
+        the fill — the trigger analogue of :meth:`match_resting`, called once per
+        bar BEFORE the controller ticks (so a trigger placed on a prior bar cannot
+        fire earlier than the next bar). No look-ahead.
+
+        Fire condition (mirrors the venue's mid trigger, read against the bar's
+        RANGE): a BUY-side trigger (an entry BUY, or a SHORT's reduce-only stop —
+        a BUY close) fires when the bar HIGH reaches its level; a SELL-side trigger
+        (an entry SELL, or a LONG's stop — a SELL close) fires when the bar LOW
+        reaches it. A triggered order CROSSES, so it fills at its level adjusted for
+        slippage and pays the TAKER fee; a reduce-only stop is clamped to the
+        current position so it can only shrink it.
+        """
+        c = self._candle
+        if c is None:
+            return
+        taker = self.costs.taker_fee
+        slip = self.costs.slippage_pct
+        # Snapshot the ARMED set at entry: a rung armed by a fire during this bar (a
+        # dependent whose parent just fired) becomes eligible on the NEXT bar.
+        eligible = [tid for tid, t in self._triggers.items() if t["armed"]]
+        for tid in eligible:
+            t = self._triggers.get(tid)
+            if t is None:
+                continue
+            order = t["order"]
+            if order.state.is_terminal:
+                continue
+            level = t["level"]
+            fire_above = order.side is TradeType.BUY
+            crossed = (c.high >= level) if fire_above else (c.low <= level)
+            if not crossed:
+                continue
+            if t["kind"] == "reduce":
+                # Reduce-only: close AT MOST the current position (never grow/flip).
+                held = abs(self._net_base.get(order.trading_pair, Decimal(0)))
+                amount = min(order.amount_base, held)
+            else:
+                amount = order.amount_base
+            if amount <= 0:
+                self._triggers.pop(tid, None)
+                continue
+            fill_px = (level * (Decimal(1) + slip) if order.side is TradeType.BUY
+                       else level * (Decimal(1) - slip))
+            fee = amount * fill_px * taker
+            self._record_fill(order, amount, fill_px, fee)
+            # Book into inventory so the report (which reads inventory) sees the
+            # trigger controller's PnL/fees. Executor strategies book their own
+            # fills; a trigger strategy runs no executor, so this is its only path.
+            if self._inventory is not None:
+                self._inventory.apply_fill(
+                    self._user_id, order.trading_pair, self._controller_id,
+                    order.side, amount, amount * fill_px, fee, timestamp=c.ts,
+                )
+            self._arm_dependents(tid)
+            self._triggers.pop(tid, None)
+
+    def _arm_dependents(self, parent_id: str) -> None:
+        for t in self._triggers.values():
+            dep = t["dependency"]
+            dep_digest = getattr(dep, "digest", dep)
+            if dep_digest == parent_id:
+                t["armed"] = True
 
     def accrue_funding(self) -> None:
         """Accrue one bar of funding on each held position. Received-positive: a
@@ -247,6 +325,77 @@ class SimNadoAdapter(NadoAdapterBase):
             return False
         order.state = OrderState.CANCELLED
         return True
+
+    # -- price-trigger surface (Reverse Grid) -----------------------------
+    async def place_trigger_order(
+        self,
+        trading_pair: str,
+        side: TradeType,
+        amount_base: Decimal,
+        trigger_price: Decimal,
+        *,
+        slippage_pct: float = 0.5,
+        dependency: Optional[str] = None,
+    ) -> NadoOrder:
+        if _dec(amount_base) <= 0:
+            raise AdapterError("place_trigger_order requires a positive amount")
+        if _dec(trigger_price) <= 0:
+            raise AdapterError("place_trigger_order requires a positive trigger price")
+        self._counter += 1
+        tid = f"sim-trg-{self._counter}"
+        order = NadoOrder(
+            id=tid, trading_pair=trading_pair, side=side, order_type=OrderType.LIMIT,
+            amount_base=_dec(amount_base), price=_dec(trigger_price),
+        )
+        self._triggers[tid] = {
+            "order": order, "level": _dec(trigger_price), "kind": "entry",
+            "dependency": dependency, "armed": dependency is None,
+        }
+        return copy.copy(order)
+
+    async def place_stop_order(
+        self,
+        trading_pair: str,
+        close_size: Decimal,
+        stop_price: Decimal,
+        position_is_long: bool,
+        *,
+        slippage_pct: float = 0.5,
+    ) -> NadoOrder:
+        if _dec(close_size) <= 0:
+            raise AdapterError("place_stop_order requires a positive close size")
+        if _dec(stop_price) <= 0:
+            raise AdapterError("place_stop_order requires a positive stop price")
+        self._counter += 1
+        sid = f"sim-stp-{self._counter}"
+        close_side = TradeType.SELL if position_is_long else TradeType.BUY
+        order = NadoOrder(
+            id=sid, trading_pair=trading_pair, side=close_side, order_type=OrderType.LIMIT,
+            amount_base=_dec(close_size), price=_dec(stop_price),
+        )
+        self._triggers[sid] = {
+            "order": order, "level": _dec(stop_price), "kind": "reduce",
+            "dependency": None, "armed": True,
+        }
+        return copy.copy(order)
+
+    async def cancel_trigger_order(self, order_id: str) -> bool:
+        t = self._triggers.get(order_id)
+        if t is None:
+            return False
+        order = t["order"]
+        if order.state.is_terminal:
+            self._triggers.pop(order_id, None)
+            return False
+        order.state = OrderState.CANCELLED
+        self._triggers.pop(order_id, None)
+        return True
+
+    async def held_base(self, trading_pair: str) -> Optional[Decimal]:
+        """The signed net position from fills — the position poll a trigger
+        controller reconciles against. The sim venue is always readable, so this
+        never returns None (a real venue may)."""
+        return _dec(self._net_base.get(trading_pair, Decimal(0)))
 
     async def order_status(self, order_id: str) -> NadoOrder:
         order = self._orders.get(order_id)

@@ -104,8 +104,13 @@ class BacktestEngine:
             self.candles.sort(key=lambda c: c.ts)
         self.user_id = user_id
         self.controller_id = controller_id
-        self.adapter = SimNadoAdapter(costs=costs, meta=meta)
+        # Inventory first: the sim books trigger-driven fills (Reverse Grid) into it
+        # directly — a trigger strategy runs no executor to book them the usual way.
         self.inventory = InventoryRepository()
+        self.adapter = SimNadoAdapter(
+            costs=costs, meta=meta, inventory=self.inventory,
+            user_id=user_id, controller_id=controller_id,
+        )
         self.orchestrator = ExecutorOrchestrator(
             risk_engine=RiskEngine(limits or _permissive_limits()),
             risk_state_provider=lambda _cid: RiskState(),
@@ -152,6 +157,7 @@ class BacktestEngine:
             candle = self.candles[i]
             self.adapter.set_candle(candle)
             self.adapter.match_resting()
+            self.adapter.match_triggers()
             try:
                 await self.orchestrator.tick_controller(self.controller.id)
             except Exception:  # noqa: BLE001 - a tick error shouldn't abort the run
