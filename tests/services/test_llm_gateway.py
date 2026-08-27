@@ -37,8 +37,10 @@ def test_gateway_on_with_key(monkeypatch):
 
 
 def test_model_for_precedence(monkeypatch):
-    # built-in defaults (verified NanoGPT ids)
-    assert llm_gateway.model_for("finance") == "dmind/dmind-1"
+    # built-in defaults (verified NanoGPT ids). Finance moved off the retired
+    # dmind/dmind-1 to Claude Opus 4.8 (2026-08-26 decision — DMind-3 is a GPU-only
+    # ~20B model with no hosted provider; un-runnable on our 1-CPU/2GB prod box).
+    assert llm_gateway.model_for("finance") == "anthropic/claude-opus-4.8"
     assert llm_gateway.model_for("chat") == "anthropic/claude-sonnet-5"
     assert llm_gateway.model_for("ta") == "anthropic/claude-opus-4.8"
     assert llm_gateway.model_for("web") == "openai/gpt-5-mini"

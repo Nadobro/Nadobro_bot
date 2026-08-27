@@ -71,13 +71,17 @@ def _analyze_via_nanogpt(
     task: str,
     schema_hint: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    # Finance/analyst reasoning defaults to the Web3-native DMind model on
-    # NanoGPT (one key). Override with NANOGPT_FINANCE_MODEL (e.g. dmind/dmind-1,
-    # or dmind/dmind-3 once it is hosted). Sanitized so a value pasted with a
-    # trailing "# note" is stripped to the bare model id.
+    # Finance/analyst reasoning defaults to Claude Opus 4.8 on NanoGPT (one key).
+    # DECISION (2026-08-26): NanoGPT RETIRED dmind/dmind-1 (HTTP 400 "Model is
+    # disabled"), and DMind-3 has no hosted inference provider and is a ~20B+ GPU
+    # model — un-runnable on our 1-CPU / 2GB / no-GPU prod box (fly.toml). Opus 4.8
+    # is already the proven Market-Call model here and out-reasons a 20B model on
+    # structured JSON analysis; this tier is advisory-only and fails open, so a
+    # frontier hosted model is the rational choice over self-hosting. Override with
+    # NANOGPT_FINANCE_MODEL (sanitized: a trailing "# note" is stripped).
     from src.nadobro.connectors.provider_config import clean_env_value
 
-    model = clean_env_value(os.environ.get("NANOGPT_FINANCE_MODEL")) or "dmind/dmind-1"
+    model = clean_env_value(os.environ.get("NANOGPT_FINANCE_MODEL")) or "anthropic/claude-opus-4.8"
     user_payload = json.dumps(
         {
             "task": task,

@@ -13,14 +13,14 @@ factory returns, never the call itself.
 
 Per-task model env vars (set these to the exact model ids your NanoGPT plan
 lists — e.g. ``anthropic/claude-sonnet-5``, ``openai/gpt-5.5``,
-``openai/gpt-5-mini``, ``dmind/dmind-1``). Values are sanitized, so a stray
+``openai/gpt-5-mini``, ``anthropic/claude-opus-4.8``). Values are sanitized, so a stray
 trailing ``# note`` is stripped. Leave them UNSET to take the defaults below:
 
     NANOGPT_MODEL_CHAT      general chat + Ask Nadobro     (anthropic/claude-sonnet-5)
     NANOGPT_MODEL_TA        Market Call synthesizer        (anthropic/claude-opus-4.8)
     NANOGPT_MODEL_WEB       open-web research pack         (openai/gpt-5-mini)
     NANOGPT_MODEL_X         X/Twitter research pack        (x-ai/grok-4-fast)
-    NANOGPT_MODEL_FINANCE   finance / analyst reasoning    (dmind/dmind-1)
+    NANOGPT_MODEL_FINANCE   finance / analyst reasoning    (anthropic/claude-opus-4.8)
     NANOGPT_MODEL_BRIEF     morning brief / news synthesis (anthropic/claude-sonnet-5)
     NANOGPT_MODEL_INTENT    cheap/fast intent classify     (openai/gpt-5-mini)
     NANOGPT_MODEL_SCAN      edge / market alpha scanning   (anthropic/claude-sonnet-5)
@@ -57,7 +57,7 @@ _TASK_MODEL_ENV: dict[str, tuple[str, str]] = {
     "ta": ("NANOGPT_MODEL_TA", "anthropic/claude-opus-4.8"),
     "web": ("NANOGPT_MODEL_WEB", "openai/gpt-5-mini"),
     "x": ("NANOGPT_MODEL_X", "x-ai/grok-4-fast"),
-    "finance": ("NANOGPT_MODEL_FINANCE", "dmind/dmind-1"),
+    "finance": ("NANOGPT_MODEL_FINANCE", "anthropic/claude-opus-4.8"),
     "brief": ("NANOGPT_MODEL_BRIEF", "anthropic/claude-sonnet-5"),
     "intent": ("NANOGPT_MODEL_INTENT", "openai/gpt-5-mini"),
     "scan": ("NANOGPT_MODEL_SCAN", "anthropic/claude-sonnet-5"),
