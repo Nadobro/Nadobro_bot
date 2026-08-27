@@ -115,6 +115,12 @@ class ReverseGridController(Controller):
         self._stop_level: Optional[Decimal] = None
         self._stop_size: Optional[Decimal] = None
         self._last_mid: Optional[Decimal] = None
+        # Order telemetry for /status. The base order_counts() sums executors, which
+        # this controller has none of — it manages venue triggers directly — so it
+        # tracks its own placed / filled / cancelled counts and overrides that method.
+        self._n_placed = 0
+        self._n_filled = 0
+        self._n_cancelled = 0
 
     # -- config ---------------------------------------------------------------
     def _load_config(self) -> None:
@@ -350,6 +356,7 @@ class ReverseGridController(Controller):
                     continue
                 self._rungs.append(_Rung(order.id, side, level, size))
                 placed += 1
+        self._n_placed += placed
         logger.info(
             "revgrid armed %s trigger rungs around anchor %s (levels=%s step=%s "
             "user=%s pair=%s)",
@@ -378,6 +385,8 @@ class ReverseGridController(Controller):
 
     async def _cancel_all_rungs(self) -> None:
         for r in self._rungs:
+            if not r.fired:
+                self._n_cancelled += 1
             try:
                 await self.adapter.cancel_trigger_order(r.digest)
             except AdapterError:
@@ -388,6 +397,7 @@ class ReverseGridController(Controller):
         keep: List[_Rung] = []
         for r in self._rungs:
             if r.side is side and not r.fired:
+                self._n_cancelled += 1
                 try:
                     await self.adapter.cancel_trigger_order(r.digest)
                 except AdapterError:
@@ -436,6 +446,8 @@ class ReverseGridController(Controller):
             take = min(r.size_base, target - acc)
             if take <= 0:
                 continue
+            if not r.fired:
+                self._n_filled += 1     # a rung just fired (entry / add)
             r.fired = True
             num += r.level * take
             acc += take
@@ -496,11 +508,13 @@ class ReverseGridController(Controller):
                 size, level, long, self.user_id, self.trading_pair, exc_info=True,
             )
             return
+        self._n_placed += 1
         old = self._stop_digest
         self._stop_digest = order.id
         self._stop_level = level
         self._stop_size = size
         if old is not None:
+            self._n_cancelled += 1
             try:
                 await self.adapter.cancel_trigger_order(old)
             except AdapterError:
@@ -511,6 +525,7 @@ class ReverseGridController(Controller):
         """The position is flat (stop fired / rail flattened). Cancel any residual
         triggers — the stop and any still-resting rungs — and clear all position
         and ladder state so the next flat tick re-anchors to the current mid."""
+        self._n_filled += 1       # the exit that flattened the position (stop / rail)
         if self._stop_digest is not None:
             try:
                 await self.adapter.cancel_trigger_order(self._stop_digest)
@@ -529,10 +544,44 @@ class ReverseGridController(Controller):
         self._stop_size = None
 
     # -- introspection (for /status and tests) -------------------------------
-    def grid_metrics(self) -> dict:
+    def order_counts(self) -> dict:
+        """Trigger activity for /status. Overrides the base (which sums executors —
+        this controller has none). placed = rungs + stops armed; filled = rungs that
+        fired + exits; cancelled = triggers/stops cancelled. Approximate but real,
+        so /status shows activity instead of a flat zero."""
         return {
-            "anchor": self._anchor,
-            "net_base": self._pos_base,
+            "orders_placed": self._n_placed,
+            "orders_filled": self._n_filled,
+            "orders_cancelled": self._n_cancelled,
+        }
+
+    def grid_metrics(self) -> dict:
+        """Telemetry for the /status card. Emits the SAME ``grid_*`` keys the legacy
+        rgrid card pipeline reads (bot_runtime maps them to ``rgrid_*``; formatters
+        renders them), so the trigger reverse grid renders in the existing card
+        instead of showing blanks — plus a few reverse-grid extras the card ignores
+        but tests / logs use."""
+        anchor = self._anchor
+        long = self._pos_base > 0
+        short = self._pos_base < 0
+        drift_pct = 0.0
+        if anchor and anchor > 0 and self._last_mid is not None:
+            drift_pct = float((self._last_mid - anchor) / anchor * Decimal(100))
+        entry = float(self._avg_entry) if self._avg_entry else 0.0
+        return {
+            # --- keys the rgrid /status card consumes ---
+            "grid_anchor_price": float(anchor) if anchor else 0.0,
+            "grid_net_base": float(self._pos_base),
+            # The reverse grid has one cost basis, not two exposure legs; surface it
+            # on the side actually held so the card shows a real entry.
+            "grid_buy_exposure_price": entry if long else 0.0,
+            "grid_sell_exposure_price": entry if short else 0.0,
+            "grid_drift_from_anchor_pct": drift_pct,
+            # The trailing stop IS the reverse grid's "soft reset": armed once in
+            # profit, it ratchets the exit with the move.
+            "grid_reset_active": bool(self._trail_armed),
+            "grid_reset_side": "long" if long else ("short" if short else "none"),
+            # --- reverse-grid extras (ignored by the card; used by tests/logs) ---
             "avg_entry": self._avg_entry,
             "stop_level": self._stop_level,
             "trail_armed": self._trail_armed,

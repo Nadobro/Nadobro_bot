@@ -211,6 +211,45 @@ def test_on_stop_cancels_all_triggers():
     asyncio.run(body())
 
 
+# ── /status telemetry (order_counts + grid_metrics card keys) ──────────
+
+def test_order_counts_track_trigger_activity():
+    async def body():
+        a = _adapter()
+        c = _controller(a)
+        await c.on_tick()                          # arm 4 rungs
+        assert c.order_counts()["orders_placed"] == 4
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))         # BUY@101 fires
+        await c.on_tick()                           # open long: cancel sells, arm stop
+        counts = c.order_counts()
+        assert counts["orders_placed"] > 4          # + the stop
+        assert counts["orders_filled"] >= 1         # the rung that fired
+        assert counts["orders_cancelled"] >= 2      # the two SELL rungs
+
+    asyncio.run(body())
+
+
+def test_grid_metrics_emits_the_status_card_keys():
+    async def body():
+        a = _adapter()
+        c = _controller(a)
+        await c.on_tick()
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))
+        await c.on_tick()
+        m = c.grid_metrics()
+        # the keys the rgrid /status card pipeline consumes
+        for key in ("grid_anchor_price", "grid_net_base", "grid_drift_from_anchor_pct",
+                    "grid_reset_active", "grid_reset_side", "grid_buy_exposure_price"):
+            assert key in m, key
+        assert m["grid_net_base"] > 0                # long
+        assert m["grid_reset_side"] == "long"
+        assert m["grid_buy_exposure_price"] > 0      # avg entry surfaced on the held side
+
+    asyncio.run(body())
+
+
 # ── short side mirrors long ────────────────────────────────────────────
 
 def test_first_sell_fill_opens_a_short_and_arms_stop_above():

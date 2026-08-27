@@ -73,6 +73,20 @@ def test_map_strategy_config_routes_rgrid_by_flag(monkeypatch):
     assert on["step_pct"] == Decimal("0.002")         # a 20bp spread is honoured
 
 
+def test_dgrid_trend_subconfig_stays_legacy_even_with_flag_on(monkeypatch):
+    """CRITICAL: D-Grid builds its trend phase as a legacy RGridController DIRECTLY
+    (not via build_controller), so its `trend_rgrid` sub-config must stay the legacy
+    rgrid shape even when the flag is on — else D-Grid's trend phase gets a config it
+    cannot read."""
+    monkeypatch.setenv("NADO_REVGRID_TRIGGER_ENABLED", "1")
+    dg = er.map_strategy_config("dgrid", {"levels": 4}, Decimal("79000"),
+                                product=PAIR, leverage=5)
+    trend = dg.get("trend_rgrid")
+    assert isinstance(trend, dict)
+    assert "spread_ask_pct" in trend            # the legacy RGridController's key
+    assert "step_pct" not in trend               # NOT the trigger-controller shape
+
+
 def test_revgrid_step_is_floored_to_the_viable_zone(monkeypatch):
     monkeypatch.setenv("NADO_REVGRID_TRIGGER_ENABLED", "1")
     # a too-tight 10bp spread is floored UP to the 15bp validated minimum
