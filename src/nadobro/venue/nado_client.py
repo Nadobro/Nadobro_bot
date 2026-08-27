@@ -1745,6 +1745,113 @@ class NadoClient:
             logger.error("place_reduce_only_stop failed: %s", _format_sdk_error(e))
             return {"success": False, "error": _format_sdk_error(e)}
 
+    async def place_entry_trigger_order(
+        self,
+        *,
+        product_id: int,
+        size: float,
+        trigger_price: float,
+        direction_is_buy: bool,
+        slippage_pct: float = 0.5,
+        isolated: bool = False,
+        client_id: Optional[int] = None,
+        dependency: Optional[object] = None,
+    ) -> dict:
+        """Place a NON-reduce-only ENTRY price-trigger order — the Reverse Grid rung
+        primitive. It OPENS/GROWS a position when the mid crosses ``trigger_price``,
+        the exact mirror of :meth:`place_reduce_only_stop`:
+
+          BUY  rung -> fires when the mid RISES above trigger_price (``mid_price_above``);
+          SELL rung -> fires when the mid FALLS below trigger_price (``mid_price_below``).
+
+        A reverse grid stacks BUY rungs ABOVE mid and SELL rungs BELOW mid — orders
+        that cannot rest as maker LIMITs (they would cross), which is exactly why the
+        maker-only R-Grid could not place them. A venue price-trigger is the correct
+        primitive: the venue watches the mid and fires the rung when the level is
+        crossed, so the ladder is placed ONCE (no per-cycle re-quoting — the
+        gateway-budget amplifier the old design suffered).
+
+        The triggered order is priced ``slippage_pct`` THROUGH the level so it
+        crosses and fills on trigger. ``never_grow`` is False by design — a rung is
+        MEANT to grow the book. ``dependency`` (another rung's digest) chains this
+        rung to fire only after that one fills, which builds a pyramid.
+
+        Reuses :meth:`_prepare_place_order_params` for the exact increment /
+        min-notional / signed-amount alignment the engine order path uses, then hands
+        the aligned x18 amount+price to the SDK's ``place_price_trigger_order``.
+
+        Returns ``{"success": bool, ...}``; never raises.
+        """
+        if not self._ensure_sdk_client():
+            return {"success": False, "error": "Client not initialized"}
+        trigger_client = getattr(getattr(self.client, "context", None), "trigger_client", None)
+        if not trigger_client:
+            return {"success": False, "error": "Trigger client not initialized"}
+        if not (product_id and size and size > 0 and trigger_price and trigger_price > 0):
+            return {"success": False, "error": "invalid trigger parameters"}
+
+        # Price the limit THROUGH the level so the triggered order crosses and
+        # fills: a buy rung rests a touch ABOVE its level, a sell rung a touch BELOW.
+        slip = max(0.0, float(slippage_pct)) / 100.0
+        order_price = (trigger_price * (1.0 + slip) if direction_is_buy
+                       else trigger_price * (1.0 - slip))
+        if order_price <= 0:
+            return {"success": False, "error": "invalid trigger order price"}
+
+        # Reuse the single order-construction home for aligned x18 amount+price.
+        # reduce_only=False and never_grow=False: this is an ENTRY that opens/grows.
+        params, _tag, _size, _price, err = self._prepare_place_order_params(
+            product_id=int(product_id),
+            size=float(size),
+            price=float(order_price),
+            order_type="default",
+            is_buy=bool(direction_is_buy),
+            isolated_only=bool(isolated),
+            isolated_margin=None,
+            reduce_only=False,
+            sender=None,
+            client_id=client_id,
+            never_grow=False,
+        )
+        if err is not None:
+            return err
+        amount_x18 = int(params.order.amount)
+        price_x18 = int(params.order.priceX18)
+        trigger_price_x18 = self._to_x18_int(float(trigger_price))
+        price_increment_x18 = _price_increment_x18_cache.get((self.network, int(product_id)))
+        if price_increment_x18 and price_increment_x18 > 0:
+            trigger_price_x18 = self._align_x18_to_increment(trigger_price_x18, int(price_increment_x18))
+        # BUY rung fires on a RISE (mid_price_above); SELL rung on a FALL (mid_price_below).
+        trigger_type = "mid_price_above" if direction_is_buy else "mid_price_below"
+
+        if not self._gateway_allowed(
+            weight=5, kind="execute", wallet=self.subaccount_hex, user_scoped=False
+        ):
+            return {"success": False, "error": "Rate limited — please retry in a moment.", "rate_limited": True}
+        try:
+            kwargs = dict(
+                product_id=int(product_id),
+                price_x18=str(price_x18),
+                amount_x18=str(amount_x18),
+                trigger_price_x18=str(trigger_price_x18),
+                trigger_type=trigger_type,
+                reduce_only=False,
+                sender=self.subaccount_hex,
+            )
+            if dependency is not None:
+                kwargs["dependency"] = dependency
+            resp = await run_blocking_exec(trigger_client.place_price_trigger_order, **kwargs)
+            return {
+                "success": True,
+                "trigger_type": trigger_type,
+                "trigger_price": float(trigger_price),
+                "amount_x18": str(amount_x18),
+                "response": self._to_plain(resp),
+            }
+        except Exception as e:  # noqa: BLE001 - venue-write guard: never raise
+            logger.error("place_entry_trigger_order failed: %s", _format_sdk_error(e))
+            return {"success": False, "error": _format_sdk_error(e)}
+
     @staticmethod
     def _from_x18_dynamic(value) -> float:
         if value is None:
