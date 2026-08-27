@@ -126,6 +126,21 @@ def deterministic_controller_id(strategy: str, user_id: int, network: str) -> st
     return f"{strategy}:{int(user_id)}:{str(network)}"
 
 
+def revgrid_trigger_enabled() -> bool:
+    """Route the ``rgrid`` strategy to the trigger-based ``ReverseGridController``
+    (native venue price-trigger rungs) instead of the legacy maker ``RGridController``.
+
+    DEFAULT OFF — a deliberate no-default-flip: ``rgrid`` keeps its shipped controller
+    until the trigger rebuild is validated on a testnet paper run. The strategy id,
+    UI, session identity and SL/TP plumbing are all UNCHANGED — only the engine
+    controller and its config dict change under the flag. Flip on a TESTNET deploy
+    (``NADO_REVGRID_TRIGGER_ENABLED=1``) to run the paper trial; never a live default
+    until that trial passes (see the Aug-2026 grid-family regression)."""
+    from src.nadobro.utils.env import env_bool
+
+    return env_bool("NADO_REVGRID_TRIGGER_ENABLED", False)
+
+
 def build_controller(
     strategy: str,
     *,
@@ -139,10 +154,15 @@ def build_controller(
 ) -> Controller:
     cls = CONTROLLER_REGISTRY.get(strategy)
     # Grid opt-in: fill-anchored maker quoting replaces the classic ladder when the
-    # user enables ``fill_anchored``. rgrid is NEVER overridden — Reverse Grid has
-    # exactly one engine, and the registry already points at it.
+    # user enables ``fill_anchored``. rgrid is NEVER overridden here — Reverse Grid
+    # has exactly one engine, and the registry already points at it.
     if strategy != "rgrid" and configs.get("controller_override") == "fill_anchored":
         cls = FillAnchoredQuotingController
+    # Flag-gated Reverse Grid rebuild: run the trigger controller for `rgrid` when the
+    # env flag is on (testnet paper trial). map_strategy_config produces the matching
+    # config under the same flag.
+    if strategy == "rgrid" and revgrid_trigger_enabled():
+        cls = ReverseGridController
     if cls is None:
         raise ValueError(f"no engine controller for strategy '{strategy}'")
     return cls(
@@ -651,6 +671,13 @@ async def _apply_live_controller_update(
     controller.limits = limits
     _apply_orchestrator_risk_limits(orch, limits)
 
+    if isinstance(controller, ReverseGridController):
+        # Trigger Reverse Grid: re-read the geometry/gate params from the refreshed
+        # configs (reload_config leaves the open position + its trailing stop alone).
+        # It manages its own venue triggers, so there is nothing here to cancel/reset.
+        controller.reload_config()
+        return
+
     if isinstance(controller, RGridController):
         # R-Grid rests nothing, so there are no quotes to reset — cancelling here
         # would be a no-op that still churns the venue.
@@ -943,6 +970,79 @@ def _effective_leverage(settings: Dict[str, Any], fallback: float = 1.0) -> floa
     if raw <= 0:
         raw = float(fallback or 1.0)
     return max(1.0, raw)
+
+
+# The trigger Reverse Grid's rung SPACING floor. The controller floors the step at
+# the taker round trip (~8.6bp) so a rung is never a structural loss; this is the
+# tighter, validation-derived floor for the DEFAULT config — the Aug-2026 real-tape
+# sweep showed ~15-25bp is the viable zone (10bp bled chop, wider gave back trend).
+# A user's own wider spread is honoured above it; it can only ever WIDEN the step.
+_REVGRID_STEP_FLOOR = Decimal("0.0015")
+
+
+def _map_revgrid_config(
+    settings: Dict[str, Any],
+    mid: Decimal,
+    *,
+    product: str,
+    levels: int,
+    deployed: float,
+    spread_frac: Decimal,
+    chunk_dec: Optional[Decimal],
+    sl_pct: float,
+    leverage: int,
+) -> Dict[str, object]:
+    """Config for the trigger-based ``ReverseGridController`` (flag-gated `rgrid`).
+
+    Reuses the SAME step sizing as the legacy rgrid mapping (``resolve_step_quote``:
+    ``deployed / levels`` shrunk by a POV chunk and by the stop budget, floored at
+    the venue minimum), so the per-rung notional and the stop-budget discipline are
+    unchanged. The controller derives its stop / trail geometry from ``step_pct``,
+    so only the essentials are set here; the chop stand-down gate is ON by default.
+    ``candle_provider`` is injected later by ``run_engine_cycle`` (rgrid is already
+    in its injection set)."""
+    from src.nadobro.quant.mm_quote_math import DEFAULT_MIN_ORDER_NOTIONAL_USD
+    from src.nadobro.quant.rgrid_sizing import resolve_step_quote, step_band_frac
+    from src.nadobro.strategy.strategy_registry import session_margin_usd
+
+    # Rung spacing: the user's spread, floored to the validated viable-zone minimum
+    # (never below — a too-tight reverse grid bleeds chop). The controller applies
+    # its own round-trip floor on top, so this can only widen the step.
+    step_pct = max(spread_frac, _REVGRID_STEP_FLOOR)
+    # Stop budget = the margin the session rail measures against × the user's SL%,
+    # exactly as the legacy rgrid mapping sizes it.
+    rg_margin = session_margin_usd(settings) or float(deployed) / max(1.0, float(leverage or 1))
+    stop_budget = rg_margin * max(0.0, float(sl_pct)) / 100.0
+    plan = resolve_step_quote(
+        deployed_quote=deployed,
+        levels=levels,
+        chunk_quote=chunk_dec,
+        stop_budget_usd=stop_budget,
+        min_step_usd=DEFAULT_MIN_ORDER_NOTIONAL_USD,
+        band_frac=step_band_frac(step_pct, Decimal(0)),
+    )
+    cfg: Dict[str, object] = {
+        "trading_pair": product,
+        # Kept so /status and the overlay/live-reconfig routers keep recognising the
+        # exposure-anchored family; the trigger controller ignores anchor_mode.
+        "anchor_mode": "rgrid",
+        "levels": int(levels),
+        "step_pct": step_pct,
+        "order_amount_quote": plan.step,
+        # The risk bound the (skipped) overlay may never exceed — kept for parity /
+        # future use; the trigger geometry is deterministic and unshaded.
+        "step_capped_quote": plan.step,
+        "leverage": int(leverage or 1),
+        # Chop stand-down gate ON by default (a reverse grid must not trade chop).
+        "revgrid_chop_stand_down": _as_bool(settings.get("rgrid_chop_stand_down", True), True),
+    }
+    # Honour explicit per-run geometry overrides if the operator set them (testnet
+    # tuning); otherwise the controller derives stop/trail from step_pct.
+    for key in ("stop_pct", "trail_arm_pct", "trail_giveback_pct", "reanchor_bands"):
+        raw = settings.get(f"revgrid_{key}")
+        if raw is not None:
+            cfg[key] = _dec(raw)
+    return cfg
 
 
 def map_strategy_config(
@@ -1421,6 +1521,15 @@ def map_strategy_config(
     # spread on a break; it never switches phase (that is D-Grid), rests no
     # ladder, and has no maker mode to opt out of.
     if strategy == "rgrid":
+        # Flag-gated trigger rebuild: produce the ReverseGridController config
+        # instead (testnet paper trial). build_controller swaps the class under the
+        # same flag; everything else about the `rgrid` strategy is unchanged.
+        if revgrid_trigger_enabled():
+            return _map_revgrid_config(
+                settings, mid, product=product, levels=levels, deployed=deployed,
+                spread_frac=spread_frac, chunk_dec=_chunk_dec, sl_pct=_sl_pct,
+                leverage=leverage,
+            )
         # The threshold ARMS the trailing soft reset, and the controller refuses one
         # that sits inside the entry band (an exit narrower than the trigger that
         # opened the trade would arm before the break is even established). The old
@@ -2300,6 +2409,12 @@ async def _maybe_apply_overlay(
         )
 
         if not overlay_applies(strategy):
+            return
+        # The trigger Reverse Grid's geometry is fully DETERMINISTIC — the engine +
+        # the venue book decide every entry/exit, and the handoff forbids the LLM
+        # overlay from shading it. Skip the overlay entirely for the flag-routed
+        # rgrid (the session rail remains the risk bound).
+        if strategy == "rgrid" and revgrid_trigger_enabled():
             return
         pid = _opt_int(product_id)
         if pid is None or client is None or not hasattr(client, "get_candlesticks"):
