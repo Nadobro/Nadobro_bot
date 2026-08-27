@@ -56,6 +56,22 @@ kill_timeout = 60
   # closes (never grows/flips). Kill-switch: set to "0" + redeploy. The software
   # rail (buffer + fast poll) is the primary stop and stays on regardless.
   NADO_VENUE_STOP_ENABLED = "1"
+  # Trigger-based Reverse Grid (PR #258/#259): routes the `rgrid` strategy to the
+  # native venue price-trigger ReverseGridController instead of the maker-only one
+  # (which placed 0 orders in a quiet book). ENABLED per owner decision — a
+  # deliberate override of the "testnet paper run first" gate, so WATCH on first
+  # deploy. Honest risk: a reverse grid WINS in trends and LOSES a little in chop
+  # BY DESIGN; the chop stand-down gate (default ON) + the session %-of-margin rail
+  # bound it (real-tape Aug-2026 validation: net + in trends, bounded chop loss,
+  # fee_leak==0). It affects the STANDALONE rgrid only — D-Grid's trend phase keeps
+  # the legacy RGridController (map_strategy_config `_for_dgrid_trend` guard).
+  # WATCH: get_trigger_orders shows buy triggers ABOVE / sell triggers BELOW mid
+  # while flat; on the first fill the opposite side cancels and ONE reduce-only stop
+  # arms + trails; venue fills attribute to the run (turnover/PnL non-zero on
+  # /status); logs `revgrid armed N trigger rungs` / `revgrid OPEN`. Kill-switch:
+  # set to "0" + redeploy (rgrid reverts to the maker controller; the session rail
+  # + venue stop keep protecting any open position either way).
+  NADO_REVGRID_TRIGGER_ENABLED = "1"
 
 [http_service]
   internal_port = 8080
