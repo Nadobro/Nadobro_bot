@@ -76,6 +76,13 @@ class MockNadoAdapter(NadoAdapterBase):
         # Current signed daily funding rate returned by funding_rate(); None =
         # "no signal" (the default — mimics a venue that isn't reporting yet).
         self.funding_rate_value: object = None
+        # Venue PRICE-TRIGGER orders (Reverse Grid rungs). Kept in their OWN maps,
+        # separate from _orders, so the double models the venue's separate trigger
+        # service: a trigger rests until the mid crosses its level, then fires.
+        #   _triggers: digest -> {order, trigger_price, side, dependency, armed}
+        self._triggers: Dict[str, dict] = {}
+        self.placed_triggers: List[NadoOrder] = []
+        self.cancelled_triggers: List[str] = []
 
     # -- test controls ----------------------------------------------------
     def set_mid(self, value: object) -> None:
@@ -198,6 +205,103 @@ class MockNadoAdapter(NadoAdapterBase):
         if order is None:
             raise AdapterError(f"unknown order {order_id}")
         return copy.copy(order)
+
+    # -- price-trigger orders (Reverse Grid rungs) ------------------------
+    async def place_trigger_order(
+        self,
+        trading_pair: str,
+        side: TradeType,
+        amount_base: Decimal,
+        trigger_price: Decimal,
+        *,
+        slippage_pct: float = 0.5,
+        dependency: Optional[str] = None,
+    ) -> NadoOrder:
+        self._maybe_fail("place_trigger_order")
+        if _dec(amount_base) <= 0:
+            raise AdapterError("place_trigger_order requires a positive amount")
+        if _dec(trigger_price) <= 0:
+            raise AdapterError("place_trigger_order requires a positive trigger price")
+        self._counter += 1
+        tid = f"trg-{self._counter}"
+        order = NadoOrder(
+            id=tid, trading_pair=trading_pair, side=side,
+            order_type=OrderType.LIMIT, amount_base=_dec(amount_base),
+            price=_dec(trigger_price),
+        )
+        self._triggers[tid] = {
+            "order": order,
+            "trigger_price": _dec(trigger_price),
+            "side": side,
+            "dependency": dependency,
+            # A dependent rung stays UNARMED until its parent fires (pyramiding);
+            # an independent rung is armed the moment it is placed.
+            "armed": dependency is None,
+        }
+        self.placed_triggers.append(order)
+        return copy.copy(order)
+
+    async def cancel_trigger_order(self, order_id: str) -> bool:
+        self._maybe_fail("cancel_trigger_order")
+        trg = self._triggers.get(order_id)
+        if trg is None:
+            return False
+        order = trg["order"]
+        if order.state.is_terminal:      # already fired / cancelled — idempotent
+            self._triggers.pop(order_id, None)
+            return False
+        order.state = OrderState.CANCELLED
+        self.cancelled_triggers.append(order_id)
+        self._triggers.pop(order_id, None)
+        return True
+
+    # -- test controls: make the venue "watch the mid" --------------------
+    def fire_trigger(self, order_id: str, *, price: object = None, fee: object = Decimal(0)) -> Fill:
+        """Fire ONE placed trigger as if the mid crossed its level: fill it, emit
+        the Fill onto the stream, and ARM any rung that depended on it (the
+        pyramiding chain). Raises KeyError for an unknown/terminal trigger."""
+        trg = self._triggers.get(order_id)
+        if trg is None:
+            raise KeyError(f"unknown trigger {order_id}")
+        order = trg["order"]
+        fill_px = _dec(price) if price is not None else trg["trigger_price"]
+        fill = self._apply_fill(order, order.amount_base, fill_px, _dec(fee), partial=False)
+        self._arm_dependents(order_id)
+        self._triggers.pop(order_id, None)
+        return fill
+
+    def cross_triggers(self, mid: object) -> List[Fill]:
+        """Fire every ARMED placed trigger whose level ``mid`` has crossed — a BUY
+        rung when ``mid >= trigger_price``, a SELL rung when ``mid <= trigger_price``
+        — filled AT ``mid``. Returns the fills in placement order. Models the
+        venue watching the mid one tick at a time; call it repeatedly along a
+        tape. A rung armed by this crossing (a freshly-fired parent's dependent)
+        is eligible on the NEXT call, not this one."""
+        mid_d = _dec(mid)
+        fills: List[Fill] = []
+        # Snapshot the set ARMED at entry: a rung armed by a fire DURING this call
+        # (a freshly-fired parent's dependent) becomes eligible on the NEXT call,
+        # not this one — so pyramiding advances one rung per tick, deterministically.
+        eligible = [tid for tid, trg in self._triggers.items() if trg["armed"]]
+        for tid in eligible:
+            trg = self._triggers.get(tid)
+            if trg is None:
+                continue
+            order = trg["order"]
+            if order.state.is_terminal:
+                continue
+            tp = trg["trigger_price"]
+            crossed = (mid_d >= tp) if trg["side"] is TradeType.BUY else (mid_d <= tp)
+            if crossed:
+                fills.append(self.fire_trigger(tid, price=mid_d))
+        return fills
+
+    def _arm_dependents(self, parent_id: str) -> None:
+        for trg in self._triggers.values():
+            dep = trg["dependency"]
+            dep_digest = getattr(dep, "digest", dep)   # accept a digest or a wrapper
+            if dep_digest == parent_id:
+                trg["armed"] = True
 
     async def cancel_and_place(
         self,

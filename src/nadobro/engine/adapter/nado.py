@@ -264,6 +264,33 @@ def _client_call_succeeded(resp: Any) -> tuple[bool, str]:
     return True, ""
 
 
+def _trigger_digest(resp: object) -> str:
+    """Pull the trigger order's digest from a ``place_entry_trigger_order`` /
+    ``place_reduce_only_stop`` response so a later cancel can target exactly this
+    trigger. The trigger-service payload nests the digest under ``response`` (and
+    sometimes ``response.data``) rather than at the top level, so probe the same
+    shapes ``strategy/venue_stop.py::_extract_digest`` handles. Returns ``''``
+    when no digest is present (the caller then fails the placement loudly — a
+    trigger we can't address is a trigger we can't cancel)."""
+    if not isinstance(resp, dict):
+        return ""
+    inner = resp.get("response")
+    for container in (resp, inner if isinstance(inner, dict) else {}):
+        if not isinstance(container, dict):
+            continue
+        for key in _DIGEST_KEYS:
+            v = container.get(key)
+            if v:
+                return str(v)
+        data = container.get("data")
+        if isinstance(data, dict):
+            for key in _DIGEST_KEYS:
+                v = data.get(key)
+                if v:
+                    return str(v)
+    return ""
+
+
 class NadoAdapter(NadoAdapterBase):
     connector_name = "nado"
 
@@ -290,6 +317,12 @@ class NadoAdapter(NadoAdapterBase):
         # Per-product open-orders snapshot for intra-tick coalescing (see
         # _OPEN_ORDERS_SNAP_TTL_S): product_id -> (monotonic_ts, orders).
         self._open_orders_snap: Dict[int, tuple[float, list]] = {}
+        # SEPARATE registry for venue PRICE-TRIGGER orders (Reverse Grid rungs).
+        # Kept apart from ``_orders`` on purpose: a trigger digest is cancelled
+        # through the venue's trigger service (``cancel_trigger_order``), NOT the
+        # resting-order path — mixing them would route a trigger cancel to the
+        # wrong endpoint and leak the trigger. digest -> _OrderRef.
+        self._trigger_orders: Dict[str, _OrderRef] = {}
 
     # -- product metadata -------------------------------------------------
     def _meta(self, trading_pair: str) -> ProductMeta:
@@ -679,6 +712,121 @@ class NadoAdapter(NadoAdapterBase):
             logger.debug("registry forget failed for %s", order_id, exc_info=True)
         if ref is not None:
             self._open_orders_snap.pop(int(ref.product_id), None)
+
+    # -- price-trigger orders (Reverse Grid rungs) ------------------------
+    async def place_trigger_order(
+        self,
+        trading_pair: str,
+        side: TradeType,
+        amount_base: Decimal,
+        trigger_price: Decimal,
+        *,
+        slippage_pct: float = 0.5,
+        dependency: Optional[str] = None,
+    ) -> NadoOrder:
+        """Place a venue PRICE-TRIGGER entry rung (see the base-class contract).
+
+        Thin wrapper over :meth:`NadoClient.place_entry_trigger_order`: the client
+        owns the per-side trigger encoding (BUY→``mid_price_above`` + a +amount,
+        SELL→``mid_price_below`` + a −amount), the through-the-level pricing, and
+        the increment / min-notional alignment. The adapter maps the engine's
+        ``TradeType`` to the client's ``direction_is_buy`` flag, records the
+        trigger digest in the SEPARATE ``_trigger_orders`` registry, and returns a
+        :class:`NadoOrder` whose ``id`` is that digest.
+
+        Unlike ``place_order`` this does NOT tag the order or call the placement
+        session-link hook: a trigger's FILL surfaces later (with its own digest)
+        via the fill→legacy-table bridge, so attribution is done there, not at
+        placement time.
+        """
+        meta = self._meta(trading_pair)
+        is_buy = side is TradeType.BUY
+        amount = abs(float(amount_base))
+        trig = float(trigger_price)
+        if amount <= 0:
+            raise AdapterError("place_trigger_order requires a positive amount")
+        if trig <= 0:
+            raise AdapterError("place_trigger_order requires a positive trigger price")
+
+        logger.info(
+            "engine place_trigger_order pair=%s pid=%s side=%s amount_base=%s "
+            "trigger_price=%s isolated_only=%s dependency=%s",
+            trading_pair, meta.product_id, side.name, amount_base, trig,
+            meta.isolated_only, dependency,
+        )
+        # The client method is ``async`` and offloads the blocking SDK call to the
+        # execution pool itself (like place_reduce_only_stop / cancel_trigger_orders),
+        # so AWAIT it directly — do NOT wrap it in _exec (which expects a sync fn).
+        try:
+            resp = await self._client.place_entry_trigger_order(
+                product_id=meta.product_id,
+                size=amount,
+                trigger_price=trig,
+                direction_is_buy=is_buy,
+                slippage_pct=float(slippage_pct),
+                isolated=bool(meta.isolated_only),
+                dependency=dependency,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize venue errors
+            raise AdapterError(f"place_trigger_order failed: {exc}") from exc
+
+        ok, err = _client_call_succeeded(resp)
+        if not ok:
+            raise AdapterError(f"place_trigger_order rejected by venue: {err}")
+
+        digest = _trigger_digest(resp)
+        if not digest:
+            # A trigger we cannot address is a trigger we cannot cancel — fail
+            # loudly rather than leak an untracked rung onto the venue.
+            raise AdapterError("venue did not return a trigger order digest")
+
+        ref = _OrderRef(
+            trading_pair, meta.product_id, side, OrderType.LIMIT,
+            abs(_dec(amount_base)), _dec(trigger_price),
+        )
+        self._trigger_orders[digest] = ref
+        try:
+            self._registry.record(digest, ref)
+        except Exception:  # noqa: BLE001 - persistence must not break placement
+            logger.warning("trigger registry record failed for %s", digest, exc_info=True)
+        return NadoOrder(
+            id=digest, trading_pair=trading_pair, side=side,
+            order_type=OrderType.LIMIT, amount_base=abs(_dec(amount_base)),
+            price=_dec(trigger_price), state=OrderState.OPEN,
+        )
+
+    async def cancel_trigger_order(self, order_id: str) -> bool:
+        """Cancel a resting price-trigger by digest via the venue TRIGGER service
+        (see the base-class contract). Idempotent: an unknown trigger returns
+        ``False`` without a venue call."""
+        if not order_id:
+            return False
+        ref = self._trigger_orders.get(order_id) or self._registry.lookup(order_id)
+        if ref is None:
+            # Not one of our tracked triggers — nothing to cancel, and we have no
+            # product_id to target the trigger service with anyway.
+            return False
+        # ``cancel_trigger_orders`` is async and offloads to the execution pool
+        # itself — await it directly (NOT via _exec).
+        try:
+            resp = await self._client.cancel_trigger_orders(
+                product_id=ref.product_id, digests=[order_id],
+            )
+        except Exception as exc:  # noqa: BLE001 - venue raised
+            raise AdapterError(
+                f"cancel_trigger_order failed for {order_id}: {exc}"
+            ) from exc
+        ok, err = _client_call_succeeded(resp)
+        if not ok:
+            raise AdapterError(
+                f"cancel_trigger_order rejected by venue for {order_id}: {err}"
+            )
+        self._trigger_orders.pop(order_id, None)
+        try:
+            self._registry.forget(order_id)
+        except Exception:  # noqa: BLE001 - best-effort
+            logger.debug("trigger registry forget failed for %s", order_id, exc_info=True)
+        return True
 
     def _order_from_response(
         self, resp: object, trading_pair: str, side: TradeType, order_type: OrderType,
