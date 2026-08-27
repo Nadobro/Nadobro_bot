@@ -95,6 +95,32 @@ class ReverseGridController(Controller):
     def __init__(self, **kwargs: object) -> None:
         kwargs.setdefault("name", "revgrid")
         super().__init__(**kwargs)  # type: ignore[arg-type]
+        # Config-derived geometry + gate params (re-readable live via reload_config).
+        self._load_config()
+
+        # -- regime hysteresis state (NOT config — survives a live reconfig) --
+        self._regime_phase: str = variance_regime.GRID
+        self._trend_streak = 0
+        self._trend_streak_dir = variance_regime.FLAT
+        self._confirmed_trend_dir = variance_regime.FLAT
+
+        # -- live state --
+        self._anchor: Optional[Decimal] = None
+        self._rungs: List[_Rung] = []
+        self._pos_base: Decimal = Decimal(0)      # last observed signed net
+        self._avg_entry: Optional[Decimal] = None
+        self._peak: Optional[Decimal] = None      # favourable extreme mid since open
+        self._trail_armed = False
+        self._stop_digest: Optional[str] = None
+        self._stop_level: Optional[Decimal] = None
+        self._stop_size: Optional[Decimal] = None
+        self._last_mid: Optional[Decimal] = None
+
+    # -- config ---------------------------------------------------------------
+    def _load_config(self) -> None:
+        """(Re)read the config-derived geometry + gate params from ``self.configs``.
+        Called at construction and by :meth:`reload_config` on a live settings edit.
+        Sets ONLY config attrs — never the runtime position/regime state."""
         self.trading_pair = str(self.cfg("trading_pair") or "")
         self.levels = max(1, int(self.cfg("levels", 4) or 4))
         # A rung must clear the taker round trip or it is a structural loss; floor
@@ -146,22 +172,14 @@ class ReverseGridController(Controller):
         self._regime_range_on_vr = float(self.cfg("revgrid_regime_range_on_vr", 1.15) or 1.15)
         self._regime_trend_drift_pct = float(self.cfg("revgrid_regime_trend_drift_pct", 0.30) or 0.30)
         self._trend_confirm_ticks = int(max(1, int(self.cfg("revgrid_trend_confirm_ticks", 3) or 3)))
-        self._regime_phase: str = variance_regime.GRID
-        self._trend_streak = 0
-        self._trend_streak_dir = variance_regime.FLAT
-        self._confirmed_trend_dir = variance_regime.FLAT
 
-        # -- live state --
-        self._anchor: Optional[Decimal] = None
-        self._rungs: List[_Rung] = []
-        self._pos_base: Decimal = Decimal(0)      # last observed signed net
-        self._avg_entry: Optional[Decimal] = None
-        self._peak: Optional[Decimal] = None      # favourable extreme mid since open
-        self._trail_armed = False
-        self._stop_digest: Optional[str] = None
-        self._stop_level: Optional[Decimal] = None
-        self._stop_size: Optional[Decimal] = None
-        self._last_mid: Optional[Decimal] = None
+    def reload_config(self) -> None:
+        """Apply a live settings edit: re-read the geometry + gate params from the
+        (already-refreshed) ``self.configs``. RUNTIME state — the anchor, the open
+        position's avg entry / peak / trailing-stop bookkeeping, and the regime
+        hysteresis — is deliberately untouched, so a mid-run edit never disturbs an
+        open position or re-arms an exit the trail had already locked in."""
+        self._load_config()
 
     # -- lifecycle -----------------------------------------------------------
     async def on_start(self) -> None:
