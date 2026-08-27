@@ -264,6 +264,30 @@ class NadoAdapterBase(abc.ABC):
         the live adapter and trigger-aware doubles implement it."""
         raise NotImplementedError
 
+    async def place_stop_order(
+        self,
+        trading_pair: str,
+        close_size: Decimal,
+        stop_price: Decimal,
+        position_is_long: bool,
+        *,
+        slippage_pct: float = 0.5,
+    ) -> NadoOrder:
+        """Place a venue REDUCE-ONLY protective / trailing stop that flattens (part
+        of) an open position when the mid crosses ``stop_price`` AGAINST it: a
+        long's stop fires on a FALL (``mid_price_below``, a SELL close), a short's
+        on a RISE (``mid_price_above``, a BUY close). ``reduce_only`` means the
+        venue guarantees it can only SHRINK the position — never grow or flip it —
+        so even a wrong price/side is bounded.
+
+        The Reverse Grid re-places this at a trailing level as the position's
+        favourable extreme advances, which locks profit while letting the winner
+        run; a fresh position arms it at the protective ``avg_entry`` distance. It
+        is a venue trigger, so it is cancelled via :meth:`cancel_trigger_order`
+        (the trigger service), and the returned :class:`NadoOrder` carries the stop
+        digest as its ``id``. Concrete default raises ``NotImplementedError``."""
+        raise NotImplementedError
+
     async def held_base(self, trading_pair: str) -> Optional[Decimal]:
         """Base units of ``trading_pair`` the account ACTUALLY holds, per the
         VENUE — the spot balance for a spot product, the signed position size for

@@ -828,6 +828,72 @@ class NadoAdapter(NadoAdapterBase):
             logger.debug("trigger registry forget failed for %s", order_id, exc_info=True)
         return True
 
+    async def place_stop_order(
+        self,
+        trading_pair: str,
+        close_size: Decimal,
+        stop_price: Decimal,
+        position_is_long: bool,
+        *,
+        slippage_pct: float = 0.5,
+    ) -> NadoOrder:
+        """Place a reduce-only protective/trailing stop (see the base-class
+        contract). Thin wrapper over :meth:`NadoClient.place_reduce_only_stop`,
+        which owns the per-side stop encoding and the through-the-stop pricing; the
+        adapter records the stop digest in the SAME ``_trigger_orders`` registry as
+        the entry rungs so :meth:`cancel_trigger_order` addresses it, and returns a
+        :class:`NadoOrder` whose ``id`` is the digest and whose ``side`` is the
+        CLOSE side (a long is closed by a SELL)."""
+        meta = self._meta(trading_pair)
+        size = abs(float(close_size))
+        stop = float(stop_price)
+        if size <= 0:
+            raise AdapterError("place_stop_order requires a positive close size")
+        if stop <= 0:
+            raise AdapterError("place_stop_order requires a positive stop price")
+        close_side = TradeType.SELL if position_is_long else TradeType.BUY
+        logger.info(
+            "engine place_stop_order pair=%s pid=%s close_side=%s close_size=%s "
+            "stop_price=%s position_is_long=%s isolated_only=%s",
+            trading_pair, meta.product_id, close_side.name, close_size, stop,
+            position_is_long, meta.isolated_only,
+        )
+        # Async client method (offloads to the exec pool itself) — await directly.
+        try:
+            resp = await self._client.place_reduce_only_stop(
+                product_id=meta.product_id,
+                close_size=size,
+                stop_price=stop,
+                position_is_long=bool(position_is_long),
+                slippage_pct=float(slippage_pct),
+                isolated=bool(meta.isolated_only),
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize venue errors
+            raise AdapterError(f"place_stop_order failed: {exc}") from exc
+
+        ok, err = _client_call_succeeded(resp)
+        if not ok:
+            raise AdapterError(f"place_stop_order rejected by venue: {err}")
+
+        digest = _trigger_digest(resp)
+        if not digest:
+            raise AdapterError("venue did not return a stop order digest")
+
+        ref = _OrderRef(
+            trading_pair, meta.product_id, close_side, OrderType.LIMIT,
+            abs(_dec(close_size)), _dec(stop_price),
+        )
+        self._trigger_orders[digest] = ref
+        try:
+            self._registry.record(digest, ref)
+        except Exception:  # noqa: BLE001 - persistence must not break placement
+            logger.warning("stop registry record failed for %s", digest, exc_info=True)
+        return NadoOrder(
+            id=digest, trading_pair=trading_pair, side=close_side,
+            order_type=OrderType.LIMIT, amount_base=abs(_dec(close_size)),
+            price=_dec(stop_price), state=OrderState.OPEN,
+        )
+
     def _order_from_response(
         self, resp: object, trading_pair: str, side: TradeType, order_type: OrderType,
         amount_base: Decimal, price: Optional[Decimal],

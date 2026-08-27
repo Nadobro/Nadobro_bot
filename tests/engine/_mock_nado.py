@@ -241,6 +241,39 @@ class MockNadoAdapter(NadoAdapterBase):
         self.placed_triggers.append(order)
         return copy.copy(order)
 
+    async def place_stop_order(
+        self,
+        trading_pair: str,
+        close_size: Decimal,
+        stop_price: Decimal,
+        position_is_long: bool,
+        *,
+        slippage_pct: float = 0.5,
+    ) -> NadoOrder:
+        self._maybe_fail("place_stop_order")
+        if _dec(close_size) <= 0:
+            raise AdapterError("place_stop_order requires a positive close size")
+        if _dec(stop_price) <= 0:
+            raise AdapterError("place_stop_order requires a positive stop price")
+        self._counter += 1
+        sid = f"stp-{self._counter}"
+        close_side = TradeType.SELL if position_is_long else TradeType.BUY
+        order = NadoOrder(
+            id=sid, trading_pair=trading_pair, side=close_side,
+            order_type=OrderType.LIMIT, amount_base=_dec(close_size),
+            price=_dec(stop_price),
+        )
+        self._triggers[sid] = {
+            "order": order,
+            "trigger_price": _dec(stop_price),
+            "side": close_side,           # a long's stop is a SELL, fires on a fall
+            "dependency": None,
+            "armed": True,
+            "kind": "reduce",             # reduce-only: flattens, never grows/flips
+        }
+        self.placed_triggers.append(order)
+        return copy.copy(order)
+
     async def cancel_trigger_order(self, order_id: str) -> bool:
         self._maybe_fail("cancel_trigger_order")
         trg = self._triggers.get(order_id)
@@ -265,7 +298,12 @@ class MockNadoAdapter(NadoAdapterBase):
             raise KeyError(f"unknown trigger {order_id}")
         order = trg["order"]
         fill_px = _dec(price) if price is not None else trg["trigger_price"]
-        fill = self._apply_fill(order, order.amount_base, fill_px, _dec(fee), partial=False)
+        amount = order.amount_base
+        if trg.get("kind") == "reduce" and order.trading_pair in self.venue_held:
+            # Reduce-only: close AT MOST the current position — never grow or flip.
+            held = abs(_dec(self.venue_held.get(order.trading_pair) or 0))
+            amount = min(order.amount_base, held) if held > 0 else Decimal(0)
+        fill = self._apply_fill(order, amount, fill_px, _dec(fee), partial=False)
         self._arm_dependents(order_id)
         self._triggers.pop(order_id, None)
         return fill
