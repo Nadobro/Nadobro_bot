@@ -174,6 +174,36 @@ def test_cancel_targets_the_trigger_service_not_the_regular_book():
     asyncio.run(body())
 
 
+def test_placement_links_the_trigger_digest_to_the_session():
+    """The trigger digest MUST be linked via on_place so the venue fill is attributed
+    to the run (turnover / realized PnL) — a Nado price trigger IS the order, so its
+    fill carries this digest."""
+    async def body():
+        linked = []
+        c = _FakeTriggerClient({"success": True, "response": {"digest": "0xbuy"}})
+        a = NadoAdapter(c, META, on_place=lambda d: linked.append(d))
+        await a.place_trigger_order(PAIR, TradeType.BUY, Decimal("1"), Decimal("79000"))
+        assert linked == ["0xbuy"]
+
+    asyncio.run(body())
+
+
+def test_stop_placement_links_the_stop_digest_to_the_session():
+    async def body():
+        linked = []
+        c = _FakeTriggerClient()
+        # place_stop_order goes through place_reduce_only_stop on the real client;
+        # give the fake that method returning a stop digest.
+        async def _stop(**kw):
+            return {"success": True, "response": {"digest": "0xstop"}}
+        c.place_reduce_only_stop = _stop
+        a = NadoAdapter(c, META, on_place=lambda d: linked.append(d))
+        await a.place_stop_order(PAIR, Decimal("1"), Decimal("77000"), position_is_long=True)
+        assert linked == ["0xstop"]
+
+    asyncio.run(body())
+
+
 def test_cancel_unknown_trigger_is_idempotent_and_makes_no_venue_call():
     async def body():
         a, c = _adapter()

@@ -1047,10 +1047,16 @@ def _map_revgrid_config(
 
 def map_strategy_config(
     strategy: str, settings: Dict[str, Any], mid: Decimal, *, product: str,
-    leverage: int = 1, network: str = "mainnet",
+    leverage: int = 1, network: str = "mainnet", _for_dgrid_trend: bool = False,
 ) -> Dict[str, object]:
     """Derive an engine controller config from a user's saved strategy settings
     + current mid. Documented, testnet-tunable mappings (not 1:1 with legacy).
+
+    ``_for_dgrid_trend`` (private): set when D-Grid builds its trend-phase sub-config
+    from the ``rgrid`` mapping. D-Grid constructs the LEGACY ``RGridController``
+    directly (it is not routed through ``build_controller``), so its sub-config must
+    stay the legacy rgrid shape even when the trigger-rebuild flag is on — the flag
+    only swaps the STANDALONE ``rgrid`` strategy.
     """
     mid = _dec(mid)
     # ``notional`` here is the user's allocated MARGIN (collateral). The grid/MM
@@ -1524,7 +1530,9 @@ def map_strategy_config(
         # Flag-gated trigger rebuild: produce the ReverseGridController config
         # instead (testnet paper trial). build_controller swaps the class under the
         # same flag; everything else about the `rgrid` strategy is unchanged.
-        if revgrid_trigger_enabled():
+        # NEVER for D-Grid's trend sub-config (_for_dgrid_trend): D-Grid builds a
+        # legacy RGridController directly and would choke on the new config shape.
+        if revgrid_trigger_enabled() and not _for_dgrid_trend:
             return _map_revgrid_config(
                 settings, mid, product=product, levels=levels, deployed=deployed,
                 spread_frac=spread_frac, chunk_dec=_chunk_dec, sl_pct=_sl_pct,
@@ -2021,7 +2029,7 @@ def map_strategy_config(
             _rg_settings["rgrid_spread_bp"] = float(_spread_bp)
         cfg["trend_rgrid"] = map_strategy_config(
             "rgrid", _rg_settings, mid, product=product,
-            leverage=leverage, network=network,
+            leverage=leverage, network=network, _for_dgrid_trend=True,
         )
 
     # GRID in-place re-center: honor the user's reset threshold so the classic
