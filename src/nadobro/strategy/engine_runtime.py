@@ -28,6 +28,7 @@ from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
 from src.nadobro.engine.controllers.grid_trading import GridController
 from src.nadobro.engine.controllers.fill_anchored import FillAnchoredQuotingController
 from src.nadobro.engine.controllers.rgrid import RGridController
+from src.nadobro.engine.controllers.reverse_grid import ReverseGridController
 from src.nadobro.engine.controllers.market_making import MarketMakingController
 from src.nadobro.engine.controllers.volume_bot import VolumeBotController
 from src.nadobro.engine.orchestrator import ExecutorOrchestrator
@@ -62,6 +63,13 @@ CONTROLLER_REGISTRY: Dict[str, type] = {
     # is what produced "Reverse GRID switched RGRID → GRID … now quoting the LONG
     # ladder" on users' R-Grid sessions.
     "rgrid": RGridController,
+    # revgrid = the trigger-based Reverse Grid rebuild (ReverseGridController):
+    # native venue price-trigger rungs (buys ABOVE mid, sells BELOW) instead of the
+    # maker-only rgrid that could not place them. BUILDABLE (so the backtester can
+    # drive it) but deliberately NOT in ENGINE_MAPPED_STRATEGIES yet — like `desk`,
+    # it is not exposed to the live strategy cycle until it is validated on real
+    # tapes + a testnet paper run and given its map_strategy_config branch.
+    "revgrid": ReverseGridController,
     "dgrid": DynamicGridController,
     "mid": MarketMakingController,
     "dn": DeltaNeutralController,

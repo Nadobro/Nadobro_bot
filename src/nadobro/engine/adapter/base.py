@@ -218,6 +218,76 @@ class NadoAdapterBase(abc.ABC):
         it). Best-effort no-op by default."""
         return None
 
+    # -- price-trigger orders (Reverse Grid rungs) ------------------------
+    # A price trigger is a DIFFERENT venue primitive from a resting order: the
+    # venue watches the mid and fires the order when it crosses a level, so a
+    # trigger can sit on the crossing side of the mid (a BUY ABOVE / a SELL
+    # BELOW) — which a post-only maker LIMIT cannot. Placement and cancellation
+    # therefore route through their OWN methods and their OWN registry, never the
+    # resting-order path (``place_order`` / ``cancel_order`` hit the wrong venue
+    # service for a trigger and would leak it).
+    async def place_trigger_order(
+        self,
+        trading_pair: str,
+        side: TradeType,
+        amount_base: Decimal,
+        trigger_price: Decimal,
+        *,
+        slippage_pct: float = 0.5,
+        dependency: Optional[str] = None,
+    ) -> NadoOrder:
+        """Place a venue PRICE-TRIGGER **entry** order — the Reverse Grid rung
+        primitive. The venue fires it when the mid crosses ``trigger_price``: a
+        BUY rung fires on a RISE, a SELL rung on a FALL (momentum). It is NOT
+        reduce-only — it OPENS/GROWS a position — and it is priced ``slippage_pct``
+        THROUGH the level so it crosses and fills on trigger.
+
+        ``dependency`` (a prior rung's digest) chains this rung to fire only after
+        that one fills, which builds a pyramid. The returned :class:`NadoOrder`
+        carries the trigger digest as its ``id`` for a later
+        :meth:`cancel_trigger_order`.
+
+        Concrete default raises ``NotImplementedError``: only the live adapter and
+        the trigger-aware test doubles implement it; no controller may hard-depend
+        on it without a capability check.
+        """
+        raise NotImplementedError
+
+    async def cancel_trigger_order(self, order_id: str) -> bool:
+        """Cancel a resting price-trigger order via the venue's TRIGGER service.
+        Idempotent: an unknown / already-fired / already-cancelled trigger returns
+        ``False`` rather than raising.
+
+        This is a DIFFERENT venue endpoint from :meth:`cancel_order` — a trigger
+        digest cancelled through the regular order path is a no-op that LEAKS the
+        trigger (it keeps watching the mid and can fire an unwanted entry). Only
+        the live adapter and trigger-aware doubles implement it."""
+        raise NotImplementedError
+
+    async def place_stop_order(
+        self,
+        trading_pair: str,
+        close_size: Decimal,
+        stop_price: Decimal,
+        position_is_long: bool,
+        *,
+        slippage_pct: float = 0.5,
+    ) -> NadoOrder:
+        """Place a venue REDUCE-ONLY protective / trailing stop that flattens (part
+        of) an open position when the mid crosses ``stop_price`` AGAINST it: a
+        long's stop fires on a FALL (``mid_price_below``, a SELL close), a short's
+        on a RISE (``mid_price_above``, a BUY close). ``reduce_only`` means the
+        venue guarantees it can only SHRINK the position — never grow or flip it —
+        so even a wrong price/side is bounded.
+
+        The Reverse Grid re-places this at a trailing level as the position's
+        favourable extreme advances, which locks profit while letting the winner
+        run; a fresh position arms it at the protective ``avg_entry`` distance. It
+        is a venue trigger, so it is cancelled via :meth:`cancel_trigger_order`
+        (the trigger service), and the returned :class:`NadoOrder` carries the stop
+        digest as its ``id``. Concrete default raises ``NotImplementedError``."""
+        raise NotImplementedError
+
     async def held_base(self, trading_pair: str) -> Optional[Decimal]:
         """Base units of ``trading_pair`` the account ACTUALLY holds, per the
         VENUE — the spot balance for a spot product, the signed position size for
