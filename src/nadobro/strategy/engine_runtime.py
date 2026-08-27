@@ -577,7 +577,13 @@ def _apply_dgrid_controller_config(controller: Controller, configs: Dict[str, ob
     packed = configs.get("trend_rgrid")
     trend = getattr(controller, "_trend", None)
     if trend is not None and isinstance(packed, dict):
-        _apply_rgrid_controller_config(trend, packed)
+        if isinstance(trend, ReverseGridController):
+            # Trigger trend delegate: re-read its geometry from the refreshed
+            # sub-config (leaves the open position + its trailing stop alone).
+            trend.configs = dict(packed)
+            trend.reload_config()
+        else:
+            _apply_rgrid_controller_config(trend, packed)
 
 
 def _apply_rgrid_controller_config(controller: Controller, configs: Dict[str, object]) -> None:
@@ -2027,10 +2033,30 @@ def map_strategy_config(
         _rg_settings = dict(settings)
         if not _f(_rg_settings, "rgrid_spread_bp", 0.0):
             _rg_settings["rgrid_spread_bp"] = float(_spread_bp)
-        cfg["trend_rgrid"] = map_strategy_config(
-            "rgrid", _rg_settings, mid, product=product,
-            leverage=leverage, network=network, _for_dgrid_trend=True,
-        )
+        if revgrid_trigger_enabled():
+            # D-Grid's trend phase runs the trigger ReverseGridController too, so the
+            # two stay consistent (and the one kill-switch reverts both). Its OWN chop
+            # stand-down gate is DISABLED: D-Grid's parent classifier already confirms
+            # the trend before spawning it, and the nested controller has no candle
+            # feed of its own — so it arms whenever D-Grid is in the RGRID phase.
+            _trend_spread_frac = (
+                Decimal(str(_f(_rg_settings, "rgrid_spread_bp", float(_spread_bp))))
+                / Decimal(10000)
+            )
+            _trend_cfg = _map_revgrid_config(
+                _rg_settings, mid, product=product, levels=levels, deployed=deployed,
+                spread_frac=_trend_spread_frac, chunk_dec=_chunk_dec, sl_pct=_sl_pct,
+                leverage=leverage,
+            )
+            _trend_cfg["revgrid_chop_stand_down"] = False
+            cfg["trend_rgrid"] = _trend_cfg
+            cfg["trend_uses_trigger"] = True
+        else:
+            cfg["trend_rgrid"] = map_strategy_config(
+                "rgrid", _rg_settings, mid, product=product,
+                leverage=leverage, network=network, _for_dgrid_trend=True,
+            )
+            cfg["trend_uses_trigger"] = False
 
     # GRID in-place re-center: honor the user's reset threshold so the classic
     # long ladder follows price ("reset and continue") instead of going stale.

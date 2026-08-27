@@ -67,7 +67,7 @@ from typing import List, Optional
 from src.nadobro.engine.adapter.base import AdapterError
 from src.nadobro.engine.controllers.controller_base import Controller
 from src.nadobro.engine.routines import variance_regime
-from src.nadobro.engine.types import TradeType, _as_bool, _dec
+from src.nadobro.engine.types import OrderType, TradeType, _as_bool, _dec
 from src.nadobro.quant.rgrid_sizing import TAKER_ROUND_TRIP_RATE, arm_pct
 
 logger = logging.getLogger(__name__)
@@ -236,6 +236,49 @@ class ReverseGridController(Controller):
         """Cancel every venue trigger this controller owns — the ladder and the
         stop — so a stopped session leaves nothing watching the mid."""
         await self._reset_after_close()
+
+    async def flatten_now(self, mid: Decimal, *, reason: str = "handoff") -> bool:
+        """Close the whole position, cancel every trigger, and report whether the
+        book is now FLAT. D-Grid calls this on a phase handoff (RGRID→GRID): its
+        ranging ladder must not inherit a naked position, so the trend delegate has
+        to be flat before it is dropped.
+
+        Crosses to close (reduce-only MARKET) when a position is open, then re-reads
+        the venue net. Returns ``True`` only once the venue confirms flat — otherwise
+        ``False`` so D-Grid retries next tick rather than dropping an open position.
+        """
+        net = await self._read_net()
+        if net is None:
+            return False              # unreadable venue — never claim flat
+        if net != 0:
+            close_side = TradeType.SELL if net > 0 else TradeType.BUY
+            try:
+                await self.adapter.place_order(
+                    self.trading_pair, close_side, OrderType.MARKET, abs(net),
+                    reduce_only=True,
+                )
+                self._n_filled += 1
+            except AdapterError:
+                logger.warning(
+                    "revgrid flatten close FAILED (%s) net=%s (user=%s pair=%s)",
+                    reason, net, self.user_id, self.trading_pair, exc_info=True,
+                )
+                return False
+            net = await self._read_net()
+            if net is None or net != 0:
+                return False          # still open — D-Grid retries next tick
+        # Flat: tear down every resting trigger and reset, so nothing re-fires under
+        # the ranging ladder that inherits the book.
+        if self._stop_digest is not None:
+            try:
+                await self.adapter.cancel_trigger_order(self._stop_digest)
+            except AdapterError:
+                logger.debug("revgrid flatten stop-cancel failed", exc_info=True)
+        await self._cancel_all_rungs()
+        self._anchor = None
+        self._pos_base = Decimal(0)
+        self._reset_position_state()
+        return True
 
     # -- venue reads ---------------------------------------------------------
     async def _mid(self) -> Optional[Decimal]:

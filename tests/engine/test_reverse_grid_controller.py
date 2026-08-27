@@ -211,6 +211,36 @@ def test_on_stop_cancels_all_triggers():
     asyncio.run(body())
 
 
+# ── flatten_now (D-Grid phase handoff) ─────────────────────────────────
+
+def test_flatten_now_closes_the_position_and_reports_flat():
+    async def body():
+        a = _adapter()
+        c = _controller(a, levels=1)
+        await c.on_tick()                          # arm
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))         # open long
+        await c.on_tick()
+        assert a.venue_held[PAIR] > 0
+        ok = await c.flatten_now(Decimal("101.5"), reason="dgrid flip")
+        assert ok is True
+        assert a.venue_held[PAIR] == 0             # crossed to close
+        assert c._pos_base == 0 and c._stop_digest is None
+        # already flat → still True, and no residual triggers
+        assert await c.flatten_now(Decimal("101.5")) is True
+
+    asyncio.run(body())
+
+
+def test_flatten_now_holds_on_an_unreadable_venue():
+    async def body():
+        a = _adapter(venue_held=None)              # held_base -> None
+        c = _controller(a, levels=1)
+        assert await c.flatten_now(Decimal("100")) is False  # never claim flat blind
+
+    asyncio.run(body())
+
+
 # ── /status telemetry (order_counts + grid_metrics card keys) ──────────
 
 def test_order_counts_track_trigger_activity():

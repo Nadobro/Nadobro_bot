@@ -12,6 +12,7 @@ import asyncio
 from decimal import Decimal
 
 from src.nadobro.strategy import engine_runtime as er
+from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
 from src.nadobro.engine.controllers.reverse_grid import ReverseGridController
 from src.nadobro.engine.controllers.rgrid import RGridController
 from src.nadobro.engine.inventory import InventoryRepository
@@ -73,18 +74,94 @@ def test_map_strategy_config_routes_rgrid_by_flag(monkeypatch):
     assert on["step_pct"] == Decimal("0.002")         # a 20bp spread is honoured
 
 
-def test_dgrid_trend_subconfig_stays_legacy_even_with_flag_on(monkeypatch):
-    """CRITICAL: D-Grid builds its trend phase as a legacy RGridController DIRECTLY
-    (not via build_controller), so its `trend_rgrid` sub-config must stay the legacy
-    rgrid shape even when the flag is on — else D-Grid's trend phase gets a config it
-    cannot read."""
+def test_dgrid_trend_subconfig_follows_the_flag(monkeypatch):
+    """D-Grid's trend phase uses the SAME controller as standalone rgrid: legacy when
+    the flag is off, the trigger ReverseGridController when on. The `_for_dgrid_trend`
+    guard keeps the flag-off path legacy even though it routes through map_strategy_config."""
+    # flag OFF -> legacy trend sub-config
+    monkeypatch.delenv("NADO_REVGRID_TRIGGER_ENABLED", raising=False)
+    dg_off = er.map_strategy_config("dgrid", {"levels": 4}, Decimal("79000"),
+                                    product=PAIR, leverage=5)
+    trend_off = dg_off["trend_rgrid"]
+    assert "spread_ask_pct" in trend_off and "step_pct" not in trend_off
+    assert dg_off["trend_uses_trigger"] is False
+
+    # flag ON -> trigger trend sub-config, with its OWN chop gate DISABLED (D-Grid's
+    # parent classifier already gates trend entry, and the delegate has no candle feed)
     monkeypatch.setenv("NADO_REVGRID_TRIGGER_ENABLED", "1")
-    dg = er.map_strategy_config("dgrid", {"levels": 4}, Decimal("79000"),
-                                product=PAIR, leverage=5)
-    trend = dg.get("trend_rgrid")
-    assert isinstance(trend, dict)
-    assert "spread_ask_pct" in trend            # the legacy RGridController's key
-    assert "step_pct" not in trend               # NOT the trigger-controller shape
+    dg_on = er.map_strategy_config("dgrid", {"levels": 4}, Decimal("79000"),
+                                   product=PAIR, leverage=5)
+    trend_on = dg_on["trend_rgrid"]
+    assert "step_pct" in trend_on and "spread_ask_pct" not in trend_on
+    assert dg_on["trend_uses_trigger"] is True
+    assert trend_on["revgrid_chop_stand_down"] is False
+
+
+def test_dgrid_spawns_the_trigger_controller_for_its_trend_phase():
+    """With trend_uses_trigger set, D-Grid's trend delegate IS the trigger
+    ReverseGridController (not the legacy maker one)."""
+    async def body():
+        a = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal(0)})
+        trend_cfg = {"trading_pair": "P", "levels": 2, "step_pct": Decimal("0.01"),
+                     "order_amount_quote": Decimal("100"), "revgrid_chop_stand_down": False}
+        cfg = {"trading_pair": "P", "total_amount_quote": "100", "levels_count": 2,
+               "dgrid_trend_follow": 1, "trend_uses_trigger": True, "trend_rgrid": trend_cfg}
+        dg = DynamicGridController(user_id=1, orchestrator=ExecutorOrchestrator(),
+                                   adapter=a, inventory=InventoryRepository(), configs=cfg)
+        assert await dg._spawn_trend(Decimal("100")) is True
+        assert isinstance(dg._trend, ReverseGridController)
+        # the delegate's own chop gate is off, so it armed a ladder immediately
+        assert len(a.placed_triggers) > 0
+
+    asyncio.run(body())
+
+
+def test_dgrid_flip_flattens_the_trigger_trend_delegate_before_dropping_it():
+    """The money-critical handoff: when D-Grid flips RGRID->GRID it must FLATTEN the
+    trigger delegate's venue position (flatten_now) before nulling it, or the ranging
+    ladder inherits a naked position."""
+    from src.nadobro.engine.routines import variance_regime
+
+    async def body():
+        a = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal(0)},
+                            tick=Decimal("0.01"), lot=Decimal("0.0001"),
+                            min_notional=Decimal("1"))
+        trend_cfg = {"trading_pair": "P", "levels": 1, "step_pct": Decimal("0.01"),
+                     "order_amount_quote": Decimal("100"), "revgrid_chop_stand_down": False}
+        cfg = {"trading_pair": "P", "start_price": "98", "end_price": "102",
+               "total_amount_quote": "100", "min_spread_between_orders": "0.002",
+               "max_open_orders": 4, "step_pct": "0.01", "levels_count": 2,
+               "dgrid_trend_follow": 1, "trend_uses_trigger": True, "trend_rgrid": trend_cfg}
+        dg = DynamicGridController(user_id=1, orchestrator=ExecutorOrchestrator(),
+                                   adapter=a, inventory=InventoryRepository(), configs=cfg)
+        await dg._spawn_trend(Decimal("100"))
+        # open a long in the trend delegate
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))
+        await dg._trend.on_tick()
+        assert a.venue_held["P"] > 0
+        # flip to GRID — flatten happens BEFORE the delegate is dropped
+        await dg._flip_to(variance_regime.GRID, Decimal("101.5"), reason="flip")
+        assert a.venue_held["P"] == 0        # the trend position was closed
+        assert dg._trend is None             # delegate dropped only after flat
+
+    asyncio.run(body())
+
+
+def test_dgrid_trend_delegate_is_legacy_when_flag_off():
+    async def body():
+        a = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal(0)})
+        legacy_trend = {"trading_pair": "P", "spread_bid_pct": Decimal("0.001"),
+                        "spread_ask_pct": Decimal("0.001"), "order_amount_quote": Decimal("50"),
+                        "rgrid_chop_stand_down": False}
+        cfg = {"trading_pair": "P", "total_amount_quote": "100", "levels_count": 2,
+               "dgrid_trend_follow": 1, "trend_uses_trigger": False, "trend_rgrid": legacy_trend}
+        dg = DynamicGridController(user_id=1, orchestrator=ExecutorOrchestrator(),
+                                   adapter=a, inventory=InventoryRepository(), configs=cfg)
+        assert await dg._spawn_trend(Decimal("100")) is True
+        assert isinstance(dg._trend, RGridController)
+
+    asyncio.run(body())
 
 
 def test_revgrid_step_is_floored_to_the_viable_zone(monkeypatch):
