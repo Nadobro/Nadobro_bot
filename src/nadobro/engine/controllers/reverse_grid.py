@@ -58,6 +58,7 @@ The LLM overlay and the HL feeds never gate an entry or an exit here.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
@@ -65,7 +66,8 @@ from typing import List, Optional
 
 from src.nadobro.engine.adapter.base import AdapterError
 from src.nadobro.engine.controllers.controller_base import Controller
-from src.nadobro.engine.types import TradeType, _dec
+from src.nadobro.engine.routines import variance_regime
+from src.nadobro.engine.types import TradeType, _as_bool, _dec
 from src.nadobro.quant.rgrid_sizing import TAKER_ROUND_TRIP_RATE, arm_pct
 
 logger = logging.getLogger(__name__)
@@ -126,6 +128,29 @@ class ReverseGridController(Controller):
         # moves at least this fraction of a step (or the position size changes).
         self.stop_min_reprice_frac = max(Decimal(0), _dec(self.cfg("stop_min_reprice_frac", "0.25") or "0.25"))
 
+        # -- chop stand-down gate --
+        # A reverse grid LOSES in chop and WINS in trends; the whole grid family bled
+        # all of Aug-2026 by trading chop. So by DEFAULT the ladder is only armed when
+        # a directional trend is CONFIRMED — otherwise the controller stands down (arms
+        # nothing, cancels any resting ladder). Exits are NEVER gated: a stop already
+        # armed keeps managing an open position regardless of the regime. Confirmation
+        # is by SUSTAINED directional drift (``variance_regime.trend_by_drift`` held for
+        # ``trend_confirm_ticks`` consecutive same-direction ticks), NOT a bare variance
+        # ratio — a high VR fires on bursty chop, which is exactly what a trend follower
+        # must not read as a trend. Set ``revgrid_chop_stand_down=0`` to disable.
+        self.chop_stand_down = _as_bool(self.cfg("revgrid_chop_stand_down", True), True)
+        self._regime_short_window = int(max(2, int(self.cfg("revgrid_regime_short_window", 4) or 4)))
+        self._regime_long_window = int(max(self._regime_short_window + 1,
+                                           int(self.cfg("revgrid_regime_long_window", 12) or 12)))
+        self._regime_trend_on_vr = float(self.cfg("revgrid_regime_trend_on_vr", 1.25) or 1.25)
+        self._regime_range_on_vr = float(self.cfg("revgrid_regime_range_on_vr", 1.15) or 1.15)
+        self._regime_trend_drift_pct = float(self.cfg("revgrid_regime_trend_drift_pct", 0.30) or 0.30)
+        self._trend_confirm_ticks = int(max(1, int(self.cfg("revgrid_trend_confirm_ticks", 3) or 3)))
+        self._regime_phase: str = variance_regime.GRID
+        self._trend_streak = 0
+        self._trend_streak_dir = variance_regime.FLAT
+        self._confirmed_trend_dir = variance_regime.FLAT
+
         # -- live state --
         self._anchor: Optional[Decimal] = None
         self._rungs: List[_Rung] = []
@@ -157,6 +182,9 @@ class ReverseGridController(Controller):
             # Unreadable venue — hold. Never act (open, close, reset) on a bad read.
             return
         self._last_mid = mid
+        # Refresh the regime read every tick so the flat gate and the debounce stay
+        # current (cheap; exits never consult it).
+        await self._classify_regime()
 
         if net == 0:
             if self._pos_base != 0:
@@ -203,8 +231,66 @@ class ReverseGridController(Controller):
             return None
         return None if held is None else _dec(held)
 
+    # -- chop stand-down gate ------------------------------------------------
+    async def _candles(self) -> List[dict]:
+        """Classification candles from the injected provider (the live cycle and the
+        backtester both wire one). Empty when none — the classifier then reports
+        insufficient history and the gate holds its safe (stand-down) default."""
+        provider = self.cfg("candle_provider")
+        if provider is None:
+            return []
+        try:
+            result = provider(self.trading_pair)  # type: ignore[operator]
+            if inspect.isawaitable(result):
+                result = await result
+            return list(result or [])
+        except Exception:  # noqa: BLE001 - no candles ⇒ stand down (safe)
+            return []
+
+    async def _classify_regime(self) -> None:
+        """Update ``_confirmed_trend_dir`` from the variance-regime routine. A trend is
+        confirmed only after ``trend_confirm_ticks`` consecutive same-direction
+        SUSTAINED-DRIFT ticks — a single bursty swing (high VR) never clears the bar."""
+        if not self.chop_stand_down:
+            return
+        info = await variance_regime.run(
+            self.trading_pair, await self._candles(),
+            short_window=self._regime_short_window,
+            long_window=self._regime_long_window,
+            trend_on=self._regime_trend_on_vr,
+            range_on=self._regime_range_on_vr,
+            trend_drift_pct=self._regime_trend_drift_pct,
+            current_phase=self._regime_phase,
+        )
+        if not info.get("insufficient_history"):
+            self._regime_phase = str(info.get("phase") or self._regime_phase)
+        d = str(info.get("direction") or variance_regime.FLAT)
+        if (not info.get("insufficient_history") and bool(info.get("trend_by_drift"))
+                and d in (variance_regime.UP, variance_regime.DOWN)):
+            if d == self._trend_streak_dir:
+                self._trend_streak += 1
+            else:
+                self._trend_streak_dir, self._trend_streak = d, 1
+        else:
+            self._trend_streak, self._trend_streak_dir = 0, variance_regime.FLAT
+        self._confirmed_trend_dir = (
+            self._trend_streak_dir if self._trend_streak >= self._trend_confirm_ticks
+            else variance_regime.FLAT
+        )
+
+    def _trend_confirmed(self) -> bool:
+        return self._confirmed_trend_dir in (variance_regime.UP, variance_regime.DOWN)
+
     # -- flat: arm / re-anchor the ladder ------------------------------------
     async def _maintain_flat(self, mid: Decimal) -> None:
+        if self.chop_stand_down and not self._trend_confirmed():
+            # No confirmed trend: stand down. Never ENTER in chop — drop any resting
+            # ladder and re-anchor fresh when a trend resumes. (An OPEN position is not
+            # here — it is managed by its stop, which the gate never touches.)
+            if self._rungs:
+                await self._cancel_all_rungs()
+            self._anchor = None
+            return
         if self._anchor is None:
             self._anchor = mid
         drift = abs(mid - self._anchor) / self._anchor if self._anchor > 0 else Decimal(0)

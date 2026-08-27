@@ -36,6 +36,10 @@ def _controller(adapter, **cfg):
         "levels": 2,
         "step_pct": Decimal("0.01"),
         "order_amount_quote": Decimal("100"),
+        # These tests exercise the ladder / stop MECHANICS directly, so the chop
+        # stand-down gate is disabled here (it has its own tests below). With the
+        # gate on and no candle feed the controller would (correctly) stand down.
+        "revgrid_chop_stand_down": False,
     }
     configs.update(cfg)
     return ReverseGridController(
@@ -223,6 +227,66 @@ def test_first_sell_fill_opens_a_short_and_arms_stop_above():
         # a short's protective stop sits ABOVE entry: 99*(1+0.02)=100.98
         assert _approx(c._stop_level, Decimal("100.98"))
         assert len(a.cancelled_triggers) == 1        # the BUY rung was cancelled
+
+    asyncio.run(body())
+
+
+# ── chop stand-down gate ───────────────────────────────────────────────
+
+def _uptrend_candles(n=24, start=100.0, step=0.2):
+    return [{"time": i, "open": start + i * step, "high": start + i * step,
+             "low": start + i * step, "close": start + i * step} for i in range(n)]
+
+
+def _chop_candles(n=24, base=100.0):
+    # tiny alternating wiggle: no sustained drift → classified as range/chop
+    return [{"time": i, "open": base, "high": base + 0.02,
+             "low": base - 0.02, "close": base + (0.02 if i % 2 else -0.02)}
+            for i in range(n)]
+
+
+def test_gate_stands_down_with_no_candle_feed():
+    async def body():
+        a = _adapter()
+        c = _controller(a, revgrid_chop_stand_down=True, candle_provider=lambda _p: [])
+        await c.on_tick()
+        assert a.placed_triggers == []          # insufficient history → stand down
+
+    asyncio.run(body())
+
+
+def test_gate_stands_down_in_chop():
+    async def body():
+        a = _adapter()
+        c = _controller(a, revgrid_chop_stand_down=True, revgrid_trend_confirm_ticks=1,
+                        candle_provider=lambda _p: _chop_candles())
+        await c.on_tick()
+        assert a.placed_triggers == []          # no confirmed trend → no ladder
+
+    asyncio.run(body())
+
+
+def test_gate_arms_the_ladder_in_a_confirmed_trend():
+    async def body():
+        a = _adapter()
+        c = _controller(a, revgrid_chop_stand_down=True, revgrid_trend_confirm_ticks=1,
+                        candle_provider=lambda _p: _uptrend_candles())
+        await c.on_tick()
+        assert len(a.placed_triggers) == 4      # confirmed uptrend → ladder armed
+
+    asyncio.run(body())
+
+
+def test_gate_needs_the_confirmation_debounce():
+    """A single trend tick does not arm when confirm_ticks=2 — it must sustain."""
+    async def body():
+        a = _adapter()
+        c = _controller(a, revgrid_chop_stand_down=True, revgrid_trend_confirm_ticks=2,
+                        candle_provider=lambda _p: _uptrend_candles())
+        await c.on_tick()
+        assert a.placed_triggers == []          # one tick: not yet confirmed
+        await c.on_tick()
+        assert len(a.placed_triggers) == 4      # second consecutive trend tick: armed
 
     asyncio.run(body())
 
