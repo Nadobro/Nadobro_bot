@@ -2811,6 +2811,15 @@ def _liq_proximity_tripped(strategy: str, snap: dict) -> bool:
         return False
 
 
+# Per-session last-observed mark for the SL overshoot buffer's VOLATILITY term.
+# Process-local (no per-poll DB write); the move between consecutive polls is the
+# live velocity the buffer projects through the flatten latency. Cleaned up when a
+# session stops (see _evaluate_session_pnl_rail); a stale entry from a crashed run
+# only ever makes the FIRST poll of a reused session id compute one wrong move,
+# which the buffer bounds anyway.
+_SLTP_MARK_CACHE: dict[int, float] = {}
+
+
 async def _evaluate_session_pnl_rail(
     telegram_id: int,
     network: str,
@@ -2952,27 +2961,38 @@ async def _evaluate_session_pnl_rail(
     if float(snap.get("margin") or 0.0) <= 0:
         # No margin basis to measure a % against — skip rather than divide by zero.
         return None
-    pnl = float(snap.get("session_pnl") or 0.0)
-    pct = float(snap.get("session_pnl_pct") or 0.0)
-    # SLTP-GROSS fix: judge the stop on NET-of-fees PnL so it doesn't fire late
-    # by the accumulated fee drag. Fall back to the gross basis when the net
-    # field is absent (older snapshots). The user-facing message still shows the
-    # gross figure (``pnl``/``pct``) for continuity.
-    pct_net = float(snap.get("session_pnl_pct_net", pct) or 0.0)
+    # Gross figures kept ONLY as the price-vs-fees breakdown for the log/message.
+    pnl_gross = float(snap.get("session_pnl") or 0.0)
+    pct_gross = float(snap.get("session_pnl_pct") or 0.0)
+    # SLTP-EXACT (owner spec, 2026-08-28): the SL/TP is a TOTAL-LOSS contract on the
+    # user's OWN money. "SL 10% of a $100 margin" means REALIZE EXACTLY -$10 — no
+    # more, no less; not before, not after. What the user actually loses is the NET
+    # of everything (mark-to-market price PnL - trading fees - funding), so the rail
+    # judges the NET %-of-margin basis (``session_pnl_pct_net``), and the overshoot
+    # buffer below TARGETS the realized net loss to land AT ``sl_pct`` (it reserves
+    # only the move projected to occur during the flatten, so it centres the exit on
+    # the user's number rather than firing early or overshooting). The user-facing
+    # figures below are the NET loss too, so the message matches the SL they set —
+    # the -3.56% GROSS that read as an "early stop" was really -10.90% NET (prod
+    # #253: price -$3.56, fees -$7.34), i.e. the $10 they configured.
+    pnl = float(snap.get("session_pnl_net", pnl_gross) or 0.0)
+    pct = float(snap.get("session_pnl_pct_net", pct_gross) or 0.0)
+    pct_net = pct
+    fees_pct = pct_gross - pct_net       # the fee/funding drag, for the log breakdown
 
-    # SLTP-OVERSHOOT-BUFFER (2026-08-25 incident: a 10%-of-$100 stop realized
-    # > -$20 at high leverage): a bare ``pct_net <= -sl_pct`` reserves nothing
-    # for the loss that keeps accruing between polls and during the flatten
-    # round-trip, so at high leverage the realized exit lands well past the
-    # user's number. Tighten the SL trigger by a leverage-scaled reserve so the
-    # realized loss lands at/under sl_pct. TP is never buffered. Fail-safe: any
-    # error falls back to the raw sl_pct (the user's exact number) — the buffer
-    # can only ever TIGHTEN the stop, never loosen or disarm it.
+    # SLTP-EXACT overshoot buffer: to land the REALIZED net loss AT ``sl_pct`` (not
+    # before, not after), fire the trigger early by exactly the move projected to
+    # occur while the breach is detected + the flatten fills — no more. In a CALM
+    # market that projection is ~0, so the trigger sits at the user's exact number
+    # and the exit realizes ~ -sl_pct; only a genuinely fast move reserves room, and
+    # only as much as the current velocity implies (never a flat leverage haircut,
+    # which stopped #253 at half its budget). TP is never buffered. Fail-safe: any
+    # error falls back to the raw sl_pct.
     sl_trigger = sl_pct
     try:
         from src.nadobro.utils.env import env_bool
         if sl_pct > 0 and env_bool("NADO_SLTP_BUFFER_ENABLED", True):
-            from src.nadobro.quant.sltp_overshoot import effective_sl_trigger
+            from src.nadobro.quant.sltp_overshoot import effective_sl_trigger, move_bp
             # Effective leverage = the run's notional over the rail's OWN margin
             # basis (both from this snapshot) — the quantity that actually drives
             # uPnL as a %-of-margin, so the buffer is sized against the same basis
@@ -2983,7 +3003,18 @@ async def _evaluate_session_pnl_rail(
             _mg = float(snap.get("margin") or 0.0)
             _pv = float(snap.get("position_value") or 0.0)
             _eff_lev = (_pv / _mg) if (_mg > 0 and _pv > 0) else float(snap.get("leverage") or 0.0)
-            sl_trigger = effective_sl_trigger(sl_pct, _eff_lev)
+            # Live per-poll velocity for the buffer — the mark move since THIS
+            # session's last poll. The buffer is now PURELY this: a calm session
+            # reserves ~0 (fires at the user's exact number), a fast move reserves
+            # the projected overshoot. 0 on the first poll (no prior mark) -> no
+            # reserve, so the very first poll can never fire EARLY of the number.
+            _sid = int(sess.get("id") or 0)
+            _mark = float(snap.get("mark") or 0.0)
+            _prev_mark = _SLTP_MARK_CACHE.get(_sid, 0.0)
+            if _mark > 0:
+                _SLTP_MARK_CACHE[_sid] = _mark
+            _recent_move_bp = move_bp(_prev_mark, _mark) if (_prev_mark > 0 and _mark > 0) else 0.0
+            sl_trigger = effective_sl_trigger(sl_pct, _eff_lev, _recent_move_bp)
     except Exception:  # noqa: BLE001 - never let the buffer math disarm the stop
         logger.debug("sltp overshoot buffer skipped", exc_info=True)
         sl_trigger = sl_pct
@@ -2999,8 +3030,12 @@ async def _evaluate_session_pnl_rail(
     if not reason and sl_pct <= 0 and tp_pct <= 0:
         return None
     if not reason and sl_pct > 0 and pct_net <= -sl_trigger:
+        # SLTP-EXACT: fire on the NET total loss so the user realizes EXACTLY the
+        # -sl_pct they set (their real loss is price - fees - funding). The buffer
+        # above targets the realized net loss at -sl_pct.
         reason = "sl_hit"
     elif not reason and tp_pct > 0 and pct_net >= tp_pct:
+        # Symmetric: the TP also clears NET (profit is what the user actually nets).
         reason = "tp_hit"
     # Overlay drawdown kill-switch: a SECOND, independent stop for the financial
     # overlay (10% of margin by default), armed only when the overlay steers
@@ -3032,7 +3067,18 @@ async def _evaluate_session_pnl_rail(
             logger.debug("venue stop sync failed", exc_info=True)
         return None
 
+    # Visibility: log the NET loss the stop judged (= the user's real loss) with the
+    # price-vs-fees breakdown and the buffered trigger, so a fee-heavy session and
+    # any over/undershoot vs the configured number are diagnosable from logs.
+    logger.info(
+        "session rail fired reason=%s strategy=%s user=%s: NET=%.2f%% "
+        "(target -%.2f%%, buffered trigger -%.2f%%) = price %.2f%% - fees/funding %.2f%% "
+        "| fees=$%.2f margin=$%.2f",
+        reason, strategy, telegram_id, pct_net, sl_pct, sl_trigger, pct_gross, fees_pct,
+        float(snap.get("fees") or 0.0), float(snap.get("margin") or 0.0),
+    )
     _finalize_session(state, stop_reason=reason)
+    _SLTP_MARK_CACHE.pop(int(sess.get("id") or 0), None)   # session over — drop its mark
     state["running"] = False
     if reason == "tp_hit":
         state["last_error"] = None

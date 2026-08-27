@@ -20,25 +20,27 @@ bare ``pct <= -sl_pct`` reserves nothing for it, so a 10%-of-$100 stop at 50x
 routinely realizes well past −$10.
 
 The fix (this module): tighten the *trigger* by a buffer that reserves room for
-that overshoot, so the rail fires early enough that the realized exit lands at
-or under the user's ``sl_pct``.
+that overshoot, so the realized exit lands AT the user's ``sl_pct`` (SLTP-EXACT:
+not before, not after).
 
-    reserve_frac = clamp( max(lev_term, vol_term), 0, max_fraction )
-        lev_term = leverage / lev_ref                 (primary — always known)
-        vol_term = L * recent_move_frac * 100 * factor / sl_pct   (optional)
+    reserve_frac = clamp( vol_term, 0, max_fraction )
+        vol_term = L * recent_move_frac * 100 * factor / sl_pct
     buffer            = sl_pct * reserve_frac         (never exceeds max_fraction)
     effective_trigger = sl_pct - buffer               (fire earlier, never later)
 
-The **leverage term** is the primary, always-available driver: a higher sizing
-multiplier deploys more notional per unit of margin, so the same price wobble is
-a larger %-of-margin overshoot — reserve proportionally. It needs no price
-history, so the rail can apply it every poll with no extra state or reads. The
-optional **volatility term** widens the buffer further when a live per-poll move
-estimate is supplied (``recent_move_bp``); when it is not (0), the buffer is
-purely leverage-driven. The reserve is clamped to a fraction of the SL budget so
-it can never invert or disarm the stop, and low leverage + no volatility yields
-≈0 buffer (fires at the user's exact number). TP is never buffered (firing a
-take-profit early would leave profit on the table)."""
+The buffer is PURELY the **volatility term**: it reserves only for the overshoot
+that will ACTUALLY happen — leverage × the recently-observed per-poll move × a
+latency factor. So a CALM market (``recent_move_bp`` ~ 0) reserves ~0 and the stop
+fires at the user's EXACT number (the realized loss lands on it); only a genuinely
+fast move reserves room, and only as much as the current velocity implies, up to
+``max_buffer_fraction``. There is NO leverage-only floor: a flat leverage haircut
+reserves budget with no live move to justify it and fires a calm high-leverage stop
+early — it stopped prod #253 at half its budget. The reserve is clamped so it can
+never invert or disarm the stop, and low leverage / no volatility yields ≈0 buffer.
+TP is never buffered (firing a take-profit early would leave profit on the table).
+
+``leverage_reserve_frac`` / ``leverage_only_cap`` remain for reference/tuning but no
+longer feed the buffer."""
 from __future__ import annotations
 
 import os
@@ -78,6 +80,19 @@ def leverage_reference() -> float:
     is ``max_fraction * clamp(leverage/lev_ref, 0, 1)``. Default 50x (a typical
     high-leverage perp deploy), floored at 1 to avoid divide-by-zero."""
     return max(1.0, _env_float("NADO_SLTP_LEVERAGE_REF", 50.0))
+
+
+def leverage_only_cap() -> float:
+    """Cap on the LEVERAGE-ONLY reserve — the modest always-on floor applied when
+    there is no live volatility estimate (a first poll, or a momentarily still
+    mark). Kept small (default 0.15) so a high-leverage but CALM session is not
+    stopped at half its SL budget: the SLTP-FEE-BLEED incident (prod #253, 49x,
+    a slow -3.56% over 3h) showed the old leverage-ONLY buffer reserving the full
+    0.5 cap on leverage alone even though no fast move was happening. The
+    VOLATILITY term (leverage x recent move x latency) is what reserves up to the
+    full ``max_buffer_fraction`` when the market is genuinely moving fast — that is
+    the overshoot the buffer exists for. Clamped to [0, max_buffer_fraction]."""
+    return min(max_buffer_fraction(), max(0.0, _env_float("NADO_SLTP_LEVERAGE_ONLY_CAP", 0.15)))
 
 
 # --- pure math ---------------------------------------------------------------
@@ -131,16 +146,21 @@ def sl_buffer_pct(
     lev_ref: Optional[float] = None,
 ) -> float:
     """The overshoot buffer to subtract from ``sl_pct``, clamped to
-    ``[0, sl_pct * max_fraction]``. Reserve = ``max(leverage_term, vol_term)``:
-    the leverage term is always available; the volatility term contributes only
-    when ``recent_move_bp > 0``. ``0`` when the stop is disarmed (``sl_pct<=0``)
-    or nothing is projected."""
+    ``[0, sl_pct * max_fraction]``.
+
+    SLTP-EXACT: the reserve is PURELY the volatility term — the overshoot projected
+    to occur while the breach is detected and the flatten fills, ``leverage x recent
+    per-poll move x factor``. So a CALM session (``recent_move_bp`` ~ 0) reserves ~0
+    and the stop fires at the user's EXACT number; only a genuinely fast move
+    reserves room, and only as much as the current velocity implies. There is no
+    leverage-only floor — a flat leverage haircut fires a calm high-leverage stop
+    early (it stopped prod #253 at half its budget). ``0`` when disarmed
+    (``sl_pct<=0``) or when nothing is projected (no recent move / leverage)."""
     if sl_pct is None or sl_pct <= 0:
         return 0.0
     cap_frac = max_buffer_fraction() if max_fraction is None else min(0.9, max(0.0, max_fraction))
-    lev_frac = leverage_reserve_frac(leverage, lev_ref)
     vol_frac = projected_overshoot_pct(leverage, recent_move_bp, factor) / float(sl_pct)
-    reserve = max(0.0, min(cap_frac, max(lev_frac, vol_frac)))
+    reserve = max(0.0, min(cap_frac, vol_frac))
     return float(sl_pct) * reserve
 
 

@@ -172,47 +172,60 @@ def test_classic_ladder_does_not_turn_a_margin_percent_into_a_level_barrier():
 
 
 # --------------------------------------------------------------------------- #
-# SLTP-OVERSHOOT-BUFFER (2026-08-25 incident: a 10%-of-$100 session stop        #
-# realized > -$20 at ~20-50x leverage). The session rail fired on a bare        #
-# `pct_net <= -sl_pct`, reserving nothing for the loss that accrues between      #
-# polls and during the flatten round-trip, so the realized exit overshot the    #
-# user's number under leverage. The rail now tightens the SL trigger by a        #
-# leverage-scaled reserve (`quant/sltp_overshoot.effective_sl_trigger`), gated   #
-# by NADO_SLTP_BUFFER_ENABLED and fail-safe back to the raw sl_pct. The buffer   #
-# only ever TIGHTENS the stop — it can never loosen, invert, or disarm it, and   #
-# never touches TP.                                                              #
+# SLTP-EXACT (owner spec, 2026-08-28, from prod GRID #253: a 10%-of-$100 stop at  #
+# 49x). The session SL/TP is a TOTAL-LOSS contract on the user's own money: "SL   #
+# 10%" must REALIZE exactly -$10 — no more, no less; not before, not after.       #
+#   * BASIS = NET %-of-margin (price - fees - funding = the user's real loss). #244 #
+#     (5% SL, $4.56 fees, 40x) and #253 (10% SL, $7.34 fees, 49x) both fired near  #
+#     the user's number on NET; the "stopped at $3.56" was a DISPLAY artifact —    #
+#     the message showed GROSS price PnL, not the -10.90% NET that tripped it. The #
+#     message now shows NET so the displayed loss matches the SL.                  #
+#   * EXACT buffer: the overshoot buffer reserves ONLY the move projected during   #
+#     the flatten (velocity term). A CALM market reserves ~0, so the stop fires at #
+#     the user's exact number; a fast move reserves just enough to land the        #
+#     realized loss ON the number. NO leverage-only floor (it stopped calm #253 at #
+#     half its budget — reserving for an overshoot that was not happening).        #
 # --------------------------------------------------------------------------- #
 
 def test_sltp_overshoot_buffer_only_ever_tightens_the_stop():
-    """SLTP-OVERSHOOT-BUFFER: the effective SL trigger is <= the user's sl_pct at
-    every leverage (fires at/before the user's number, never after), and equals
-    it exactly when disarmed. High leverage fires meaningfully earlier so the
-    realized loss lands at/under the configured %."""
+    """The effective SL trigger is <= the user's sl_pct at every leverage (fires
+    at/before the user's number, never after), equals it EXACTLY when the market is
+    calm (no early reserve), and equals it when disarmed."""
     from src.nadobro.quant.sltp_overshoot import effective_sl_trigger
 
     for lev in (1, 5, 10, 20, 50, 100):
-        eff = effective_sl_trigger(10.0, float(lev))
-        assert 0.0 < eff <= 10.0, (lev, eff)          # only tightens, never disarms
-    # Disarmed stays disarmed (buffer must not manufacture a stop).
-    assert effective_sl_trigger(0.0, 50.0) == 0.0
-    # The incident leverage band trips well before the raw -10% barrier.
-    assert effective_sl_trigger(10.0, 50.0) <= 6.0
-    # Low leverage stays effectively at the user's number.
-    assert effective_sl_trigger(10.0, 2.0) >= 9.0
+        eff = effective_sl_trigger(10.0, float(lev))  # calm (no recent move)
+        assert eff == pytest.approx(10.0), (lev, eff)  # calm -> fires at the exact number
+    assert effective_sl_trigger(0.0, 50.0) == 0.0     # disarmed stays disarmed
 
 
-def test_sltp_overshoot_buffer_never_fires_a_take_profit_early():
-    """The buffer is SL-only: the rail applies the buffered trigger to the SL
-    branch but still fires TP at the exact user tp_pct (tightening a take-profit
-    would leave profit on the table). Asserted by reading the rail source as text
-    (no import) so this stays runnable in the pytest-only CI invariant job."""
+def test_sltp_buffer_is_zero_when_calm_but_reserves_on_a_fast_move():
+    """SLTP-EXACT: with NO live volatility (recent_move_bp=0) the buffer is ZERO —
+    the stop fires at the user's exact number at ANY leverage (it is NOT stopped at
+    half its number in a calm market, the #253 defect). A genuinely fast per-poll
+    move reserves proportionally, up to the cap, to land the realized loss ON the
+    number."""
+    from src.nadobro.quant.sltp_overshoot import effective_sl_trigger
+
+    calm = effective_sl_trigger(10.0, 50.0, 0.0)      # 49-50x, no recent move
+    assert calm == pytest.approx(10.0), calm          # exact number when calm
+    fast = effective_sl_trigger(10.0, 50.0, 50.0)     # a 50 bp move this poll
+    assert fast < calm and fast <= 6.0, (calm, fast)  # overshoot risk reserves more
+    assert effective_sl_trigger(10.0, 2.0, 0.0) >= 9.5  # low leverage ~ the user's number
+
+
+def test_sl_and_tp_judge_the_users_net_total_loss():
+    """SLTP-EXACT: the SL and TP fire on the NET %-of-margin basis (pct_net = the
+    user's REAL loss/gain, price - fees - funding), so "SL 10%" realizes exactly
+    -10% of margin. Read as source (no import) so it runs in the pytest-only CI job."""
     from pathlib import Path
 
     repo = Path(__file__).resolve().parents[2]
     src = (repo / "src" / "nadobro" / "strategy" / "bot_runtime.py").read_text()
-    # SL compare uses the buffered trigger; TP compare uses the raw user tp_pct.
-    assert "pct_net <= -sl_trigger" in src
-    assert "pct_net >= tp_pct" in src
+    assert "pct_net = pct" in src                          # rail judges the net basis
+    assert "pct_net <= -sl_trigger" in src                 # SL on net total loss, buffered
+    assert "pct_net >= tp_pct" in src                      # TP on net total gain
+    assert "pct_drawdown" not in src                       # no gross-only stop basis
 
 
 def test_sltp_fast_poll_is_wired_into_the_cycle_and_scheduler():

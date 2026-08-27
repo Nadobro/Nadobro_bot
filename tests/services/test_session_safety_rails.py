@@ -85,15 +85,24 @@ class SessionPnlRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(closed.get("called"))
         fin.assert_not_called()
 
-    async def test_buffer_tightens_sl_at_high_leverage(self):
-        # SLTP-OVERSHOOT-BUFFER (2026-08-25 incident): sl 10%, 50x -> buffered
-        # trigger ~5%. A -6% draw (between the buffered 5% and the raw 10%) MUST
-        # fire under leverage, so the realized loss lands near the user's number
-        # instead of overshooting it.
-        snap = {"session_pnl": -6.0, "session_pnl_pct": -6.0, "margin": 100.0, "leverage": 50.0}
-        res, _closed, _state, fin = await self._run_rail(snap, sl=10.0, tp=50.0)
-        self.assertEqual(res, (True, None))
-        self.assertEqual(fin.call_args.kwargs.get("stop_reason"), "sl_hit")
+    async def test_buffer_tightens_sl_only_on_a_fast_move_not_leverage_alone(self):
+        # SLTP-FEE-BLEED rebalance (prod #253): a -6% PRICE draw at 50x in a CALM
+        # market must NOT fire a 10% SL — the old leverage-only buffer tightened to
+        # ~5% on leverage alone and stopped the user at half their budget. The buffer
+        # now keeps the budget when calm and only tightens on a genuinely fast move.
+        bot_runtime._SLTP_MARK_CACHE.clear()
+        calm = {"session_pnl": -6.0, "session_pnl_pct": -6.0, "margin": 100.0,
+                "leverage": 50.0, "position_value": 5000.0, "mark": 79000.0}
+        res, _c, _s, fin = await self._run_rail(calm, sl=10.0, tp=50.0)
+        self.assertIsNone(res)                 # calm: keeps the budget
+        fin.assert_not_called()
+        # A fast ~50bp per-poll move at the same leverage reserves for the overshoot,
+        # so the SAME -6% draw now fires (protection where it is actually warranted).
+        fast = {"session_pnl": -6.0, "session_pnl_pct": -6.0, "margin": 100.0,
+                "leverage": 50.0, "position_value": 5000.0, "mark": 78600.0}
+        res2, _c2, _s2, fin2 = await self._run_rail(fast, sl=10.0, tp=50.0)
+        self.assertEqual(res2, (True, None))
+        self.assertEqual(fin2.call_args.kwargs.get("stop_reason"), "sl_hit")
 
     async def test_buffer_absent_at_low_leverage_same_draw_holds(self):
         # The SAME -6% draw does NOT fire without leverage (buffer ~0, raw -10%
@@ -104,17 +113,20 @@ class SessionPnlRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(res)
         fin.assert_not_called()
 
-    async def test_buffer_uses_effective_leverage_when_venue_leverage_is_zero(self):
-        # SLTP-tracer MED: the stale-DB -> fresh-venue position fallback hard-codes
-        # leverage 0, which would no-op the buffer exactly when the read is
-        # freshest. The rail now derives effective leverage = position_value /
-        # margin ($5,000 / $100 = 50x), so the buffered ~5% trigger still fires on
-        # a -6% draw even though snap["leverage"] is 0.
-        snap = {
-            "session_pnl": -6.0, "session_pnl_pct": -6.0, "margin": 100.0,
-            "leverage": 0.0, "position_value": 5000.0,
-        }
-        res, _closed, _state, fin = await self._run_rail(snap, sl=10.0, tp=50.0)
+    async def test_buffer_uses_effective_leverage_from_position_over_margin(self):
+        # SLTP-tracer MED: the stale-DB -> fresh-venue fallback hard-codes
+        # leverage 0, which would no-op the buffer's volatility term (leverage x
+        # move) exactly when the read is freshest. The rail derives effective
+        # leverage = position_value / margin ($5,000 / $100 = 50x). Prove it: seed
+        # a mark, then a fast move fires the -6% draw ONLY because eff-leverage 50x
+        # (not snap.leverage 0) scaled the overshoot reserve.
+        bot_runtime._SLTP_MARK_CACHE.clear()
+        seed = {"session_pnl": 0.0, "session_pnl_pct": 0.0, "margin": 100.0,
+                "leverage": 0.0, "position_value": 5000.0, "mark": 79000.0}
+        await self._run_rail(seed, sl=10.0, tp=50.0)
+        fast = {"session_pnl": -6.0, "session_pnl_pct": -6.0, "margin": 100.0,
+                "leverage": 0.0, "position_value": 5000.0, "mark": 78600.0}
+        res, _closed, _state, fin = await self._run_rail(fast, sl=10.0, tp=50.0)
         self.assertEqual(res, (True, None))
         self.assertEqual(fin.call_args.kwargs.get("stop_reason"), "sl_hit")
 
@@ -223,18 +235,25 @@ class SessionPnlRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(res)
         self.assertFalse(closed.get("called"))
 
-    async def test_sl_judged_on_net_of_fees_pct(self):
-        # SLTP-GROSS fix: gross PnL is -0.5% (within a 1% stop) but NET of fees
-        # it is -1.5% — the stop MUST fire on the net basis, not ride past it.
+    async def test_sl_judged_on_net_total_loss(self):
+        # SLTP-EXACT: the SL is a TOTAL-LOSS contract. Gross price PnL is -0.5%
+        # (within a 1% stop) but NET of fees the user is actually down -1.5% — past
+        # their 1% budget — so the stop fires (their real loss reached the number).
         snap = {
             "session_pnl": -0.5, "session_pnl_pct": -0.5,
             "session_pnl_net": -1.5, "session_pnl_pct_net": -1.5,
             "margin": 100.0,
         }
-        res, closed, state, fin = await self._run_rail(snap, sl=1.0)
+        res, closed, _state, fin = await self._run_rail(snap, sl=1.0)
         self.assertEqual(res, (True, None))
-        self.assertTrue(closed.get("called"))
         self.assertEqual(fin.call_args.kwargs.get("stop_reason"), "sl_hit")
+        # And it does NOT fire while the user's NET loss is still inside the stop,
+        # even if the gross price move is larger.
+        inside = {"session_pnl": -0.9, "session_pnl_pct": -0.9,
+                  "session_pnl_net": -0.6, "session_pnl_pct_net": -0.6, "margin": 100.0}
+        res2, _c2, _s2, fin2 = await self._run_rail(inside, sl=1.0)
+        self.assertIsNone(res2)
+        fin2.assert_not_called()
 
     async def test_tp_not_triggered_when_fees_eat_the_gross_gain(self):
         # Gross +2.1% would trip a 2% TP, but net of fees it's only +1.0% — the
