@@ -734,13 +734,20 @@ class NadoAdapter(NadoAdapterBase):
         trigger digest in the SEPARATE ``_trigger_orders`` registry, and returns a
         :class:`NadoOrder` whose ``id`` is that digest.
 
-        The placement session-link hook (``_on_place``) IS called with the trigger
-        digest — a Nado price trigger IS the order (conditionally activated), so its
-        fill carries this digest, and linking it is what attributes the fill to the
-        run (turnover / realized PnL / History) via the venue-sync bridge, exactly
-        as ``place_order`` does for a resting order. It is NOT tagged with an
-        order_tags client id (that path is for the WS executor fill stream, which a
-        trigger controller does not use).
+        Attribution is DUAL-PATH, so the run's turnover / realized PnL / History are
+        captured whether or not the venue echoes the trigger digest on the fill:
+          1. PRIMARY — the placement session-link hook (``_on_place``) is called with
+             the trigger digest. A Nado price trigger IS the order (conditionally
+             activated), so if its fill carries this digest ``venue/nado_sync`` links
+             it to the run via ``_back_link_intent``, exactly as for a resting order.
+          2. BACKSTOP — if the fill carries a DIFFERENT digest (the trigger spawns a
+             fresh order id), ``nado_sync``'s product+session-window fallback
+             (``_resolve_session_by_window``) still attributes the fill to the session
+             that owns the product during the run, labelling it ``source='strategy'``;
+             it is gated on ``not intent_found`` so a manual-tagged fill is never
+             swallowed. So no fill is lost regardless of the venue's fire semantics.
+        It is NOT tagged with an order_tags client id (that path is for the WS
+        executor fill stream, which a trigger controller does not use).
         """
         meta = self._meta(trading_pair)
         is_buy = side is TradeType.BUY

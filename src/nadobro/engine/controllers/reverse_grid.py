@@ -107,7 +107,13 @@ class ReverseGridController(Controller):
         # -- live state --
         self._anchor: Optional[Decimal] = None
         self._rungs: List[_Rung] = []
-        self._pos_base: Decimal = Decimal(0)      # last observed signed net
+        self._pos_base: Decimal = Decimal(0)      # last observed signed net (run-only)
+        # Venue position that already existed on the product when the run began,
+        # captured on the first successful net read and subtracted from held_base so
+        # the controller manages ONLY the exposure IT opens (a pre-existing manual
+        # position, or a leftover from a prior run that was NOT auto-resumed, is
+        # baselined out — mirrors live_session's baseline). None = not yet captured.
+        self._baseline_net: Optional[Decimal] = None
         self._avg_entry: Optional[Decimal] = None
         self._peak: Optional[Decimal] = None      # favourable extreme mid since open
         self._trail_armed = False
@@ -189,12 +195,15 @@ class ReverseGridController(Controller):
 
     # -- lifecycle -----------------------------------------------------------
     async def on_start(self) -> None:
-        # No auto-resume: a redeploy/start never re-arms a prior ladder. Start from
-        # a clean slate; the first on_tick anchors and arms from the live mid. If the
-        # account happens to hold a position (a user restart mid-trade), on_tick
-        # detects it and arms a protective stop rather than adding new exposure.
+        # No auto-resume: a redeploy/start never re-arms a prior ladder OR re-engages
+        # a position it did not open. Start from a clean slate; the first on_tick
+        # captures whatever is held now as the BASELINE (see _read_net) so a
+        # pre-existing / leftover position is left alone (the session rail still
+        # bounds it), and the ladder is armed fresh from the live mid.
         self._anchor = None
         self._rungs = []
+        self._pos_base = Decimal(0)
+        self._baseline_net = None
         self._reset_position_state()
 
     async def on_tick(self) -> None:
@@ -294,14 +303,30 @@ class ReverseGridController(Controller):
             return None
 
     async def _read_net(self) -> Optional[Decimal]:
-        """Signed net position base from the VENUE (``held_base``). None = the venue
-        could not be read — the caller then holds and acts on nothing (fail safe)."""
+        """Signed net position base for THIS RUN: the venue position (``held_base``)
+        minus the baseline captured at the run's start. The baseline excludes any
+        position that already existed on the product when the run began, so the
+        controller reads, sizes stops against, and flattens ONLY its own exposure.
+        None = the venue could not be read — the caller then holds and acts on
+        nothing (fail safe), and the baseline is NOT captured off a bad read."""
         try:
             held = await self.adapter.held_base(self.trading_pair)
         except Exception:  # noqa: BLE001
             logger.debug("revgrid net read failed pair=%s", self.trading_pair, exc_info=True)
             return None
-        return None if held is None else _dec(held)
+        if held is None:
+            return None
+        held = _dec(held)
+        if self._baseline_net is None:
+            # First good read of the run — the ladder is not armed yet, so whatever
+            # is held now is pre-existing and is baselined out.
+            self._baseline_net = held
+            logger.info(
+                "revgrid baseline captured: %s pre-existing on %s (run reads net "
+                "relative to this) (user=%s)",
+                held, self.trading_pair, self.user_id,
+            )
+        return held - self._baseline_net
 
     # -- chop stand-down gate ------------------------------------------------
     async def _candles(self) -> List[dict]:

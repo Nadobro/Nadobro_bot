@@ -80,6 +80,27 @@ def test_unreadable_venue_arms_nothing():
     asyncio.run(body())
 
 
+def test_preexisting_position_is_baselined_out():
+    """P2: a position already on the product when the run starts (a manual trade, or
+    a leftover NOT auto-resumed) must be baselined out — the controller reads, sizes,
+    and flattens ONLY its own exposure, and treats itself as flat at start."""
+    async def body():
+        a = _adapter(venue_held={PAIR: Decimal("5")})   # 5 pre-existing
+        c = _controller(a)
+        await c.on_tick()                                # first read captures baseline
+        assert c._baseline_net == Decimal("5")
+        assert c._pos_base == 0                          # the run reads as flat...
+        assert len(a.placed_triggers) == 4               # ...and arms its ladder
+        # the controller's OWN buy fill grows net from 0, not from 5
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))               # venue_held 5 -> ~5.99
+        await c.on_tick()
+        assert Decimal("0") < c._pos_base < Decimal("1")  # ~0.99 (run-only), not ~5.99
+        assert _approx(c._avg_entry, Decimal("101"))     # its own entry, uncontaminated
+
+    asyncio.run(body())
+
+
 # ── first fill: cancel the losing side + arm the protective stop ────────
 
 def test_first_buy_fill_cancels_sells_and_arms_a_stop():
