@@ -985,3 +985,75 @@ def test_dgrid_trend_phase_delegates_to_the_rgrid_follower():
     assert "flatten_now" in inspect.getsource(
         dynamic_grid.DynamicGridController._flip_to
     )
+
+
+def test_dgrid_stop_in_trend_phase_cancels_the_delegates_venue_triggers():
+    """SLTP-TRACER / DGRID-AUDIT 2026-08-28 (CRITICAL): D-Grid's trend delegate is a
+    trigger ReverseGridController holding its entry rungs + stop as VENUE TRIGGER
+    orders — off the resting-order path the orchestrator's executor batch-cancel and
+    close_all_positions use. Before the fix D-Grid had no on_stop, so a session-rail
+    stop (or user stop / redeploy stand-down) left the entry rungs (NOT reduce-only)
+    ARMED — a later cross would RE-OPEN an unmonitored position with no rail running.
+    on_stop must tear the delegate down on EVERY stop path."""
+    import asyncio
+
+    from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    async def body():
+        a = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal(0)})
+        trend_cfg = {"trading_pair": "P", "levels": 2, "step_pct": Decimal("0.01"),
+                     "order_amount_quote": Decimal("100"), "revgrid_chop_stand_down": False}
+        cfg = {"trading_pair": "P", "total_amount_quote": "100", "levels_count": 2,
+               "dgrid_trend_follow": 1, "trend_uses_trigger": True, "trend_rgrid": trend_cfg}
+        dg = DynamicGridController(user_id=1, orchestrator=ExecutorOrchestrator(),
+                                   adapter=a, inventory=InventoryRepository(), configs=cfg)
+        assert await dg._spawn_trend(Decimal("100")) is True
+        # the delegate armed entry rungs as live venue triggers
+        assert len(a.placed_triggers) > 0
+        assert len(a._triggers) > 0                       # noqa: SLF001 - venue-armed set
+
+        await dg.on_stop("sl_hit")
+
+        assert dg._trend is None
+        # every armed trigger the delegate placed is now cancelled at the venue —
+        # nothing left watching the mid to re-open a naked position after the stop.
+        assert len(a._triggers) == 0, (                   # noqa: SLF001
+            "delegate venue triggers orphaned after D-Grid stop — a cross would "
+            "re-open an unmonitored position"
+        )
+
+    asyncio.run(body())
+
+
+def test_dgrid_candle_outage_degrades_to_grid_not_trapped_in_rgrid():
+    """DGRID-AUDIT 2026-08-28 (Medium): a candle outage (cold cache / gateway
+    throttle) must degrade D-Grid to the SAFE mean-reversion GRID, not HOLD the
+    current phase. Holding RGRID through an outage would keep the trend delegate —
+    its chop gate is disabled for the D-Grid path — arming/pyramiding BLIND with no
+    regime protection for the whole outage (an unbounded-duration chop premium,
+    newly reachable now that the trend phase defaults ON). Pins _classify: no
+    candles => GRID even when the live phase is RGRID."""
+    import asyncio
+
+    from src.nadobro.engine.controllers import dynamic_grid as _dg
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    async def body():
+        c = _dg.DynamicGridController(
+            user_id=1, orchestrator=ExecutorOrchestrator(),
+            adapter=MockNadoAdapter(mid=Decimal("100")), inventory=InventoryRepository(),
+            configs={"trading_pair": "P", "candle_provider": lambda _p: []},
+        )
+        # parked in the trend phase, a candle-less classify must NOT hold RGRID
+        c.current_phase = _dg.variance_regime.RGRID
+        assert await c._classify() == _dg.variance_regime.GRID
+        # and a GRID session simply stays GRID
+        c.current_phase = _dg.variance_regime.GRID
+        assert await c._classify() == _dg.variance_regime.GRID
+
+    asyncio.run(body())

@@ -213,6 +213,33 @@ class DynamicGridController(Controller):
     async def on_start(self) -> None:
         return None
 
+    async def on_stop(self, reason: str = "stopped") -> None:
+        """Tear down the trend delegate's VENUE TRIGGERS on ANY stop.
+
+        D-Grid's trend phase is the trigger ``ReverseGridController``, which manages
+        its entry rungs + trailing stop as venue TRIGGER orders — off the
+        resting-order path the orchestrator's executor batch-cancel and
+        ``close_all_positions`` use. The base ``on_stop`` cancels executors only, so
+        without this the delegate's triggers are left ARMED on the venue after a stop:
+        the entry rungs are NOT reduce-only, so a later price cross RE-OPENS an
+        unmonitored position with no session rail running — an SL/TP coverage hole and
+        a violation of the redeploy stand-down rule (audit SLTP-TRACER 2026-08-28,
+        surfaced by defaulting the trend phase ON). The session-stop path stops the
+        controller (this hook) BEFORE it flattens (``close_all_positions``), so
+        cancelling here also keeps a rung from firing mid-flatten. Best-effort: a stop
+        must complete even if the delegate teardown fails.
+        """
+        if self._trend is not None:
+            try:
+                await self._trend.on_stop(reason)  # cancels rungs + stop (reverse_grid)
+            except Exception:  # noqa: BLE001 - a stop must never be blocked by cleanup
+                logger.warning(
+                    "dgrid %s: trend delegate on_stop failed during '%s' — its venue "
+                    "triggers may remain armed; continuing the stop (controller=%s)",
+                    self.id, reason, self.id, exc_info=True,
+                )
+            self._trend = None
+
     async def _candles(self) -> List[dict]:
         provider = self.cfg("candle_provider")
         if provider is None:
@@ -276,8 +303,8 @@ class DynamicGridController(Controller):
             # cache / gateway throttle / provider never injected). Make it loud.
             logger.warning(
                 "dgrid no candles for pair=%s (controller=%s) — cannot classify "
-                "regime; holding phase=%s, will retry next tick",
-                self.trading_pair, self.id, self.current_phase,
+                "regime; degrading to GRID (safe), will retry next tick",
+                self.trading_pair, self.id,
             )
             # Do NOT leave a stale verdict behind. A candle-less tick knows
             # nothing, and the reversal flip can still fire from price alone — it
@@ -285,7 +312,16 @@ class DynamicGridController(Controller):
             # into the user-facing flip event.
             self.last_is_trend = False
             self.last_direction = variance_regime.FLAT
-            return self.current_phase
+            # DGRID-CANDLE-OUTAGE (audit DGRID-AUDIT 2026-08-28): degrade to the SAFE
+            # mean-reversion GRID rather than HOLD the current phase. Holding RGRID
+            # through an outage would keep the trend delegate (its chop gate is
+            # disabled for the D-Grid path) arming/pyramiding BLIND for the whole
+            # outage — an unbounded-duration chop premium, newly reachable now that
+            # the trend phase defaults ON. Returning GRID lets the debounced flip
+            # flatten the delegate and re-arm the ranging ladder (GRID's home regime);
+            # a session already in GRID just holds GRID. When candles return the
+            # classifier re-evaluates and can flip back to RGRID on a real trend.
+            return variance_regime.GRID
         info = await variance_regime.run(
             self.trading_pair, candles,
             short_window=self.short_window, long_window=self.long_window,
