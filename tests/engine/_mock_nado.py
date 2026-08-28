@@ -42,7 +42,9 @@ class MockNadoAdapter(NadoAdapterBase):
         fill_marketable_limits: bool = False,
     ) -> None:
         # SPOT-RECONCILE: pair -> base units the VENUE reports, independent of
-        # engine inventory. None entries model an unreadable venue (fail safe).
+        # engine inventory. A pair ABSENT from this dict reads as an unreadable
+        # venue (held_base -> None, fail safe); map a pair to 0 to model a flat,
+        # readable venue for that pair.
         self.venue_held: dict = dict(venue_held or {})
         self._mid = _dec(mid)
         self._mids = [_dec(m) for m in mids] if mids else None
