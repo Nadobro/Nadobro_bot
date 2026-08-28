@@ -907,11 +907,11 @@ async def _handle_strategy(query, data, context, telegram_id):
             "dgrid_trend_on_variance_ratio", "dgrid_range_on_variance_ratio",
             "dgrid_spread_bp", "dgrid_min_spread_bp", "dgrid_max_spread_bp",
             "dgrid_short_window_points", "dgrid_long_window_points",
-            # D-Grid auto-switch: 1 = also run the RGRID (trend-follow) phase so the
-            # bot switches GRID<->RGRID with the regime and stays in-market; 0 (the
-            # default) = mean-reversion GRID ladder only. Routes to the rebuilt
-            # trigger ReverseGridController. OPT-IN pending the nested-delegate
-            # net-floor backtest (see engine_runtime dgrid branch).
+            # D-Grid auto-switch: 1 (the default, under the trigger flag) = also run
+            # the RGRID trend-follow phase so the bot switches GRID<->RGRID with the
+            # regime and stays in-market; 0 = mean-reversion GRID ladder only. Routes
+            # to the rebuilt trigger ReverseGridController, validated on the real Aug
+            # tapes (+207bp trend / -107bp chop; see engine_runtime dgrid branch).
             "dgrid_trend_follow",
             "auto_close_on_maintenance", "is_long_bias",
             # GRID quoting mode (1 = fill-anchored maker with no-cross + soft reset,

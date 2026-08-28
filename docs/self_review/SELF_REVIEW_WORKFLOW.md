@@ -222,6 +222,31 @@ The lifecycle code is fixed + unit-tested against a mock client. The live trigge
 
 ---
 
+## Open findings — self-review audit 2026-08-28 (D-Grid auto-switch default-on, PR #263)
+
+Enabling `dgrid_trend_follow` by default (under the trigger flag) put the trigger
+`ReverseGridController` in the RGRID phase for every D-Grid session by default.
+Two auditors (dgrid strategy-auditor + sltp-tracer) independently flagged the same
+CRITICAL. Validated net floor: +207bp trend / −107bp chop / fee_leak 0
+(`test_dgrid_autoswitch_net_floor.py`).
+
+### Fixed in the same PR
+| ID | Sev | What |
+|---|---|---|
+| `DGRID-ONSTOP-ORPHAN` | **Critical** | `DynamicGridController` had no `on_stop`, so a session-rail stop / user stop / redeploy stand-down during the RGRID phase left the trigger delegate's entry rungs (NOT reduce-only) ARMED on the venue — a later cross re-opened an unmonitored position with no rail. Added `DynamicGridController.on_stop` that awaits `self._trend.on_stop(reason)` (cancels rungs + stop); the stop path runs this BEFORE `close_all_positions`, so it also prevents a rung firing mid-flatten. Guarded by `test_dgrid_stop_in_trend_phase_cancels_the_delegates_venue_triggers`. |
+| `DGRID-CANDLE-OUTAGE-RGRID` | Med | `_classify` HELD the current phase on a candle outage; parked in RGRID (delegate chop gate disabled) it kept pyramiding blind for the whole outage. Now degrades to the SAFE mean-reversion GRID (debounced flip flattens the delegate); a GRID session stays GRID; candles returning can flip back. Guarded by `test_dgrid_candle_outage_degrades_to_grid_not_trapped_in_rgrid`. |
+
+### Recorded (not yet guardrailed)
+| ID | Sev | Where / what |
+|---|---|---|
+| `DGRID-GRIDRGRID-RESIDUAL` | Med [SUSPECTED] | GRID→RGRID handoff gates only on `_inventory_net_base()` (inventory), with no venue re-read (RGRID→GRID has one via `flatten_now`). If the grid's local accounting drifts from the venue, inventory reads flat while a residual remains; the delegate baselines it out (`reverse_grid.py:~329`) and it survives the cycle, invisible to the exposure cap / tier booking / status. Money impact bounded (the %-of-margin session rail reads live venue uPnL). Fix idea: venue-net re-read before `_spawn_phase(RGRID)`, symmetric with the RGRID→GRID check. |
+| `DGRID-LEGACY-OPTIN-FLAGOFF` | Low [VERIFIED] | With `NADO_REVGRID_TRIGGER_ENABLED` OFF, an explicit `dgrid_trend_follow=1` (the "🔀 Auto-switch" button always sends `:1`) spawns the legacy pyramiding `RGridController` — the measured August bleed — with no PHASE-0 backstop. Moot in prod (flag ON). Fix idea: force trend-follow off when the trigger delegate isn't available, or retire the legacy delegate. |
+| `DGRID-DELEGATE-RISK-BYPASS` | Low [VERIFIED] | The trend delegate places rungs via `place_trigger_order` directly, not `spawn_executor`, so `max_single_order_quote` / kill-switch aren't enforced per-order. Self-bounded (`deployed/levels`, finite ladder, sub-min declined) and the parent stays `pre_tick_check`-gated. Pre-existing, not introduced here. |
+| `DGRID-SIM-HANDOFF-COVERAGE` | Low [SUSPECTED] | The net-floor backtest books the delegate's fills into inventory (`book_market_fills`), so the sim's inventory is non-vacuous while LIVE's is — the PnL floors are trustworthy but the sim does not exercise `DGRID-GRIDRGRID-RESIDUAL`'s live inventory-flat-but-venue-not gap. |
+| `RGRID-QUOTE-ZERO-ORDERS` | Low [VERIFIED] | The gate telemetry renders "QUOTE" with 0 orders in the first-tick-before-read and degenerate-sizing (sub-min-notional / `order_amount_quote<=0`) cases — safe direction (never a false PAUSE), pre-existing; the telemetry only distinguishes the chop stand-down. |
+
+---
+
 ## Product decision — D-Grid trend phase should pyramid (2026-08-12)
 
 The owner has decided that **dgrid's trend phase should behave like R-Grid** (add
