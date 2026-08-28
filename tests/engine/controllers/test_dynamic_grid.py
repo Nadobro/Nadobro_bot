@@ -49,7 +49,7 @@ def test_phase0_default_holds_grid_and_never_spawns_the_trend_follower():
     """
     async def body():
         for provider in (_down, _up):
-            adapter = MockNadoAdapter(mid=Decimal(100))
+            adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
             orch = ExecutorOrchestrator()
             # CFG minus the opt-in flag = the real Phase-0 default.
             cfg = {k: v for k, v in CFG.items() if k != "dgrid_trend_follow"}
@@ -70,7 +70,7 @@ def test_phase0_default_holds_grid_and_never_spawns_the_trend_follower():
 
 def test_trending_down_selects_the_rgrid_follower():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         cfg = dict(CFG, candle_provider=lambda p: _down())
         c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
@@ -86,7 +86,7 @@ def test_trending_down_selects_the_rgrid_follower():
 
 def test_trending_up_selects_the_rgrid_follower():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         cfg = dict(CFG, candle_provider=lambda p: _up())
         c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
@@ -104,7 +104,7 @@ def test_chop_suppress_does_not_stand_the_trend_follower_down():
     inherit dgrid's overlay chop-suppress or a chop read pauses the pyramid."""
     c = DynamicGridController(
         user_id=1, orchestrator=ExecutorOrchestrator(),
-        adapter=MockNadoAdapter(mid=Decimal(100)), inventory=InventoryRepository(),
+        adapter=MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100)), inventory=InventoryRepository(),
         configs=dict(CFG, suppress_new_entries=True, signal_regime="chop",
                      signal_confidence=0.9),
     )
@@ -115,7 +115,7 @@ def test_chop_suppress_does_not_stand_the_trend_follower_down():
 
 def test_ranging_selects_long_grid():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         cfg = dict(CFG, candle_provider=lambda p: _range())
         c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
@@ -131,7 +131,7 @@ def test_ranging_selects_long_grid():
 
 def test_same_regime_does_not_flip():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         cfg = dict(CFG, candle_provider=lambda p: _down())
         c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
@@ -148,7 +148,7 @@ def test_same_regime_does_not_flip():
 
 def test_midflight_flip_grid_to_rgrid_on_confirmed_regime_change():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         box = {"data": _range()}
         cfg = dict(CFG, candle_provider=lambda p: box["data"], dgrid_flip_confirm_ticks=2)
@@ -177,7 +177,7 @@ def test_midflight_flip_grid_to_rgrid_on_confirmed_regime_change():
 
 def test_metrics_exposed_for_dashboard():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         # 25bp requested. The re-center only re-quotes unfilled maker opens (no
         # flatten), so we follow price closely: an explicit value is honored with
@@ -203,7 +203,7 @@ def test_recenter_on_by_default_reuses_executor_no_respawn():
     # ladder in place (GridExecutor.recenter) — never a flatten + respawn, so a
     # moving mid does not churn the position.
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         cfg = dict(CFG, candle_provider=lambda p: _range())  # ranging -> grid, no flip
         assert "dgrid_reset_threshold_bp" not in cfg  # user did not pin a value
@@ -229,7 +229,7 @@ def test_reset_recenters_in_place_on_large_move():
     # When enabled, reset re-quotes the SAME executor's ladder in place (no
     # flatten, no new executor) only after a move past the floored threshold.
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         cfg = dict(CFG, candle_provider=lambda p: _range(), dgrid_reset_threshold_bp=200.0)
         c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
@@ -264,7 +264,7 @@ def test_flip_deferred_while_gate_paused():
     # Finding 2 regression: a confirmed flip during a breakout/expansion PAUSE
     # must close the old position but NOT arm a fresh grid into the chaos.
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         box = {"data": _range()}  # gate disabled in cfg; we drive the verdict
         cfg = dict(CFG, candle_provider=lambda p: box["data"], dgrid_flip_confirm_ticks=1)
@@ -297,7 +297,7 @@ def test_leaving_the_trend_follower_flattens_before_the_range_ladder_arms():
     from src.nadobro.engine.types import TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), fill_marketable_limits=True)
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100), fill_marketable_limits=True)
         orch = ExecutorOrchestrator()
         box = {"data": _down()}
         cfg = dict(CFG, candle_provider=lambda p: box["data"], dgrid_flip_confirm_ticks=1)
@@ -324,7 +324,7 @@ def test_tick_records_diagnostics_for_services_log():
     # The per-tick diagnostics (candle count + mid) must be captured so the
     # services-stream engine_diag line can pinpoint a no-orders run.
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         cfg = dict(CFG, candle_provider=lambda p: _down())
         c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
@@ -349,7 +349,7 @@ def test_diag_telemetry_attrs_are_dynamic_grid_only():
 
     dg = DynamicGridController(
         user_id=1, orchestrator=ExecutorOrchestrator(),
-        adapter=MockNadoAdapter(mid=Decimal(100)), inventory=InventoryRepository(),
+        adapter=MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100)), inventory=InventoryRepository(),
         configs=dict(CFG, candle_provider=lambda p: _range()),
     )
     for attr in ("_last_candle_count", "_last_mid", "current_phase", "variance_ratio"):
@@ -357,7 +357,7 @@ def test_diag_telemetry_attrs_are_dynamic_grid_only():
 
     mm = MarketMakingController(
         user_id=1, orchestrator=ExecutorOrchestrator(),
-        adapter=MockNadoAdapter(mid=Decimal(100)), inventory=InventoryRepository(),
+        adapter=MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100)), inventory=InventoryRepository(),
         configs=dict(CFG),
     )
     for attr in ("_last_candle_count", "_last_mid", "current_phase", "variance_ratio"):
@@ -373,7 +373,7 @@ def test_profit_booking_scales_out_on_tier_cross():
     from src.nadobro.engine.types import OrderType, TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(102))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(102))
         orch = ExecutorOrchestrator()
         inv = InventoryRepository()
         cfg = dict(CFG, candle_provider=lambda p: _range(), margin_quote="100",
@@ -417,7 +417,7 @@ def test_profit_booking_does_not_book_tier_on_zero_fill():
     from src.nadobro.engine.types import TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(102), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(102), auto_fill_market=False)
         orch = ExecutorOrchestrator()
         inv = InventoryRepository()
         cfg = dict(CFG, candle_provider=lambda p: _range(), margin_quote="100",
@@ -449,7 +449,7 @@ def test_profit_booking_does_not_fallback_around_live_executor_zero_fill():
             return Decimal(0)
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(102))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(102))
         orch = ExecutorOrchestrator()
         inv = InventoryRepository()
         cfg = dict(CFG, candle_provider=lambda p: _range(), margin_quote="100",
@@ -474,7 +474,7 @@ def test_spawn_deferred_when_prior_inventory_not_flat():
     from src.nadobro.engine.types import TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         inv = InventoryRepository()
         cfg = dict(CFG, candle_provider=lambda p: _down())
@@ -494,7 +494,7 @@ def test_profit_booking_skips_when_below_tier():
     from src.nadobro.engine.types import TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(101))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(101))
         orch = ExecutorOrchestrator()
         inv = InventoryRepository()
         cfg = dict(CFG, candle_provider=lambda p: _range(), margin_quote="100",
@@ -572,7 +572,7 @@ def test_tiered_tp_anchors_to_user_tp_not_deployed_basis():
     from src.nadobro.engine.types import TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(110))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(110))
         orch = ExecutorOrchestrator()
         inv = InventoryRepository()
         c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
@@ -600,7 +600,7 @@ def test_tiered_tp_top_tier_lands_exactly_at_user_tp():
     from src.nadobro.engine.types import TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(150))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(150))
         orch = ExecutorOrchestrator()
         inv = InventoryRepository()
         c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
@@ -621,7 +621,7 @@ def test_tiered_tp_scales_up_with_a_higher_user_tp():
     from src.nadobro.engine.types import TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(150))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(150))
         orch = ExecutorOrchestrator()
         inv = InventoryRepository()
         c = DynamicGridController(user_id=1, orchestrator=orch, adapter=adapter,
@@ -642,7 +642,7 @@ def test_tiered_tp_falls_back_to_legacy_when_no_tp_set():
     from src.nadobro.engine.types import TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(110))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(110))
         orch = ExecutorOrchestrator()
         inv = InventoryRepository()
         # No tp_pct, no tp_margin_basis: margin_quote=100 is the legacy basis.
@@ -668,7 +668,7 @@ def test_tiered_tp_falls_back_to_legacy_when_no_tp_set():
 # is correct) — the message was wrong: it read sign(drift) as a trend verdict.
 def test_flip_event_records_whether_a_trend_was_actually_declared():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         box = {"data": _range()}
         cfg = dict(CFG, candle_provider=lambda p: box["data"], dgrid_flip_confirm_ticks=1)
@@ -729,7 +729,7 @@ def test_reverse_grid_can_no_longer_emit_a_phase_flip_at_all():
 # conservative. A wrong flip costs a reduce-only round trip AND leaves the book on
 # the wrong side of the move.
 def _dg(**cfg):
-    adapter = MockNadoAdapter(mid=Decimal(100))
+    adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
     orch = ExecutorOrchestrator()
     base = dict(CFG, candle_provider=lambda p: _range(), dgrid_flip_confirm_ticks=2)
     base.update(cfg)
@@ -781,7 +781,7 @@ def test_the_switcher_still_flips_on_a_confirmed_regime_change():
     """The overlay must not break the core behaviour: a real downtrend still arms
     the R-Grid follower once the debounce is satisfied."""
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(100))
         orch = ExecutorOrchestrator()
         box = {"data": _range()}
         cfg = dict(CFG, candle_provider=lambda p: box["data"],
@@ -893,7 +893,7 @@ def test_a_partial_fill_does_not_credit_the_tier_until_the_slice_closes():
             return take
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(102))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(102))
         inv = InventoryRepository()
         cfg = dict(CFG, candle_provider=lambda p: _range(), margin_quote="100",
                    dgrid_tp_tiers_pct=[2.0, 4.0, 6.0], dgrid_tp_fraction=0.33)
@@ -933,7 +933,7 @@ def test_a_profit_tier_will_not_cross_when_there_is_no_executor():
     from src.nadobro.engine.types import OrderType, TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(109))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(109))
         inv = InventoryRepository()
         cfg = dict(CFG, candle_provider=lambda p: _range(), margin_quote="100",
                    dgrid_tp_tiers_pct=[2.0, 4.0, 6.0], dgrid_tp_fraction=0.33)
@@ -957,7 +957,7 @@ def test_a_tier_crossing_while_a_slice_rests_extends_it_rather_than_queueing():
     from src.nadobro.engine.types import TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(102))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(102))
         inv = InventoryRepository()
         cfg = dict(CFG, candle_provider=lambda p: _range(), margin_quote="100",
                    dgrid_tp_tiers_pct=[2.0, 4.0, 6.0], dgrid_tp_fraction=0.33)
@@ -987,7 +987,7 @@ def test_going_flat_clears_a_resting_slice_instead_of_working_a_ghost():
     from src.nadobro.engine.types import TradeType
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(102))
+        adapter = MockNadoAdapter(venue_held={"P": Decimal(0)}, mid=Decimal(102))
         inv = InventoryRepository()
         cfg = dict(CFG, candle_provider=lambda p: _range(), margin_quote="100",
                    dgrid_tp_tiers_pct=[2.0, 4.0, 6.0], dgrid_tp_fraction=0.33)
