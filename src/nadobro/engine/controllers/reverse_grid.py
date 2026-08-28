@@ -250,6 +250,13 @@ class ReverseGridController(Controller):
         net = await self._read_net()
         if net is None:
             return False              # unreadable venue — never claim flat
+        # Cancel the ENTRY rungs FIRST — they are still armed (pyramiding) and, unlike
+        # the reduce-only stop (which can only SHRINK the position), an entry rung
+        # firing between the close and the re-read would RE-OPEN the position, so
+        # D-Grid could never hand off flat and would churn taker round-trips. The
+        # protective stop is deliberately LEFT until the book is confirmed flat, so
+        # the position is never naked while the close is in flight.
+        await self._cancel_all_rungs()
         if net != 0:
             close_side = TradeType.SELL if net > 0 else TradeType.BUY
             try:
@@ -267,14 +274,12 @@ class ReverseGridController(Controller):
             net = await self._read_net()
             if net is None or net != 0:
                 return False          # still open — D-Grid retries next tick
-        # Flat: tear down every resting trigger and reset, so nothing re-fires under
-        # the ranging ladder that inherits the book.
+        # Flat: now drop the protective stop too, and reset. Nothing is left armed.
         if self._stop_digest is not None:
             try:
                 await self.adapter.cancel_trigger_order(self._stop_digest)
             except AdapterError:
                 logger.debug("revgrid flatten stop-cancel failed", exc_info=True)
-        await self._cancel_all_rungs()
         self._anchor = None
         self._pos_base = Decimal(0)
         self._reset_position_state()

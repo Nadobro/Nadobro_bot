@@ -241,6 +241,28 @@ def test_flatten_now_holds_on_an_unreadable_venue():
     asyncio.run(body())
 
 
+def test_flatten_now_cancels_the_armed_rungs_so_nothing_reopens():
+    """P1: the pyramiding rungs stay armed in a position; flatten_now MUST cancel them
+    (before the close) or a cross into one would re-open the position and D-Grid could
+    never hand off flat. After flatten_now, a cross past a would-be rung stays flat."""
+    async def body():
+        a = _adapter()
+        c = _controller(a, levels=2)               # BUY@102 stays armed after the open
+        await c.on_tick()
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))         # open long; BUY@102 still armed
+        await c.on_tick()
+        assert any(not r.fired and r.side is TradeType.BUY for r in c._rungs)
+        assert await c.flatten_now(Decimal("101.5")) is True
+        assert a.venue_held[PAIR] == 0 and c._rungs == []   # all rungs torn down
+        # a cross that WOULD have fired the old BUY@102 must not re-open the position
+        a.set_mid(Decimal("102.5"))
+        a.cross_triggers(Decimal("102.5"))
+        assert a.venue_held[PAIR] == 0
+
+    asyncio.run(body())
+
+
 # ── /status telemetry (order_counts + grid_metrics card keys) ──────────
 
 def test_order_counts_track_trigger_activity():
