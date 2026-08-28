@@ -37,6 +37,7 @@ from src.nadobro.engine.risk import RiskEngine
 # engine — see tests/lint/test_architecture_layers.py): the human-readable
 # quote-gate pause reasons rendered on /status and in gate notifications.
 from src.nadobro.engine.routines.regime_gate import GATE_REASON_HUMAN as GATE_REASON_HUMAN  # noqa: F401
+from src.nadobro.engine.routines.regime_gate import REVGRID_GATE_REASONS as REVGRID_GATE_REASONS  # noqa: F401
 from src.nadobro.engine.types import (
     RiskLimits,
     RiskState,
@@ -1960,12 +1961,24 @@ def map_strategy_config(
         # and an embedded R-Grid trend follower on a clear directional signal
         # (both directions). Standalone R-Grid never reaches this branch.
         cfg["candle_provider"] = None
-        # PHASE-0 EMERGENCY REVERT (2026-08-24): the R-Grid trend delegate pyramids
-        # to 100% of deployed and is net-losing in every regime on the honest
-        # backtester, so it is OFF by default — D-Grid runs its mean-reversion GRID
-        # ladder (profitable in range/chop) until the Phase-2 rework. Opt back in
-        # with dgrid_trend_follow=1.
-        cfg["dgrid_trend_follow"] = _as_bool(settings.get("dgrid_trend_follow"), False)
+        # Trend phase = which controller runs in the RGRID phase, decided ONCE here.
+        _dgrid_trend_uses_trigger = revgrid_trigger_enabled()
+        # AUTO-SWITCH (2026-08-28, user directive): D-Grid switches GRID<->RGRID with
+        # the regime (via the rebuilt trigger ReverseGridController) so it stays
+        # in-market instead of holding a single-side ladder that fills a couple levels
+        # and idles ("places 2 orders and stops"). Default ON — but ONLY when the RGRID
+        # phase runs the trigger delegate (validated on the real Aug tapes once the
+        # backtester booked the delegate's MARKET close symmetrically: +207bp trend,
+        # -107bp chop, fee_leak 0 — a real trend-follower, NOT the old pyramiding bleed;
+        # see tests/engine/backtester/test_dgrid_autoswitch_net_floor.py).
+        #
+        # PHASE-0 GUARD still holds when the flag is OFF: there the delegate would be
+        # the OLD RGridController that pyramids to 100% of deployed and was net-losing
+        # on the honest backtester (the measured August bleed), so trend-follow stays
+        # OFF by default in that case. Either way an explicit dgrid_trend_follow wins.
+        cfg["dgrid_trend_follow"] = _as_bool(
+            settings.get("dgrid_trend_follow"), _dgrid_trend_uses_trigger
+        )
         # (recycle_levels is set for the whole GridExecutor family above.)
         cfg["dgrid_short_window"] = int(max(2, _f(settings, "dgrid_short_window_points", 4)))
         cfg["dgrid_long_window"] = int(max(4, _f(settings, "dgrid_long_window_points", 12)))
@@ -2033,7 +2046,7 @@ def map_strategy_config(
         _rg_settings = dict(settings)
         if not _f(_rg_settings, "rgrid_spread_bp", 0.0):
             _rg_settings["rgrid_spread_bp"] = float(_spread_bp)
-        if revgrid_trigger_enabled():
+        if _dgrid_trend_uses_trigger:
             # D-Grid's trend phase runs the trigger ReverseGridController too, so the
             # two stay consistent (and the one kill-switch reverts both). Its OWN chop
             # stand-down gate is DISABLED: D-Grid's parent classifier already confirms

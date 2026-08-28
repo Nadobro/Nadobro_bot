@@ -90,8 +90,19 @@ class SimNadoAdapter(NadoAdapterBase):
         inventory: Optional[InventoryRepository] = None,
         user_id: int = 1,
         controller_id: str = "bt",
+        book_market_fills: bool = False,
     ) -> None:
         self.costs = costs or SimCosts()
+        # When set, direct MARKET fills are booked into inventory the same way
+        # trigger fills are (below). A trigger controller has NO executor, so its
+        # reduce-only MARKET *close* (ReverseGridController.flatten_now, used on a
+        # D-Grid RGRID->GRID handoff) otherwise updates the venue net (_net_base)
+        # but never reaches inventory — the report reads inventory, so the delegate's
+        # OPENS were booked (via match_triggers) while its CLOSE was not, stranding a
+        # phantom position that blocked D-Grid's next spawn and leaked fees. Only set
+        # for trigger-managing controllers, where MARKET never comes from an executor
+        # (grid legs are post-only / marketable LIMIT), so this can never double-book.
+        self.book_market_fills = bool(book_market_fills)
         self._meta = meta or {}
         self._default_meta = default_meta or SimMeta()
         self._orders: Dict[str, NadoOrder] = {}
@@ -276,6 +287,16 @@ class SimNadoAdapter(NadoAdapterBase):
             fill_px = mid * (Decimal(1) + slip) if side is TradeType.BUY else mid * (Decimal(1) - slip)
             fee = order.amount_base * fill_px * self.costs.taker_fee
             self._record_fill(order, order.amount_base, fill_px, fee)
+            # Trigger controllers run no executor, so a direct MARKET close would
+            # never reach inventory (see book_market_fills). Book it here, mirroring
+            # the trigger path, so the delegate's open+close cycle is symmetric.
+            if self.book_market_fills and self._inventory is not None:
+                ts = self._candle.ts if self._candle is not None else 0.0
+                self._inventory.apply_fill(
+                    self._user_id, order.trading_pair, self._controller_id,
+                    order.side, order.amount_base, order.amount_base * fill_px, fee,
+                    timestamp=ts,
+                )
         elif self._candle is not None and self._is_marketable_limit(
             side, order_type, order.price
         ):

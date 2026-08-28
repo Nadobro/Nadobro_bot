@@ -137,6 +137,18 @@ class BacktestEngine:
             adapter=self.adapter, inventory=self.inventory,
             limits=limits or _permissive_limits(), controller_id=controller_id,
         )
+        # A trigger-managing controller (standalone Reverse Grid, or D-Grid whose
+        # trend phase is the trigger delegate) closes via a direct reduce-only MARKET
+        # that no executor books. Tell the sim to book MARKET fills into inventory so
+        # the report sees the full open+close cycle (grid legs never use MARKET, so
+        # this can't double-book the D-Grid GRID phase). See book_market_fills.
+        from src.nadobro.engine.controllers.reverse_grid import ReverseGridController
+        from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
+        self.adapter.book_market_fills = (
+            isinstance(self.controller, ReverseGridController)
+            or (isinstance(self.controller, DynamicGridController)
+                and bool(cfg.get("trend_uses_trigger")))
+        )
 
     def _candle_provider(self, _pair: str) -> List[dict]:
         return [_candle_to_dict(c) for c in self.candles[: self._idx + 1]]

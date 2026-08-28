@@ -127,6 +127,14 @@ class ReverseGridController(Controller):
         self._n_placed = 0
         self._n_filled = 0
         self._n_cancelled = 0
+        # Quote-gate telemetry ONLY. This controller never BRANCHES on the gate
+        # (its chop stand-down is driven by chop_stand_down / _trend_confirmed,
+        # not gate_verdict) — these fields exist so a chop stand-down surfaces on
+        # the /status card as "Quoting: PAUSED (choppy — waiting for a trend)"
+        # instead of a silent "LIVE, 0 orders" (the "R-Grid places no orders"
+        # reports). engine_diag reads gate_verdict/gate_reason each cycle.
+        self.gate_verdict: str = "QUOTE"
+        self.gate_reason: str = ""
 
     # -- config ---------------------------------------------------------------
     def _load_config(self) -> None:
@@ -226,7 +234,8 @@ class ReverseGridController(Controller):
             await self._maintain_flat(mid)
             return
 
-        # In a position.
+        # In a position — actively managing (never "paused" for the card).
+        self.gate_verdict, self.gate_reason = "QUOTE", ""
         if self._pos_base == 0 or _sign(net) != _sign(self._pos_base):
             if self._pos_base != 0 and _sign(net) != _sign(self._pos_base):
                 # Sign flip in one tick (e.g. a rail overshoot): tidy the old side.
@@ -384,10 +393,13 @@ class ReverseGridController(Controller):
             # No confirmed trend: stand down. Never ENTER in chop — drop any resting
             # ladder and re-anchor fresh when a trend resumes. (An OPEN position is not
             # here — it is managed by its stop, which the gate never touches.)
+            self.gate_verdict, self.gate_reason = "PAUSE", "revgrid_chop"
             if self._rungs:
                 await self._cancel_all_rungs()
             self._anchor = None
             return
+        # Armed / re-anchoring: quoting is live again.
+        self.gate_verdict, self.gate_reason = "QUOTE", ""
         if self._anchor is None:
             self._anchor = mid
         drift = abs(mid - self._anchor) / self._anchor if self._anchor > 0 else Decimal(0)

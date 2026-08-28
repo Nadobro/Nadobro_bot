@@ -3889,13 +3889,19 @@ async def _run_cycle(
             # translate the known action names into plain language.
             _diag1 = result.get("engine_diag") if isinstance(result, dict) else None
             if isinstance(_diag1, dict) and _diag1.get("gate_paused"):
-                from src.nadobro.engine.routines.regime_gate import GATE_REASON_HUMAN
-                _why = GATE_REASON_HUMAN.get(
-                    str(_diag1.get("gate_reason") or ""), "unfavourable regime")
-                reason = (
-                    f"quoting is paused by the regime gate ({_why}); "
-                    "it resumes when the market ranges again"
+                from src.nadobro.engine.routines.regime_gate import (
+                    GATE_REASON_HUMAN, REVGRID_GATE_REASONS,
                 )
+                _reason_key = str(_diag1.get("gate_reason") or "")
+                _why = GATE_REASON_HUMAN.get(_reason_key, "unfavourable regime")
+                # Reverse Grid stands down in chop and arms on a trend — the mirror
+                # of the ranging grid, so its resume condition is the opposite.
+                _resume = (
+                    "it arms when a trend forms"
+                    if _reason_key in REVGRID_GATE_REASONS
+                    else "it resumes when the market ranges again"
+                )
+                reason = f"standing down ({_why}); {_resume}"
             elif reason in ("engine_ticked", "engine_completed"):
                 reason = "no quoting opportunity this cycle; the engine keeps watching"
             await _notify(

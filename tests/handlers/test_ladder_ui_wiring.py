@@ -34,6 +34,21 @@ def test_levels_button_exists_for_mid_and_grid():
         assert f"strategy:input:{sid}:levels" in _CALLBACKS, f"{sid} has no custom Levels input"
 
 
+def test_custom_levels_input_exists_for_every_grid_family_strategy():
+    """User report 2026-08-28: D-Grid's config screen offered only fixed level
+    presets (3/4/6) with no custom-input button, while grid/rgrid/mid all had one
+    — so a D-Grid user could not set an arbitrary level count. Every grid-family
+    card must expose BOTH the presets and the ✍️ custom input, and the input the
+    button emits must be one the `input` action allowlist accepts (else the tap
+    opens a prompt whose reply is silently dropped)."""
+    for sid in ("grid", "rgrid", "dgrid", "mid"):
+        assert _emitted(f"strategy:set:{sid}:levels:"), f"{sid} has no Levels preset buttons"
+        assert f"strategy:input:{sid}:levels" in _CALLBACKS, f"{sid} has no custom Levels input"
+    # the field the button names must be routable for dgrid, not just present as a string
+    assert '"levels"' in _SOURCE.split("allowed_inputs = (", 1)[1].split(")", 1)[0], \
+        "levels missing from the input allowlist — every custom-levels tap is dropped"
+
+
 def test_size_curve_button_exists_for_mid_and_grid():
     for sid in ("mid", "grid"):
         emitted = _emitted(f"strategy:set_text:{sid}:size_curve:")

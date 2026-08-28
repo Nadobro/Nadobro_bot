@@ -74,6 +74,61 @@ def test_map_strategy_config_routes_rgrid_by_flag(monkeypatch):
     assert on["step_pct"] == Decimal("0.002")         # a 20bp spread is honoured
 
 
+def test_chop_guard_toggle_button_is_wired_end_to_end(monkeypatch):
+    """User report 2026-08-28: "R-Grid doesn't even place orders." Root cause is
+    the chop guard (default ON) standing the trigger ladder down until a trend
+    confirms. The config screen now exposes an On/Off toggle; this pins the whole
+    path — button callback -> set-action allowlist -> engine mapping -> the flag
+    the controller reads — so the toggle cannot silently rot at either end."""
+    from src.nadobro.handlers import strategy_handler as sh
+
+    src = open(sh.__file__).read()
+    # both button ends exist
+    assert 'callback_data="strategy:set:rgrid:rgrid_chop_stand_down:1"' in src
+    assert 'callback_data="strategy:set:rgrid:rgrid_chop_stand_down:0"' in src
+    # the set-action accepts the field (else the tap is silently dropped)
+    assert '"rgrid_chop_stand_down"' in src.split("allowed_numeric_fields = {", 1)[1].split("}", 1)[0]
+    assert '"rgrid_chop_stand_down": (0, 1)' in src          # bounds present
+    # the engine honours OFF: no chop stand-down -> the ladder quotes in every regime
+    monkeypatch.setenv("NADO_REVGRID_TRIGGER_ENABLED", "1")
+    off = er.map_strategy_config("rgrid", {"levels": 4, "rgrid_chop_stand_down": 0},
+                                 Decimal("79000"), product=PAIR, leverage=5)
+    assert off["revgrid_chop_stand_down"] is False
+
+
+def test_dgrid_auto_switch_default_on_and_wired_end_to_end(monkeypatch):
+    """User directive 2026-08-28: D-Grid switches GRID<->RGRID with the regime (via
+    the rebuilt trigger ReverseGridController) so it stays in-market. Enabled by
+    DEFAULT once the nested-delegate net-floor backtest went green (+207bp trend /
+    -107bp chop / fee_leak 0 — see test_dgrid_autoswitch_net_floor). Pin: default ON
+    under the trigger flag, routes to the trigger delegate (never the old pyramiding
+    RGridController), the toggle exists both ways, and an explicit 0 opts out."""
+    from src.nadobro.handlers import strategy_handler as sh
+
+    src = open(sh.__file__).read()
+    assert 'callback_data="strategy:set:dgrid:dgrid_trend_follow:1"' in src
+    assert 'callback_data="strategy:set:dgrid:dgrid_trend_follow:0"' in src
+    assert '"dgrid_trend_follow"' in src.split("allowed_numeric_fields = {", 1)[1].split("}", 1)[0]
+    assert '"dgrid_trend_follow": (0, 1)' in src
+
+    monkeypatch.setenv("NADO_REVGRID_TRIGGER_ENABLED", "1")
+    # default: auto-switch ON, routing to the trigger delegate (not the legacy one)
+    default = er.map_strategy_config("dgrid", {"levels": 4}, Decimal("79000"),
+                                     product=PAIR, leverage=5)
+    assert default["dgrid_trend_follow"] is True
+    assert default["trend_uses_trigger"] is True
+    # explicit opt-OUT still respected
+    off = er.map_strategy_config("dgrid", {"levels": 4, "dgrid_trend_follow": 0},
+                                 Decimal("79000"), product=PAIR, leverage=5)
+    assert off["dgrid_trend_follow"] is False
+    # with the flag OFF, trend-follow stays OFF by default (PHASE-0 guard: the OLD
+    # pyramiding delegate must never spawn by default)
+    monkeypatch.delenv("NADO_REVGRID_TRIGGER_ENABLED", raising=False)
+    flag_off = er.map_strategy_config("dgrid", {"levels": 4}, Decimal("79000"),
+                                      product=PAIR, leverage=5)
+    assert flag_off["dgrid_trend_follow"] is False and flag_off["trend_uses_trigger"] is False
+
+
 def test_dgrid_trend_subconfig_follows_the_flag(monkeypatch):
     """D-Grid's trend phase uses the SAME controller as standalone rgrid: legacy when
     the flag is off, the trigger ReverseGridController when on. The `_for_dgrid_trend`

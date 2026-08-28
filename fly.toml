@@ -82,12 +82,19 @@ kill_timeout = 60
   max_machines_running = 1
   processes = ['app']
 
+# CPU-BOUND SIGNING (2026-08-28): each order placement is a secp256k1 signature.
+# Mid re-quotes a ~20-24 order ladder per cycle (~1000 signed requests/session),
+# and on a 1-CPU VM those signing threads contend with the event-loop thread for
+# the single core — the bursty tap-latency the users reported. performance-2x
+# gives the event loop its own core during placement bursts (2 dedicated CPUs,
+# 4 GB). Note: applying this restarts the machine, which stands every running
+# strategy down (redeploy = no auto-resume) — resume is user-initiated.
 [[vm]]
-  memory = '2gb'
+  memory = '4gb'
   cpu_kind = 'performance'
-  cpus = 1
-  memory_mb = 2048
-  size = 'performance-1x'
+  cpus = 2
+  memory_mb = 4096
+  size = 'performance-2x'
 
 [[http_service.checks]]
   interval = "15s"

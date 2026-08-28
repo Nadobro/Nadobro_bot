@@ -1739,9 +1739,11 @@ def fmt_status_overview(status: dict, onboarding: dict):
     if gate_verdict == "PAUSE":
         # Via the strategy layer: handlers must not import engine directly
         # (tests/lint/test_architecture_layers.py pins the edge set).
-        from src.nadobro.strategy.engine_runtime import GATE_REASON_HUMAN
-        gate_why = GATE_REASON_HUMAN.get(
-            str(status.get("mm_gate_reason") or "").strip(), "unfavourable regime")
+        from src.nadobro.strategy.engine_runtime import (
+            GATE_REASON_HUMAN, REVGRID_GATE_REASONS,
+        )
+        _gate_reason_key = str(status.get("mm_gate_reason") or "").strip()
+        gate_why = GATE_REASON_HUMAN.get(_gate_reason_key, "unfavourable regime")
         gate_age = _fmt_age_seconds(float(status.get("mm_gate_since_ts") or 0.0))
         gate_line = (
             f"⏸ {_loc('Quoting')}: *{_loc_md('PAUSED')}* \\({_loc_md(gate_why)}\\)"
@@ -1749,9 +1751,15 @@ def fmt_status_overview(status: dict, onboarding: dict):
         if gate_age != "—":
             gate_line += f" \\| {_loc('for')} *{escape_md(gate_age)}*"
         lines.append(gate_line)
-        lines.append(
-            f"{escape_md(_loc('New quotes resume automatically when the market ranges again.'))}"
-        )
+        # Resume condition is the MIRROR of the strategy: a ranging grid resumes
+        # when the market ranges again; a reverse grid pyramids WITH a trend, so it
+        # resumes when a trend forms. Word it per reason so the card never tells a
+        # reverse-grid user to wait for the opposite of what actually arms it.
+        if _gate_reason_key in REVGRID_GATE_REASONS:
+            _resume_line = _loc("New quotes resume automatically when a trend forms.")
+        else:
+            _resume_line = _loc("New quotes resume automatically when the market ranges again.")
+        lines.append(f"{escape_md(_resume_line)}")
     elif gate_verdict == "QUOTE" and str(status.get("mm_gate_reason") or "") == "":
         # Quiet confirmation only — the pause state is the one that matters.
         lines.append(f"{_loc('Quoting')}: {_loc_md('active')} ✅")

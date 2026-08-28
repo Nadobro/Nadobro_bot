@@ -898,9 +898,21 @@ async def _handle_strategy(query, data, context, telegram_id):
             "grid_reset_threshold_pct", "grid_reset_timeout_seconds",
             "rgrid_spread_bp", "rgrid_stop_loss_pct", "rgrid_take_profit_pct",
             "rgrid_reset_threshold_pct", "rgrid_reset_timeout_seconds", "rgrid_discretion",
+            # Reverse Grid chop protection (1 = stand down until a trend confirms —
+            # the default; 0 = quote in every regime, at the user's own risk). The
+            # engine reads it live (engine_runtime maps rgrid_chop_stand_down ->
+            # revgrid_chop_stand_down and _apply_live_controller_update pushes it),
+            # so a running session picks the change up without a restart.
+            "rgrid_chop_stand_down",
             "dgrid_trend_on_variance_ratio", "dgrid_range_on_variance_ratio",
             "dgrid_spread_bp", "dgrid_min_spread_bp", "dgrid_max_spread_bp",
             "dgrid_short_window_points", "dgrid_long_window_points",
+            # D-Grid auto-switch: 1 = also run the RGRID (trend-follow) phase so the
+            # bot switches GRID<->RGRID with the regime and stays in-market; 0 (the
+            # default) = mean-reversion GRID ladder only. Routes to the rebuilt
+            # trigger ReverseGridController. OPT-IN pending the nested-delegate
+            # net-floor backtest (see engine_runtime dgrid branch).
+            "dgrid_trend_follow",
             "auto_close_on_maintenance", "is_long_bias",
             # GRID quoting mode (1 = fill-anchored maker with no-cross + soft reset,
             # 0 = classic static ladder). Ignored for rgrid: Reverse Grid has one
@@ -978,6 +990,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "rgrid_reset_threshold_pct": (0.1, 10.0),
             "rgrid_reset_timeout_seconds": (15, 86400),
             "rgrid_discretion": (0.01, 0.5),
+            "rgrid_chop_stand_down": (0, 1),
             "dgrid_trend_on_variance_ratio": (1.0, 5.0),
             "dgrid_range_on_variance_ratio": (0.1, 2.0),
             "dgrid_spread_bp": (0.1, 200.0),
@@ -985,6 +998,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "dgrid_max_spread_bp": (1.0, 200.0),
             "dgrid_short_window_points": (2, 50),
             "dgrid_long_window_points": (4, 200),
+            "dgrid_trend_follow": (0, 1),
             "auto_close_on_maintenance": (0, 1),
             "is_long_bias": (0, 1),
             "fill_anchored": (0, 1),
@@ -1027,6 +1041,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "auto_close_on_maintenance", "is_long_bias", "rgrid_reset_timeout_seconds",
             "dn_hold_seconds", "dn_cycles", "dn_cycle_gap_seconds", "mm_leverage_override",
             "fill_anchored", "mm_duration_minutes", "twap_pause_move_bp",
+            "rgrid_chop_stand_down", "dgrid_trend_follow",
         }
 
         def _mutate(s):
@@ -2543,6 +2558,16 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                     InlineKeyboardButton("Levels 3", callback_data="strategy:set:dgrid:levels:3"),
                     InlineKeyboardButton("Levels 4", callback_data="strategy:set:dgrid:levels:4"),
                     InlineKeyboardButton("Levels 6", callback_data="strategy:set:dgrid:levels:6"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:dgrid:levels"),
+                ],
+                # Trend phase (default ON): D-Grid also runs the RGRID trend-follow
+                # phase (rebuilt trigger controller) so it switches GRID<->RGRID with
+                # the regime and stays in-market instead of holding a single-side
+                # ladder. Validated +207bp trend / -107bp chop. "Grid only" opts out
+                # to the pure mean-reversion ladder (no trend capture, no chop premium).
+                [
+                    InlineKeyboardButton("🔀 Auto-switch (default)", callback_data="strategy:set:dgrid:dgrid_trend_follow:1"),
+                    InlineKeyboardButton("Grid only", callback_data="strategy:set:dgrid:dgrid_trend_follow:0"),
                 ],
                 [
                     InlineKeyboardButton("30s", callback_data="strategy:set:dgrid:interval_seconds:30"),
@@ -2659,6 +2684,14 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                     InlineKeyboardButton("Discretion 0.06", callback_data="strategy:set:rgrid:rgrid_discretion:0.06"),
                     InlineKeyboardButton("0.12", callback_data="strategy:set:rgrid:rgrid_discretion:0.12"),
                     InlineKeyboardButton("0.25", callback_data="strategy:set:rgrid:rgrid_discretion:0.25"),
+                ],
+                # Chop guard (default ON): Reverse Grid only arms once a trend is
+                # confirmed, so it sits flat in ranges/chop (the "R-Grid places no
+                # orders" reports). Turn it OFF to quote in every regime — faster to
+                # engage, but a reverse grid bleeds in chop, so this is opt-in.
+                [
+                    InlineKeyboardButton("🛡️ Chop guard: On", callback_data="strategy:set:rgrid:rgrid_chop_stand_down:1"),
+                    InlineKeyboardButton("Off (quote always)", callback_data="strategy:set:rgrid:rgrid_chop_stand_down:0"),
                 ],
                 [
                     InlineKeyboardButton("Custom Levels", callback_data="strategy:input:rgrid:levels"),
