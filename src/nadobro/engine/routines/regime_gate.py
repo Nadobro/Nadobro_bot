@@ -58,7 +58,17 @@ GATE_REASON_HUMAN: Dict[str, str] = {
     "trending_down": "market trending down",
     "breakout": "price broke out of its range",
     "expansion": "range is expanding",
+    # Reverse Grid chop guard: the mirror image of the grid gate. A reverse grid
+    # pyramids WITH a trend, so it stands down in chop/range (where it would
+    # whipsaw) and arms once a trend confirms — the opposite resume condition to
+    # the ranging grid, so REVGRID_GATE_REASONS below flips the card's wording.
+    "revgrid_chop": "choppy — waiting for a trend",
 }
+
+# Reasons whose resume condition is "a trend forms" (reverse grid), NOT "the
+# market ranges again" (grid/mid). The /status card and the pause notice read
+# this to word the resume line correctly per strategy.
+REVGRID_GATE_REASONS: frozenset = frozenset({"revgrid_chop"})
 
 
 # CANDLE-ORDER guardrail (2026-07-31): shared with variance_regime — see

@@ -389,6 +389,44 @@ def test_gate_arms_the_ladder_in_a_confirmed_trend():
     asyncio.run(body())
 
 
+def test_stand_down_surfaces_on_the_gate_telemetry():
+    """User report 2026-08-28: "R-Grid doesn't even place orders." The chop guard
+    standing the ladder down is CORRECT, but it must be VISIBLE — the controller
+    populates gate_verdict/gate_reason (telemetry only; it never branches on them)
+    so /status can render "Quoting: PAUSED (choppy — waiting for a trend)" instead
+    of a silent LIVE/0-orders. The reason must be a known one AND flagged as a
+    reverse-grid reason so the card/notice flip the resume wording to 'a trend'."""
+    from src.nadobro.engine.routines.regime_gate import (
+        GATE_REASON_HUMAN, REVGRID_GATE_REASONS,
+    )
+
+    async def chop():
+        a = _adapter()
+        c = _controller(a, revgrid_chop_stand_down=True, revgrid_trend_confirm_ticks=1,
+                        candle_provider=lambda _p: _chop_candles())
+        await c.on_tick()
+        assert a.placed_triggers == []
+        assert c.gate_verdict == "PAUSE" and c.gate_reason == "revgrid_chop"
+        assert c.gate_paused is True
+    asyncio.run(chop())
+
+    async def trend():
+        a = _adapter()
+        c = _controller(a, revgrid_chop_stand_down=True, revgrid_trend_confirm_ticks=1,
+                        candle_provider=lambda _p: _uptrend_candles())
+        await c.on_tick()
+        assert len(a.placed_triggers) == 4
+        assert c.gate_verdict == "QUOTE" and c.gate_reason == ""
+        assert c.gate_paused is False
+    asyncio.run(trend())
+
+    # the reason renders on the card AND flips the resume wording to "a trend"
+    assert "revgrid_chop" in GATE_REASON_HUMAN
+    assert "revgrid_chop" in REVGRID_GATE_REASONS
+    # grid/mid reasons stay on the "ranges again" wording
+    assert "trending_up" not in REVGRID_GATE_REASONS
+
+
 def test_gate_needs_the_confirmation_debounce():
     """A single trend tick does not arm when confirm_ticks=2 — it must sustain."""
     async def body():
