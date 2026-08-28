@@ -205,6 +205,14 @@ class DynamicGridController(Controller):
         # ReverseGridController when NADO_REVGRID_TRIGGER_ENABLED routes it (the
         # ``trend_uses_trigger`` config flag, set by map_strategy_config).
         self._trend: Optional[Controller] = None
+        # Order counts BANKED from trend delegates that have been dropped on a
+        # flip/stop. The delegate is a trigger controller (no executor), so the base
+        # order_counts (which sums executors) loses its trigger activity the moment
+        # ``_trend`` is nulled — undercounting strategy_sessions.total_orders_* and
+        # the /status figure for every completed RGRID phase. Bank before dropping.
+        self._dropped_trend_counts: Dict[str, int] = {
+            "orders_placed": 0, "orders_filled": 0, "orders_cancelled": 0,
+        }
         # Per-tick diagnostics surfaced to the services log so a "no orders"
         # run is pinpointable (candle feed vs gate pause vs spawn refusal).
         self._last_candle_count: int = 0
@@ -238,6 +246,7 @@ class DynamicGridController(Controller):
                     "triggers may remain armed; continuing the stop (controller=%s)",
                     self.id, reason, self.id, exc_info=True,
                 )
+            self._bank_trend_counts()
             self._trend = None
 
     async def _candles(self) -> List[dict]:
@@ -362,6 +371,40 @@ class DynamicGridController(Controller):
             self.realized_move_bp = float(
                 abs((mid - self._grid_anchor_mid) / self._grid_anchor_mid) * Decimal(10000)
             )
+
+    def _bank_trend_counts(self) -> None:
+        """Accumulate the live trend delegate's cumulative order counts before it is
+        dropped, so a completed RGRID phase's trigger activity is not lost from
+        ``order_counts`` (the delegate is not a registered executor)."""
+        fn = getattr(self._trend, "order_counts", None)
+        if not callable(fn):
+            return
+        try:
+            d = fn() or {}
+        except Exception:  # policy: degrade-ok(telemetry only; a count read must never break a flip/stop)
+            return
+        for k in self._dropped_trend_counts:
+            self._dropped_trend_counts[k] += int(d.get(k, 0) or 0)
+
+    def order_counts(self) -> Dict[str, int]:
+        """GRID-phase executor counts PLUS the trend delegate's trigger counts —
+        banked from completed RGRID phases and the live delegate — so /status and
+        strategy_sessions.total_orders_* reflect BOTH phases, not just the executors
+        (the trend delegate runs none). Fixes the RGRID-phase undercount surfaced by
+        the 2026-08-28 DB-tracking audit."""
+        counts = dict(super().order_counts())
+        banked = dict(self._dropped_trend_counts)
+        fn = getattr(self._trend, "order_counts", None)
+        if callable(fn):
+            try:
+                d = fn() or {}
+                for k in banked:
+                    banked[k] += int(d.get(k, 0) or 0)
+            except Exception:  # policy: degrade-ok(telemetry only; a status count read must not crash the tick)
+                pass
+        for k in ("orders_placed", "orders_filled", "orders_cancelled"):
+            counts[k] = int(counts.get(k, 0) or 0) + int(banked.get(k, 0) or 0)
+        return counts
 
     def _inventory_net_base(self) -> Decimal:
         if self.inventory is None:
@@ -590,6 +633,7 @@ class DynamicGridController(Controller):
                     reason, self.id,
                 )
                 return
+            self._bank_trend_counts()
             self._trend = None
         # Close the live range-ladder position via the executor's reduce-only
         # flatten (GridExecutor._stop_out, keep_position=False), then re-arm.
@@ -1049,6 +1093,7 @@ class DynamicGridController(Controller):
         )
         if spawned:
             self.current_phase = phase
+            self._bank_trend_counts()
             self._trend = None
             self._grid_anchor_mid = _dec(mid)
             self.realized_move_bp = 0.0
