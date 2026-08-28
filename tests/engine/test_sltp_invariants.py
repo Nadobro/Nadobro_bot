@@ -1098,3 +1098,47 @@ def test_dgrid_trend_spawn_closes_a_venue_residual_before_the_delegate_baselines
         assert dg._trend._baseline_net == 0            # delegate started from true flat
 
     asyncio.run(body())
+
+
+def test_dgrid_order_counts_include_the_trend_delegate_across_a_flip():
+    """DB-TRACKING audit 2026-08-28: the RGRID trend delegate is a trigger controller
+    with NO executor, so the base order_counts (which sums executors) undercounts its
+    trigger activity — the /status figure and strategy_sessions.total_orders_* read 0
+    for the whole RGRID phase (while the FILLS still reach trades_<network> via
+    nado_sync). order_counts must include the live delegate AND bank a completed
+    phase's counts when the delegate is dropped on a flip."""
+    import asyncio
+
+    from src.nadobro.engine.routines import variance_regime as _vr
+    from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    async def body():
+        a = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal(0)},
+                            tick=Decimal("0.01"), lot=Decimal("0.0001"),
+                            min_notional=Decimal("1"))
+        trend_cfg = {"trading_pair": "P", "levels": 2, "step_pct": Decimal("0.01"),
+                     "order_amount_quote": Decimal("100"), "revgrid_chop_stand_down": False}
+        cfg = {"trading_pair": "P", "start_price": "98", "end_price": "102",
+               "total_amount_quote": "100", "min_spread_between_orders": "0.002",
+               "max_open_orders": 4, "step_pct": "0.01", "levels_count": 2,
+               "dgrid_trend_follow": 1, "trend_uses_trigger": True, "trend_rgrid": trend_cfg}
+        dg = DynamicGridController(user_id=1, orchestrator=ExecutorOrchestrator(),
+                                   adapter=a, inventory=InventoryRepository(), configs=cfg)
+        await dg._spawn_trend(Decimal("100"))
+        live = dg.order_counts()
+        placed_in_rgrid = int(live["orders_placed"])
+        assert placed_in_rgrid > 0, "RGRID-phase trigger orders missing from order_counts"
+        assert placed_in_rgrid == dg._trend.order_counts()["orders_placed"]
+
+        # flip RGRID->GRID drops the delegate; its counts must survive (banked)
+        await dg._flip_to(_vr.GRID, Decimal("100"), reason="flip")
+        assert dg._trend is None
+        after = dg.order_counts()
+        assert int(after["orders_placed"]) >= placed_in_rgrid, (
+            "trend delegate's order counts were lost when it was dropped on the flip"
+        )
+
+    asyncio.run(body())
