@@ -43,6 +43,7 @@ from src.nadobro.engine.controllers.controller_base import (
     ladder_recenter_threshold_bp,
 )
 from src.nadobro.engine.controllers.grid_trading import build_grid_config
+from src.nadobro.engine.controllers.reverse_grid import ReverseGridController
 from src.nadobro.engine.controllers.rgrid import RGridController
 from src.nadobro.engine.executors.grid_executor import GridExecutor
 from src.nadobro.engine.risk import ExecutorRequest
@@ -200,7 +201,10 @@ class DynamicGridController(Controller):
         # Trend-phase delegate. Same controller_id / inventory / orchestrator as
         # this parent so fills stay on the session; never registered as a second
         # orchestrator controller (that would overwrite this one).
-        self._trend: Optional[RGridController] = None
+        # The trend delegate: the legacy maker RGridController, or the trigger-based
+        # ReverseGridController when NADO_REVGRID_TRIGGER_ENABLED routes it (the
+        # ``trend_uses_trigger`` config flag, set by map_strategy_config).
+        self._trend: Optional[Controller] = None
         # Per-tick diagnostics surfaced to the services log so a "no orders"
         # run is pinpointable (candle feed vs gate pause vs spawn refusal).
         self._last_candle_count: int = 0
@@ -543,7 +547,7 @@ class DynamicGridController(Controller):
                     reason, self.id,
                 )
                 return
-            if not await self._trend.flatten_now(mid, reason=f"dgrid {reason}"):
+            if not await self._trend.flatten_now(mid, reason=f"dgrid {reason}"):  # type: ignore[attr-defined]
                 logger.warning(
                     "dgrid %s: trend flatten still open — deferring re-arm "
                     "(controller=%s)",
@@ -844,20 +848,24 @@ class DynamicGridController(Controller):
             return
         packed = self._trend_mapped_config()
         self._trend.configs = packed
-        self._trend.reset_threshold_pct = _dec(packed.get("reset_threshold_pct", "0.002"))
-        self._trend.trail_enabled = bool(packed.get("trail_enabled", True))
-        self._trend.order_amount_quote = _dec(
-            packed.get("order_amount_quote", self._trend.order_amount_quote)
+        if isinstance(self._trend, ReverseGridController):
+            # The trigger delegate re-derives its own geometry from the config; the
+            # legacy RGridController attrs below do not exist on it.
+            self._trend.reload_config()
+            return
+        if not isinstance(self._trend, RGridController):
+            return
+        trend = self._trend      # narrowed: the legacy maker delegate
+        trend.reset_threshold_pct = _dec(packed.get("reset_threshold_pct", "0.002"))
+        trend.trail_enabled = bool(packed.get("trail_enabled", True))
+        trend.order_amount_quote = _dec(
+            packed.get("order_amount_quote", trend.order_amount_quote)
         )
-        self._trend.spread_bid_pct = _dec(
-            packed.get("spread_bid_pct", self._trend.spread_bid_pct)
-        )
-        self._trend.spread_ask_pct = _dec(
-            packed.get("spread_ask_pct", self._trend.spread_ask_pct)
-        )
-        self._trend.signal_regime = str(packed.get("signal_regime", "") or "")
+        trend.spread_bid_pct = _dec(packed.get("spread_bid_pct", trend.spread_bid_pct))
+        trend.spread_ask_pct = _dec(packed.get("spread_ask_pct", trend.spread_ask_pct))
+        trend.signal_regime = str(packed.get("signal_regime", "") or "")
         try:
-            self._trend.signal_confidence = float(packed.get("signal_confidence", 0.0) or 0.0)
+            trend.signal_confidence = float(packed.get("signal_confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
             pass
 
@@ -878,7 +886,11 @@ class DynamicGridController(Controller):
             logger.warning("dgrid %s: no mid for trend spawn — retry next tick", self.id)
             return False
         cfg = self._trend_mapped_config()
-        self._trend = RGridController(
+        # Trigger ReverseGridController when routed (flag), else the legacy maker one.
+        _trend_cls = (ReverseGridController
+                      if _as_bool(self.cfg("trend_uses_trigger", False), False)
+                      else RGridController)
+        self._trend = _trend_cls(
             user_id=self.user_id,
             orchestrator=self.orchestrator,
             adapter=self.adapter,

@@ -126,6 +126,21 @@ def deterministic_controller_id(strategy: str, user_id: int, network: str) -> st
     return f"{strategy}:{int(user_id)}:{str(network)}"
 
 
+def revgrid_trigger_enabled() -> bool:
+    """Route the ``rgrid`` strategy to the trigger-based ``ReverseGridController``
+    (native venue price-trigger rungs) instead of the legacy maker ``RGridController``.
+
+    DEFAULT OFF — a deliberate no-default-flip: ``rgrid`` keeps its shipped controller
+    until the trigger rebuild is validated on a testnet paper run. The strategy id,
+    UI, session identity and SL/TP plumbing are all UNCHANGED — only the engine
+    controller and its config dict change under the flag. Flip on a TESTNET deploy
+    (``NADO_REVGRID_TRIGGER_ENABLED=1``) to run the paper trial; never a live default
+    until that trial passes (see the Aug-2026 grid-family regression)."""
+    from src.nadobro.utils.env import env_bool
+
+    return env_bool("NADO_REVGRID_TRIGGER_ENABLED", False)
+
+
 def build_controller(
     strategy: str,
     *,
@@ -139,10 +154,15 @@ def build_controller(
 ) -> Controller:
     cls = CONTROLLER_REGISTRY.get(strategy)
     # Grid opt-in: fill-anchored maker quoting replaces the classic ladder when the
-    # user enables ``fill_anchored``. rgrid is NEVER overridden — Reverse Grid has
-    # exactly one engine, and the registry already points at it.
+    # user enables ``fill_anchored``. rgrid is NEVER overridden here — Reverse Grid
+    # has exactly one engine, and the registry already points at it.
     if strategy != "rgrid" and configs.get("controller_override") == "fill_anchored":
         cls = FillAnchoredQuotingController
+    # Flag-gated Reverse Grid rebuild: run the trigger controller for `rgrid` when the
+    # env flag is on (testnet paper trial). map_strategy_config produces the matching
+    # config under the same flag.
+    if strategy == "rgrid" and revgrid_trigger_enabled():
+        cls = ReverseGridController
     if cls is None:
         raise ValueError(f"no engine controller for strategy '{strategy}'")
     return cls(
@@ -557,7 +577,13 @@ def _apply_dgrid_controller_config(controller: Controller, configs: Dict[str, ob
     packed = configs.get("trend_rgrid")
     trend = getattr(controller, "_trend", None)
     if trend is not None and isinstance(packed, dict):
-        _apply_rgrid_controller_config(trend, packed)
+        if isinstance(trend, ReverseGridController):
+            # Trigger trend delegate: re-read its geometry from the refreshed
+            # sub-config (leaves the open position + its trailing stop alone).
+            trend.configs = dict(packed)
+            trend.reload_config()
+        else:
+            _apply_rgrid_controller_config(trend, packed)
 
 
 def _apply_rgrid_controller_config(controller: Controller, configs: Dict[str, object]) -> None:
@@ -650,6 +676,13 @@ async def _apply_live_controller_update(
     controller.configs = dict(configs)
     controller.limits = limits
     _apply_orchestrator_risk_limits(orch, limits)
+
+    if isinstance(controller, ReverseGridController):
+        # Trigger Reverse Grid: re-read the geometry/gate params from the refreshed
+        # configs (reload_config leaves the open position + its trailing stop alone).
+        # It manages its own venue triggers, so there is nothing here to cancel/reset.
+        controller.reload_config()
+        return
 
     if isinstance(controller, RGridController):
         # R-Grid rests nothing, so there are no quotes to reset — cancelling here
@@ -945,12 +978,91 @@ def _effective_leverage(settings: Dict[str, Any], fallback: float = 1.0) -> floa
     return max(1.0, raw)
 
 
+# The trigger Reverse Grid's rung SPACING floor. The controller floors the step at
+# the taker round trip (~8.6bp) so a rung is never a structural loss; this is the
+# tighter, validation-derived floor for the DEFAULT config — the Aug-2026 real-tape
+# sweep showed ~15-25bp is the viable zone (10bp bled chop, wider gave back trend).
+# A user's own wider spread is honoured above it; it can only ever WIDEN the step.
+_REVGRID_STEP_FLOOR = Decimal("0.0015")
+
+
+def _map_revgrid_config(
+    settings: Dict[str, Any],
+    mid: Decimal,
+    *,
+    product: str,
+    levels: int,
+    deployed: float,
+    spread_frac: Decimal,
+    chunk_dec: Optional[Decimal],
+    sl_pct: float,
+    leverage: int,
+) -> Dict[str, object]:
+    """Config for the trigger-based ``ReverseGridController`` (flag-gated `rgrid`).
+
+    Reuses the SAME step sizing as the legacy rgrid mapping (``resolve_step_quote``:
+    ``deployed / levels`` shrunk by a POV chunk and by the stop budget, floored at
+    the venue minimum), so the per-rung notional and the stop-budget discipline are
+    unchanged. The controller derives its stop / trail geometry from ``step_pct``,
+    so only the essentials are set here; the chop stand-down gate is ON by default.
+    ``candle_provider`` is injected later by ``run_engine_cycle`` (rgrid is already
+    in its injection set)."""
+    from src.nadobro.quant.mm_quote_math import DEFAULT_MIN_ORDER_NOTIONAL_USD
+    from src.nadobro.quant.rgrid_sizing import resolve_step_quote, step_band_frac
+    from src.nadobro.strategy.strategy_registry import session_margin_usd
+
+    # Rung spacing: the user's spread, floored to the validated viable-zone minimum
+    # (never below — a too-tight reverse grid bleeds chop). The controller applies
+    # its own round-trip floor on top, so this can only widen the step.
+    step_pct = max(spread_frac, _REVGRID_STEP_FLOOR)
+    # Stop budget = the margin the session rail measures against × the user's SL%,
+    # exactly as the legacy rgrid mapping sizes it.
+    rg_margin = session_margin_usd(settings) or float(deployed) / max(1.0, float(leverage or 1))
+    stop_budget = rg_margin * max(0.0, float(sl_pct)) / 100.0
+    plan = resolve_step_quote(
+        deployed_quote=deployed,
+        levels=levels,
+        chunk_quote=chunk_dec,
+        stop_budget_usd=stop_budget,
+        min_step_usd=DEFAULT_MIN_ORDER_NOTIONAL_USD,
+        band_frac=step_band_frac(step_pct, Decimal(0)),
+    )
+    cfg: Dict[str, object] = {
+        "trading_pair": product,
+        # Kept so /status and the overlay/live-reconfig routers keep recognising the
+        # exposure-anchored family; the trigger controller ignores anchor_mode.
+        "anchor_mode": "rgrid",
+        "levels": int(levels),
+        "step_pct": step_pct,
+        "order_amount_quote": plan.step,
+        # The risk bound the (skipped) overlay may never exceed — kept for parity /
+        # future use; the trigger geometry is deterministic and unshaded.
+        "step_capped_quote": plan.step,
+        "leverage": int(leverage or 1),
+        # Chop stand-down gate ON by default (a reverse grid must not trade chop).
+        "revgrid_chop_stand_down": _as_bool(settings.get("rgrid_chop_stand_down", True), True),
+    }
+    # Honour explicit per-run geometry overrides if the operator set them (testnet
+    # tuning); otherwise the controller derives stop/trail from step_pct.
+    for key in ("stop_pct", "trail_arm_pct", "trail_giveback_pct", "reanchor_bands"):
+        raw = settings.get(f"revgrid_{key}")
+        if raw is not None:
+            cfg[key] = _dec(raw)
+    return cfg
+
+
 def map_strategy_config(
     strategy: str, settings: Dict[str, Any], mid: Decimal, *, product: str,
-    leverage: int = 1, network: str = "mainnet",
+    leverage: int = 1, network: str = "mainnet", _for_dgrid_trend: bool = False,
 ) -> Dict[str, object]:
     """Derive an engine controller config from a user's saved strategy settings
     + current mid. Documented, testnet-tunable mappings (not 1:1 with legacy).
+
+    ``_for_dgrid_trend`` (private): set when D-Grid builds its trend-phase sub-config
+    from the ``rgrid`` mapping. D-Grid constructs the LEGACY ``RGridController``
+    directly (it is not routed through ``build_controller``), so its sub-config must
+    stay the legacy rgrid shape even when the trigger-rebuild flag is on — the flag
+    only swaps the STANDALONE ``rgrid`` strategy.
     """
     mid = _dec(mid)
     # ``notional`` here is the user's allocated MARGIN (collateral). The grid/MM
@@ -1421,6 +1533,17 @@ def map_strategy_config(
     # spread on a break; it never switches phase (that is D-Grid), rests no
     # ladder, and has no maker mode to opt out of.
     if strategy == "rgrid":
+        # Flag-gated trigger rebuild: produce the ReverseGridController config
+        # instead (testnet paper trial). build_controller swaps the class under the
+        # same flag; everything else about the `rgrid` strategy is unchanged.
+        # NEVER for D-Grid's trend sub-config (_for_dgrid_trend): D-Grid builds a
+        # legacy RGridController directly and would choke on the new config shape.
+        if revgrid_trigger_enabled() and not _for_dgrid_trend:
+            return _map_revgrid_config(
+                settings, mid, product=product, levels=levels, deployed=deployed,
+                spread_frac=spread_frac, chunk_dec=_chunk_dec, sl_pct=_sl_pct,
+                leverage=leverage,
+            )
         # The threshold ARMS the trailing soft reset, and the controller refuses one
         # that sits inside the entry band (an exit narrower than the trigger that
         # opened the trade would arm before the break is even established). The old
@@ -1910,10 +2033,30 @@ def map_strategy_config(
         _rg_settings = dict(settings)
         if not _f(_rg_settings, "rgrid_spread_bp", 0.0):
             _rg_settings["rgrid_spread_bp"] = float(_spread_bp)
-        cfg["trend_rgrid"] = map_strategy_config(
-            "rgrid", _rg_settings, mid, product=product,
-            leverage=leverage, network=network,
-        )
+        if revgrid_trigger_enabled():
+            # D-Grid's trend phase runs the trigger ReverseGridController too, so the
+            # two stay consistent (and the one kill-switch reverts both). Its OWN chop
+            # stand-down gate is DISABLED: D-Grid's parent classifier already confirms
+            # the trend before spawning it, and the nested controller has no candle
+            # feed of its own — so it arms whenever D-Grid is in the RGRID phase.
+            _trend_spread_frac = (
+                Decimal(str(_f(_rg_settings, "rgrid_spread_bp", float(_spread_bp))))
+                / Decimal(10000)
+            )
+            _trend_cfg = _map_revgrid_config(
+                _rg_settings, mid, product=product, levels=levels, deployed=deployed,
+                spread_frac=_trend_spread_frac, chunk_dec=_chunk_dec, sl_pct=_sl_pct,
+                leverage=leverage,
+            )
+            _trend_cfg["revgrid_chop_stand_down"] = False
+            cfg["trend_rgrid"] = _trend_cfg
+            cfg["trend_uses_trigger"] = True
+        else:
+            cfg["trend_rgrid"] = map_strategy_config(
+                "rgrid", _rg_settings, mid, product=product,
+                leverage=leverage, network=network, _for_dgrid_trend=True,
+            )
+            cfg["trend_uses_trigger"] = False
 
     # GRID in-place re-center: honor the user's reset threshold so the classic
     # long ladder follows price ("reset and continue") instead of going stale.
@@ -2300,6 +2443,12 @@ async def _maybe_apply_overlay(
         )
 
         if not overlay_applies(strategy):
+            return
+        # The trigger Reverse Grid's geometry is fully DETERMINISTIC — the engine +
+        # the venue book decide every entry/exit, and the handoff forbids the LLM
+        # overlay from shading it. Skip the overlay entirely for the flag-routed
+        # rgrid (the session rail remains the risk bound).
+        if strategy == "rgrid" and revgrid_trigger_enabled():
             return
         pid = _opt_int(product_id)
         if pid is None or client is None or not hasattr(client, "get_candlesticks"):

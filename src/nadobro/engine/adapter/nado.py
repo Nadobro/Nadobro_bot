@@ -734,10 +734,20 @@ class NadoAdapter(NadoAdapterBase):
         trigger digest in the SEPARATE ``_trigger_orders`` registry, and returns a
         :class:`NadoOrder` whose ``id`` is that digest.
 
-        Unlike ``place_order`` this does NOT tag the order or call the placement
-        session-link hook: a trigger's FILL surfaces later (with its own digest)
-        via the fill→legacy-table bridge, so attribution is done there, not at
-        placement time.
+        Attribution is DUAL-PATH, so the run's turnover / realized PnL / History are
+        captured whether or not the venue echoes the trigger digest on the fill:
+          1. PRIMARY — the placement session-link hook (``_on_place``) is called with
+             the trigger digest. A Nado price trigger IS the order (conditionally
+             activated), so if its fill carries this digest ``venue/nado_sync`` links
+             it to the run via ``_back_link_intent``, exactly as for a resting order.
+          2. BACKSTOP — if the fill carries a DIFFERENT digest (the trigger spawns a
+             fresh order id), ``nado_sync``'s product+session-window fallback
+             (``_resolve_session_by_window``) still attributes the fill to the session
+             that owns the product during the run, labelling it ``source='strategy'``;
+             it is gated on ``not intent_found`` so a manual-tagged fill is never
+             swallowed. So no fill is lost regardless of the venue's fire semantics.
+        It is NOT tagged with an order_tags client id (that path is for the WS
+        executor fill stream, which a trigger controller does not use).
         """
         meta = self._meta(trading_pair)
         is_buy = side is TradeType.BUY
@@ -789,6 +799,10 @@ class NadoAdapter(NadoAdapterBase):
             self._registry.record(digest, ref)
         except Exception:  # noqa: BLE001 - persistence must not break placement
             logger.warning("trigger registry record failed for %s", digest, exc_info=True)
+        # Link the trigger digest to the live session so its fill is attributed to
+        # this run (turnover / realized PnL). Best-effort, off the event loop — a
+        # link failure must never fail a placed trigger.
+        await self._link_placement(digest)
         return NadoOrder(
             id=digest, trading_pair=trading_pair, side=side,
             order_type=OrderType.LIMIT, amount_base=abs(_dec(amount_base)),
@@ -888,11 +902,25 @@ class NadoAdapter(NadoAdapterBase):
             self._registry.record(digest, ref)
         except Exception:  # noqa: BLE001 - persistence must not break placement
             logger.warning("stop registry record failed for %s", digest, exc_info=True)
+        # A reduce-only stop that fires books a CLOSE fill — link it so the run's
+        # realized PnL and turnover include the exit, not just the entries.
+        await self._link_placement(digest)
         return NadoOrder(
             id=digest, trading_pair=trading_pair, side=close_side,
             order_type=OrderType.LIMIT, amount_base=abs(_dec(close_size)),
             price=_dec(stop_price), state=OrderState.OPEN,
         )
+
+    async def _link_placement(self, digest: str) -> None:
+        """Best-effort placement→session link (off the event loop) for a trigger /
+        stop digest, so a venue fill for it is attributed to the run. No-op when no
+        ``_on_place`` hook is wired (e.g. a backtest / a non-session adapter)."""
+        if self._on_place is None or not digest:
+            return
+        try:
+            await _db(self._on_place, digest)
+        except Exception:  # noqa: BLE001 - placement link is best-effort
+            logger.debug("on_place link failed for %s", digest, exc_info=True)
 
     def _order_from_response(
         self, resp: object, trading_pair: str, side: TradeType, order_type: OrderType,

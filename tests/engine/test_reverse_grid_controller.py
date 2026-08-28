@@ -80,6 +80,27 @@ def test_unreadable_venue_arms_nothing():
     asyncio.run(body())
 
 
+def test_preexisting_position_is_baselined_out():
+    """P2: a position already on the product when the run starts (a manual trade, or
+    a leftover NOT auto-resumed) must be baselined out — the controller reads, sizes,
+    and flattens ONLY its own exposure, and treats itself as flat at start."""
+    async def body():
+        a = _adapter(venue_held={PAIR: Decimal("5")})   # 5 pre-existing
+        c = _controller(a)
+        await c.on_tick()                                # first read captures baseline
+        assert c._baseline_net == Decimal("5")
+        assert c._pos_base == 0                          # the run reads as flat...
+        assert len(a.placed_triggers) == 4               # ...and arms its ladder
+        # the controller's OWN buy fill grows net from 0, not from 5
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))               # venue_held 5 -> ~5.99
+        await c.on_tick()
+        assert Decimal("0") < c._pos_base < Decimal("1")  # ~0.99 (run-only), not ~5.99
+        assert _approx(c._avg_entry, Decimal("101"))     # its own entry, uncontaminated
+
+    asyncio.run(body())
+
+
 # ── first fill: cancel the losing side + arm the protective stop ────────
 
 def test_first_buy_fill_cancels_sells_and_arms_a_stop():
@@ -207,6 +228,97 @@ def test_on_stop_cancels_all_triggers():
         await c.on_stop("user stopped")
         assert len(a.cancelled_triggers) == 4      # every armed rung cancelled
         assert c._rungs == []
+
+    asyncio.run(body())
+
+
+# ── flatten_now (D-Grid phase handoff) ─────────────────────────────────
+
+def test_flatten_now_closes_the_position_and_reports_flat():
+    async def body():
+        a = _adapter()
+        c = _controller(a, levels=1)
+        await c.on_tick()                          # arm
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))         # open long
+        await c.on_tick()
+        assert a.venue_held[PAIR] > 0
+        ok = await c.flatten_now(Decimal("101.5"), reason="dgrid flip")
+        assert ok is True
+        assert a.venue_held[PAIR] == 0             # crossed to close
+        assert c._pos_base == 0 and c._stop_digest is None
+        # already flat → still True, and no residual triggers
+        assert await c.flatten_now(Decimal("101.5")) is True
+
+    asyncio.run(body())
+
+
+def test_flatten_now_holds_on_an_unreadable_venue():
+    async def body():
+        a = _adapter(venue_held=None)              # held_base -> None
+        c = _controller(a, levels=1)
+        assert await c.flatten_now(Decimal("100")) is False  # never claim flat blind
+
+    asyncio.run(body())
+
+
+def test_flatten_now_cancels_the_armed_rungs_so_nothing_reopens():
+    """P1: the pyramiding rungs stay armed in a position; flatten_now MUST cancel them
+    (before the close) or a cross into one would re-open the position and D-Grid could
+    never hand off flat. After flatten_now, a cross past a would-be rung stays flat."""
+    async def body():
+        a = _adapter()
+        c = _controller(a, levels=2)               # BUY@102 stays armed after the open
+        await c.on_tick()
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))         # open long; BUY@102 still armed
+        await c.on_tick()
+        assert any(not r.fired and r.side is TradeType.BUY for r in c._rungs)
+        assert await c.flatten_now(Decimal("101.5")) is True
+        assert a.venue_held[PAIR] == 0 and c._rungs == []   # all rungs torn down
+        # a cross that WOULD have fired the old BUY@102 must not re-open the position
+        a.set_mid(Decimal("102.5"))
+        a.cross_triggers(Decimal("102.5"))
+        assert a.venue_held[PAIR] == 0
+
+    asyncio.run(body())
+
+
+# ── /status telemetry (order_counts + grid_metrics card keys) ──────────
+
+def test_order_counts_track_trigger_activity():
+    async def body():
+        a = _adapter()
+        c = _controller(a)
+        await c.on_tick()                          # arm 4 rungs
+        assert c.order_counts()["orders_placed"] == 4
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))         # BUY@101 fires
+        await c.on_tick()                           # open long: cancel sells, arm stop
+        counts = c.order_counts()
+        assert counts["orders_placed"] > 4          # + the stop
+        assert counts["orders_filled"] >= 1         # the rung that fired
+        assert counts["orders_cancelled"] >= 2      # the two SELL rungs
+
+    asyncio.run(body())
+
+
+def test_grid_metrics_emits_the_status_card_keys():
+    async def body():
+        a = _adapter()
+        c = _controller(a)
+        await c.on_tick()
+        a.set_mid(Decimal("101.5"))
+        a.cross_triggers(Decimal("101.5"))
+        await c.on_tick()
+        m = c.grid_metrics()
+        # the keys the rgrid /status card pipeline consumes
+        for key in ("grid_anchor_price", "grid_net_base", "grid_drift_from_anchor_pct",
+                    "grid_reset_active", "grid_reset_side", "grid_buy_exposure_price"):
+            assert key in m, key
+        assert m["grid_net_base"] > 0                # long
+        assert m["grid_reset_side"] == "long"
+        assert m["grid_buy_exposure_price"] > 0      # avg entry surfaced on the held side
 
     asyncio.run(body())
 

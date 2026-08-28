@@ -67,7 +67,7 @@ from typing import List, Optional
 from src.nadobro.engine.adapter.base import AdapterError
 from src.nadobro.engine.controllers.controller_base import Controller
 from src.nadobro.engine.routines import variance_regime
-from src.nadobro.engine.types import TradeType, _as_bool, _dec
+from src.nadobro.engine.types import OrderType, TradeType, _as_bool, _dec
 from src.nadobro.quant.rgrid_sizing import TAKER_ROUND_TRIP_RATE, arm_pct
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,44 @@ class ReverseGridController(Controller):
     def __init__(self, **kwargs: object) -> None:
         kwargs.setdefault("name", "revgrid")
         super().__init__(**kwargs)  # type: ignore[arg-type]
+        # Config-derived geometry + gate params (re-readable live via reload_config).
+        self._load_config()
+
+        # -- regime hysteresis state (NOT config — survives a live reconfig) --
+        self._regime_phase: str = variance_regime.GRID
+        self._trend_streak = 0
+        self._trend_streak_dir = variance_regime.FLAT
+        self._confirmed_trend_dir = variance_regime.FLAT
+
+        # -- live state --
+        self._anchor: Optional[Decimal] = None
+        self._rungs: List[_Rung] = []
+        self._pos_base: Decimal = Decimal(0)      # last observed signed net (run-only)
+        # Venue position that already existed on the product when the run began,
+        # captured on the first successful net read and subtracted from held_base so
+        # the controller manages ONLY the exposure IT opens (a pre-existing manual
+        # position, or a leftover from a prior run that was NOT auto-resumed, is
+        # baselined out — mirrors live_session's baseline). None = not yet captured.
+        self._baseline_net: Optional[Decimal] = None
+        self._avg_entry: Optional[Decimal] = None
+        self._peak: Optional[Decimal] = None      # favourable extreme mid since open
+        self._trail_armed = False
+        self._stop_digest: Optional[str] = None
+        self._stop_level: Optional[Decimal] = None
+        self._stop_size: Optional[Decimal] = None
+        self._last_mid: Optional[Decimal] = None
+        # Order telemetry for /status. The base order_counts() sums executors, which
+        # this controller has none of — it manages venue triggers directly — so it
+        # tracks its own placed / filled / cancelled counts and overrides that method.
+        self._n_placed = 0
+        self._n_filled = 0
+        self._n_cancelled = 0
+
+    # -- config ---------------------------------------------------------------
+    def _load_config(self) -> None:
+        """(Re)read the config-derived geometry + gate params from ``self.configs``.
+        Called at construction and by :meth:`reload_config` on a live settings edit.
+        Sets ONLY config attrs — never the runtime position/regime state."""
         self.trading_pair = str(self.cfg("trading_pair") or "")
         self.levels = max(1, int(self.cfg("levels", 4) or 4))
         # A rung must clear the taker round trip or it is a structural loss; floor
@@ -146,31 +184,26 @@ class ReverseGridController(Controller):
         self._regime_range_on_vr = float(self.cfg("revgrid_regime_range_on_vr", 1.15) or 1.15)
         self._regime_trend_drift_pct = float(self.cfg("revgrid_regime_trend_drift_pct", 0.30) or 0.30)
         self._trend_confirm_ticks = int(max(1, int(self.cfg("revgrid_trend_confirm_ticks", 3) or 3)))
-        self._regime_phase: str = variance_regime.GRID
-        self._trend_streak = 0
-        self._trend_streak_dir = variance_regime.FLAT
-        self._confirmed_trend_dir = variance_regime.FLAT
 
-        # -- live state --
-        self._anchor: Optional[Decimal] = None
-        self._rungs: List[_Rung] = []
-        self._pos_base: Decimal = Decimal(0)      # last observed signed net
-        self._avg_entry: Optional[Decimal] = None
-        self._peak: Optional[Decimal] = None      # favourable extreme mid since open
-        self._trail_armed = False
-        self._stop_digest: Optional[str] = None
-        self._stop_level: Optional[Decimal] = None
-        self._stop_size: Optional[Decimal] = None
-        self._last_mid: Optional[Decimal] = None
+    def reload_config(self) -> None:
+        """Apply a live settings edit: re-read the geometry + gate params from the
+        (already-refreshed) ``self.configs``. RUNTIME state — the anchor, the open
+        position's avg entry / peak / trailing-stop bookkeeping, and the regime
+        hysteresis — is deliberately untouched, so a mid-run edit never disturbs an
+        open position or re-arms an exit the trail had already locked in."""
+        self._load_config()
 
     # -- lifecycle -----------------------------------------------------------
     async def on_start(self) -> None:
-        # No auto-resume: a redeploy/start never re-arms a prior ladder. Start from
-        # a clean slate; the first on_tick anchors and arms from the live mid. If the
-        # account happens to hold a position (a user restart mid-trade), on_tick
-        # detects it and arms a protective stop rather than adding new exposure.
+        # No auto-resume: a redeploy/start never re-arms a prior ladder OR re-engages
+        # a position it did not open. Start from a clean slate; the first on_tick
+        # captures whatever is held now as the BASELINE (see _read_net) so a
+        # pre-existing / leftover position is left alone (the session rail still
+        # bounds it), and the ladder is armed fresh from the live mid.
         self._anchor = None
         self._rungs = []
+        self._pos_base = Decimal(0)
+        self._baseline_net = None
         self._reset_position_state()
 
     async def on_tick(self) -> None:
@@ -213,6 +246,54 @@ class ReverseGridController(Controller):
         stop — so a stopped session leaves nothing watching the mid."""
         await self._reset_after_close()
 
+    async def flatten_now(self, mid: Decimal, *, reason: str = "handoff") -> bool:
+        """Close the whole position, cancel every trigger, and report whether the
+        book is now FLAT. D-Grid calls this on a phase handoff (RGRID→GRID): its
+        ranging ladder must not inherit a naked position, so the trend delegate has
+        to be flat before it is dropped.
+
+        Crosses to close (reduce-only MARKET) when a position is open, then re-reads
+        the venue net. Returns ``True`` only once the venue confirms flat — otherwise
+        ``False`` so D-Grid retries next tick rather than dropping an open position.
+        """
+        net = await self._read_net()
+        if net is None:
+            return False              # unreadable venue — never claim flat
+        # Cancel the ENTRY rungs FIRST — they are still armed (pyramiding) and, unlike
+        # the reduce-only stop (which can only SHRINK the position), an entry rung
+        # firing between the close and the re-read would RE-OPEN the position, so
+        # D-Grid could never hand off flat and would churn taker round-trips. The
+        # protective stop is deliberately LEFT until the book is confirmed flat, so
+        # the position is never naked while the close is in flight.
+        await self._cancel_all_rungs()
+        if net != 0:
+            close_side = TradeType.SELL if net > 0 else TradeType.BUY
+            try:
+                await self.adapter.place_order(
+                    self.trading_pair, close_side, OrderType.MARKET, abs(net),
+                    reduce_only=True,
+                )
+                self._n_filled += 1
+            except AdapterError:
+                logger.warning(
+                    "revgrid flatten close FAILED (%s) net=%s (user=%s pair=%s)",
+                    reason, net, self.user_id, self.trading_pair, exc_info=True,
+                )
+                return False
+            net = await self._read_net()
+            if net is None or net != 0:
+                return False          # still open — D-Grid retries next tick
+        # Flat: now drop the protective stop too, and reset. Nothing is left armed.
+        if self._stop_digest is not None:
+            try:
+                await self.adapter.cancel_trigger_order(self._stop_digest)
+            except AdapterError:
+                logger.debug("revgrid flatten stop-cancel failed", exc_info=True)
+        self._anchor = None
+        self._pos_base = Decimal(0)
+        self._reset_position_state()
+        return True
+
     # -- venue reads ---------------------------------------------------------
     async def _mid(self) -> Optional[Decimal]:
         try:
@@ -222,14 +303,30 @@ class ReverseGridController(Controller):
             return None
 
     async def _read_net(self) -> Optional[Decimal]:
-        """Signed net position base from the VENUE (``held_base``). None = the venue
-        could not be read — the caller then holds and acts on nothing (fail safe)."""
+        """Signed net position base for THIS RUN: the venue position (``held_base``)
+        minus the baseline captured at the run's start. The baseline excludes any
+        position that already existed on the product when the run began, so the
+        controller reads, sizes stops against, and flattens ONLY its own exposure.
+        None = the venue could not be read — the caller then holds and acts on
+        nothing (fail safe), and the baseline is NOT captured off a bad read."""
         try:
             held = await self.adapter.held_base(self.trading_pair)
         except Exception:  # noqa: BLE001
             logger.debug("revgrid net read failed pair=%s", self.trading_pair, exc_info=True)
             return None
-        return None if held is None else _dec(held)
+        if held is None:
+            return None
+        held = _dec(held)
+        if self._baseline_net is None:
+            # First good read of the run — the ladder is not armed yet, so whatever
+            # is held now is pre-existing and is baselined out.
+            self._baseline_net = held
+            logger.info(
+                "revgrid baseline captured: %s pre-existing on %s (run reads net "
+                "relative to this) (user=%s)",
+                held, self.trading_pair, self.user_id,
+            )
+        return held - self._baseline_net
 
     # -- chop stand-down gate ------------------------------------------------
     async def _candles(self) -> List[dict]:
@@ -332,6 +429,7 @@ class ReverseGridController(Controller):
                     continue
                 self._rungs.append(_Rung(order.id, side, level, size))
                 placed += 1
+        self._n_placed += placed
         logger.info(
             "revgrid armed %s trigger rungs around anchor %s (levels=%s step=%s "
             "user=%s pair=%s)",
@@ -360,6 +458,8 @@ class ReverseGridController(Controller):
 
     async def _cancel_all_rungs(self) -> None:
         for r in self._rungs:
+            if not r.fired:
+                self._n_cancelled += 1
             try:
                 await self.adapter.cancel_trigger_order(r.digest)
             except AdapterError:
@@ -370,6 +470,7 @@ class ReverseGridController(Controller):
         keep: List[_Rung] = []
         for r in self._rungs:
             if r.side is side and not r.fired:
+                self._n_cancelled += 1
                 try:
                     await self.adapter.cancel_trigger_order(r.digest)
                 except AdapterError:
@@ -418,6 +519,8 @@ class ReverseGridController(Controller):
             take = min(r.size_base, target - acc)
             if take <= 0:
                 continue
+            if not r.fired:
+                self._n_filled += 1     # a rung just fired (entry / add)
             r.fired = True
             num += r.level * take
             acc += take
@@ -478,11 +581,13 @@ class ReverseGridController(Controller):
                 size, level, long, self.user_id, self.trading_pair, exc_info=True,
             )
             return
+        self._n_placed += 1
         old = self._stop_digest
         self._stop_digest = order.id
         self._stop_level = level
         self._stop_size = size
         if old is not None:
+            self._n_cancelled += 1
             try:
                 await self.adapter.cancel_trigger_order(old)
             except AdapterError:
@@ -493,6 +598,7 @@ class ReverseGridController(Controller):
         """The position is flat (stop fired / rail flattened). Cancel any residual
         triggers — the stop and any still-resting rungs — and clear all position
         and ladder state so the next flat tick re-anchors to the current mid."""
+        self._n_filled += 1       # the exit that flattened the position (stop / rail)
         if self._stop_digest is not None:
             try:
                 await self.adapter.cancel_trigger_order(self._stop_digest)
@@ -511,10 +617,44 @@ class ReverseGridController(Controller):
         self._stop_size = None
 
     # -- introspection (for /status and tests) -------------------------------
-    def grid_metrics(self) -> dict:
+    def order_counts(self) -> dict:
+        """Trigger activity for /status. Overrides the base (which sums executors —
+        this controller has none). placed = rungs + stops armed; filled = rungs that
+        fired + exits; cancelled = triggers/stops cancelled. Approximate but real,
+        so /status shows activity instead of a flat zero."""
         return {
-            "anchor": self._anchor,
-            "net_base": self._pos_base,
+            "orders_placed": self._n_placed,
+            "orders_filled": self._n_filled,
+            "orders_cancelled": self._n_cancelled,
+        }
+
+    def grid_metrics(self) -> dict:
+        """Telemetry for the /status card. Emits the SAME ``grid_*`` keys the legacy
+        rgrid card pipeline reads (bot_runtime maps them to ``rgrid_*``; formatters
+        renders them), so the trigger reverse grid renders in the existing card
+        instead of showing blanks — plus a few reverse-grid extras the card ignores
+        but tests / logs use."""
+        anchor = self._anchor
+        long = self._pos_base > 0
+        short = self._pos_base < 0
+        drift_pct = 0.0
+        if anchor and anchor > 0 and self._last_mid is not None:
+            drift_pct = float((self._last_mid - anchor) / anchor * Decimal(100))
+        entry = float(self._avg_entry) if self._avg_entry else 0.0
+        return {
+            # --- keys the rgrid /status card consumes ---
+            "grid_anchor_price": float(anchor) if anchor else 0.0,
+            "grid_net_base": float(self._pos_base),
+            # The reverse grid has one cost basis, not two exposure legs; surface it
+            # on the side actually held so the card shows a real entry.
+            "grid_buy_exposure_price": entry if long else 0.0,
+            "grid_sell_exposure_price": entry if short else 0.0,
+            "grid_drift_from_anchor_pct": drift_pct,
+            # The trailing stop IS the reverse grid's "soft reset": armed once in
+            # profit, it ratchets the exit with the move.
+            "grid_reset_active": bool(self._trail_armed),
+            "grid_reset_side": "long" if long else ("short" if short else "none"),
+            # --- reverse-grid extras (ignored by the card; used by tests/logs) ---
             "avg_entry": self._avg_entry,
             "stop_level": self._stop_level,
             "trail_armed": self._trail_armed,
