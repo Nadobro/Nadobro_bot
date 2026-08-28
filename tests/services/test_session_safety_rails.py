@@ -130,6 +130,19 @@ class SessionPnlRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res, (True, None))
         self.assertEqual(fin.call_args.kwargs.get("stop_reason"), "sl_hit")
 
+    async def test_mark_cache_seeds_while_running_and_is_dropped_on_stop(self):
+        # The velocity buffer needs the mark to persist across polls, but the cache
+        # must not leak: a firing stop pops the session's entry (no unbounded growth).
+        bot_runtime._SLTP_MARK_CACHE.clear()
+        calm = {"session_pnl": -0.2, "session_pnl_pct": -0.2, "session_pnl_net": -0.2,
+                "session_pnl_pct_net": -0.2, "margin": 100.0, "mark": 79000.0}
+        await self._run_rail(calm, sl=1.0)                       # non-firing poll
+        self.assertEqual(bot_runtime._SLTP_MARK_CACHE.get(11), 79000.0)  # seeded
+        hit = {"session_pnl": -2.0, "session_pnl_pct": -2.0, "session_pnl_net": -2.0,
+               "session_pnl_pct_net": -2.0, "margin": 100.0, "mark": 78000.0}
+        await self._run_rail(hit, sl=1.0)                        # firing stop
+        self.assertNotIn(11, bot_runtime._SLTP_MARK_CACHE)       # dropped, no leak
+
     async def test_safety_rails_dispatch_runs_duration_then_session_rail(self):
         # SLTP-FAST-POLL: _run_sltp_safety_rails runs the MM duration rail then
         # the %-of-margin session rail for an engine strategy and returns the

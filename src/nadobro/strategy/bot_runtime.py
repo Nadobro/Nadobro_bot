@@ -2950,6 +2950,7 @@ async def _evaluate_session_pnl_rail(
             await cancel_session_venue_stop(client, state)
         except Exception:  # noqa: BLE001 - best-effort cleanup
             logger.debug("venue stop cancel on stale session failed", exc_info=True)
+        _SLTP_MARK_CACHE.pop(int(sess.get("id") or 0), None)   # session over — drop its mark
         return True, None
 
     from src.nadobro.trading.live_session import get_live_session_snapshot
@@ -3012,6 +3013,12 @@ async def _evaluate_session_pnl_rail(
             _mark = float(snap.get("mark") or 0.0)
             _prev_mark = _SLTP_MARK_CACHE.get(_sid, 0.0)
             if _mark > 0:
+                # Backstop against a slow leak: a session that ends OUTSIDE this rail
+                # (user stop / duration cap) never hits the pop paths, so hard-cap the
+                # cache far above any realistic concurrent-session count. Clearing only
+                # costs each live session one poll of zero buffer before its mark reseeds.
+                if len(_SLTP_MARK_CACHE) > 4096 and _sid not in _SLTP_MARK_CACHE:
+                    _SLTP_MARK_CACHE.clear()
                 _SLTP_MARK_CACHE[_sid] = _mark
             _recent_move_bp = move_bp(_prev_mark, _mark) if (_prev_mark > 0 and _mark > 0) else 0.0
             sl_trigger = effective_sl_trigger(sl_pct, _eff_lev, _recent_move_bp)
