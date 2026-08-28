@@ -1057,3 +1057,44 @@ def test_dgrid_candle_outage_degrades_to_grid_not_trapped_in_rgrid():
         assert await c._classify() == _dg.variance_regime.GRID
 
     asyncio.run(body())
+
+
+def test_dgrid_trend_spawn_closes_a_venue_residual_before_the_delegate_baselines_it():
+    """DGRID-GRIDRGRID-RESIDUAL 2026-08-28: the GRID phase books via inventory, but
+    the trigger delegate BASELINES OUT whatever the VENUE holds on its first read. If
+    inventory reads flat while the venue still holds a grid-close residual, arming the
+    delegate would baseline that residual out and hide it for the whole RGRID cycle
+    (invisible to the exposure cap / tier booking / status). _spawn_trend must confirm
+    the venue is flat — closing any residual reduce-only — before the delegate arms,
+    symmetric with the RGRID->GRID flatten_now venue check."""
+    import asyncio
+
+    from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from src.nadobro.engine.types import TradeType
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    async def body():
+        # inventory is EMPTY (net 0) but the VENUE holds a 0.5-base residual
+        a = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal("0.5")})
+        trend_cfg = {"trading_pair": "P", "levels": 2, "step_pct": Decimal("0.01"),
+                     "order_amount_quote": Decimal("100"), "revgrid_chop_stand_down": False}
+        cfg = {"trading_pair": "P", "total_amount_quote": "100", "levels_count": 2,
+               "dgrid_trend_follow": 1, "trend_uses_trigger": True, "trend_rgrid": trend_cfg}
+        dg = DynamicGridController(user_id=1, orchestrator=ExecutorOrchestrator(),
+                                   adapter=a, inventory=InventoryRepository(), configs=cfg)
+        assert dg._inventory_net_base() == 0          # the inventory gate would pass...
+        assert a.venue_held["P"] == Decimal("0.5")    # ...but the venue is NOT flat
+
+        assert await dg._spawn_trend(Decimal("100")) is True
+
+        # the residual was CLOSED before the delegate armed (a SELL to flatten the
+        # long residual), so the delegate baselined a flat book and manages ONLY its
+        # own new exposure.
+        assert a.venue_held["P"] == 0, "grid residual not closed before trend spawn"
+        assert any(o.side is TradeType.SELL for o in a.placed), "no residual close order placed"
+        assert dg._trend is not None
+        assert dg._trend._baseline_net == 0            # delegate started from true flat
+
+    asyncio.run(body())

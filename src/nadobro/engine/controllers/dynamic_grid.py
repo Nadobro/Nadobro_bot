@@ -48,7 +48,7 @@ from src.nadobro.engine.controllers.rgrid import RGridController
 from src.nadobro.engine.executors.grid_executor import GridExecutor
 from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.routines import variance_regime
-from src.nadobro.engine.types import TradeType, _as_bool, _dec
+from src.nadobro.engine.types import OrderType, TradeType, _as_bool, _dec
 
 logger = logging.getLogger(__name__)
 
@@ -917,9 +917,65 @@ class DynamicGridController(Controller):
         if self._trend is not None:
             await self._trend.on_tick()
 
+    async def _ensure_venue_flat_for_trend(self, mid: Decimal) -> bool:
+        """Confirm the VENUE is flat before the trigger trend delegate arms.
+
+        DGRID-GRIDRGRID-RESIDUAL (audit 2026-08-28): the GRID phase books via the
+        shared inventory (the ``_spawn_phase`` gate reads it), but the trigger
+        delegate tracks position via the VENUE and BASELINES OUT whatever it finds on
+        its first read (``ReverseGridController._read_net``). If the grid's inventory
+        drifted from the venue, inventory can read flat while the venue still holds a
+        residual — the delegate would then baseline that residual out and manage
+        around it, leaving a HIDDEN position for the whole RGRID cycle (invisible to
+        the exposure cap, tier booking, and /status). This is the symmetric
+        counterpart of the RGRID->GRID ``flatten_now`` venue check. Close any residual
+        reduce-only and return True only once the venue confirms flat (below a ~$1
+        notional dust floor); defer (False) on an unreadable venue or a close that
+        did not confirm — never arm the delegate onto a venue position it did not open.
+        """
+        try:
+            held = await self.adapter.held_base(self.trading_pair)
+        except Exception:  # noqa: BLE001 - can't confirm flat -> defer, retry next tick
+            logger.warning("dgrid %s: venue read failed before trend spawn — deferring",
+                           self.id, exc_info=True)
+            return False
+        if held is None:
+            return False                       # unreadable -> never arm on a bad read
+        held = _dec(held)
+        dust = (Decimal(1) / mid) if mid > 0 else Decimal(0)   # ~$1 notional
+        if abs(held) <= dust:
+            return True                        # venue already flat
+        close_side = TradeType.SELL if held > 0 else TradeType.BUY
+        logger.warning(
+            "dgrid %s: venue residual %s base before trend spawn (inventory read flat) "
+            "— closing reduce-only so the delegate arms from true flat (controller=%s)",
+            self.id, held, self.id,
+        )
+        try:
+            await self.adapter.place_order(
+                self.trading_pair, close_side, OrderType.MARKET, abs(held),
+                reduce_only=True,
+            )
+        except Exception:  # noqa: BLE001 - close failed; defer and retry next tick
+            logger.warning("dgrid %s: residual close failed — deferring trend spawn",
+                           self.id, exc_info=True)
+            return False
+        try:
+            held2 = await self.adapter.held_base(self.trading_pair)
+        except Exception:  # noqa: BLE001
+            return False
+        return held2 is not None and abs(_dec(held2)) <= dust
+
     async def _spawn_trend(self, mid: Optional[Decimal]) -> bool:
         if mid is None or mid <= 0:
             logger.warning("dgrid %s: no mid for trend spawn — retry next tick", self.id)
+            return False
+        # Symmetric with the RGRID->GRID flatten_now check: the delegate baselines out
+        # whatever it finds on the venue, so it must arm from a VENUE-confirmed flat,
+        # not merely an inventory-flat, book (DGRID-GRIDRGRID-RESIDUAL).
+        if not await self._ensure_venue_flat_for_trend(mid):
+            logger.warning("dgrid %s: venue not confirmed flat — deferring trend spawn "
+                           "(controller=%s)", self.id, self.id)
             return False
         cfg = self._trend_mapped_config()
         # Trigger ReverseGridController when routed (flag), else the legacy maker one.
