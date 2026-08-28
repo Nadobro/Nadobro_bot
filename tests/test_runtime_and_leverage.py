@@ -745,14 +745,15 @@ class RuntimeAndLeverageTests(unittest.TestCase):
         self.assertEqual(result, (True, None))
         self.assertTrue(close_mock.called)
 
-    def test_run_cycle_mid_stops_on_net_session_loss_at_user_threshold(self):
-        """Mid's live session rail closes after realized/unrealized PnL plus
-        fees crosses the user's selected percent-of-margin stop."""
+    def test_run_cycle_mid_stops_on_net_total_loss_at_user_threshold(self):
+        """SLTP-EXACT: Mid's live session rail closes once the user's NET total loss
+        (price - fees - funding) crosses the percent-of-margin stop — "SL 1%" means
+        realize -1% of the user's own money. Proves the Mid execution cycle reaches
+        the rail and judges the net basis."""
         result, close_mock = self._run_grid_cycle_with_snapshot(
             strategy="mid", sl_pct=1.0,
-            # Gross loss is still inside the stop, but fees push net loss past
-            # the exact 1%-of-$100 threshold. This proves the Mid execution
-            # cycle reaches the rail and uses its fee-aware session PnL basis.
+            # Gross price loss is inside the 1% stop, but fees push the user's real
+            # (net) loss past it.
             snapshot={
                 "session_pnl": -0.75,
                 "session_pnl_pct": -0.75,

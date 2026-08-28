@@ -66,13 +66,13 @@ def test_buffer_never_exceeds_the_capped_fraction_of_sl():
     assert buf == pytest.approx(5.0)          # capped at 50% of the 10% budget
 
 
-def test_buffer_is_leverage_driven_even_with_no_volatility():
-    # No recent move, but 25x on a 50x reference -> reserve 0.5·(25/50)=... the
-    # leverage term = 25/50 = 0.5 of budget, under the 0.5 cap -> buffer 5% of a
-    # 10% stop.
+def test_buffer_is_zero_when_calm_even_at_high_leverage():
+    # SLTP-EXACT: with NO recent move the buffer is ZERO — there is no leverage-only
+    # floor, so a calm high-leverage session keeps its FULL SL budget and the stop
+    # fires at the user's exact number (the defect that stopped #253 at half its SL).
     buf = sl_buffer_pct(10.0, leverage=25.0, recent_move_bp=0.0,
                         max_fraction=0.5, lev_ref=50.0)
-    assert buf == pytest.approx(5.0)
+    assert buf == pytest.approx(0.0)
 
 
 def test_buffer_zero_when_stop_disarmed():
@@ -90,12 +90,11 @@ def test_effective_trigger_tightens_under_leverage_and_volatility():
     assert 0.0 < eff < 10.0                   # fires earlier, never disarms
 
 
-def test_effective_trigger_fires_at_users_number_at_low_leverage_and_calm():
-    # 2x, no recent move -> leverage term 2/50 = 0.04 -> effectively the user's
-    # number (fires ~at −10%, not early).
-    eff = effective_sl_trigger(10.0, leverage=2.0, recent_move_bp=0.0, lev_ref=50.0)
-    assert eff == pytest.approx(10.0 * (1 - 2.0 / 50.0))     # 9.6, ≈ user's 10%
-    assert eff > 9.0
+def test_effective_trigger_fires_at_exactly_the_users_number_when_calm():
+    # SLTP-EXACT: no recent move -> ZERO buffer -> the trigger IS the user's number,
+    # at ANY leverage (a calm session realizes exactly -sl_pct, not early).
+    assert effective_sl_trigger(10.0, leverage=2.0, recent_move_bp=0.0) == pytest.approx(10.0)
+    assert effective_sl_trigger(10.0, leverage=50.0, recent_move_bp=0.0) == pytest.approx(10.0)
 
 
 def test_effective_trigger_unchanged_when_disarmed():
