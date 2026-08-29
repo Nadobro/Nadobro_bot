@@ -140,9 +140,10 @@ def test_copy_builder_guards_missing_and_foreign():
 # ── round-trip (desk/manual) builder ────────────────────────────
 
 def test_round_trip_builder_desk_badge_and_perp_mapping():
-    rt = {"product_name": "ETH-PERP", "side": "long", "leverage": 10, "realized_pnl": 55.5,
-          "avg_open_price": 2412.35, "avg_close_price": 2456.78, "size": 1.25}
-    with patch("src.nadobro.trading.trade_service.find_round_trip", return_value=rt), \
+    # Sourced from the positions table (correct LEVERAGE — the fills record 0/1).
+    rt = {"pair": "ETH-PERP", "side": "long", "leverage": 10, "close_realized_pnl": 55.5,
+          "avg_entry_price": 2412.35, "close_price": 2456.78, "size": 1.25}
+    with patch("src.nadobro.models.database.get_manual_closed_round_trip", return_value=rt), \
          patch.object(bld, "_fetch_active_referral_code", return_value="NADO8RO"):
         d = bld.build_round_trip_card_data(42, "mainnet", "99")
     assert d["badge"] == "DESK TRADE"
@@ -151,11 +152,11 @@ def test_round_trip_builder_desk_badge_and_perp_mapping():
 
 
 def test_round_trip_builder_gates_spot_and_missing():
-    with patch("src.nadobro.trading.trade_service.find_round_trip", return_value=None):
+    with patch("src.nadobro.models.database.get_manual_closed_round_trip", return_value=None):
         assert bld.build_round_trip_card_data(42, "mainnet", "1").get("unsupported") == "not_found"
-    spot = {"product_name": "KBTC", "side": "long", "realized_pnl": 1.0,
-            "avg_open_price": 1.0, "avg_close_price": 1.1, "size": 1.0}
-    with patch("src.nadobro.trading.trade_service.find_round_trip", return_value=spot):
+    spot = {"pair": "KBTC", "side": "long", "close_realized_pnl": 1.0,
+            "avg_entry_price": 1.0, "close_price": 1.1, "size": 1.0, "leverage": 1}
+    with patch("src.nadobro.models.database.get_manual_closed_round_trip", return_value=spot):
         assert bld.build_round_trip_card_data(42, "mainnet", "1").get("unsupported") == "spot"
 
 
@@ -164,26 +165,28 @@ def test_round_trip_builder_gates_spot_and_missing():
 def test_history_merges_copy_positions_without_touching_round_trips():
     from src.nadobro.handlers import history_view
 
+    from datetime import datetime, timezone
     manual_rt = [{
-        "trip_key": "rt1", "product_id": 1, "product_name": "ETH-PERP", "pair": "ETH-PERP",
-        "side": "long", "size": 1.0, "leverage": 10, "avg_open_price": 2400.0,
-        "avg_close_price": 2450.0, "realized_pnl": 50.0, "fees": 1.0, "funding_paid": 0.0,
-        "volume_usd": 4850.0, "open_ts": "2026-07-19T10:00:00Z", "close_ts": "2026-07-19T11:00:00Z",
-        "isolated": False,
+        "id": 77, "product_id": 1, "pair": "ETH-PERP", "side": "long", "size": 1.0,
+        "leverage": 10, "avg_entry_price": 2400.0, "close_price": 2450.0,
+        "close_realized_pnl": 50.0, "isolated": False,
+        "opened_at": datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
+        "closed_at": datetime(2026, 7, 19, 11, tzinfo=timezone.utc),
+        "metadata": {"close_fees": 1.0, "close_funding": 0.0},
     }]
     closed_copy = [{
         "id": 55, "product_id": 2, "product_name": "BTC-PERP", "side": "short",
         "entry_price": 100.0, "size": 2.0, "leverage": 5, "pnl": 20.0,
         "closed_at": "2026-07-19T12:00:00Z",
     }]
-    with patch("src.nadobro.trading.trade_service.compute_round_trips", return_value=manual_rt), \
+    with patch("src.nadobro.models.database.get_manual_closed_round_trips", return_value=manual_rt), \
          patch("src.nadobro.models.database.get_closed_copy_positions", return_value=closed_copy):
         text, kb = history_view.render_history_view({"network": "mainnet", "user_id": 42})
 
     cbs = [btn.callback_data for row in kb.inline_keyboard for btn in row]
     # Both a copy card and a desk round-trip card are offered, from their OWN sources.
     assert "portfolio:share_pnl:copy:55" in cbs
-    assert "portfolio:share_pnl:rt:rt1" in cbs
+    assert "portfolio:share_pnl:rt:77" in cbs
     # Copy renders after the manual trip (later close_ts sorts first) — display only.
     assert "copy" in text and "ETH-PERP" in text
 
