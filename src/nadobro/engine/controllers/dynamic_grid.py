@@ -48,7 +48,7 @@ from src.nadobro.engine.controllers.rgrid import RGridController
 from src.nadobro.engine.executors.grid_executor import GridExecutor
 from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.routines import variance_regime
-from src.nadobro.engine.types import TradeType, _as_bool, _dec
+from src.nadobro.engine.types import OrderType, TradeType, _as_bool, _dec
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +205,14 @@ class DynamicGridController(Controller):
         # ReverseGridController when NADO_REVGRID_TRIGGER_ENABLED routes it (the
         # ``trend_uses_trigger`` config flag, set by map_strategy_config).
         self._trend: Optional[Controller] = None
+        # Order counts BANKED from trend delegates that have been dropped on a
+        # flip/stop. The delegate is a trigger controller (no executor), so the base
+        # order_counts (which sums executors) loses its trigger activity the moment
+        # ``_trend`` is nulled — undercounting strategy_sessions.total_orders_* and
+        # the /status figure for every completed RGRID phase. Bank before dropping.
+        self._dropped_trend_counts: Dict[str, int] = {
+            "orders_placed": 0, "orders_filled": 0, "orders_cancelled": 0,
+        }
         # Per-tick diagnostics surfaced to the services log so a "no orders"
         # run is pinpointable (candle feed vs gate pause vs spawn refusal).
         self._last_candle_count: int = 0
@@ -212,6 +220,34 @@ class DynamicGridController(Controller):
 
     async def on_start(self) -> None:
         return None
+
+    async def on_stop(self, reason: str = "stopped") -> None:
+        """Tear down the trend delegate's VENUE TRIGGERS on ANY stop.
+
+        D-Grid's trend phase is the trigger ``ReverseGridController``, which manages
+        its entry rungs + trailing stop as venue TRIGGER orders — off the
+        resting-order path the orchestrator's executor batch-cancel and
+        ``close_all_positions`` use. The base ``on_stop`` cancels executors only, so
+        without this the delegate's triggers are left ARMED on the venue after a stop:
+        the entry rungs are NOT reduce-only, so a later price cross RE-OPENS an
+        unmonitored position with no session rail running — an SL/TP coverage hole and
+        a violation of the redeploy stand-down rule (audit SLTP-TRACER 2026-08-28,
+        surfaced by defaulting the trend phase ON). The session-stop path stops the
+        controller (this hook) BEFORE it flattens (``close_all_positions``), so
+        cancelling here also keeps a rung from firing mid-flatten. Best-effort: a stop
+        must complete even if the delegate teardown fails.
+        """
+        if self._trend is not None:
+            try:
+                await self._trend.on_stop(reason)  # cancels rungs + stop (reverse_grid)
+            except Exception:  # noqa: BLE001 - a stop must never be blocked by cleanup
+                logger.warning(
+                    "dgrid %s: trend delegate on_stop failed during '%s' — its venue "
+                    "triggers may remain armed; continuing the stop (controller=%s)",
+                    self.id, reason, self.id, exc_info=True,
+                )
+            self._bank_trend_counts()
+            self._trend = None
 
     async def _candles(self) -> List[dict]:
         provider = self.cfg("candle_provider")
@@ -276,8 +312,8 @@ class DynamicGridController(Controller):
             # cache / gateway throttle / provider never injected). Make it loud.
             logger.warning(
                 "dgrid no candles for pair=%s (controller=%s) — cannot classify "
-                "regime; holding phase=%s, will retry next tick",
-                self.trading_pair, self.id, self.current_phase,
+                "regime; degrading to GRID (safe), will retry next tick",
+                self.trading_pair, self.id,
             )
             # Do NOT leave a stale verdict behind. A candle-less tick knows
             # nothing, and the reversal flip can still fire from price alone — it
@@ -285,7 +321,16 @@ class DynamicGridController(Controller):
             # into the user-facing flip event.
             self.last_is_trend = False
             self.last_direction = variance_regime.FLAT
-            return self.current_phase
+            # DGRID-CANDLE-OUTAGE (audit DGRID-AUDIT 2026-08-28): degrade to the SAFE
+            # mean-reversion GRID rather than HOLD the current phase. Holding RGRID
+            # through an outage would keep the trend delegate (its chop gate is
+            # disabled for the D-Grid path) arming/pyramiding BLIND for the whole
+            # outage — an unbounded-duration chop premium, newly reachable now that
+            # the trend phase defaults ON. Returning GRID lets the debounced flip
+            # flatten the delegate and re-arm the ranging ladder (GRID's home regime);
+            # a session already in GRID just holds GRID. When candles return the
+            # classifier re-evaluates and can flip back to RGRID on a real trend.
+            return variance_regime.GRID
         info = await variance_regime.run(
             self.trading_pair, candles,
             short_window=self.short_window, long_window=self.long_window,
@@ -326,6 +371,40 @@ class DynamicGridController(Controller):
             self.realized_move_bp = float(
                 abs((mid - self._grid_anchor_mid) / self._grid_anchor_mid) * Decimal(10000)
             )
+
+    def _bank_trend_counts(self) -> None:
+        """Accumulate the live trend delegate's cumulative order counts before it is
+        dropped, so a completed RGRID phase's trigger activity is not lost from
+        ``order_counts`` (the delegate is not a registered executor)."""
+        fn = getattr(self._trend, "order_counts", None)
+        if not callable(fn):
+            return
+        try:
+            d = fn() or {}
+        except Exception:  # policy: degrade-ok(telemetry only; a count read must never break a flip/stop)
+            return
+        for k in self._dropped_trend_counts:
+            self._dropped_trend_counts[k] += int(d.get(k, 0) or 0)
+
+    def order_counts(self) -> Dict[str, int]:
+        """GRID-phase executor counts PLUS the trend delegate's trigger counts —
+        banked from completed RGRID phases and the live delegate — so /status and
+        strategy_sessions.total_orders_* reflect BOTH phases, not just the executors
+        (the trend delegate runs none). Fixes the RGRID-phase undercount surfaced by
+        the 2026-08-28 DB-tracking audit."""
+        counts = dict(super().order_counts())
+        banked = dict(self._dropped_trend_counts)
+        fn = getattr(self._trend, "order_counts", None)
+        if callable(fn):
+            try:
+                d = fn() or {}
+                for k in banked:
+                    banked[k] += int(d.get(k, 0) or 0)
+            except Exception:  # policy: degrade-ok(telemetry only; a status count read must not crash the tick)
+                pass
+        for k in ("orders_placed", "orders_filled", "orders_cancelled"):
+            counts[k] = int(counts.get(k, 0) or 0) + int(banked.get(k, 0) or 0)
+        return counts
 
     def _inventory_net_base(self) -> Decimal:
         if self.inventory is None:
@@ -554,6 +633,7 @@ class DynamicGridController(Controller):
                     reason, self.id,
                 )
                 return
+            self._bank_trend_counts()
             self._trend = None
         # Close the live range-ladder position via the executor's reduce-only
         # flatten (GridExecutor._stop_out, keep_position=False), then re-arm.
@@ -881,9 +961,65 @@ class DynamicGridController(Controller):
         if self._trend is not None:
             await self._trend.on_tick()
 
+    async def _ensure_venue_flat_for_trend(self, mid: Decimal) -> bool:
+        """Confirm the VENUE is flat before the trigger trend delegate arms.
+
+        DGRID-GRIDRGRID-RESIDUAL (audit 2026-08-28): the GRID phase books via the
+        shared inventory (the ``_spawn_phase`` gate reads it), but the trigger
+        delegate tracks position via the VENUE and BASELINES OUT whatever it finds on
+        its first read (``ReverseGridController._read_net``). If the grid's inventory
+        drifted from the venue, inventory can read flat while the venue still holds a
+        residual — the delegate would then baseline that residual out and manage
+        around it, leaving a HIDDEN position for the whole RGRID cycle (invisible to
+        the exposure cap, tier booking, and /status). This is the symmetric
+        counterpart of the RGRID->GRID ``flatten_now`` venue check. Close any residual
+        reduce-only and return True only once the venue confirms flat (below a ~$1
+        notional dust floor); defer (False) on an unreadable venue or a close that
+        did not confirm — never arm the delegate onto a venue position it did not open.
+        """
+        try:
+            held = await self.adapter.held_base(self.trading_pair)
+        except Exception:  # noqa: BLE001 - can't confirm flat -> defer, retry next tick
+            logger.warning("dgrid %s: venue read failed before trend spawn — deferring",
+                           self.id, exc_info=True)
+            return False
+        if held is None:
+            return False                       # unreadable -> never arm on a bad read
+        held = _dec(held)
+        dust = (Decimal(1) / mid) if mid > 0 else Decimal(0)   # ~$1 notional
+        if abs(held) <= dust:
+            return True                        # venue already flat
+        close_side = TradeType.SELL if held > 0 else TradeType.BUY
+        logger.warning(
+            "dgrid %s: venue residual %s base before trend spawn (inventory read flat) "
+            "— closing reduce-only so the delegate arms from true flat (controller=%s)",
+            self.id, held, self.id,
+        )
+        try:
+            await self.adapter.place_order(
+                self.trading_pair, close_side, OrderType.MARKET, abs(held),
+                reduce_only=True,
+            )
+        except Exception:  # noqa: BLE001 - close failed; defer and retry next tick
+            logger.warning("dgrid %s: residual close failed — deferring trend spawn",
+                           self.id, exc_info=True)
+            return False
+        try:
+            held2 = await self.adapter.held_base(self.trading_pair)
+        except Exception:  # noqa: BLE001
+            return False
+        return held2 is not None and abs(_dec(held2)) <= dust
+
     async def _spawn_trend(self, mid: Optional[Decimal]) -> bool:
         if mid is None or mid <= 0:
             logger.warning("dgrid %s: no mid for trend spawn — retry next tick", self.id)
+            return False
+        # Symmetric with the RGRID->GRID flatten_now check: the delegate baselines out
+        # whatever it finds on the venue, so it must arm from a VENUE-confirmed flat,
+        # not merely an inventory-flat, book (DGRID-GRIDRGRID-RESIDUAL).
+        if not await self._ensure_venue_flat_for_trend(mid):
+            logger.warning("dgrid %s: venue not confirmed flat — deferring trend spawn "
+                           "(controller=%s)", self.id, self.id)
             return False
         cfg = self._trend_mapped_config()
         # Trigger ReverseGridController when routed (flag), else the legacy maker one.
@@ -957,6 +1093,7 @@ class DynamicGridController(Controller):
         )
         if spawned:
             self.current_phase = phase
+            self._bank_trend_counts()
             self._trend = None
             self._grid_anchor_mid = _dec(mid)
             self.realized_move_bp = 0.0

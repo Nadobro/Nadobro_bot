@@ -985,3 +985,160 @@ def test_dgrid_trend_phase_delegates_to_the_rgrid_follower():
     assert "flatten_now" in inspect.getsource(
         dynamic_grid.DynamicGridController._flip_to
     )
+
+
+def test_dgrid_stop_in_trend_phase_cancels_the_delegates_venue_triggers():
+    """SLTP-TRACER / DGRID-AUDIT 2026-08-28 (CRITICAL): D-Grid's trend delegate is a
+    trigger ReverseGridController holding its entry rungs + stop as VENUE TRIGGER
+    orders — off the resting-order path the orchestrator's executor batch-cancel and
+    close_all_positions use. Before the fix D-Grid had no on_stop, so a session-rail
+    stop (or user stop / redeploy stand-down) left the entry rungs (NOT reduce-only)
+    ARMED — a later cross would RE-OPEN an unmonitored position with no rail running.
+    on_stop must tear the delegate down on EVERY stop path."""
+    import asyncio
+
+    from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    async def body():
+        a = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal(0)})
+        trend_cfg = {"trading_pair": "P", "levels": 2, "step_pct": Decimal("0.01"),
+                     "order_amount_quote": Decimal("100"), "revgrid_chop_stand_down": False}
+        cfg = {"trading_pair": "P", "total_amount_quote": "100", "levels_count": 2,
+               "dgrid_trend_follow": 1, "trend_uses_trigger": True, "trend_rgrid": trend_cfg}
+        dg = DynamicGridController(user_id=1, orchestrator=ExecutorOrchestrator(),
+                                   adapter=a, inventory=InventoryRepository(), configs=cfg)
+        assert await dg._spawn_trend(Decimal("100")) is True
+        # the delegate armed entry rungs as live venue triggers
+        assert len(a.placed_triggers) > 0
+        assert len(a._triggers) > 0                       # noqa: SLF001 - venue-armed set
+
+        await dg.on_stop("sl_hit")
+
+        assert dg._trend is None
+        # every armed trigger the delegate placed is now cancelled at the venue —
+        # nothing left watching the mid to re-open a naked position after the stop.
+        assert len(a._triggers) == 0, (                   # noqa: SLF001
+            "delegate venue triggers orphaned after D-Grid stop — a cross would "
+            "re-open an unmonitored position"
+        )
+
+    asyncio.run(body())
+
+
+def test_dgrid_candle_outage_degrades_to_grid_not_trapped_in_rgrid():
+    """DGRID-AUDIT 2026-08-28 (Medium): a candle outage (cold cache / gateway
+    throttle) must degrade D-Grid to the SAFE mean-reversion GRID, not HOLD the
+    current phase. Holding RGRID through an outage would keep the trend delegate —
+    its chop gate is disabled for the D-Grid path — arming/pyramiding BLIND with no
+    regime protection for the whole outage (an unbounded-duration chop premium,
+    newly reachable now that the trend phase defaults ON). Pins _classify: no
+    candles => GRID even when the live phase is RGRID."""
+    import asyncio
+
+    from src.nadobro.engine.controllers import dynamic_grid as _dg
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    async def body():
+        c = _dg.DynamicGridController(
+            user_id=1, orchestrator=ExecutorOrchestrator(),
+            adapter=MockNadoAdapter(mid=Decimal("100")), inventory=InventoryRepository(),
+            configs={"trading_pair": "P", "candle_provider": lambda _p: []},
+        )
+        # parked in the trend phase, a candle-less classify must NOT hold RGRID
+        c.current_phase = _dg.variance_regime.RGRID
+        assert await c._classify() == _dg.variance_regime.GRID
+        # and a GRID session simply stays GRID
+        c.current_phase = _dg.variance_regime.GRID
+        assert await c._classify() == _dg.variance_regime.GRID
+
+    asyncio.run(body())
+
+
+def test_dgrid_trend_spawn_closes_a_venue_residual_before_the_delegate_baselines_it():
+    """DGRID-GRIDRGRID-RESIDUAL 2026-08-28: the GRID phase books via inventory, but
+    the trigger delegate BASELINES OUT whatever the VENUE holds on its first read. If
+    inventory reads flat while the venue still holds a grid-close residual, arming the
+    delegate would baseline that residual out and hide it for the whole RGRID cycle
+    (invisible to the exposure cap / tier booking / status). _spawn_trend must confirm
+    the venue is flat — closing any residual reduce-only — before the delegate arms,
+    symmetric with the RGRID->GRID flatten_now venue check."""
+    import asyncio
+
+    from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from src.nadobro.engine.types import TradeType
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    async def body():
+        # inventory is EMPTY (net 0) but the VENUE holds a 0.5-base residual
+        a = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal("0.5")})
+        trend_cfg = {"trading_pair": "P", "levels": 2, "step_pct": Decimal("0.01"),
+                     "order_amount_quote": Decimal("100"), "revgrid_chop_stand_down": False}
+        cfg = {"trading_pair": "P", "total_amount_quote": "100", "levels_count": 2,
+               "dgrid_trend_follow": 1, "trend_uses_trigger": True, "trend_rgrid": trend_cfg}
+        dg = DynamicGridController(user_id=1, orchestrator=ExecutorOrchestrator(),
+                                   adapter=a, inventory=InventoryRepository(), configs=cfg)
+        assert dg._inventory_net_base() == 0          # the inventory gate would pass...
+        assert a.venue_held["P"] == Decimal("0.5")    # ...but the venue is NOT flat
+
+        assert await dg._spawn_trend(Decimal("100")) is True
+
+        # the residual was CLOSED before the delegate armed (a SELL to flatten the
+        # long residual), so the delegate baselined a flat book and manages ONLY its
+        # own new exposure.
+        assert a.venue_held["P"] == 0, "grid residual not closed before trend spawn"
+        assert any(o.side is TradeType.SELL for o in a.placed), "no residual close order placed"
+        assert dg._trend is not None
+        assert dg._trend._baseline_net == 0            # delegate started from true flat
+
+    asyncio.run(body())
+
+
+def test_dgrid_order_counts_include_the_trend_delegate_across_a_flip():
+    """DB-TRACKING audit 2026-08-28: the RGRID trend delegate is a trigger controller
+    with NO executor, so the base order_counts (which sums executors) undercounts its
+    trigger activity — the /status figure and strategy_sessions.total_orders_* read 0
+    for the whole RGRID phase (while the FILLS still reach trades_<network> via
+    nado_sync). order_counts must include the live delegate AND bank a completed
+    phase's counts when the delegate is dropped on a flip."""
+    import asyncio
+
+    from src.nadobro.engine.routines import variance_regime as _vr
+    from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    async def body():
+        a = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal(0)},
+                            tick=Decimal("0.01"), lot=Decimal("0.0001"),
+                            min_notional=Decimal("1"))
+        trend_cfg = {"trading_pair": "P", "levels": 2, "step_pct": Decimal("0.01"),
+                     "order_amount_quote": Decimal("100"), "revgrid_chop_stand_down": False}
+        cfg = {"trading_pair": "P", "start_price": "98", "end_price": "102",
+               "total_amount_quote": "100", "min_spread_between_orders": "0.002",
+               "max_open_orders": 4, "step_pct": "0.01", "levels_count": 2,
+               "dgrid_trend_follow": 1, "trend_uses_trigger": True, "trend_rgrid": trend_cfg}
+        dg = DynamicGridController(user_id=1, orchestrator=ExecutorOrchestrator(),
+                                   adapter=a, inventory=InventoryRepository(), configs=cfg)
+        await dg._spawn_trend(Decimal("100"))
+        live = dg.order_counts()
+        placed_in_rgrid = int(live["orders_placed"])
+        assert placed_in_rgrid > 0, "RGRID-phase trigger orders missing from order_counts"
+        assert placed_in_rgrid == dg._trend.order_counts()["orders_placed"]
+
+        # flip RGRID->GRID drops the delegate; its counts must survive (banked)
+        await dg._flip_to(_vr.GRID, Decimal("100"), reason="flip")
+        assert dg._trend is None
+        after = dg.order_counts()
+        assert int(after["orders_placed"]) >= placed_in_rgrid, (
+            "trend delegate's order counts were lost when it was dropped on the flip"
+        )
+
+    asyncio.run(body())

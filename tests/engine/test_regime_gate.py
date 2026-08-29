@@ -134,7 +134,7 @@ def _mm(adapter, candles, inventory=None, extra=None):
 
 def test_mm_paused_flat_places_no_quotes_and_emits_event():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         orch, c = _mm(adapter, trending_candles())
         await orch.spawn_controller(c)
         await orch.tick_controller(c.id)
@@ -148,7 +148,7 @@ def test_mm_paused_flat_places_no_quotes_and_emits_event():
 
 def test_mm_paused_with_long_inventory_quotes_only_the_exit_side():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         inv = InventoryRepository()
         # Seed a LONG: pause must keep the SELL (reducing) quote only.
         inv.apply_fill(1, PAIR, "MM", TradeType.BUY, Decimal("1"), Decimal("100"), Decimal(0), 0.0)
@@ -163,7 +163,7 @@ def test_mm_paused_with_long_inventory_quotes_only_the_exit_side():
 
 def test_mm_quotes_both_sides_in_ranging_market():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         orch, c = _mm(adapter, ranging_candles())
         await orch.spawn_controller(c)
         await orch.tick_controller(c.id)
@@ -177,7 +177,7 @@ def test_mm_quotes_both_sides_in_ranging_market():
 # --------------------------------------------------------------------------
 def test_inventory_cap_suppresses_worsening_side_with_hysteresis():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         inv = InventoryRepository()
         orch, c = _mm(
             adapter, ranging_candles(), inventory=inv,
@@ -205,7 +205,7 @@ def test_inventory_cap_suppresses_worsening_side_with_hysteresis():
 # --------------------------------------------------------------------------
 def test_mm_auto_spread_tracks_atr_within_floor_and_cap():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         orch, c = _mm(
             adapter, ranging_candles(),
             extra={"auto_spread": True, "auto_spread_k": Decimal("1.5")},
@@ -232,7 +232,7 @@ def test_mm_auto_spread_never_quotes_below_fee_floor():
         # quoting tighter than fees pays to trade.
         flat = [{"open": 100.0, "high": 100.001, "low": 99.999,
                  "close": 100.0, "volume": 1000.0} for _ in range(80)]
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         orch, c = _mm(adapter, flat, extra={"auto_spread": True})
         await orch.spawn_controller(c)
         await orch.tick_controller(c.id)
@@ -260,7 +260,7 @@ def _grid_configs(candles):
 
 def test_grid_defers_arming_into_a_trend_then_arms_on_range():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal("99.5"), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal("99.5"), auto_fill_market=False)
         candles_box = {"data": trending_candles()}
         orch = ExecutorOrchestrator()
         c = GridController(
@@ -286,7 +286,7 @@ def test_grid_defers_arming_into_a_trend_then_arms_on_range():
 
 def test_paused_grid_suppresses_new_entries_but_close_legs_continue():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal("99.5"), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal("99.5"), auto_fill_market=False)
         cfg = GridExecutorConfig(
             trading_pair=PAIR, side=TradeType.BUY,
             start_price=Decimal("99"), end_price=Decimal("100"),
@@ -342,7 +342,7 @@ def test_dgrid_trades_a_trend_with_rgrid_follower():
     # spawns the R-Grid pyramiding follower (pause_on_trend=False).
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         orch, c = _dgrid(adapter, {"data": trending_candles(step=-0.4)})
         await orch.spawn_controller(c)
         await orch.tick_controller(c.id)
@@ -361,7 +361,7 @@ def test_dgrid_reversal_flip_locks_profit_and_switches_side():
     from src.nadobro.engine.executors.grid_executor import GridExecutor
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         orch, c = _dgrid(adapter, {"data": ranging_candles()})
         # Tight, deterministic trail knobs (defaults are 1.0 / 0.4 / 2 ticks).
         c.trail_arm_pct = 1.0
@@ -399,7 +399,7 @@ def test_dgrid_reversal_flip_cannot_spawn_the_trend_delegate_when_disabled():
     from src.nadobro.engine.executors.grid_executor import GridExecutor
 
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         orch = ExecutorOrchestrator()
         c = DynamicGridController(
             user_id=1, orchestrator=orch, adapter=adapter,
@@ -441,7 +441,7 @@ def test_dgrid_tears_down_the_delegate_when_trend_follow_toggled_off_midsession(
     the next ticks must flip back to the mean-reversion GRID ladder — flatten the
     delegate and re-arm GRID — not keep pyramiding at 100%."""
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         # _dgrid enables the delegate (dgrid_trend_follow=1); a downtrend spawns it.
         orch, c = _dgrid(adapter, {"data": trending_candles(step=-0.4)})
         c.flip_confirm_ticks = 1
@@ -465,7 +465,7 @@ def test_dgrid_reversal_does_not_arm_a_short_inside_an_uptrend():
     sibling still lock-and-switches onto the follower.
     """
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         orch, c = _dgrid(adapter, {"data": trending_candles(step=0.4)})
         c.trail_arm_pct = 1.0
         c.reversal_flip_pct = 0.4
@@ -525,7 +525,7 @@ def test_reverse_grid_arms_in_both_trends():
 
     async def body():
         for step, label in ((-0.4, "downtrend"), (0.4, "uptrend")):
-            adapter = MockNadoAdapter(mid=Decimal("100"), auto_fill_market=False)
+            adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal("100"), auto_fill_market=False)
             orch = ExecutorOrchestrator()
             c = ShortLadderController(
                 user_id=1, orchestrator=orch, adapter=adapter, inventory=InventoryRepository(),
@@ -567,7 +567,7 @@ def test_dgrid_trades_through_breakout_expansion():
     # breakout/expansion must NOT sit it out (pause_on_breakout=False). It quotes
     # rather than going flat — the no-orders-on-breakout fix.
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         box = {"data": expansion_candles()}
         orch, c = _dgrid(adapter, box)
         await orch.spawn_controller(c)
@@ -586,7 +586,7 @@ def test_gate_resume_requires_consecutive_quote_verdicts():
     # gate_resume_confirm_ticks consecutive QUOTE verdicts so a regime
     # flickering at the threshold can't churn quotes or spam notifications.
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         box = {"data": trending_candles()}
         orch, c = _mm(adapter, None, extra={"candle_provider": lambda _p: box["data"]})
         await orch.spawn_controller(c)
@@ -614,7 +614,7 @@ def test_gate_resume_requires_consecutive_quote_verdicts():
 # --------------------------------------------------------------------------
 def test_disabling_the_gate_clears_a_stale_pause():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         orch, c = _mm(adapter, trending_candles())
         await orch.spawn_controller(c)
         await orch.tick_controller(c.id)
@@ -634,7 +634,7 @@ def test_disabling_the_gate_clears_a_stale_pause():
 
 def test_disabled_gate_from_start_emits_no_event():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)
+        adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal(100), auto_fill_market=False)
         orch, c = _mm(adapter, trending_candles(), extra={"regime_gate_enabled": False})
         await orch.spawn_controller(c)
         await orch.tick_controller(c.id)
