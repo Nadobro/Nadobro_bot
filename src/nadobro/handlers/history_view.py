@@ -19,20 +19,19 @@ def render_history_view(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Render the History tab — round-trips for non-strategy trades only.
 
-    Per the workflow plan:
     - Strategy fills are excluded (they live in the Performance tab).
-    - Manual fills are paired open/close FIFO into round-trips via
-      :func:`trade_service.compute_round_trips`.
-    - Each round-trip gets its own ``Share PnL`` button so the user can
-      mint a per-trade card. The card is requested via
-      ``portfolio:share_pnl:rt:{trip_key}``.
+    - Manual round-trips come from the venue-synced ``positions`` table
+      (:func:`database.get_manual_closed_round_trips`) — the authoritative record
+      with correct leverage. The old FIFO reconstruction over the (holey) fill
+      stream drifted and fabricated phantom trades / 1x leverage (2026-08-29 fix).
+    - Each round-trip gets its own ``Share PnL`` button (``trip_key`` = position id).
     """
-    from src.nadobro.trading.trade_service import compute_round_trips
+    from src.nadobro.models.database import get_manual_closed_round_trips
 
     network = str(snapshot.get("network") or "mainnet")
     user_id = int(snapshot.get("user_id") or 0)
     try:
-        round_trips = compute_round_trips(user_id, network, limit=200) if user_id else []
+        round_trips = get_manual_closed_round_trips(user_id, network, limit=200) if user_id else []
     except Exception:
         round_trips = []
     # Closed copy positions are single trades too — surface them in History
@@ -51,30 +50,30 @@ def render_history_view(
     entries: list[tuple[str, list[str], str]] = []
     for trip in round_trips:
         pair = _resolve_pair_name(
-            trip.get("product_id"),
-            str(trip.get("pair") or trip.get("product_name") or ""),
-            network,
+            trip.get("product_id"), str(trip.get("pair") or ""), network,
         )
-        side = "📈 long" if str(trip.get("side") or "").lower() == "long" else "📉 short"
-        size = _dec(trip.get("size"))
-        open_px = _dec(trip.get("avg_open_price"))
-        close_px = _dec(trip.get("avg_close_price"))
-        pnl = _dec(trip.get("realized_pnl"))
-        fees = _dec(trip.get("fees"))
-        funding = _dec(trip.get("funding_paid"))
-        volume = _dec(trip.get("volume_usd"))
-        hold = _hold_duration(trip.get("open_ts"), trip.get("close_ts"))
+        is_long = str(trip.get("side") or "").lower() in ("long", "buy")
+        side = "📈 long" if is_long else "📉 short"
+        size = abs(_dec(trip.get("size")))
+        open_px = _dec(trip.get("avg_entry_price"))
+        close_px = _dec(trip.get("close_price"))
+        pnl = _dec(trip.get("close_realized_pnl"))
+        meta = _meta(trip.get("metadata"))
+        fees = _dec(meta.get("close_fees"))
+        funding = _dec(meta.get("close_funding"))
+        volume = size * (open_px + close_px)     # round-trip notional (both legs)
+        hold = _hold_duration(trip.get("opened_at"), trip.get("closed_at"))
         margin = "iso" if bool(trip.get("isolated")) else "cross"
-        closed_at = _fmt_ts(trip.get("close_ts"))
+        closed_at = _fmt_ts(trip.get("closed_at"))
         entries.append((
-            str(trip.get("close_ts") or ""),
+            str(trip.get("closed_at") or ""),
             [
                 f"{b(pair)}  {side} · {margin}" + (f" · {closed_at}" if closed_at else ""),
-                f"    {_fmt_size(abs(size))} @ {money(open_px)} → {money(close_px)} · held {hold}",
+                f"    {_fmt_size(size)} @ {money(open_px)} → {money(close_px)} · held {hold}",
                 f"    Realized {pnl_dot(pnl)} {signed_money(pnl)} · Fees -{money(abs(fees))} · "
                 f"Funding {signed_money(-funding)} · Vol {money(volume)}",
             ],
-            f"portfolio:share_pnl:rt:{trip.get('trip_key')}",
+            f"portfolio:share_pnl:rt:{trip.get('id')}",
         ))
     for pos in closed_copies:
         pair = _resolve_pair_name(
@@ -179,6 +178,20 @@ def _dec(value: Any) -> Decimal:
         return Decimal(str(value))
     except Exception:
         return Decimal("0")
+
+
+def _meta(value: Any) -> dict:
+    """positions.metadata comes back as a dict (jsonb adapter) or a JSON string."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        import json
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def _fmt_ts(value: Any) -> str:

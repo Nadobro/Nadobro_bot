@@ -606,6 +606,18 @@ def _write_snapshot(snapshot: dict[str, Any], duration_ms: int) -> None:
     fills_inserted = _write_matches(user_id, network, matches)
     funding_inserted = _write_funding(user_id, network, funding)
 
+    # Settle just-closed manual positions NOW, while their close fills are still in
+    # the freshly-written match feed (they age out of the venue's ~200-fill window
+    # later). This populates positions.close_price / close_realized_pnl so the
+    # History tab and Share PnL cards read a real exit + PnL + correct leverage from
+    # the authoritative positions table instead of FIFO-reconstructing from a holey
+    # fill stream (the phantom-trade / 1x-leverage fix, 2026-08-29). Best-effort.
+    try:
+        from src.nadobro.models.database import settle_closed_manual_positions
+        settle_closed_manual_positions(user_id, network)
+    except Exception:  # policy: degrade-ok(settlement is best-effort; a miss retries next sync)
+        logger.warning("settle_closed_manual_positions failed user=%s", user_id, exc_info=True)
+
     # Realized PnL is DERIVED position-aware from the FULL trades history (this
     # venue reports none per-fill, so the snapshot's per-fill sum was always 0).
     # Recompute it here — off the event loop, AFTER _write_matches has persisted

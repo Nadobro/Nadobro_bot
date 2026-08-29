@@ -965,6 +965,125 @@ def get_closed_copy_positions(user_id: int, network: str, limit: int = 100) -> l
     )
 
 
+def get_manual_closed_round_trips(user_id: int, network: str, limit: int = 200) -> list:
+    """Closed MANUAL (non-strategy, non-copy) round-trips for the History tab,
+    sourced from the venue-synced ``positions`` table — the authoritative record
+    of what positions actually existed, with correct leverage.
+
+    Why not FIFO-reconstruct from ``trades_<network>`` fills: the venue's match
+    feed only syncs the newest ~200 fills, so old CLOSE fills age out. A FIFO over
+    that holey stream never returns to flat and pairs new fills against stale lots,
+    fabricating phantom round-trips (wrong entry/leverage/PnL, multi-day holds) —
+    the "history is wrong" report (2026-08-29). The positions table has no such
+    drift and carries the true leverage (the fills record it as 0/1).
+
+    We show ONLY positions whose exit + realized PnL are REAL (``close_realized_pnl``
+    populated — by the sync-time recording or the one-time fill-FIFO backfill), never
+    fabricated: a closed position whose close fills aged out before we could settle
+    it is omitted rather than shown with a guessed exit.
+    """
+    return query_all(
+        f"""SELECT id, product_id, pair, side, size, avg_entry_price, close_price,
+                   close_realized_pnl, leverage, isolated, opened_at, closed_at, metadata
+            FROM positions
+            WHERE user_id = %s AND network = %s AND status = 'closed'
+              AND strategy_session_id IS NULL AND strategy_id IS NULL
+              AND close_realized_pnl IS NOT NULL AND close_price IS NOT NULL
+            ORDER BY closed_at DESC NULLS LAST, id DESC
+            LIMIT %s""",
+        (int(user_id), network, int(limit)),
+    )
+
+
+def settle_closed_manual_positions(user_id: int, network: str) -> None:
+    """Populate close_price / close_realized_pnl (+ fees/funding in metadata) for
+    the user's CLOSED manual positions that aren't settled yet, deriving the exit
+    from the venue-synced closing fills (FIFO-capped at the position size).
+
+    Called from the position sync right after fills are written, so a just-closed
+    position is settled while its close fills are still fresh in the match feed
+    (they age out of the venue's ~200-fill window later). The SAME query is the
+    one-time backfill for pre-fix rows.
+
+    Only COMPLETE matches (>= 98% of the size found on the closing side within the
+    position's [opened_at, next-same-product-open) window) are settled — a position
+    whose close fills already aged out stays NULL and is simply omitted from History
+    rather than shown with a guessed exit.
+    """
+    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    execute(
+        f"""
+        WITH pos AS (
+          SELECT id, product_id, isolated, side, size AS psize, avg_entry_price, opened_at,
+                 LEAD(opened_at) OVER (PARTITION BY product_id, isolated ORDER BY opened_at) AS next_open
+          FROM positions
+          WHERE user_id = %s AND network = %s AND status = 'closed'
+            AND strategy_session_id IS NULL AND strategy_id IS NULL
+            AND size > 0 AND close_realized_pnl IS NULL
+        ),
+        cand AS (
+          SELECT p.id AS pos_id, p.psize, p.side, p.avg_entry_price,
+                 COALESCE(t.fill_size, t.size, 0) AS fsz,
+                 COALESCE(NULLIF(t.fill_price, 0), t.price, 0) AS fpx,
+                 COALESCE(t.fill_fee, t.fees, 0) + COALESCE(t.builder_fee, 0) AS ffee,
+                 COALESCE(t.funding_paid, 0) AS ffund,
+                 SUM(COALESCE(t.fill_size, t.size, 0)) OVER (
+                   PARTITION BY p.id ORDER BY COALESCE(t.filled_at, t.created_at), t.id) AS cum
+          FROM pos p
+          JOIN {table} t ON t.user_id = %s AND t.product_id = p.product_id
+            AND t.strategy_session_id IS NULL AND COALESCE(t.source, 'manual') = 'manual'
+            AND t.submission_idx IS NOT NULL
+            AND t.status IN ('filled', 'closed', 'partially_filled')
+            AND (CASE WHEN p.side = 'long' THEN t.side IN ('short', 'sell')
+                      ELSE t.side IN ('long', 'buy') END)
+            AND COALESCE(t.filled_at, t.created_at) > p.opened_at
+            AND COALESCE(t.filled_at, t.created_at) < COALESCE(p.next_open, now())
+        ),
+        capped AS (
+          SELECT pos_id, psize, side, avg_entry_price, fpx,
+                 LEAST(fsz, GREATEST(psize - (cum - fsz), 0)) AS used, fsz, ffee, ffund
+          FROM cand WHERE (cum - fsz) < psize
+        ),
+        agg AS (
+          SELECT pos_id, MAX(psize) AS psize, MAX(side) AS side, MAX(avg_entry_price) AS entry,
+                 SUM(used) AS matched,
+                 SUM(used * fpx) / NULLIF(SUM(used), 0) AS close_px,
+                 SUM(ffee * (used / NULLIF(fsz, 0))) AS fees,
+                 SUM(ffund * (used / NULLIF(fsz, 0))) AS funding
+          FROM capped GROUP BY pos_id
+        )
+        UPDATE positions p SET
+          close_price = a.close_px,
+          close_realized_pnl = CASE WHEN a.side = 'long' THEN (a.close_px - a.entry)
+                                    ELSE (a.entry - a.close_px) END * a.psize,
+          metadata = COALESCE(p.metadata, '{{}}'::jsonb) || jsonb_build_object(
+             'close_fees', ROUND(a.fees::numeric, 6),
+             'close_funding', ROUND(a.funding::numeric, 6),
+             'close_source', 'fills_fifo')
+        FROM agg a
+        WHERE p.id = a.pos_id AND a.matched >= a.psize * 0.98
+        """,
+        (int(user_id), network, int(user_id)),
+    )
+
+
+def get_manual_closed_round_trip(user_id: int, network: str, position_id: int) -> Optional[dict]:
+    """One settled manual round-trip (positions row) for the Share PnL card.
+
+    Scoped to the user + a real exit/PnL so a stale/foreign id can never mint a
+    card; mirrors :func:`get_manual_closed_round_trips`.
+    """
+    return query_one(
+        """SELECT id, product_id, pair, side, size, avg_entry_price, close_price,
+                  close_realized_pnl, leverage, isolated, opened_at, closed_at, metadata
+           FROM positions
+           WHERE id = %s AND user_id = %s AND network = %s AND status = 'closed'
+             AND strategy_session_id IS NULL AND strategy_id IS NULL
+             AND close_realized_pnl IS NOT NULL AND close_price IS NOT NULL""",
+        (int(position_id), int(user_id), network),
+    )
+
+
 def get_open_copy_position_for_product(mirror_id: int, product_id: int) -> Optional[dict]:
     return query_one(
         "SELECT * FROM copy_positions WHERE mirror_id = %s AND product_id = %s AND status = 'open' ORDER BY opened_at DESC LIMIT 1",

@@ -90,62 +90,53 @@ def test_portfolio_deck_and_subviews_render_without_local_sync_text():
         assert "TESTNET" in view_text
         assert view_kb.inline_keyboard
 
-    # History view pulls round-trips from the DB; stub them out for the
-    # smoke test so the renderer still produces a valid card.
-    with patch("src.nadobro.trading.trade_service.compute_round_trips", return_value=[]):
+    # History view pulls closed round-trips from the positions table; stub them
+    # out for the smoke test so the renderer still produces a valid card.
+    with patch("src.nadobro.models.database.get_manual_closed_round_trips", return_value=[]):
         view_text, view_kb = render_history_view(_snapshot())
     assert "TESTNET" in view_text
     assert view_kb.inline_keyboard
 
 
 def test_history_renders_round_trips_newest_first():
-    """History now displays round-trips computed from manual fills.
-
-    The renderer must surface ``trip_key`` on the Share PnL button so the
-    callback can mint the per-trade card.
+    """History displays closed round-trips from the authoritative positions table
+    (not the drifting fill FIFO). Each row shows entry -> exit -> realized, and the
+    Share PnL button carries the position id as ``trip_key`` so the callback can
+    mint the per-trade card with the correct leverage.
     """
     from datetime import datetime, timezone
 
-    round_trips = [
+    trips = [
         {
-            "trip_key": "200",
-            "pair": "NEW",
-            "side": "long",
-            "size": 1.0,
-            "avg_open_price": 100.0,
-            "avg_close_price": 110.0,
-            "realized_pnl": 10.0,
-            "fees": 0.2,
-            "funding_paid": 0.0,
-            "volume_usd": 210.0,
-            "open_ts": datetime(2026, 1, 2, tzinfo=timezone.utc),
-            "close_ts": datetime(2026, 1, 2, 1, tzinfo=timezone.utc),
+            "id": 200, "product_id": 1, "pair": "NEW", "side": "long", "size": 1.0,
+            "avg_entry_price": 100.0, "close_price": 110.0, "close_realized_pnl": 10.0,
+            "leverage": 50.0, "isolated": False,
+            "opened_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
+            "closed_at": datetime(2026, 1, 2, 1, tzinfo=timezone.utc),
+            "metadata": {"close_fees": 0.2, "close_funding": 0.0},
         },
         {
-            "trip_key": "100",
-            "pair": "OLD",
-            "side": "short",
-            "size": 0.5,
-            "avg_open_price": 90.0,
-            "avg_close_price": 80.0,
-            "realized_pnl": 5.0,
-            "fees": 0.1,
-            "funding_paid": 0.0,
-            "volume_usd": 85.0,
-            "open_ts": datetime(2026, 1, 1, tzinfo=timezone.utc),
-            "close_ts": datetime(2026, 1, 1, 1, tzinfo=timezone.utc),
+            "id": 100, "product_id": 2, "pair": "OLD", "side": "short", "size": 0.5,
+            "avg_entry_price": 90.0, "close_price": 80.0, "close_realized_pnl": 5.0,
+            "leverage": 10.0, "isolated": False,
+            "opened_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "closed_at": datetime(2026, 1, 1, 1, tzinfo=timezone.utc),
+            "metadata": {"close_fees": 0.1, "close_funding": 0.0},
         },
     ]
     with patch(
-        "src.nadobro.trading.trade_service.compute_round_trips",
-        return_value=round_trips,
+        "src.nadobro.models.database.get_manual_closed_round_trips",
+        return_value=trips,
     ):
         text, kb = render_history_view(_snapshot())
 
     assert text.index("NEW") < text.index("OLD")
+    # entry -> exit is rendered from the position (100 -> 110 for the NEW long)
+    assert "100" in text and "110" in text
     callback_data = [
         btn.callback_data for row in kb.inline_keyboard for btn in row
     ]
+    # trip_key is the position id -> the Share card fetches it (correct leverage)
     assert any("portfolio:share_pnl:rt:200" in cb for cb in callback_data)
 
 

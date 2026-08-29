@@ -242,21 +242,24 @@ def build_round_trip_card_data(
     network: str,
     round_trip_key: str,
 ) -> dict:
-    """Type A card data for a History round-trip (desk/agent/manual trade).
+    """Type A card data for a History round-trip (manual/desk trade).
 
-    ``round_trip_key`` is the stable id minted by
-    :func:`trade_service.compute_round_trips` (the close trade id). Returns the
-    Type A contract consumed by ``pnl_card_type_a.generate_type_a_card``. A
-    spot round-trip returns ``{"unsupported": "spot"}`` — Type A is perps-only
-    for now.
+    ``round_trip_key`` is the closed ``positions`` row id shown in the History
+    tab. Sourcing the card from the positions table (not the FIFO fill
+    reconstruction) is what makes the leverage correct — the fills record it as
+    0/1, the position carries the real value (2026-08-29 fix). Returns the Type A
+    contract; a spot round-trip returns ``{"unsupported": "spot"}``.
     """
-    from src.nadobro.trading.trade_service import find_round_trip
+    from src.nadobro.models.database import get_manual_closed_round_trip
 
-    rt = find_round_trip(int(telegram_id), network, str(round_trip_key))
+    try:
+        rt = get_manual_closed_round_trip(int(telegram_id), network, int(round_trip_key))
+    except (TypeError, ValueError):
+        rt = None
     if not rt:
         return {"unsupported": "not_found"}
 
-    product_name = rt.get("product_name") or rt.get("pair")
+    product_name = rt.get("pair")
     base, display, is_perp = _type_a_product(product_name)
     if not is_perp:
         return {"unsupported": "spot"}
@@ -267,9 +270,9 @@ def build_round_trip_card_data(
         "base_symbol": base,
         "side": "LONG" if str(rt.get("side") or "").lower() in ("long", "buy") else "SHORT",
         "leverage": float(rt.get("leverage") or 0.0),
-        "pnl": float(_to_decimal(rt.get("realized_pnl"))),
-        "entry_price": float(_to_decimal(rt.get("avg_open_price"))),
-        "exit_price": float(_to_decimal(rt.get("avg_close_price"))),
+        "pnl": float(_to_decimal(rt.get("close_realized_pnl"))),
+        "entry_price": float(_to_decimal(rt.get("avg_entry_price"))),
+        "exit_price": float(_to_decimal(rt.get("close_price"))),
         "size": float(_to_decimal(rt.get("size"))),
         "referral_code": _fetch_active_referral_code(telegram_id, network) or "",
     }
