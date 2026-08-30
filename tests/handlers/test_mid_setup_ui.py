@@ -40,6 +40,16 @@ def test_mid_setup_exposes_only_user_facing_controls():
         "strategy:set_text:mid:mid_execution_mode:aggressive",
         "strategy:set_text:mid:mid_execution_mode:normal",
         "strategy:set_text:mid:mid_execution_mode:passive",
+        # RUN DURATION + CADENCE (user request 2026-08-30): a Mid session can now be
+        # given a hard run duration (mm_duration_minutes, honored as a stop by the
+        # runtime) and a custom fast-cadence interval (interval_seconds), matching
+        # the controls grid/dgrid/rgrid already expose.
+        "strategy:set:mid:mm_duration_minutes:30",
+        "strategy:set:mid:mm_duration_minutes:120",
+        "strategy:input:mid:mm_duration_minutes",
+        "strategy:set:mid:interval_seconds:5",
+        "strategy:set:mid:interval_seconds:8",
+        "strategy:input:mid:interval_seconds",
         "strategy:set:mid:directional_bias:-0.5",
         "strategy:set:mid:directional_bias:0",
         "strategy:set:mid:directional_bias:0.5",
@@ -59,11 +69,12 @@ def test_mid_setup_exposes_only_user_facing_controls():
     assert callbacks[-1] == "strategy:config:mid"
 
     # Still intentionally off the mid card (the mapping ignores them or they are
-    # engine-internal): min/max spread bounds, POV participation, MM duration,
-    # TWAP pause, and the old margin presets.
+    # engine-internal): min/max spread bounds, POV participation, TWAP pause, and
+    # the old margin presets. (mm_duration_minutes is now exposed above — a user
+    # needs a run-duration cap so the session doesn't stop at an arbitrary time.)
     obsolete_fields = (
         "min_spread_bp", "max_spread_bp",
-        "participation_preset", "mm_duration_minutes",
+        "participation_preset",
         "twap_pause_move_bp",
     )
     assert not any(

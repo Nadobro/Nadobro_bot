@@ -2834,6 +2834,23 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                     InlineKeyboardButton("Normal", callback_data="strategy:set_text:mid:mid_execution_mode:normal"),
                     InlineKeyboardButton("Passive", callback_data="strategy:set_text:mid:mid_execution_mode:passive"),
                 ],
+                # RUN DURATION: a hard cap for Mid — the session stops itself after
+                # this many minutes (0/unset = runs until you stop it). Custom lets
+                # you type any value. mm_duration_minutes is honored by the engine.
+                [
+                    InlineKeyboardButton("Duration 30m", callback_data="strategy:set:mid:mm_duration_minutes:30"),
+                    InlineKeyboardButton("2h", callback_data="strategy:set:mid:mm_duration_minutes:120"),
+                    InlineKeyboardButton("✍️ Custom Duration", callback_data="strategy:input:mid:mm_duration_minutes"),
+                ],
+                # CADENCE: Mid runs on a fast cycle (capped at ~8s); Custom Interval
+                # sets interval_seconds (faster is honored down to the ~3s venue
+                # floor). The Execution buttons above are the primary cadence/quote-
+                # life control (Aggressive/Normal/Passive).
+                [
+                    InlineKeyboardButton("Interval 5s", callback_data="strategy:set:mid:interval_seconds:5"),
+                    InlineKeyboardButton("8s", callback_data="strategy:set:mid:interval_seconds:8"),
+                    InlineKeyboardButton("✍️ Custom Interval", callback_data="strategy:input:mid:interval_seconds"),
+                ],
                 [
                     InlineKeyboardButton("Short −0.5", callback_data="strategy:set:mid:directional_bias:-0.5"),
                     InlineKeyboardButton("Neutral", callback_data="strategy:set:mid:directional_bias:0"),
