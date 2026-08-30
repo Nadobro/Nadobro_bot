@@ -249,6 +249,48 @@ CRITICAL. Validated net floor: +207bp trend / −107bp chop / fee_leak 0
 
 ---
 
+## Open findings — self-review audit 2026-08-30 (Grid + Reverse Grid presence-first entry)
+
+User directive: "Grid and Reverse Grid are not placing orders. They need to enter
+the market first before figuring out whether to pause or keep quoting." Root cause
+(evidence in prod telemetry): both modes gated the ENTRY. Trigger `ReverseGridController`
+(prod `NADO_REVGRID_TRIGGER_ENABLED=1`) with `chop_stand_down=True` armed zero triggers
+until a trend confirmed (rgrid user 1124285818: 19/20 zero-order cycles). Classic grid
+rests maker buys that don't fill on the thin venue; fill-anchored grid (user 8542863313,
+`fill_anchored=1`) showed 25 placed / 21 cancelled / 0 filled with gate=QUOTE.
+
+Fix = **presence-first (maker)**, user-chosen: always place the initial ladder / arm the
+triggers on entry; demote the regime/chop gate from an ENTRY BLOCK to an ADD/RE-arm
+governor. Four read-only auditors (grid + rgrid + dgrid strategy-auditors + sltp-tracer)
+returned **zero `[VERIFIED]` bugs**. Full suite green (2858 passed), mypy clean, SL/TP
+invariants 60 passed, DGrid net-floor unchanged (+207bp/−107bp).
+
+### Changed
+| File | Change |
+|---|---|
+| `reverse_grid.py` | New `_has_opened` (reset in `on_start`, set in `_open_position`). `_maintain_flat` gate now `chop_stand_down and _has_opened and not _trend_confirmed()` — the FIRST arming is never gated; chop only gates RE-arm after a close. |
+| `grid_trading.py` | `on_start` always `_spawn()`s the initial ladder (was: return early when paused). Deferred re-spawn in `on_tick` no longer gated (retry a failed initial spawn even while paused). |
+| `fill_anchored.py` | Paused-gate reduce-only clamp now `gate_paused and base_value != 0` — a FLAT book still places entry quotes; reduce-only applies only once a position is held. |
+| `dynamic_grid.py` | `_trend_mapped_config` forces `revgrid_chop_stand_down=False` (mirrors the mapper's live default at `engine_runtime.py:2064`; makes it authoritative for the fallback branch too). |
+
+### Recorded (intended / by-design / pre-existing — no fix, no guardrail)
+| ID | Sev | What |
+|---|---|---|
+| `RGRID-PRESENCE-ONE-CHOP-ENTRY` | Info [VERIFIED] | Presence-first allows exactly ONE ungated entry per run, including into chop. Worst case ≈ one round-trip: `stop_pct` (floored above the taker round trip) + taker fees, then gated. Bounded by the venue reduce-only stop + session %-margin rail. Matches the directive. |
+| `GRID-ARMEDGATE-QUOTEFIRST` | Low [VERIFIED] | For an EXPLICITLY-armed classic-grid gate (`regime_gate_enabled=1`, non-default), a later PAUSE suppresses NEW levels but does not withdraw the resting ladder (gate contract = "stop digging, never flatten"), so resting opens keep filling into a trend. Bounded by `total_amount_quote` + inventory cap (new levels) + session SL rail. Documented in `grid_trading.on_start`. Fill-anchored differs: its reconciler cancels the disallowed side's resting quote. |
+| `GRID-NO-VENUE-STOP-OFFLINE` | Low [VERIFIED, pre-existing] | Grid (and dgrid GRID phase) has no controller-side venue stop; presence-first raises trend-entry frequency, so an offline polling loop leaves such a position protected only by the default-off `sync_session_venue_stop` (`NADO_VENUE_STOP_ENABLED`). Enable once testnet-validated — already tracked in the 2026-08-25 SL/TP-overshoot work. Not introduced here. |
+
+### Guardrails / tests updated (contract change, not a bug fix)
+The 4 rgrid chop-gate tests + 1 grid regime-gate test encoded the OLD "stand down before
+entry" contract; rewritten to the presence-first contract (initial entry arms; chop gates
+the re-arm). New coverage: `test_initial_entry_arms_with_no_candle_feed`,
+`test_initial_entry_arms_in_chop_then_gates_the_rearm`,
+`test_rearm_after_close_arms_once_a_trend_confirms` (rgrid);
+`test_grid_enters_first_then_suppresses_new_entries_while_trending` (regime_gate);
+`test_presence_first_flat_book_quotes_while_paused_then_reduce_only_in_position` (fill_anchored).
+
+---
+
 ## Open findings — self-review audit 2026-08-30 (Mid level recycling "fill the gaps")
 
 User request: in Mid, after a level round-trips (buy fills → its sell closes), re-arm
@@ -275,7 +317,7 @@ covers a recycled position byte-identically to a normal one.
 ### Fixed in the same change (auditor findings — config-robustness, no money impact)
 | ID | Sev | What |
 |---|---|---|
-| `MID-RECYCLE-FLOOR-REDUCEONLY` | Low [VERIFIED] (sltp-tracer) | The floor suppressed ANY bid below the band, including a bid that REDUCES a net short (a profit-taking cover). Now exempts reducing orders (`_base_value(mid) >= 0` guard) — mirrors the exposure cap's reduce-only exemption; the floor bounds LONG accumulation only, never an exit. Guarded by `test_floor_exempts_a_reducing_cover_bid_when_short`. |
+| `MID-RECYCLE-FLOOR-REDUCEONLY` | Low [VERIFIED] (sltp-tracer) | The floor suppressed ANY bid below the band, including a bid that REDUCES a net short (a profit-taking cover). Now exempts reducing orders (`_base_value(mid) >= 0` guard) — mirrors the exposure cap's reduce-only exemption; the floor bounds LONG accumulation only, never an exit. A cover-bid larger than a small short may flip to a bounded new long below the band (net-exposure-cap-bounded, re-floored next tick) — documented inline as intentional. Guarded by `test_floor_exempts_a_reducing_cover_bid_when_short`. |
 | `MID-RECYCLE-ALPHA-ZERO` | Low [VERIFIED] (strategy-auditor) | `mid_recycle_drift_alpha=0` did not freeze the anchor — a bare `or "0.02"` treated the falsy `Decimal(0)` as "unset" and restored drift. Now 0 is honored (static via alpha); only None/"" default. Guarded by `test_drift_alpha_zero_freezes_the_anchor`. |
 | `MID-RECYCLE-FLOOR-DEGENERATE` | Info [VERIFIED] (strategy-auditor) | `floor_pct>=1` silently disabled the floor, and `floor_pct<=0` would suppress EVERY buy. Now the floor arms only for a sane band `0 < floor_pct < 1`; outside that it is disabled (None), with the inventory cap + SL as the hard bounds. Guarded by `test_floor_pct_zero_disables...` / `test_floor_pct_ge_one_disables...`. |
 

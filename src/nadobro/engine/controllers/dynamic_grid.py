@@ -920,6 +920,21 @@ class DynamicGridController(Controller):
         # Standalone R-Grid is NEVER_SUPPRESSED. Chop-suppress on the dgrid
         # parent must not stand the nested follower down.
         cfg.pop("suppress_new_entries", None)
+        # The trigger ReverseGridController delegate must NEVER run its own chop
+        # stand-down: D-Grid's variance-ratio classifier IS the regime gate here and
+        # only spawns the delegate once it has decided the regime is a trend. Leaving
+        # the delegate's own chop gate at its (standalone) default ON double-gated it
+        # — it could stand down and arm nothing even inside D-Grid's trend phase
+        # (the delegate is candle-BLIND in this path — no candle_provider is injected
+        # into the nested config — so its classifier reports insufficient history and
+        # never confirms a trend), the "spawns but places no orders" trap. Force it
+        # OFF so the delegate arms immediately for as long as D-Grid keeps it in the
+        # RGRID phase; D-Grid owns the flip back to GRID. This MIRRORS the live-path
+        # default set by the mapper (engine_runtime.py `_trend_cfg["revgrid_chop_
+        # stand_down"] = False`); this line makes _trend_mapped_config authoritative
+        # for the FALLBACK branch above (a directly-constructed controller with no
+        # packed ``trend_rgrid``). Keep both — do not delete one assuming the other.
+        cfg["revgrid_chop_stand_down"] = False
         cfg["trading_pair"] = self.trading_pair
         return cfg
 
