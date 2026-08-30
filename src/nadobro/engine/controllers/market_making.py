@@ -1098,7 +1098,11 @@ class MarketMakingController(Controller):
         # profit-taking cover, not fresh risk, so — like the exposure cap's
         # reduce-only exemption (_projected_order_within_exposure) — it is never
         # floored; base_value >= 0 means the buy would open/add a LONG, which is the
-        # only exposure this bound exists to cap. Forcing ``allowed`` False cancels
+        # only exposure this bound exists to cap. (A cover-bid larger than a small
+        # short may flip to a new long below the band; that residual is intentionally
+        # allowed — like every reduce-only path — and stays bounded by the net-
+        # exposure cap, then re-floored next tick once the book reads long.) Forcing
+        # ``allowed`` False cancels
         # any resting bid that has drifted below the band and skips placing a fresh
         # one; FILLED inventory is not a resting quote and is untouched (the exits +
         # the session SL manage it). ``_recycle_floor_price`` is None for every
