@@ -333,6 +333,52 @@ covers a recycled position byte-identically to a normal one.
 
 ---
 
+## Open findings — self-review audit 2026-08-30 (Mid quoting — 298-placed/0-filled + gate flap)
+
+User report (live logs + screenshot): Mid makes NO volume (entry far from price) and
+the regime gate flaps pause/resume every ~15 min. A 4-agent investigation workflow +
+verification pinned FOUR compounding defects on a thin, rate-limited venue (user
+5776741680, BTC, levels=20, aggressive):
+
+1. **Infeasible ladder** — `levels=20` → 40 order-ops/tick at ~1 execute/sec; the
+   deep ladder is re-laid one-per-second and never rests (298 placed / 0 filled).
+2. **TTL < cadence** — aggressive `max_quote_lifetime_s=6s` sat UNDER the 8s enforced
+   cadence, so `_should_hold` force-refreshed every quote every tick; the 16s
+   min-lifetime queue-hold was unreachable dead code above it.
+3. **Gate flap** — the overlay toggled `regime_gate_enabled` True↔0.0 each cycle
+   (arm-on-suppress, mapper-default-off), flipping the live-config signature
+   (→ stop_all_quotes teardown) AND bypassing the gate's resume hysteresis.
+4. **Blind pricing** — `quote_mode="mid"` never reads the touch, so quotes rest
+   behind the book and can't fill on a thin venue.
+
+Fix (user-chosen "all four, touch opt-in"). Two auditors (mid strategy-auditor +
+sltp-tracer) returned zero Critical/High/Med; full suite green (2877), mypy clean,
+SL/TP invariants pass.
+
+### Changed (bug fixes 1–3 default ON, mid-only; touch opt-in default OFF)
+| File | Change |
+|---|---|
+| `engine_runtime.py` | `_mid_max_ladder_levels` caps mid `ladder_levels` to `min(levels, place_rate×cadence/2, NADO_MM_MAX_LADDER_LEVELS=5)` (20→4). `max_quote_lifetime_s = max(profile_ttl, min_quote_lifetime_s)` (6→16 > cadence). `_maybe_apply_overlay` sticky gate arm with a decaying dwell (`NADO_MID_GATE_ARM_DWELL_CYCLES=24`), re-asserted BEFORE the candle fetch so a transient overlay skip can't disarm it. `quote_mode` resolves to "touch" on `mid_objective=volume`/`mm_quote_mode=touch`, else "mid". |
+| `controller_base.py` | `evaluate_quote_gate`: on an overlay-driven gate DISARM, keep the internal stale-PAUSE reset (MID-GATE-STALE-PAUSE) but emit no `_gate_event` (no spurious "resumed" card). |
+
+### Auditor findings (both Low, no money-bleed)
+| ID | Sev | Disposition |
+|---|---|---|
+| `MID-GATE-DWELL-TRANSIENT` | Low [SUSPECTED] | An overlay early-return DURING the dwell would disarm the gate for one tick (2 teardowns). **FIXED**: the arm is re-asserted at the top of `_maybe_apply_overlay` before the candle fetch; the dwell decays only on a clean cycle. Guarded by `test_mid_gate_arm_survives_a_transient_overlay_skip`. |
+| `MID-GATE-DWELL-STALE-CARD` | Low [VERIFIED] | On dwell-expiry the gate disarms silently (no resume card) while the last card may still say "paused" — the intended 3b tradeoff (an overlay disarm is not a market resume). Book resumes correctly; no money impact. Recorded, not fixed. |
+
+### Recorded (product notes)
+- Touch mode rests INSIDE the fee — the session %-margin SL rail becomes the
+  adverse-selection bound. Hence opt-in + testnet-gated before any default flip.
+- The aggressive profile's mapped `interval_seconds=4` is DEAD (the scheduler uses
+  the user's interval via `effective_interval_seconds`, capped at 8s); the TTL fix
+  derives from the real 8s cadence. Left as-is (a faster cadence would worsen the
+  rate-limit problem); flagged for a later cleanup.
+- Longer-term: batch placement via a real `place_orders` (weight=count) would let an
+  N-level side lay in one round-trip — a build, not part of this minimal fix.
+
+---
+
 ## Product decision — D-Grid trend phase should pyramid (2026-08-12)
 
 The owner has decided that **dgrid's trend phase should behave like R-Grid** (add

@@ -144,7 +144,17 @@ def test_mid_execution_profiles_change_only_mid_quote_policy():
     assert aggressive["interval_seconds"] < normal["interval_seconds"] < passive["interval_seconds"]
     assert aggressive["spread_bid_pct"] < normal["spread_bid_pct"] < passive["spread_bid_pct"]
     assert aggressive["order_amount_quote"] > normal["order_amount_quote"] > passive["order_amount_quote"]
-    assert aggressive["max_quote_lifetime_s"] < normal["max_quote_lifetime_s"] < passive["max_quote_lifetime_s"]
+    # MID-TTL-INVERSION: the quote TTL is now FLOORED at min_quote_lifetime_s
+    # (= 2× the enforced ~8s cadence = 16s) so it always exceeds the cadence —
+    # a profile TTL below the floor (aggressive 6s, normal 12s) can no longer sit
+    # UNDER the cadence and force a per-tick cancel/replace. So the TTL is
+    # non-decreasing across profiles (aggressive == normal at the floor, passive's
+    # 24s clears it) and every profile's TTL exceeds min_quote_lifetime_s − 1.
+    assert (aggressive["max_quote_lifetime_s"]
+            <= normal["max_quote_lifetime_s"]
+            <= passive["max_quote_lifetime_s"])
+    for prof in (aggressive, normal, passive):
+        assert prof["max_quote_lifetime_s"] >= prof["min_quote_lifetime_s"]
 
     for strategy in ("grid", "rgrid", "dgrid"):
         cfg = er.map_strategy_config(strategy, dict(base), Decimal(100), product="BTC-USDC")

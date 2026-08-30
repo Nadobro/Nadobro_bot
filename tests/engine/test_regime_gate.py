@@ -643,7 +643,11 @@ def test_disabling_the_gate_clears_a_stale_pause():
         c.configs["regime_gate_enabled"] = False
         await orch.tick_controller(c.id)
         assert not c.gate_paused, "a disabled gate has exactly one honest verdict"
-        assert c.consume_gate_event() == {"state": "QUOTE", "reason": ""}
+        # MID-GATE-FLAP: the internal PAUSE is cleared (flat book quotes again), but
+        # an overlay-driven DISARM must NOT emit a resume event — it is a state-
+        # machine artifact, not a market resume, so it fires no user card flip (half
+        # of the ~15-min pause/resume flap). A genuine PAUSE→QUOTE still emits.
+        assert c.consume_gate_event() is None, "overlay disarm is not a market resume"
         assert adapter.placed, "flat book must quote again once the gate is off"
 
     asyncio.run(body())
