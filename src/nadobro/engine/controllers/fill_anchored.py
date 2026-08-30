@@ -274,7 +274,13 @@ class FillAnchoredQuotingController(MarketMakingController):
         allow_sell = exposure["sell"]
 
         await self.evaluate_quote_gate(self.trading_pair)
-        if self.gate_paused:
+        if self.gate_paused and base_value != 0:
+            # PRESENCE-FIRST: a paused gate is reduce-only only once a position is
+            # HELD (stop adding, keep closing). While FLAT the grid still places its
+            # entry quotes so it ENTERS the market first — the gate governs adds only
+            # after that. A flat + paused book previously suppressed BOTH sides
+            # (base_value == 0), which is how a paused grid sat dark with nothing on
+            # the book. The inventory cap and session rail remain the risk bounds.
             allow_buy = allow_buy and base_value < 0
             allow_sell = allow_sell and base_value > 0
 

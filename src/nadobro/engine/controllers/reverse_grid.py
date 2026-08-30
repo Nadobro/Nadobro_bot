@@ -116,6 +116,12 @@ class ReverseGridController(Controller):
         self._baseline_net: Optional[Decimal] = None
         self._avg_entry: Optional[Decimal] = None
         self._peak: Optional[Decimal] = None      # favourable extreme mid since open
+        # PRESENCE-FIRST: the ladder's FIRST arming (this run) is never gated — the
+        # reverse grid enters the market immediately so it is on the book from the
+        # first flat tick. The chop stand-down only governs RE-arming AFTER a close
+        # (once this has flipped True), so a whipsaw stop-out doesn't instantly
+        # re-enter the same chop. Reset per run in on_start; set in _open_position.
+        self._has_opened = False
         self._trail_armed = False
         self._stop_digest: Optional[str] = None
         self._stop_level: Optional[Decimal] = None
@@ -212,6 +218,8 @@ class ReverseGridController(Controller):
         self._rungs = []
         self._pos_base = Decimal(0)
         self._baseline_net = None
+        # A fresh run always does the presence-first initial entry (see _maintain_flat).
+        self._has_opened = False
         self._reset_position_state()
 
     async def on_tick(self) -> None:
@@ -389,10 +397,18 @@ class ReverseGridController(Controller):
 
     # -- flat: arm / re-anchor the ladder ------------------------------------
     async def _maintain_flat(self, mid: Decimal) -> None:
-        if self.chop_stand_down and not self._trend_confirmed():
-            # No confirmed trend: stand down. Never ENTER in chop — drop any resting
-            # ladder and re-anchor fresh when a trend resumes. (An OPEN position is not
-            # here — it is managed by its stop, which the gate never touches.)
+        # PRESENCE-FIRST (user directive): the FIRST arming of the run is never gated
+        # — the reverse grid enters the market immediately so a break in either
+        # direction fills from the first tick. The chop stand-down only governs
+        # RE-arming after a close (``_has_opened``): a whipsaw stop-out then waits
+        # for a confirmed trend instead of instantly re-entering the same chop,
+        # which bounds the chop bleed to ~one round trip per episode. (An OPEN
+        # position is never here — its stop manages it and the gate never touches
+        # an exit.) The finite ladder + venue reduce-only stop + session %-margin
+        # rail remain the risk bounds on the presence-first entry.
+        if self.chop_stand_down and self._has_opened and not self._trend_confirmed():
+            # Re-arm after a close, no confirmed trend: stand down. Drop any resting
+            # ladder and re-anchor fresh when a trend resumes.
             self.gate_verdict, self.gate_reason = "PAUSE", "revgrid_chop"
             if self._rungs:
                 await self._cancel_all_rungs()
@@ -494,6 +510,10 @@ class ReverseGridController(Controller):
     # -- position: open / grow / trail ---------------------------------------
     async def _open_position(self, net: Decimal, mid: Decimal) -> None:
         long = net > 0
+        # A position has now opened this run: subsequent flats are RE-arms, which
+        # the chop stand-down governs (see _maintain_flat) — the presence-first
+        # first entry is done.
+        self._has_opened = True
         # The losing side is cancelled — the break went the other way.
         await self._cancel_side_rungs(TradeType.SELL if long else TradeType.BUY)
         self._recompute_avg_entry(net)

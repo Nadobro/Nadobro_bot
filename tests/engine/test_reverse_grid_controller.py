@@ -343,7 +343,12 @@ def test_first_sell_fill_opens_a_short_and_arms_stop_above():
     asyncio.run(body())
 
 
-# ── chop stand-down gate ───────────────────────────────────────────────
+# ── chop stand-down gate: PRESENCE-FIRST (enter first, gate the re-arm) ──
+# User directive 2026-08-30: the reverse grid must ENTER the market first, then
+# decide whether to keep quoting. So the INITIAL arming of a run is never gated —
+# it arms even in chop / with no candle feed. The chop stand-down only governs
+# RE-arming AFTER a close (``_has_opened``), so a whipsaw stop-out waits for a
+# confirmed trend instead of instantly re-entering the same chop.
 
 def _uptrend_candles(n=24, start=100.0, step=0.2):
     return [{"time": i, "open": start + i * step, "high": start + i * step,
@@ -357,23 +362,74 @@ def _chop_candles(n=24, base=100.0):
             for i in range(n)]
 
 
-def test_gate_stands_down_with_no_candle_feed():
+async def _open_then_close_long(a, c):
+    """Drive the controller through a full presence-first open → stop-out so the
+    NEXT flat tick is a RE-arm (``_has_opened`` is set). Returns with the venue
+    flat but the controller not yet re-armed (the caller ticks once more)."""
+    a.set_mid(Decimal("101.5"))
+    a.cross_triggers(Decimal("101.5"))       # BUY@101 fires → long ~0.99
+    await c.on_tick()                         # open; protective stop @ 98.98
+    assert c._has_opened is True and c._pos_base > 0
+    a.set_mid(Decimal("98.9"))
+    a.cross_triggers(Decimal("98.9"))         # crosses the reduce-only stop → flat
+    assert a.venue_held[PAIR] == 0
+
+
+def test_initial_entry_arms_with_no_candle_feed():
+    """Presence-first: no candle feed = no regime read, but the FIRST entry still
+    arms (enter the market first). Previously this stood down and placed nothing."""
     async def body():
         a = _adapter()
         c = _controller(a, revgrid_chop_stand_down=True, candle_provider=lambda _p: [])
         await c.on_tick()
-        assert a.placed_triggers == []          # insufficient history → stand down
+        assert len(a.placed_triggers) == 4      # presence-first: armed regardless
+        assert c.gate_verdict == "QUOTE" and c.gate_paused is False
 
     asyncio.run(body())
 
 
-def test_gate_stands_down_in_chop():
+def test_initial_entry_arms_in_chop_then_gates_the_rearm():
+    """Presence-first: arm in chop on the FIRST entry; after a stop-out, the chop
+    stand-down gates the RE-arm (no confirmed trend → wait, don't re-enter chop)."""
     async def body():
         a = _adapter()
-        c = _controller(a, revgrid_chop_stand_down=True, revgrid_trend_confirm_ticks=1,
+        c = _controller(a, levels=1, revgrid_chop_stand_down=True,
+                        revgrid_trend_confirm_ticks=1,
                         candle_provider=lambda _p: _chop_candles())
         await c.on_tick()
-        assert a.placed_triggers == []          # no confirmed trend → no ladder
+        assert len(a.placed_triggers) == 2      # initial entry arms despite chop
+        assert c.gate_verdict == "QUOTE"
+
+        await _open_then_close_long(a, c)
+        armed_before = len(a.placed_triggers)
+        await c.on_tick()                        # flat again → this is a RE-arm
+        # chop + _has_opened → the re-arm stands down: no fresh rungs, ladder torn down
+        assert len(a.placed_triggers) == armed_before
+        assert c._rungs == []
+        assert c.gate_verdict == "PAUSE" and c.gate_reason == "revgrid_chop"
+
+    asyncio.run(body())
+
+
+def test_rearm_after_close_arms_once_a_trend_confirms():
+    """The gated re-arm resumes as soon as a trend confirms — the reverse grid's
+    resume condition is 'a trend forms', not 'the market ranges again'."""
+    async def body():
+        candles = {"feed": _chop_candles()}
+        a = _adapter()
+        c = _controller(a, levels=1, revgrid_chop_stand_down=True,
+                        revgrid_trend_confirm_ticks=1,
+                        candle_provider=lambda _p: candles["feed"])
+        await c.on_tick()                        # presence-first entry (chop)
+        await _open_then_close_long(a, c)
+        await c.on_tick()                        # RE-arm in chop → stands down
+        assert c.gate_verdict == "PAUSE"
+        armed_before = len(a.placed_triggers)
+
+        candles["feed"] = _uptrend_candles()     # a trend now confirms
+        await c.on_tick()
+        assert len(a.placed_triggers) == armed_before + 2   # re-armed
+        assert c.gate_verdict == "QUOTE"
 
     asyncio.run(body())
 
@@ -389,26 +445,30 @@ def test_gate_arms_the_ladder_in_a_confirmed_trend():
     asyncio.run(body())
 
 
-def test_stand_down_surfaces_on_the_gate_telemetry():
-    """User report 2026-08-28: "R-Grid doesn't even place orders." The chop guard
-    standing the ladder down is CORRECT, but it must be VISIBLE — the controller
-    populates gate_verdict/gate_reason (telemetry only; it never branches on them)
-    so /status can render "Quoting: PAUSED (choppy — waiting for a trend)" instead
-    of a silent LIVE/0-orders. The reason must be a known one AND flagged as a
-    reverse-grid reason so the card/notice flip the resume wording to 'a trend'."""
+def test_rearm_stand_down_surfaces_on_the_gate_telemetry():
+    """User report 2026-08-28: "R-Grid doesn't even place orders." Presence-first
+    fixes the STARTUP blackout (it now enters first). When the chop guard stands
+    down a RE-arm, that must still be VISIBLE — gate_verdict/gate_reason (telemetry
+    only; the controller branches on _has_opened + _trend_confirmed, not these) so
+    /status renders "Quoting: PAUSED (choppy — waiting for a trend)". The reason
+    must be known AND flagged as a reverse-grid reason so the resume wording reads
+    'a trend'."""
     from src.nadobro.engine.routines.regime_gate import (
         GATE_REASON_HUMAN, REVGRID_GATE_REASONS,
     )
 
-    async def chop():
+    async def rearm_in_chop():
         a = _adapter()
-        c = _controller(a, revgrid_chop_stand_down=True, revgrid_trend_confirm_ticks=1,
+        c = _controller(a, levels=1, revgrid_chop_stand_down=True,
+                        revgrid_trend_confirm_ticks=1,
                         candle_provider=lambda _p: _chop_candles())
         await c.on_tick()
-        assert a.placed_triggers == []
+        assert c.gate_verdict == "QUOTE"          # initial entry is never paused
+        await _open_then_close_long(a, c)
+        await c.on_tick()                          # re-arm in chop → paused
         assert c.gate_verdict == "PAUSE" and c.gate_reason == "revgrid_chop"
         assert c.gate_paused is True
-    asyncio.run(chop())
+    asyncio.run(rearm_in_chop())
 
     async def trend():
         a = _adapter()
@@ -427,16 +487,25 @@ def test_stand_down_surfaces_on_the_gate_telemetry():
     assert "trending_up" not in REVGRID_GATE_REASONS
 
 
-def test_gate_needs_the_confirmation_debounce():
-    """A single trend tick does not arm when confirm_ticks=2 — it must sustain."""
+def test_rearm_needs_the_confirmation_debounce():
+    """The confirm-ticks debounce governs the RE-arm (not the presence-first entry):
+    a single trend tick after a chop stop-out does not re-arm when confirm_ticks=2."""
     async def body():
+        candles = {"feed": _chop_candles()}
         a = _adapter()
-        c = _controller(a, revgrid_chop_stand_down=True, revgrid_trend_confirm_ticks=2,
-                        candle_provider=lambda _p: _uptrend_candles())
+        c = _controller(a, levels=1, revgrid_chop_stand_down=True,
+                        revgrid_trend_confirm_ticks=2,
+                        candle_provider=lambda _p: candles["feed"])
+        await c.on_tick()                          # presence-first entry
+        await _open_then_close_long(a, c)
+        await c.on_tick()                          # re-arm in chop → stands down
+        armed_before = len(a.placed_triggers)
+
+        candles["feed"] = _uptrend_candles()
         await c.on_tick()
-        assert a.placed_triggers == []          # one tick: not yet confirmed
+        assert len(a.placed_triggers) == armed_before   # one trend tick: not yet
         await c.on_tick()
-        assert len(a.placed_triggers) == 4      # second consecutive trend tick: armed
+        assert len(a.placed_triggers) == armed_before + 2  # second: re-armed
 
     asyncio.run(body())
 

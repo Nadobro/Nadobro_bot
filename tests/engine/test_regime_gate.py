@@ -258,7 +258,14 @@ def _grid_configs(candles):
     }
 
 
-def test_grid_defers_arming_into_a_trend_then_arms_on_range():
+def test_grid_enters_first_then_suppresses_new_entries_while_trending():
+    """Presence-first (user directive 2026-08-30): the grid ENTERS the market on
+    start regardless of the regime gate — the initial ladder is always placed, so
+    the strategy is on the book from t=0 instead of sitting dark until the market
+    ranges (the old "must not arm a grid into a trend" behavior). A paused
+    (trending) gate then only SUPPRESSES NEW entry levels; the initial ladder keeps
+    resting and its close legs/stops keep managing. Entries resume once the range
+    confirms (gate_resume_confirm_ticks hysteresis)."""
     async def body():
         adapter = MockNadoAdapter(venue_held={PAIR: Decimal(0)}, mid=Decimal("99.5"), auto_fill_market=False)
         candles_box = {"data": trending_candles()}
@@ -270,16 +277,26 @@ def test_grid_defers_arming_into_a_trend_then_arms_on_range():
             controller_id="G",
         )
         await orch.spawn_controller(c)
-        assert c.my_executors() == [], "must not arm a grid into a trend"
-        await orch.tick_controller(c.id)
-        assert c.my_executors() == [], "must not re-arm while trending"
-        # Range returns -> resume needs gate_resume_confirm_ticks (2)
-        # consecutive QUOTE verdicts (anti-flap hysteresis), then arms.
-        candles_box["data"] = ranging_candles()
-        await orch.tick_controller(c.id)
-        assert c.my_executors() == [], "one QUOTE verdict must not re-arm yet"
+        # Presence-first: armed on start even though the gate reads a trend, and the
+        # initial ladder is actually placed on the venue (on_create runs at spawn).
+        assert len(c.my_executors()) == 1, "grid must ENTER the market on start"
+        ex = c.my_executors()[0]
+        assert ex.orders_placed > 0, "initial ladder placed on the presence-first entry"
+        assert c.gate_paused is True, "the gate did read the trend (pause)"
+
+        # A tick while still trending: the executor now suppresses NEW entries
+        # ("stop digging") but the initial ladder stays on the book.
         await orch.tick_controller(c.id)
         assert len(c.my_executors()) == 1
+        assert ex.suppress_new_entries is True, "paused gate suppresses NEW entries only"
+
+        # Range returns -> resume needs gate_resume_confirm_ticks (2) consecutive
+        # QUOTE verdicts (anti-flap hysteresis); then new entries resume.
+        candles_box["data"] = ranging_candles()
+        await orch.tick_controller(c.id)
+        assert ex.suppress_new_entries is True, "one QUOTE verdict must not resume yet"
+        await orch.tick_controller(c.id)
+        assert ex.suppress_new_entries is False, "entries resume once the range confirms"
 
     asyncio.run(body())
 

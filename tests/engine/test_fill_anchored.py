@@ -97,6 +97,50 @@ def test_no_cross_invariant_clamps_quotes():
     asyncio.run(body())
 
 
+def _trending_candles(n=80, base=100.0, step=0.4):
+    return [{"time": i, "open": base + i * step, "high": base + i * step,
+             "low": base + i * step, "close": base + i * step} for i in range(n)]
+
+
+def test_presence_first_flat_book_quotes_while_paused_then_reduce_only_in_position():
+    """Presence-first (user directive 2026-08-30): a paused regime gate is
+    reduce-only ONLY once a position is HELD. While FLAT the fill-anchored grid
+    still places its entry quotes so it ENTERS the market first — the flat+paused
+    book used to suppress BOTH sides (base_value == 0) and sat dark. Once long, a
+    paused gate correctly quotes the reduce (sell) side only."""
+    async def body():
+        # Flat + trending (gate pauses): entry quotes must still place.
+        adapter = MockNadoAdapter(mid=Decimal(100), venue_held={PAIR: Decimal(0)},
+                                  auto_fill_market=False)
+        orch, c = _controller(adapter, extra={
+            "regime_gate_enabled": True,
+            "candle_provider": lambda _p: _trending_candles(),
+        })
+        await orch.spawn_controller(c)
+        await orch.tick_controller(c.id)
+        assert c.gate_paused is True, "the trend must pause the gate"
+        bid, ask = _quotes(adapter)
+        assert bid is not None and ask is not None, \
+            "a flat book must still place entry quotes while paused (presence-first)"
+
+        # Now simulate a HELD long: the paused gate becomes reduce-only (sell only).
+        adapter2 = MockNadoAdapter(mid=Decimal(100), venue_held={PAIR: Decimal(0)},
+                                   auto_fill_market=False)
+        orch2, c2 = _controller(adapter2, extra={
+            "regime_gate_enabled": True,
+            "candle_provider": lambda _p: _trending_candles(),
+        })
+        c2._base_value = lambda _mid: Decimal(50)   # held long
+        await orch2.spawn_controller(c2)
+        await orch2.tick_controller(c2.id)
+        assert c2.gate_paused is True
+        bid2, ask2 = _quotes(adapter2)
+        assert bid2 is None, "paused + long: no NEW buy (adds suppressed)"
+        assert ask2 is not None, "paused + long: the reduce (sell) leg still quotes"
+
+    asyncio.run(body())
+
+
 def test_soft_reset_reanchors_to_mid_beyond_threshold():
     async def body():
         adapter = MockNadoAdapter(mid=Decimal(100), auto_fill_market=False)

@@ -88,14 +88,28 @@ class GridController(Controller):
         self._last_recenter_ts = 0.0
 
     async def on_start(self) -> None:
-        # Regime gate: never ARM a grid into a trending/breakout market —
-        # the post-mortem failure was "reset re-armed just in time for the
-        # next leg down". A paused start defers the spawn to a later tick.
+        # PRESENCE-FIRST (user directive): always place the ladder on start so the
+        # grid ENTERS the market immediately, then decide whether to keep quoting.
+        # The regime gate no longer withholds the initial spawn — it governs NEW
+        # entry levels per tick via ``suppress_new_entries`` (see on_tick), while the
+        # close legs, resting-order stops, the inventory net-exposure cap, and the
+        # session %-of-margin SL/TP rail remain the risk bounds. (The gate defaults
+        # OFF for grid anyway; this makes an explicitly-enabled gate quote-first
+        # instead of dark-at-start.) The initial opens are placed synchronously in
+        # the executor's on_create — before the first tick can set suppression — so
+        # a paused start still rests its ladder and only stops ADDING new levels.
+        #
+        # SEMANTICS for an EXPLICITLY-armed gate (regime_gate_enabled=1, non-default):
+        # a later PAUSE suppresses NEW entry levels but does NOT withdraw the resting
+        # ladder (the gate contract is "stop digging, never flatten" — see
+        # controller_base.evaluate_quote_gate), so the already-resting opens keep
+        # filling. That is the presence-first tradeoff: quote-first, then reduce-only
+        # on NEW levels — bounded by total_amount_quote (the full ladder is the risk-
+        # approved deployment) + the inventory net-exposure cap on new levels + the
+        # session SL rail. It is NOT the old "sit the whole trend out from a flat book".
         await self.evaluate_quote_gate(
             str(self.configs.get("trading_pair")), adverse_trend=self.GATE_ADVERSE_TREND
         )
-        if self.gate_paused:
-            return
         await self._spawn()
 
     async def _spawn(self) -> None:
@@ -185,8 +199,11 @@ class GridController(Controller):
         pair = str(self.configs.get("trading_pair"))
         await self.evaluate_quote_gate(pair, adverse_trend=self.GATE_ADVERSE_TREND)
         active = self.my_executors()
-        if not active and self._executor_id is None and not self.gate_paused:
-            # Spawn was gate-deferred at on_start; the regime is now ranging.
+        if not active and self._executor_id is None:
+            # Presence-first: the ladder is spawned at on_start regardless of the
+            # gate, so this only fires if that initial spawn FAILED (e.g. a transient
+            # venue error). Retry it — the market entry is never gate-blocked; the
+            # gate only suppresses NEW entry levels below.
             await self._spawn()
             active = self.my_executors()
         # Inventory cap: a long grid's only worsening side is its entries.
