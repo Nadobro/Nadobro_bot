@@ -216,9 +216,16 @@ class Controller(abc.ABC):
             if getattr(self, "_gate_prev_enabled", False):
                 self._gate_prev_enabled = False
                 if self.gate_verdict != "QUOTE":
+                    # MID-GATE-FLAP: reset the internal verdict (MID-GATE-STALE-PAUSE
+                    # — never freeze a stale PAUSE on a flat book) but do NOT emit a
+                    # ``_gate_event``. A gate turned OFF by the overlay is a state-
+                    # machine artifact, not a market resume, so it must not fire a
+                    # user-facing "resumed quoting" card — that spurious resume was
+                    # half of the ~15-min pause/resume flap the user saw. A genuine
+                    # PAUSE→QUOTE (inside a continuously-enabled gate) still emits,
+                    # via the hysteresis path below.
                     self.gate_verdict, self.gate_reason = "QUOTE", ""
                     self._gate_resume_streak = 0
-                    self._gate_event = {"state": "QUOTE", "reason": ""}
             return self.gate_verdict
         self._gate_prev_enabled = True
         provider = self.cfg("candle_provider")

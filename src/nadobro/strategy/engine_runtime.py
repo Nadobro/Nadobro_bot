@@ -926,6 +926,33 @@ def _min_quote_lifetime_s(strategy: str, settings) -> Decimal:
     return Decimal(str(min(_MAX_AUTO_QUOTE_LIFETIME_S, 2.0 * cadence)))
 
 
+def _mid_max_ladder_levels(levels: int, strategy: str, settings) -> int:
+    """Cap Mid's per-side ladder depth to what the rate-limited venue can place,
+    REST, and fill within one cadence.
+
+    A venue limited to ~1 execute/sec cannot maintain a deep ladder on a fast
+    cadence — the deep levels are re-laid one-per-second and cancelled before they
+    ever rest, so nothing beyond the first few fills (the ``levels=20`` →
+    298-placed / 0-filled report). Depth = min(user levels, place_rate × cadence /
+    2, absolute ceiling), floored at 1; ``_retire_levels_beyond`` cancels the
+    dropped deep levels and ``plan_ladder`` redistributes the SAME per-side
+    notional over the survivors, so deployment and the exposure caps are unchanged
+    — only the shape is. env-tunable: ``NADO_MM_PLACE_RATE_PER_S`` (default 1.0 —
+    the MEASURED effective rate, not the nominal wallet budget) and
+    ``NADO_MM_MAX_LADDER_LEVELS`` (default 5)."""
+    from src.nadobro.core.cadence import effective_interval_seconds
+
+    try:
+        n = max(1, int(levels))
+    except (TypeError, ValueError):
+        return 1
+    cadence_s = float(effective_interval_seconds(strategy, settings.get("interval_seconds", 60)))
+    place_rate = max(0.1, env_float("NADO_MM_PLACE_RATE_PER_S", 1.0))
+    rate_cap = max(1, int(place_rate * cadence_s / 2.0))
+    hard_cap = max(1, int(env_float("NADO_MM_MAX_LADDER_LEVELS", 5.0)))
+    return max(1, min(n, rate_cap, hard_cap))
+
+
 def _quote_defense_defaults(settings, notional, *, auto_spread: bool) -> dict:
     """Regime gate / inventory cap / ATR-spread knobs for grid family + MM.
 
@@ -1176,6 +1203,20 @@ def map_strategy_config(
             (_chunk_dec or Decimal(str(deployed)))
             * Decimal(str(_mid_execution.size_multiplier))
         )
+        # Volume objective (opt-in, default OFF): join the live touch so quotes
+        # actually FILL on a thin book instead of resting behind it at mid ± a
+        # fixed spread (the "entry far from price / no volume" report). Resolves to
+        # "touch" when the user picks it explicitly (mm_quote_mode=touch — Turbo
+        # Volume) OR selects the volume objective (mid_objective=volume). Default
+        # stays "mid" (spread capture). Touch quotes rest INSIDE the fee, so the
+        # session %-of-margin SL rail becomes the adverse-selection bound — hence
+        # opt-in and testnet-gated, not a default flip.
+        _quote_mode = str(settings.get("mm_quote_mode") or "").lower()
+        if _quote_mode not in ("mid", "touch"):
+            _quote_mode = (
+                "touch" if str(settings.get("mid_objective") or "").lower() == "volume"
+                else "mid"
+            )
         return {
             "trading_pair": product,
             "spread_bid_pct": spread_frac,
@@ -1197,14 +1238,17 @@ def map_strategy_config(
             # move and back out of it. Each level is clamped to the venue
             # min-notional by the planner, and levels=1 reproduces the old
             # single-quote behaviour exactly.
-            "ladder_levels": levels,
+            # Rate-aware depth cap: the user's ``levels`` is capped to what the
+            # rate-limited venue can place, rest, and fill within one cadence — a
+            # deep ladder (levels=20 → 40 order-ops) at ~1 execute/sec just churns
+            # and never fills. See _mid_max_ladder_levels.
+            "ladder_levels": _mid_max_ladder_levels(levels, strategy, settings),
             # Step per level. Touch mode glues to a one-tick book where a
             # spread-sized step would be nonsense, so it takes the planner's
             # auto spacing (one tick, floored at 1bp); mid mode steps by the
             # quoted spread, matching how the classic grid ladder spaces levels.
             "ladder_step_bp": (
-                Decimal(0)
-                if str(settings.get("mm_quote_mode") or "mid").lower() == "touch"
+                Decimal(0) if _quote_mode == "touch"
                 else spread_frac * Decimal(10000)
             ),
             "ladder_curve": str(settings.get("size_curve") or "flat"),
@@ -1219,7 +1263,17 @@ def map_strategy_config(
             "min_base_quote": Decimal(str(-_inv_hard)),
             "mid_policy_enabled": Decimal(1),
             "mid_execution_mode": _mid_execution.name,
-            "max_quote_lifetime_s": Decimal(str(_mid_execution.quote_ttl_seconds)),
+            # MID-TTL-INVERSION: the max quote lifetime MUST exceed the enforced
+            # cadence, else _should_hold force-refreshes every quote every tick (a
+            # full cancel/replace of the whole ladder — the 298-placed/0-filled
+            # churn). The aggressive profile's 6s ttl sat UNDER the 8s effective
+            # cadence, and min_quote_lifetime_s (2× cadence = 16s) was unreachable
+            # dead code ABOVE it. Floor the TTL at min_quote_lifetime_s so a quote
+            # rests ~2 cadences and the queue-preservation hold becomes reachable.
+            "max_quote_lifetime_s": max(
+                Decimal(str(_mid_execution.quote_ttl_seconds)),
+                _min_quote_lifetime_s(strategy, settings),
+            ),
             "inventory_soft_limit_quote": Decimal(str(_inv_cap)),
             "inventory_hard_limit_quote": Decimal(str(_inv_hard)),
             "expected_budget_usd": Decimal(str(max(0.0, _f(settings, "expected_budget_usd", 0.0)))),
@@ -1231,7 +1285,7 @@ def map_strategy_config(
             # best bid/ask — Turbo Volume). Unknown values fall back to "mid".
             # POLICY (2026-07-15): mid is MAKER-ONLY — the cross-on-deadline
             # taker flatten was removed (fees + Nado wash-trading policy).
-            "quote_mode": str(settings.get("mm_quote_mode") or "mid"),
+            "quote_mode": _quote_mode,
             # Mid Mode v3 Phase 2: read the SIZED book once per tick and record
             # microprice / imbalance / spread. OBSERVATION ONLY — it does not
             # price a quote or change a requote decision. Set here and nowhere
@@ -2486,6 +2540,17 @@ async def _maybe_apply_overlay(
         if pid is None or client is None or not hasattr(client, "get_candlesticks"):
             return
 
+        # MID-GATE-FLAP (dwell resilience): keep Mid's gate armed through the whole
+        # sticky dwell BEFORE the candle fetch / signal build below, so a TRANSIENT
+        # overlay skip (a cold candle cache -> ``if not features: return``, or a
+        # downstream exception caught by the outer handler) cannot silently disarm
+        # the gate for one tick and churn a teardown/re-quote. The dwell is primed
+        # on suppress and decayed on a clean non-suppress cycle further down; here we
+        # only re-assert the arm so it survives a failed cycle (armed slightly longer
+        # is the safe direction — the dwell still decays to OFF on clean cycles).
+        if strategy == "mid" and int(state.get("mid_gate_arm_dwell", 0) or 0) > 0:
+            configs["regime_gate_enabled"] = True
+
         from src.nadobro.core.async_utils import run_blocking, run_blocking_sdk
         from src.nadobro.strategy import market_features as _mf
         from src.nadobro.llm.signal_engine import build_signal
@@ -2580,6 +2645,31 @@ async def _maybe_apply_overlay(
         applied_changed = applied != prev_applied
         state["overlay_applied"] = applied
         changed = apply_overrides_to_configs(strategy, configs, overrides)
+        # MID-GATE-FLAP (sticky arm): apply_overrides arms Mid's regime gate ONLY on
+        # a suppress/chop cycle and the mapper defaults it OFF, so the flag flipped
+        # True<->0.0 each time the slow signal crossed its chop boundary — flipping
+        # the live-config signature (=> stop_all_quotes teardown) AND bypassing the
+        # gate's own resume hysteresis (the ~15-min pause/resume flap). Keep the arm
+        # STICKY: once armed, hold it armed for a decaying dwell of N cycles after
+        # suppress clears, so the flag stops flipping every episode and the gate's own
+        # asymmetric pause-immediate/resume-hysteresis governs transitions. Decays to
+        # OFF, so a sticky arm never becomes a permanent arm (which would reintroduce
+        # dark sessions on Nado's thin-book volume-profile PAUSEs — MID-GATE-DEFAULT).
+        if strategy == "mid":
+            from src.nadobro.utils.env import env_int
+
+            _arm_dwell = max(0, env_int("NADO_MID_GATE_ARM_DWELL_CYCLES", 24))
+            if bool(overrides.get("suppress_new_entries")):
+                # apply_overrides already armed the gate this cycle; prime the dwell.
+                state["mid_gate_arm_dwell"] = _arm_dwell
+            else:
+                _rem = int(state.get("mid_gate_arm_dwell", 0) or 0)
+                if _rem > 0:
+                    # The gate is already armed (re-asserted at the top of this
+                    # function so it survives a transient overlay skip); only decay
+                    # the dwell on a CLEAN non-suppress cycle so it converges to OFF.
+                    changed["regime_gate_enabled"] = True
+                    state["mid_gate_arm_dwell"] = _rem - 1
         # Hand the signal's READ (not just its effects) to the controllers that can
         # use it: D-Grid weighs it when deciding whether to flip phase, R-Grid and
         # the cards surface it so a decision can be explained after the fact.
