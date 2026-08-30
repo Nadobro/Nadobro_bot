@@ -291,6 +291,48 @@ the re-arm). New coverage: `test_initial_entry_arms_with_no_candle_feed`,
 
 ---
 
+## Open findings — self-review audit 2026-08-30 (Mid level recycling "fill the gaps")
+
+User request: in Mid, after a level round-trips (buy fills → its sell closes), re-arm
+the entry at ~the same price so a reversal re-fills it. Root cause it addresses: Mid
+quotes around `_reservation_price(mid)`, which FOLLOWS the mid, so a filled deep level
+is re-quoted near the new mid, never recycled. Chosen design (Path B, drift anchor,
+2% floor): pin the quoting anchor to a slowly-drifting reference so Mid's existing
+reconciler (which already re-places a terminated level) recycles fixed levels.
+
+**Opt-in, default OFF.** Two auditors (mid strategy-auditor + sltp-tracer) returned
+zero Critical/High/Med findings. Full suite green (2868 passed), mypy clean, SL/TP
+invariants 60 passed. Backtest (cost-aware harness): range **+35% net** vs plain Mid;
+steep downtrend **identical** (floor + cap bind at the same exposure — never worse);
+gentle downtrend bounded. The session %-margin SL rail is controller-external and
+covers a recycled position byte-identically to a normal one.
+
+### Changed
+| File | Change |
+|---|---|
+| `market_making.py` | `_recycle_theta(mid)` (drift/static anchor + 2% floor); `on_tick` pins `theta` when `recycle_enabled`; `_reconcile` floor guard suppresses new LONG-side buys below the band; `ladder_metrics` telemetry. All opt-in, default OFF — inheritors (FillAnchored/RGrid) never set the keys and fully override `on_tick`, so it is inert for them (3 independent layers). |
+| `engine_runtime.py` | Mid-branch config keys: `mid_recycle_enabled` / `mid_recycle_anchor_mode` (drift) / `mid_recycle_drift_alpha` / `mid_recycle_floor_pct` (percent→fraction). |
+| `tests/engine/controllers/test_mm_recycle.py` (new) | 10 tests: off-by-default, drift lag, static freeze, recycle-near-anchor, floor suppression, inheritor inertness, + the 3 fixes below. |
+
+### Fixed in the same change (auditor findings — config-robustness, no money impact)
+| ID | Sev | What |
+|---|---|---|
+| `MID-RECYCLE-FLOOR-REDUCEONLY` | Low [VERIFIED] (sltp-tracer) | The floor suppressed ANY bid below the band, including a bid that REDUCES a net short (a profit-taking cover). Now exempts reducing orders (`_base_value(mid) >= 0` guard) — mirrors the exposure cap's reduce-only exemption; the floor bounds LONG accumulation only, never an exit. A cover-bid larger than a small short may flip to a bounded new long below the band (net-exposure-cap-bounded, re-floored next tick) — documented inline as intentional. Guarded by `test_floor_exempts_a_reducing_cover_bid_when_short`. |
+| `MID-RECYCLE-ALPHA-ZERO` | Low [VERIFIED] (strategy-auditor) | `mid_recycle_drift_alpha=0` did not freeze the anchor — a bare `or "0.02"` treated the falsy `Decimal(0)` as "unset" and restored drift. Now 0 is honored (static via alpha); only None/"" default. Guarded by `test_drift_alpha_zero_freezes_the_anchor`. |
+| `MID-RECYCLE-FLOOR-DEGENERATE` | Info [VERIFIED] (strategy-auditor) | `floor_pct>=1` silently disabled the floor, and `floor_pct<=0` would suppress EVERY buy. Now the floor arms only for a sane band `0 < floor_pct < 1`; outside that it is disabled (None), with the inventory cap + SL as the hard bounds. Guarded by `test_floor_pct_zero_disables...` / `test_floor_pct_ge_one_disables...`. |
+
+### Recorded (by-design, no fix)
+- Bypassing the reservation inventory-skew removes a SOFT accumulation brake, so a
+  recycled position can reach the (unchanged) net-exposure cap faster — higher
+  effective velocity within the same margin. The %-margin rail measures this
+  correctly and the velocity-aware overshoot buffer sizes to it. Bounded by the cap
+  + SL. **Risk note for high leverage:** at 40× the SL rail is the primary backstop;
+  advised to the user, leverage left to their discretion.
+- Backtest is controller-only (no session rail); the live SL rail caps trend loss
+  earlier than the raw backtest figure, more so at high leverage.
+
+---
+
 ## Product decision — D-Grid trend phase should pyramid (2026-08-12)
 
 The owner has decided that **dgrid's trend phase should behave like R-Grid** (add

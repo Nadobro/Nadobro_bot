@@ -250,6 +250,43 @@ class MarketMakingController(Controller):
             Decimal(0), _dec(self.cfg("restore_expected_budget_used_usd", "0") or "0")
         )
         self.budget_stop_reason = ""
+        # --- Level recycling ("fill the gaps") -------------------------------
+        # OPT-IN, default OFF — like every flag above, so the inherited
+        # FillAnchoredQuotingController / RGridController stay bit-for-bit
+        # unchanged (they never set these keys). When ON (Mid only) the quoting
+        # anchor is pinned to a SLOWLY-DRIFTING reference instead of the live mid
+        # (see _recycle_theta), so a filled level re-arms at ~the same price — the
+        # reconciler already re-places a terminated level (see _reconcile), so
+        # round-tripped levels RECYCLE to catch reversals ("fill the gaps"), while
+        # the slow drift keeps the grid from going permanently stale in a trend.
+        # The band floor (default 2% below the anchor) suppresses NEW buys deeper
+        # than that — the falling-knife bound — on top of the inventory cap and the
+        # session %-margin SL rail, which remain the HARD bounds. The reservation-
+        # price inventory skew is bypassed in this mode: accumulation is bounded by
+        # the cap, not by shifting the anchor.
+        self.recycle_enabled = bool(_dec(self.cfg("mid_recycle_enabled", "0") or "0"))
+        self.recycle_anchor_mode = str(
+            self.cfg("mid_recycle_anchor_mode", "drift") or "drift"
+        ).lower()
+        # EMA weight per tick toward the live mid (0 = static anchor, 1 = follow the
+        # mid exactly). 0 is HONORED as a static anchor — the mapper emits Decimal(0)
+        # for a user-set 0, and a bare ``or "0.02"`` would treat that falsy value as
+        # "unset" and silently restore drift (only None/"" mean unset). Clamped to
+        # [0, 1] so a malformed value can never diverge.
+        _drift_raw = self.cfg("mid_recycle_drift_alpha", "0.02")
+        if _drift_raw is None or _drift_raw == "":
+            _drift_raw = "0.02"
+        self.recycle_drift_alpha = min(Decimal(1), max(Decimal(0), _dec(_drift_raw)))
+        # Fraction below the anchor beyond which NEW long-side buys are suppressed
+        # (0.02 = 2%). Only a sane band 0 < floor_pct < 1 arms the floor (enforced in
+        # _recycle_theta): floor_pct<=0 would suppress EVERY buy and floor_pct>=1
+        # would silently disable it — both are coerced to "floor off" there instead.
+        _floor_raw = self.cfg("mid_recycle_floor_pct", "0.02")
+        if _floor_raw is None or _floor_raw == "":
+            _floor_raw = "0.02"
+        self.recycle_floor_pct = max(Decimal(0), _dec(_floor_raw))
+        self._recycle_anchor: Optional[Decimal] = None
+        self._recycle_floor_price: Optional[Decimal] = None
 
     # -- level-0 compatibility -------------------------------------------------
     # The ladder generalises what used to be two scalar pairs. Level 0 keeps the
@@ -495,6 +532,41 @@ class MarketMakingController(Controller):
         total = max(-cap, min(cap, total))
         return mid * (Decimal(1) + _dec(str(total)) / Decimal(10000))
 
+    def _recycle_theta(self, mid: Decimal) -> Decimal:
+        """Level-recycling quoting anchor — a slowly-drifting (or static) reference
+        rather than the live mid, so a filled level re-arms at ~the same price and
+        round-tripped levels RECYCLE (the reconciler re-places a terminated level).
+
+        ``drift`` mode nudges the anchor toward the mid by ``recycle_drift_alpha``
+        each tick (a slow EMA, so within-tolerance drift is held by _should_hold and
+        never churns the book), so the grid follows a persistent move instead of
+        going stale; ``static`` freezes the anchor at the session's first mid.
+
+        Also sets ``_recycle_floor_price`` = anchor*(1 - floor_pct): _reconcile
+        suppresses NEW buys below it (the falling-knife bound). The inventory-skew
+        reservation shift is deliberately BYPASSED here — accumulation is bounded by
+        the inventory / net-exposure cap and the session SL rail, not by moving the
+        anchor. Bounds are unchanged; only the quoting reference is.
+        """
+        self.reservation_offset_bp = Decimal(0)
+        self.alpha_offset_bp = Decimal(0)
+        if mid <= 0:
+            return self._recycle_anchor if self._recycle_anchor and self._recycle_anchor > 0 else mid
+        if self._recycle_anchor is None or self._recycle_anchor <= 0:
+            self._recycle_anchor = mid
+        elif self.recycle_anchor_mode != "static" and self.recycle_drift_alpha > 0:
+            self._recycle_anchor += self.recycle_drift_alpha * (mid - self._recycle_anchor)
+        # Arm the floor ONLY for a sane band 0 < floor_pct < 1. Outside that it is
+        # DISABLED (None) rather than degenerate: floor_pct<=0 would put the floor AT
+        # the anchor and suppress every (below-anchor) buy, and floor_pct>=1 would
+        # make the floor price <=0 so it never fires yet reads as "set". When off,
+        # the inventory / net-exposure cap + session SL rail remain the hard bounds.
+        if Decimal(0) < self.recycle_floor_pct < Decimal(1):
+            self._recycle_floor_price = self._recycle_anchor * (Decimal(1) - self.recycle_floor_pct)
+        else:
+            self._recycle_floor_price = None
+        return self._recycle_anchor
+
     # -- Phase 6: signal refresh, degraded mode, mark-out defence -------------
     async def _refresh_alpha(self, mid: Decimal) -> None:
         """Pull the forecast components and blend them. Never raises.
@@ -721,7 +793,11 @@ class MarketMakingController(Controller):
         # two sides can never cross and neither can breach the fee floor.
         # Kept out of ``directional_bias`` on purpose — that field is the
         # user's, and two writers to one field is how dead-bands stop working.
-        theta = self._reservation_price(mid)
+        #
+        # Level recycling ("fill the gaps"): pin the anchor to a slowly-drifting
+        # reference instead of the live mid, so filled levels re-arm at ~the same
+        # price and reversals re-fill them (see _recycle_theta). Bounds unchanged.
+        theta = self._recycle_theta(mid) if self.recycle_enabled else self._reservation_price(mid)
         target_bid = theta * (Decimal(1) - eff_bid_pct)
         target_ask = theta * (Decimal(1) + eff_ask_pct)
         # Touch mode (Turbo Volume): glue quotes to the live touch instead of
@@ -1016,6 +1092,25 @@ class MarketMakingController(Controller):
         order_quote = self.order_amount_quote if size_quote is None else size_quote
         slot = self._slot(is_bid, level)
         cur_id, cur_price = slot.ex_id, slot.price
+
+        # Level-recycling floor (falling-knife bound): never rest a NEW LONG-side
+        # buy below anchor*(1 - floor_pct). A buy that REDUCES a net short is a
+        # profit-taking cover, not fresh risk, so — like the exposure cap's
+        # reduce-only exemption (_projected_order_within_exposure) — it is never
+        # floored; base_value >= 0 means the buy would open/add a LONG, which is the
+        # only exposure this bound exists to cap. (A cover-bid larger than a small
+        # short may flip to a new long below the band; that residual is intentionally
+        # allowed — like every reduce-only path — and stays bounded by the net-
+        # exposure cap, then re-floored next tick once the book reads long.) Forcing
+        # ``allowed`` False cancels
+        # any resting bid that has drifted below the band and skips placing a fresh
+        # one; FILLED inventory is not a resting quote and is untouched (the exits +
+        # the session SL manage it). ``_recycle_floor_price`` is None for every
+        # non-recycling controller, so this is inert for Grid / R-Grid / plain Mid.
+        if (is_bid and self._recycle_floor_price is not None
+                and target > 0 and target < self._recycle_floor_price
+                and self._base_value(mid) >= 0):
+            allowed = False
 
         # Include the next order in the exposure decision, not only inventory
         # that has already filled. This also cancels a partially filled resting
@@ -1341,4 +1436,10 @@ class MarketMakingController(Controller):
             "expected_budget_usd": float(self.expected_budget_usd),
             "expected_budget_used_usd": float(self.expected_budget_used_usd),
             "budget_stop_reason": self.budget_stop_reason,
+            # Level recycling ("fill the gaps") — empty/0 unless enabled (Mid only).
+            "recycle_enabled": self.recycle_enabled,
+            "recycle_anchor_mode": self.recycle_anchor_mode if self.recycle_enabled else "",
+            "recycle_anchor_price": float(self._recycle_anchor) if self._recycle_anchor else 0.0,
+            "recycle_floor_price": float(self._recycle_floor_price) if self._recycle_floor_price else 0.0,
+            "recycle_floor_pct": float(self.recycle_floor_pct) if self.recycle_enabled else 0.0,
         }

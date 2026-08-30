@@ -1271,6 +1271,25 @@ def map_strategy_config(
                 Decimal(1) if _f(settings, "inventory_skew_enabled", 1.0) > 0 else Decimal(0)
             ),
             "inventory_skew_gamma": Decimal(str(_f(settings, "inventory_skew_gamma", 0.1))),
+            # --- Level recycling ("fill the gaps"): OPT-IN, default OFF -------
+            # After a level round-trips (buy fills, its paired sell closes), re-arm
+            # the entry at ~the same price so a reversal re-fills it. Implemented by
+            # pinning the quoting anchor to a slowly-DRIFTING reference instead of
+            # the live mid (Mid's reconciler already re-places a terminated level).
+            # Bounds unchanged: the band floor (2% below the anchor by default), the
+            # inventory / net-exposure cap, and the session %-margin SL rail remain
+            # the falling-knife backstops. Existing Mid users are untouched (OFF).
+            "mid_recycle_enabled": (
+                Decimal(1) if _f(settings, "mid_recycle_enabled", 0.0) > 0 else Decimal(0)
+            ),
+            # drift (default: slow EMA toward the mid, so the grid follows a
+            # persistent move) or static (freeze the anchor at the session's mid).
+            "mid_recycle_anchor_mode": str(settings.get("mid_recycle_anchor_mode") or "drift"),
+            "mid_recycle_drift_alpha": Decimal(str(_f(settings, "mid_recycle_drift_alpha", 0.02))),
+            # The user setting is a PERCENT (2.0 = 2%); the controller reads a fraction.
+            "mid_recycle_floor_pct": (
+                Decimal(str(_f(settings, "mid_recycle_floor_pct", 2.0))) / Decimal(100)
+            ),
             # --- Mid Mode v3 Phase 6: alpha, mark-out defence, STP -----------
             # The blended Hyperliquid forecast moves the quoting ANCHOR (never
             # directional_bias, which the user owns) and is hard-clamped to
