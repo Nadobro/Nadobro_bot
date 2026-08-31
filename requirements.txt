@@ -14,6 +14,15 @@ Brotli==1.2.0
 # linked-signer keys encrypted under 48.x still decrypt (core/crypto.py).
 cryptography==50.0.0
 eth-account>=0.8.0,<0.9.0
+# Native libsecp256k1 signing backend for eth-keys (the ECDSA under eth-account).
+# WITHOUT this, eth-keys uses its pure-Python backend (eth_keys.backends.native),
+# ~15-25x slower AND GIL-bound for the entire signature — so a strategy's order-
+# signing burst pins the one GIL and starves the single event loop, which is why
+# more CPU didn't fix tap latency (one process, one GIL). coincurve (libsecp256k1)
+# is ~20x faster and RELEASES the GIL during the C sign, so the loop stays
+# responsive and the 2nd vCPU is actually used. eth-keys auto-selects
+# CoinCurveECCBackend whenever coincurve is importable — no code change needed.
+coincurve>=21,<22
 # Direct dependency (lowiq_relay_client, hl_client); also pulled in by openai.
 httpx>=0.27,<1.0
 nado-protocol==0.3.3
