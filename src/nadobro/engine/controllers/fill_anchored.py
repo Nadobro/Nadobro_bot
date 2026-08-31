@@ -333,8 +333,14 @@ class FillAnchoredQuotingController(MarketMakingController):
         # ladder_levels > 1 this rests N levels per side stepping away from the
         # anchor (scaling in/out) instead of the single order that used to sit
         # there until it filled; the per-side total is unchanged either way.
-        await self._quote_side(TradeType.BUY, target_bid, allow_buy, mid)
-        await self._quote_side(TradeType.SELL, target_ask, allow_sell, mid)
+        # Per-cycle opening cap: like Mid, defer only the side that GROWS the
+        # position, never the side that reduces it — otherwise a deep-ladder cap
+        # could withhold the rebalancing leg. A BUY grows while flat/long
+        # (base_value >= 0), a SELL grows while flat/short (base_value <= 0).
+        buy_is_opening = base_value >= 0
+        sell_is_opening = base_value <= 0
+        await self._quote_side(TradeType.BUY, target_bid, allow_buy, mid, is_opening=buy_is_opening)
+        await self._quote_side(TradeType.SELL, target_ask, allow_sell, mid, is_opening=sell_is_opening)
 
         # Step 2 of the stall escalation: if the soft-reset's maker concession
         # can't rebalance, escalate to a bounded reduce-only taker before SL.
