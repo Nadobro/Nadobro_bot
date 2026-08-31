@@ -17,6 +17,22 @@ from enum import Enum
 from typing import AsyncIterator, List, Optional
 
 from src.nadobro.engine.types import OrderType, TradeType
+from src.nadobro.utils.env import env_int
+
+# Per-cycle placement cap (all strategies). Bounds how many EXPOSURE-GROWING or
+# requoting venue writes one engine cycle may issue on a single strategy session,
+# so a deep-ladder re-quote burst can't flood the rate-limited venue and starve
+# the (shared, single-GIL) event loop — the failure that hung the whole bot when
+# a 15-level Mid book churned hundreds of orders in one 180s cycle. It counts and
+# gates ONLY openings/requotes (place_order with reduce_only/never_grow False,
+# cancel_and_place, place_trigger_order); it NEVER counts or gates a risk-reducing
+# write (a reduce-only close/flatten, or the inherently-reduce-only protective
+# stop), so the book can always trim or exit even when the opening budget is spent.
+# It NEVER changes per-order size — it only withholds whole placements, which the
+# reconcile-style controllers re-issue on the next cycle (the #268 lesson: a cap
+# must not resize orders as a side effect). <=0 disables it. Read at call time so
+# a redeploy — or a test monkeypatch — picks up the new value.
+_OPENING_CAP_PER_CYCLE = env_int("NADO_MAX_OPENINGS_PER_CYCLE", 20)
 
 
 class OrderState(Enum):
@@ -108,6 +124,34 @@ class NadoAdapterBase(abc.ABC):
     """
 
     connector_name: str = "nado"
+
+    # -- per-cycle placement budget (see _OPENING_CAP_PER_CYCLE) --------------
+    # State is lazy (getattr-defaulted) so every concrete adapter — live,
+    # simulated, or a test double — inherits the budget without changing its
+    # __init__. The live adapter increments the counter on each successful
+    # opening/requote via _note_opening_placement(); the simulator never
+    # increments, so the cap is inert in backtests (as intended).
+    def begin_cycle(self) -> None:
+        """Reset this session's per-cycle opening/requote counter. Called once
+        per engine cycle (the tick path) before the controller places anything."""
+        self._cycle_openings = 0
+
+    def _note_opening_placement(self) -> None:
+        """Record one successful exposure-growing / requoting placement."""
+        self._cycle_openings = getattr(self, "_cycle_openings", 0) + 1
+
+    def opening_placements_this_cycle(self) -> int:
+        return int(getattr(self, "_cycle_openings", 0))
+
+    def opening_budget_exhausted(self) -> bool:
+        """True once this cycle has issued the configured number of opening/
+        requote placements. Controllers consult this to DEFER further OPENING
+        quotes (never a reducing/exit quote) to the next cycle. Cap <=0 disables
+        the bound entirely."""
+        cap = _OPENING_CAP_PER_CYCLE
+        if cap <= 0:
+            return False
+        return int(getattr(self, "_cycle_openings", 0)) >= cap
 
     @abc.abstractmethod
     async def place_order(

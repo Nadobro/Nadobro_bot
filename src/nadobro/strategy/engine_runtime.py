@@ -299,6 +299,14 @@ class EngineRuntime:
         orch = self._orchestrators.get(key)
         if controller is None or orch is None:
             return
+        # Per-cycle placement budget: the adapter is built ONCE at session start
+        # and reused for every tick, so its opening/requote counter must be zeroed
+        # at the top of each cycle. The START path (build_adapter) hands the
+        # controller a fresh 0-counter, so only the tick path needs the reset.
+        adapter = getattr(controller, "adapter", None)
+        begin_cycle = getattr(adapter, "begin_cycle", None)
+        if callable(begin_cycle):
+            begin_cycle()
         await orch.tick_controller(controller.id)
         self._persist_executors(orch)
 

@@ -107,6 +107,11 @@ class ReverseGridController(Controller):
         # -- live state --
         self._anchor: Optional[Decimal] = None
         self._rungs: List[_Rung] = []
+        # True when the entry ladder was truncated by the per-cycle opening cap and
+        # still has rungs left to place. _maintain_flat keeps re-arming (placing only
+        # the missing rungs) until the ladder is complete, so a capped arm finishes
+        # over the next few ticks instead of resting a permanently-partial ladder.
+        self._ladder_incomplete: bool = False
         self._pos_base: Decimal = Decimal(0)      # last observed signed net (run-only)
         # Venue position that already existed on the product when the run began,
         # captured on the first successful net read and subtracted from held_base so
@@ -216,6 +221,7 @@ class ReverseGridController(Controller):
         # bounds it), and the ladder is armed fresh from the live mid.
         self._anchor = None
         self._rungs = []
+        self._ladder_incomplete = False
         self._pos_base = Decimal(0)
         self._baseline_net = None
         # A fresh run always does the presence-first initial entry (see _maintain_flat).
@@ -422,16 +428,27 @@ class ReverseGridController(Controller):
         if drift > self.reanchor_bands * self.step_pct:
             await self._cancel_all_rungs()
             self._anchor = mid
-        if not self._rungs_resting():
+        # Re-arm when the ladder is empty OR was left partial by the per-cycle
+        # opening cap. _place_ladder only places rungs that are not already resting,
+        # so this completes a capped ladder over successive ticks without
+        # double-placing the rungs that are already on the book.
+        if not self._rungs_resting() or self._ladder_incomplete:
             await self._place_ladder(self._anchor)
 
     def _rungs_resting(self) -> bool:
         return any(not r.fired for r in self._rungs)
 
     async def _place_ladder(self, anchor: Decimal) -> None:
-        """Arm both sides: BUY rungs above the anchor, SELL rungs below it."""
+        """Arm both sides: BUY rungs above the anchor, SELL rungs below it.
+
+        Resumable + cap-aware: skips any (side, level) already resting and stops
+        once the per-cycle opening budget is spent, flagging the ladder incomplete
+        so ``_maintain_flat`` places the remaining rungs on the next tick. Each rung
+        is sized independently (``_rung_base``), so a truncated ladder never resizes
+        the rungs that do get placed."""
         if anchor <= 0 or self.order_amount_quote <= 0:
             return
+        resting = {(r.side, r.level) for r in self._rungs if not r.fired}
         placed = 0
         for k in range(1, self.levels + 1):
             offset = self.step_pct * Decimal(k)
@@ -441,6 +458,19 @@ class ReverseGridController(Controller):
             ):
                 if level <= 0:
                     continue
+                if (side, level) in resting:
+                    continue          # already on the book — don't double-place
+                # Per-cycle opening cap: stop laying rungs once the budget is spent.
+                # The remaining rungs are placed on the next tick (see _maintain_flat).
+                if self.adapter.opening_budget_exhausted():
+                    self._n_placed += placed
+                    self._ladder_incomplete = True
+                    logger.info(
+                        "revgrid ladder capped: armed %s rungs this cycle, "
+                        "deferring the rest (anchor=%s user=%s pair=%s)",
+                        placed, anchor, self.user_id, self.trading_pair,
+                    )
+                    return
                 size = self._rung_base(level)
                 if size is None or size <= 0:
                     continue
@@ -458,6 +488,7 @@ class ReverseGridController(Controller):
                 self._rungs.append(_Rung(order.id, side, level, size))
                 placed += 1
         self._n_placed += placed
+        self._ladder_incomplete = False
         logger.info(
             "revgrid armed %s trigger rungs around anchor %s (levels=%s step=%s "
             "user=%s pair=%s)",
@@ -493,6 +524,8 @@ class ReverseGridController(Controller):
             except AdapterError:
                 logger.debug("revgrid rung cancel failed digest=%s", r.digest, exc_info=True)
         self._rungs = []
+        # No ladder on the book — the next flat arm starts a fresh, complete lay.
+        self._ladder_incomplete = False
 
     async def _cancel_side_rungs(self, side: TradeType) -> None:
         keep: List[_Rung] = []

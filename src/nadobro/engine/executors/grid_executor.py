@@ -308,6 +308,14 @@ class GridExecutor(Executor):
         for level in self.levels:
             if placed >= self.config.max_orders_per_batch:
                 break
+            # Per-cycle opening budget (all strategies): once this cycle has issued
+            # its allotted opening placements across every executor on this session,
+            # stop opening NEW rungs — leave them NOT_ACTIVE so the next tick re-scans
+            # and places them (identical to the suppress_new_entries / batch-cap
+            # deferral: no state mutates, size is unchanged, close legs and stops keep
+            # running). Bounds the deep-ladder signing burst without resizing orders.
+            if self.adapter.opening_budget_exhausted():
+                break
             if level.state is GridLevelState.NOT_ACTIVE and self._within_bounds(level.open_price, mid):
                 await self._place_open(level)
                 placed += 1

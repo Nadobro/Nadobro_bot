@@ -811,8 +811,17 @@ class MarketMakingController(Controller):
         # Observation only — must run AFTER targets are fixed so it cannot
         # influence them, and never raise into the quoting path.
         await self._record_microstructure(mid, target_bid, target_ask)
-        await self._quote_side(TradeType.BUY, target_bid, allow_buy, mid)
-        await self._quote_side(TradeType.SELL, target_ask, allow_sell, mid)
+        # Opening vs reducing side, for the per-cycle placement cap. A BUY opens/adds
+        # while flat or long (base_value >= 0) and REDUCES a short otherwise; a SELL
+        # opens/adds while flat or short (base_value <= 0) and REDUCES a long. The
+        # opening budget may DEFER only the opening side's quotes to the next cycle —
+        # never the side that trims inventory — so a capped cycle can still always
+        # work an existing position back toward neutral. (When flat, base_value == 0,
+        # both sides are opening and both are subject to the bound.)
+        buy_is_opening = base_value >= 0
+        sell_is_opening = base_value <= 0
+        await self._quote_side(TradeType.BUY, target_bid, allow_buy, mid, is_opening=buy_is_opening)
+        await self._quote_side(TradeType.SELL, target_ask, allow_sell, mid, is_opening=sell_is_opening)
 
     async def _record_microstructure(
         self, mid: Decimal, target_bid: Decimal, target_ask: Decimal
@@ -968,9 +977,13 @@ class MarketMakingController(Controller):
             slot.price = None
 
     async def _quote_side(
-        self, side: TradeType, base_target: Decimal, allowed: bool, mid: Decimal
+        self, side: TradeType, base_target: Decimal, allowed: bool, mid: Decimal,
+        *, is_opening: bool = True,
     ) -> None:
-        """Reconcile the whole ladder on one side against ``base_target``."""
+        """Reconcile the whole ladder on one side against ``base_target``.
+
+        ``is_opening`` marks whether this side GROWS exposure (so the per-cycle
+        opening budget may defer its placements) or REDUCES it (never deferred)."""
         is_bid = side is TradeType.BUY
         plan = (
             self._plan_side(mid, base_target=base_target, is_bid=is_bid)
@@ -979,7 +992,7 @@ class MarketMakingController(Controller):
         if not plan:
             # Degenerate deployment/target: fall through to the single-quote path
             # so behaviour is exactly what it was before the ladder existed.
-            await self._reconcile(side, base_target, allowed, mid)
+            await self._reconcile(side, base_target, allowed, mid, is_opening=is_opening)
             await self._retire_levels_beyond(is_bid, 1)
             return
         if len(plan) > 1:
@@ -995,6 +1008,7 @@ class MarketMakingController(Controller):
                 mid,
                 level=lvl.index,
                 size_quote=lvl.size_quote,
+                is_opening=is_opening,
             )
         await self._retire_levels_beyond(is_bid, len(plan))
 
@@ -1087,6 +1101,7 @@ class MarketMakingController(Controller):
     async def _reconcile(
         self, side: TradeType, target: Decimal, allowed: bool, mid: Decimal,
         *, level: int = 0, size_quote: Optional[Decimal] = None,
+        is_opening: bool = True,
     ) -> None:
         is_bid = side is TradeType.BUY
         order_quote = self.order_amount_quote if size_quote is None else size_quote
@@ -1132,6 +1147,18 @@ class MarketMakingController(Controller):
             if cur_id is not None:
                 await self.orchestrator.stop(cur_id)
                 self._set_quote(is_bid, None, None, level=level)
+            return
+
+        # Per-cycle opening budget: once this cycle has spent its opening/requote
+        # allotment, DEFER further OPENING quotes to the next cycle. This runs after
+        # the not-allowed cancel above (an over-cap cycle must still cancel a quote
+        # it no longer wants) and only affects the OPENING side — the reducing side
+        # (is_opening False) is never deferred, so inventory can always be trimmed.
+        # Deferral is safe and non-destructive: an empty slot is re-spawned next
+        # cycle, and a resting quote is simply left in place (its price stays valid
+        # one more cycle); no order is resized. Bounds the deep-ladder requote burst
+        # that starved the loop.
+        if is_opening and self.adapter.opening_budget_exhausted():
             return
 
         if cur_id is not None and cur_price is not None:

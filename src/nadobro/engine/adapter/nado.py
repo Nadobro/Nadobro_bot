@@ -530,6 +530,14 @@ class NadoAdapter(NadoAdapterBase):
             raise AdapterError(f"place_order rejected by venue: {err}")
 
         order = self._order_from_response(resp, trading_pair, side, order_type, amount_base, price)
+        # Per-cycle placement budget: count only EXPOSURE-GROWING placements. A
+        # reducing order is exempt — ``never_grow`` captured the reduce_only intent
+        # BEFORE the spot strip (nado.py:371), so it is the reliable "this is an
+        # exit" signal even on a spot leg where reduce_only was stripped to False.
+        # Reducing writes are never counted and never capped: the book must always
+        # be able to trim inventory or close. See NadoAdapterBase / _OPENING_CAP_PER_CYCLE.
+        if not never_grow:
+            self._note_opening_placement()
         # Link the venue digest to the tag so stream events keyed by EITHER the
         # client id (tag) OR the digest resolve back to this order's metadata.
         order_tags.bind_digest(tag, order.id)
@@ -683,6 +691,11 @@ class NadoAdapter(NadoAdapterBase):
             raise AdapterError(f"cancel_and_place response parse failed: {exc}") from exc
         order_tags.bind_digest(tag, order.id)
         order_lifecycle.seed(order.id, state=order.state, tag=tag)
+        # A fused requote is one signed venue write, so it counts against the
+        # per-cycle budget like a fresh quote. cancel_and_place is a net-neutral
+        # REPLACE (Mid only) — never a reducing close (nado.py:618-619) — so it is
+        # always a budgeted opening/requote here.
+        self._note_opening_placement()
         if self._on_place is not None:
             try:
                 await _db(self._on_place, order.id)
@@ -803,6 +816,10 @@ class NadoAdapter(NadoAdapterBase):
         # this run (turnover / realized PnL). Best-effort, off the event loop — a
         # link failure must never fail a placed trigger.
         await self._link_placement(digest)
+        # A Reverse-Grid entry rung is an exposure-growing opening (base.py contract:
+        # place_trigger_order OPENS/GROWS, never reduces), so it counts against the
+        # per-cycle opening budget.
+        self._note_opening_placement()
         return NadoOrder(
             id=digest, trading_pair=trading_pair, side=side,
             order_type=OrderType.LIMIT, amount_base=abs(_dec(amount_base)),
