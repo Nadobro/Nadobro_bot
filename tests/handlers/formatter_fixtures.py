@@ -349,6 +349,7 @@ CASES: list[tuple[str, str, tuple, dict]] = [
     ("home_command_center__mainnet", "fmt_home_command_center_card", ("mainnet", "$2,481.09"), {}),
     ("home_command_center__testnet", "fmt_home_command_center_card", ("testnet", "$0.00"), {}),
     ("home_command_center__updating", "fmt_home_command_center_card", ("mainnet", "updating…"), {}),
+    ("home_command_center__na", "fmt_home_command_center_card", ("mainnet", "N/A"), {}),
     ("mode_view__mainnet", "fmt_mode_view", ("mainnet",), {}),
     ("mode_view__testnet", "fmt_mode_view", ("testnet",), {}),
 

@@ -42,6 +42,8 @@ UPDATE = os.environ.get("NADO_UPDATE_SNAPSHOTS") == "1"
 # pretending the cards have no clock in them.
 FROZEN_UPTIME = "6h 30m"
 FROZEN_AGE = "12s"
+# STATUS_RUNNING.worker_last_heartbeat + 12 → heartbeat age 12s → "live" state.
+FROZEN_NOW = 1_756_000_012.0
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +51,11 @@ def _deterministic_render(monkeypatch):
     """Pin the clock and the language so a snapshot is a pure function of input."""
     monkeypatch.setattr(F, "_fmt_uptime", lambda _started_at: FROZEN_UPTIME if _started_at else "—")
     monkeypatch.setattr(F, "_fmt_age_seconds", lambda ts: FROZEN_AGE if ts else "—")
+    # Freeze wall-clock so the status card's heartbeat-freshness line (which
+    # compares time.time() to worker_last_heartbeat) is deterministic. The
+    # STATUS_RUNNING fixture's heartbeat is FROZEN_NOW - 12s, so it renders the
+    # "live" state; _fmt_age_seconds is already stubbed to "12s" to match.
+    monkeypatch.setattr(F.time, "time", lambda: FROZEN_NOW)
     # Cards route every string through i18n; pin to English so a translation
     # edit cannot silently rewrite the snapshot of an unrelated screen.
     monkeypatch.setattr(F, "get_active_language", lambda: "en")

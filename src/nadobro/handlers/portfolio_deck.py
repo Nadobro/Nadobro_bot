@@ -10,7 +10,7 @@ from src.nadobro.handlers.orders_view import order_kind_label
 from src.nadobro.core.feature_flags import portfolio_sync_enabled, portfolio_sync_interval_seconds
 from src.nadobro.venue.nado_sync import sync_user
 from src.nadobro.users.user_service import get_user
-from src.nadobro.utils.visual import b, divider, esc, money, pct, pnl_dot, signed_money, stale_banner, time_ago
+from src.nadobro.utils.visual import b, divider, esc, freshness_line, money, pct, pnl_dot, signed_money, time_ago
 
 
 _VALID_WINDOWS = ("24h", "7d", "30d", "all")
@@ -133,7 +133,6 @@ def render_portfolio_deck(
     equity = snapshot.get("equity") or {}
     last_sync = _as_dt(snapshot.get("last_sync"))
     threshold = (portfolio_sync_interval_seconds() * 2) if portfolio_sync_enabled() else 300
-    stale = stale_banner(last_sync, threshold) if last_sync else "⚠️ Never synced"
 
     total_upnl = sum((_dec(p.get("est_pnl")) for p in positions if p.get("est_pnl") is not None), Decimal("0"))
     total_balance = _dec(equity.get("total")) if equity else Decimal("0")
@@ -148,16 +147,15 @@ def render_portfolio_deck(
     fees_window = _window_value(stats, "fees_windows", window)
     funding_window = _window_value(stats, "funding_windows", window)
 
-    if refreshing:
-        sync_line = f"🔄 Refreshing · showing {time_ago(last_sync) if last_sync else 'cached'} data"
-    elif snapshot.get("stale") and snapshot.get("error"):
-        # The last refresh ATTEMPT failed (gateway circuit, venue error).
-        # Don't claim "Live" — say what the user is actually looking at.
-        sync_line = f"⚠️ Sync issue · showing {time_ago(last_sync) if last_sync else 'cached'} data"
-    elif stale:
-        sync_line = stale
-    else:
-        sync_line = f"🟢 Live · synced {time_ago(last_sync)}"
+    # Shared freshness contract (utils.visual.freshness_line). Behaviour is
+    # byte-identical to the four states this deck pioneered; the degraded
+    # state fires when the last refresh ATTEMPT failed (gateway / venue error).
+    sync_line = freshness_line(
+        last_sync,
+        threshold_s=threshold,
+        refreshing=refreshing,
+        degraded=bool(snapshot.get("stale") and snapshot.get("error")),
+    )
 
     # Funding sign convention: positive = paid (a cost), negative = received.
     if funding_window > 0:

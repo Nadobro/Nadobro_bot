@@ -133,3 +133,44 @@ def stale_banner(last_sync: datetime, threshold_s: int) -> Optional[str]:
     if age_s <= int(threshold_s):
         return None
     return f"⚠ Stale · last sync {time_ago(last_sync)}"
+
+
+def freshness_line(
+    last_sync: Optional[datetime],
+    *,
+    threshold_s: int,
+    refreshing: bool = False,
+    degraded: bool = False,
+) -> str:
+    """The one-line freshness declaration for a data card backed by a sync clock.
+
+    The freshness contract (Phase 3): a card never presents a number as live
+    when it is cached or degraded. This is the shared implementation of the
+    four states ``render_portfolio_deck`` pioneered, lifted here (a leaf, beside
+    its only dependencies ``time_ago``/``stale_banner``, with no config or
+    feature-flag import) so any renderer — MarkdownV2 or HTML — can reach it.
+
+    Returns PLAIN text (no markup); MarkdownV2 callers escape it as usual. The
+    caller computes ``threshold_s`` from its own feature flags so this stays a
+    pure leaf.
+
+    - ``refreshing`` — a cached view is shown while a background sync lands.
+    - ``degraded`` — the last refresh ATTEMPT failed; don't claim "Live", say
+      what the user is actually looking at.
+    - otherwise: stale (past threshold) → a stale banner; fresh → live + age.
+
+    The glyphs and wording are byte-for-byte what the deck shipped, because the
+    deck is only partially test-pinned and not in the formatter snapshot; the
+    ⚠️ in the degraded/never states carries U+FE0F, the bare ⚠ in the stale
+    banner does not — both preserved deliberately.
+    """
+    if refreshing:
+        return f"🔄 Refreshing · showing {time_ago(last_sync) if last_sync else 'cached'} data"
+    if degraded:
+        return f"⚠️ Sync issue · showing {time_ago(last_sync) if last_sync else 'cached'} data"
+    if last_sync is None:
+        return "⚠️ Never synced"
+    stale = stale_banner(last_sync, threshold_s)
+    if stale:
+        return stale
+    return f"🟢 Live · synced {time_ago(last_sync)}"

@@ -1114,8 +1114,30 @@ def _fmt_network_balance_snapshot(network: str, balance_str: str) -> str:
             f"*{_loc('Quick snapshot')}*",
             f"├ {net_emoji} *Mode:* {escape_md(net_name)}",
             f"├ 💵 *USDT:* {escape_md(balance_str)}",
+            _fmt_balance_freshness(balance_str),
         ]
     )
+
+
+def _fmt_balance_freshness(balance_str: str) -> str:
+    """The tree-closing freshness line for the home balance snapshot.
+
+    Freshness contract (Phase 3), at the only fidelity this surface supports.
+    The home balance is served exclusively from cache (the click path never
+    touches the gateway) and the cache carries no timestamp, so there is no age
+    and it can never honestly claim "Live" — the Portfolio deck is the
+    age-bearing surface. This closes the ├ tree (previously open) and turns the
+    bare value sentinels into explained states:
+
+      • "updating…" → a background warm is in flight
+      • "$X"        → a cached snapshot; deck has the live, age-stamped figure
+      • "N/A"       → no cached value (not linked, throttled, or errored)
+    """
+    if balance_str == "updating…":
+        return f"└ 🔄 {_loc_md('Refreshing balance…')}"
+    if balance_str.startswith("$"):
+        return f"└ 🕔 {_loc_md('Cached')} · {_loc_md('open Portfolio for the live figure')}"
+    return f"└ ⚪ {_loc_md('Balance unavailable')}"
 
 
 def fmt_home_command_center_card(network: str, balance_str: str) -> str:
@@ -1595,6 +1617,35 @@ def _fmt_age_seconds(ts: float) -> str:
         return "—"
 
 
+def _fmt_heartbeat_freshness(worker_last_heartbeat, interval_seconds: int) -> str | None:
+    """One MarkdownV2 line declaring whether a running worker is ticking.
+
+    Three honest states, keyed off the worker heartbeat epoch:
+      • warming up — heartbeat 0.0 (no cycle completed yet); assert neither
+        live nor stale, just that the first cycle is pending.
+      • live — heartbeat within ~2 cycles; the numbers above are current.
+      • stalling — heartbeat older than that; at least one scheduled tick was
+        missed, so the numbers are last-known, not live.
+
+    The stale cutoff is ``max(2 * interval, 90)`` — two missed cycles, with a
+    90s floor so a fast strategy (rgrid/mid/vol at an ~8s cadence) doesn't flag
+    stale during a single slow render. Returns ``None`` if the heartbeat is
+    unusable, so a malformed value drops the line rather than lying.
+    """
+    try:
+        hb = float(worker_last_heartbeat or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if hb <= 0:
+        return f"{_loc('Feed')}: *{_loc('warming up')}* · {_loc('first cycle pending')}"
+    age = max(0, int(time.time() - hb))
+    cutoff = max(2 * int(interval_seconds or 0), 90)
+    age_str = _fmt_age_seconds(hb)
+    if age <= cutoff:
+        return f"{_loc('Feed')}: *{_loc('live')}* ✅ · {_loc('heartbeat')} {escape_md(age_str)}"
+    return f"{_loc('Feed')}: *{_loc('stalling')}* ⚠️ · {_loc('last heartbeat')} {escape_md(age_str)}"
+
+
 def _fmt_progress_bar(done: float, total: float, width: int = 12) -> str:
     total_v = max(0.0, float(total or 0.0))
     done_v = max(0.0, float(done or 0.0))
@@ -1718,6 +1769,15 @@ def fmt_status_overview(status: dict, onboarding: dict):
         f"*{escape_md(strategy)} · {escape_md(product_label)}*",
         f"{_loc('Status')}: *{escape_md(state_label)}* \\| {runtime_summary}",
     ])
+    # Freshness contract (Phase 3): a running strategy declares whether its
+    # worker is actually ticking. worker_last_heartbeat is written once per
+    # cycle (bot_runtime), so a heartbeat older than ~2 cycles means at least
+    # one scheduled tick was missed — the numbers above are then last-known,
+    # not live. Additive: a new line, no existing field touched. Stopped
+    # strategies never reach here, so no dead "heartbeat" line on an OFF card.
+    hb_line = _fmt_heartbeat_freshness(status.get("worker_last_heartbeat"), interval)
+    if hb_line:
+        lines.append(hb_line)
     # GATE-VISIBILITY (2026-07-31): while the regime gate pauses quoting, the
     # card used to read "LIVE … Last cycle: OK" with zero orders — dark quoting
     # was invisible. Name the state, the reason, and how long it has held.
