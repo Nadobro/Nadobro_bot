@@ -14,6 +14,7 @@ from telegram.ext import CallbackContext, ContextTypes
 
 from src.nadobro.core.async_utils import fire_and_forget
 from src.nadobro.core.perf import increment_counter
+from src.nadobro.handlers.ui import toast_for
 from src.nadobro.i18n import get_active_language, localize_text
 from src.nadobro.utils.env import env_float
 
@@ -53,10 +54,18 @@ async def _lock_for_user(telegram_id: int) -> asyncio.Lock:
         return lock
 
 
-async def _safe_answer(query) -> None:
-    """Clear Telegram's button spinner; stale/expired queries are not an error."""
+async def _safe_answer(query, text: str | None = None) -> None:
+    """Clear Telegram's button spinner; stale/expired queries are not an error.
+
+    When ``text`` is given it rides along as a non-modal toast — the tap's
+    acknowledgement (Phase 2). It is the SAME single Telegram call the bare ack
+    already made, with one extra field, so it adds no round-trip to the tap path.
+    """
     try:
-        await query.answer()
+        if text:
+            await query.answer(text=text)
+        else:
+            await query.answer()
     except BadRequest as exc:
         msg = str(exc)
         if "Query is too old" not in msg and "query id is invalid" not in msg:
@@ -79,7 +88,11 @@ def with_callback_ack(
     async def _wrapped(update: Update, context: CallbackContext):
         query = update.callback_query
         if query is not None and (query.data or "") not in _NO_PREACK_CALLBACK_DATA:
-            fire_and_forget(_safe_answer(query), name="callback-ack")
+            # Toast text is derived from callback_data alone (pure map, no IO) so
+            # it stays on the "instant, no work" pre-ack path. An unmapped tap
+            # gets today's silent bare ack — no regression, never a wrong verb.
+            toast = toast_for(query.data or "")
+            fire_and_forget(_safe_answer(query, toast), name="callback-ack")
         return await handler(update, context)
 
     return _wrapped

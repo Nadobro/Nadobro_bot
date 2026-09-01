@@ -220,3 +220,102 @@ def pager(label: str) -> tuple[str, str]:
 # Anything added here would be a duplicate that immediately starts drifting —
 # which is the exact failure this module exists to end.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Callback toasts
+#
+# The tap-acknowledgement layer (Phase 2). Telegram gives a bot exactly one
+# feedback channel for an inline-button tap: the answer to the callback query.
+# The bot already spends it on a bare ``answer()`` before the per-user lock, so
+# the spinner clears instantly — but a bare answer is silent, so a tap that
+# takes two seconds looks identical to one that did nothing.
+#
+# ``toast_for`` turns that same single answer into a one-line present-tense
+# acknowledgement — "Placing your order…", "Loading portfolio…" — derived from
+# ``callback_data`` ALONE, because the pre-ack fires before the handler has run
+# and before the lock is held. No lookup, no IO: a pure string map.
+#
+# Accuracy is the whole point, so the bias is deliberately conservative — an
+# UNMAPPED callback keeps today's silent bare ack (no regression), while a WRONG
+# verb would actively lie about what a tap does. So a verb is added only for a
+# callback whose behaviour was read from the handler, and the screen-vs-execute
+# distinction is honoured: ``pos:close_all`` merely opens a confirm dialog and
+# is intentionally NOT mapped, while ``pos:confirm_close_all`` (which executes)
+# is. Sub-flow micro-steps (a size tap, a leverage tap) stay silent too —
+# toasting each one would be noise, not feedback.
+#
+# Localization is intentionally deferred to Phase 5 (the i18n/copy pass): these
+# verbs are English here, and the pre-ack stays free of the cache/DB lookup a
+# localized toast would require. The verb is transient (~1s) and is replaced by
+# the fully-localized card, so the cost of English-for-now is small and bounded.
+# ---------------------------------------------------------------------------
+
+
+def toast_for(data: str) -> str | None:
+    """Present-tense acknowledgement for an inline-button tap, or None.
+
+    ``None`` means "no toast" — the caller falls back to today's bare ack. Pure
+    and total: any unmapped or malformed ``data`` simply returns ``None``.
+    """
+    if not data:
+        return None
+
+    def pre(*prefixes: str) -> bool:
+        return any(data.startswith(p) for p in prefixes)
+
+    # --- actions that execute something (verb = what is happening now) ---
+    if pre("card:trade:") and data.endswith(":confirm"):
+        return "Placing your order…"
+    if pre("exec_trade:"):
+        return "Placing your order…"
+    if pre("pos:close:"):
+        return "Closing position…"
+    if data == "pos:confirm_close_all":
+        return "Closing everything…"
+    if pre("strategy:startok:", "strategy:start:"):
+        return "Starting strategy…"
+    if data == "strategy:stop":
+        return "Stopping strategy…"
+    if pre("mode:"):
+        return "Switching mode…"
+    if data in ("refer:claim", "refer:autogen"):
+        return "Claiming your code…"
+    if pre("alert:del:"):
+        return "Deleting alert…"
+
+    # --- refreshes ---
+    if data in ("nav:refresh", "status:refresh", "strategy:status"):
+        return "Refreshing…"
+    if data == "pos:view":
+        return "Loading positions…"
+
+    # --- screen loads that do real fetching (verb = loading X) ---
+    if data == "portfolio:view":
+        return "Loading portfolio…"
+    if data == "portfolio:performance":
+        return "Loading performance…"
+    if pre("portfolio:history"):
+        return "Loading history…"
+    if data == "wallet:view":
+        return "Loading wallet…"
+    if data == "points:view":
+        return "Loading points…"
+    if data == "refer:view":
+        return "Loading referrals…"
+    if data == "alert:menu":
+        return "Loading alerts…"
+    if data == "settings:view":
+        return "Loading settings…"
+    if data == "vault:home":
+        return "Loading vault…"
+    if data == "resources:home":
+        return "Opening links…"
+    if data == "desk:view":
+        return "Opening Nadobro…"
+    if data == "card:trade:start":
+        return "Opening trade console…"
+    if data == "nav:strategy_hub":
+        return "Loading strategies…"
+
+    return None
