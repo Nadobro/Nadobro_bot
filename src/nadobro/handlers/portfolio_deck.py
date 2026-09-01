@@ -295,31 +295,3 @@ def _as_dt(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-# --- Engine v2 portfolio (per-controller PnL) -----------------------------
-async def fetch_engine_portfolio_state(user_id: int):
-    """Engine v2 portfolio state, sourced through engine.portfolio (no
-    handler-level PnL aggregation)."""
-    from src.nadobro.portfolio.portfolio_history_worker import build_db_portfolio
-
-    return await build_db_portfolio().state(user_id)
-
-
-def render_per_controller_pnl(state: Any) -> str:
-    """Render the per-controller PnL section from engine.portfolio.state().
-
-    Returns '' when there are no engine-managed controllers, so the existing
-    deck is unchanged until the engine is driving trades.
-    """
-    per = getattr(state, "per_controller", {}) or {}
-    if not per:
-        return ""
-    lines = ["", "*Strategy PnL (per controller)*"]
-    for cid, pnl in per.items():
-        lines.append(
-            f"`{cid}` · net ${pnl.net:.2f} "
-            f"(realized ${pnl.realized:.2f} · unrealized ${pnl.unrealized:.2f} · "
-            f"fees ${pnl.fees:.2f}) · {pnl.open_executors} open"
-        )
-    return "\n".join(lines)
