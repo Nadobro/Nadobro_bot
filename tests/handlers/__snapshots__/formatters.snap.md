@@ -10,7 +10,7 @@ Regenerate with `NADO_UPDATE_SNAPSHOTS=1 pytest tests/handlers/test_formatter_sn
 
 ```
 🔔 *Alerts*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *What you can set*
 ├ Price alerts
@@ -26,7 +26,7 @@ _Pick an action below\._
 ```
 🔔 *Create Alert*
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _Choose the asset you want to monitor\._
 ```
@@ -36,7 +36,7 @@ _Choose the asset you want to monitor\._
 
 ```
 ⚠️ *Close everything?*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 This closes every open position in your current mode\.
 
@@ -168,7 +168,7 @@ _Your trading bro's online\. Let's get it\._
 
 ```
 🧠 *Managed AI* is *OFF*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Back to standard Nadobro chat\.
 
@@ -180,7 +180,7 @@ _Turn it back on anytime:_ `/agent\_on`
 
 ```
 🧠 *Managed AI* is *ON*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Just talk to me normally\.
 I send *analysis* to the brain and run any *strategy* through the usual safety checks first\.
@@ -193,7 +193,7 @@ _Check anytime with_ `/agent\_status`\.
 
 ```
 🧠 *Managed AI mode*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ⚠️ *Turned off by ops* right now\.
 Try again a bit later\.
@@ -204,7 +204,7 @@ Try again a bit later\.
 
 ```
 🔄 *Revoke 1CT Key \(Nado\)*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 1\. Open Nado → Settings
 2\. 1\-Click Trading → Advanced 1CT
@@ -235,7 +235,7 @@ _Pick one below\._
 ```
 💰 *Wallet Balance*
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ⚠️ Could not fetch balance right now\. Try again shortly\.
 ```
@@ -246,7 +246,7 @@ _Pick one below\._
 ```
 🔄 *Revoke 1CT Key*
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Steps*
 ├ 1\. Open Nado → Settings
@@ -285,7 +285,7 @@ _Your trading bro's online\. Let's get it\._
 ├ ⚙️ *Settings* · leverage and slippage
 └ 🌐 *Execution Mode* · mainnet or testnet
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _Tap a button, or just type\. I'll answer questions and place trades in plain English\._
 ```
@@ -319,7 +319,7 @@ _Your trading bro's online\. Let's get it\._
 ├ ⚙️ *Settings* · leverage and slippage
 └ 🌐 *Execution Mode* · mainnet or testnet
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _Tap a button, or just type\. I'll answer questions and place trades in plain English\._
 ```
@@ -353,7 +353,7 @@ _Your trading bro's online\. Let's get it\._
 ├ ⚙️ *Settings* · leverage and slippage
 └ 🌐 *Execution Mode* · mainnet or testnet
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _Tap a button, or just type\. I'll answer questions and place trades in plain English\._
 ```
@@ -363,7 +363,7 @@ _Tap a button, or just type\. I'll answer questions and place trades in plain En
 
 ```
 🌐 *Execution Mode*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Quick snapshot*
 └ *Current mode:* 🌐 MAINNET
@@ -376,7 +376,7 @@ _Mainnet trades real funds\. Testnet is your sandbox\. Flip anytime\._
 
 ```
 🌐 *Execution Mode*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Quick snapshot*
 └ *Current mode:* 🧪 TESTNET
@@ -389,7 +389,7 @@ _Mainnet trades real funds\. Testnet is your sandbox\. Flip anytime\._
 
 ```
 📋 *Open Positions*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 No open positions\.
 ```
@@ -399,7 +399,7 @@ No open positions\.
 
 ```
 📋 *Open Positions*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 *Snapshot*
 └ 🌐 *Mode:* 🌐 MAINNET
 
@@ -411,7 +411,7 @@ No open positions\.
 
 ```
 📋 *Open Positions*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Snapshot*
 ├ 🌐 *Mode:* 🌐 MAINNET
@@ -421,7 +421,7 @@ No open positions\.
 Size: *0\.0500 BTC* \| uPnL: 🟢 *\+$62\.54*
 Entry: $92,000\.00 \| Mark: $93,250\.75 \| Liq: $84,150\.25
 
-━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━
 
 🔴 *SHORT* ETH\-PERP
 Size: *1\.5000 ETH* \| uPnL: 🟢 *\+$60\.45*
@@ -435,7 +435,7 @@ Entry: $3,120\.40 \| Mark: $3,080\.10 \| Liq: $3,480\.00
 
 ```
 📋 *Open Positions*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Snapshot*
 └ 📌 *Total:* 1
@@ -450,7 +450,7 @@ Entry: $92,000\.00 \| Mark: — \| Liq: $84,150\.25
 
 ```
 📁 *Portfolio Deck*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🌐 *Mode:* 🌐 MAINNET
 
@@ -458,7 +458,7 @@ Entry: $92,000\.00 \| Mark: — \| Liq: $84,150\.25
 📌 *Open Positions:* 2 \| 📬 *Open Orders:* 1
 💎 *Position Value:* $9,282\.69 \| 🟢 *Unrealized PnL:* \+$122\.99
 
-━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Bot Trading Stats*
 💰 *Volume:* 24h $41,200\.00 \| 7d $288,400\.00
@@ -482,7 +482,7 @@ Entry: $92,000\.00 \| Mark: — \| Liq: $84,150\.25
 
 ```
 📁 *Portfolio Deck*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🌐 *Mode:* 🌐 MAINNET
 
@@ -501,7 +501,7 @@ No open positions right now\.
 
 ```
 📊 *Trading Analytics*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🌐 *Mode:* 🌐 MAINNET
 
@@ -509,7 +509,7 @@ No open positions right now\.
 🟢 *Total PnL:* \+$842\.19 \| 🏆 *Win Rate:* 57\.8%
 📋 *Total Trades:* 128 \| ✅ *Wins:* 74 \| ❌ *Losses:* 54
 
-━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Volume*
 💰 *24h:* $41,200\.00 \| *7d:* $288,400\.00
@@ -517,7 +517,7 @@ No open positions right now\.
 💰 *Total Volume:* $1,284,500\.00 \| 📏 *Avg Trade Size:* $5,057\.09
 💸 *Fees:* $61\.44 \| 🌀 *Funding:* $\-12\.08
 
-━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Outcomes*
 ✅ *Filled:* 126 \| 🔒 *Closed:* 128 \| ❌ *Failed:* 2
@@ -532,7 +532,7 @@ No open positions right now\.
 
 ```
 📊 *Trading Analytics*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 No trades recorded yet\.
 ```
@@ -542,7 +542,7 @@ No trades recorded yet\.
 
 ```
 📜 *Trade History*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🌐 *Mode:* 🌐 MAINNET
 
@@ -566,7 +566,7 @@ Entry: 3,200\.00 → Exit: 3,260\.00
 
 ```
 📜 *Trade History*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 No trade history yet\.
 ```
@@ -576,7 +576,7 @@ No trade history yet\.
 
 ```
 🔔 *Alerts*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Snapshot*
 └ 📌 *Active alerts:* 2
@@ -595,7 +595,7 @@ Target: *$2,900\.00* \| ID: *\#12* \| Mode: *MAINNET*
 
 ```
 🔔 *Alerts*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 No alerts set yet\.
 
@@ -608,7 +608,7 @@ Tap *Set Alert* to add a price, funding, or PnL trigger\.
 ```
 🔔 *BTC\-PERP Alert*
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _Choose the trigger type below\._
 ```
@@ -619,7 +619,7 @@ _Choose the trigger type below\._
 ```
 🔔 *BTC\-PERP*
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Trigger*
 └ above
@@ -633,7 +633,7 @@ Enter the target value in chat\.
 
 ```
 💼 *Wallet Vault*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 📊 *Network:* 🌐 MAINNET
 
@@ -654,7 +654,7 @@ _Use Wallet actions below to view balance, link, or revoke your trading signer\.
 
 ```
 💼 *Wallet Vault*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 📊 *Network:* 🧪 TESTNET
 
@@ -672,7 +672,7 @@ _Use Wallet actions below to view balance, link, or revoke your trading signer\.
 
 ```
 💰 *Wallet Vault Balance*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 💵 *USDT0:* $2,481\.09
 
@@ -684,7 +684,7 @@ _Use Wallet actions below to view balance, link, or revoke your trading signer\.
 
 ```
 💰 *Wallet Vault Balance*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ⚠️ No subaccount found\.
 
@@ -696,7 +696,7 @@ _Use Wallet actions below to view balance, link, or revoke your trading signer\.
 ```
 💰 *Wallet Balance*
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Quick snapshot*
 └ *Available USDT0:* $2,481\.09
@@ -708,7 +708,7 @@ _Use Wallet actions below to view balance, link, or revoke your trading signer\.
 ```
 👛 *Wallet Connect*
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Setup steps*
 ├ 1\. Open https://app\.nado\.xyz\?join\=FzpOSwX, connect your wallet, and deposit at least $5 USDT0\.
@@ -842,7 +842,7 @@ no open position
 
 ```
 🛑 *Automation stopped*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 3 strategies stopped
 
@@ -854,7 +854,7 @@ _Check Positions if exposure remains\._
 
 ```
 ⚠️ *Stop automation*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 gateway timeout
 
@@ -866,7 +866,7 @@ _Retry in a moment\._
 
 ```
 📡 *Status*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Network: *TESTNET*
 
 *GRID · BTC\-PERP*
@@ -896,7 +896,7 @@ Quote health: fill *76%* \| cancel *24%* \| avg distance *0\.0bp*
 
 ```
 📡 *Status*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Network: *TESTNET*
 
 *Setup*
@@ -922,7 +922,7 @@ SL: 0\.75%
 
 ```
 🧪 *Ops Snapshot*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Strategy: *GRID* \| ON
 
 *Queue & Workers*
@@ -941,7 +941,7 @@ Account snapshot: *unavailable*
 
 ```
 🏆 *Your Nado Points Dashboard*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 *Snapshot*
 └ 📅 *Window:* 30d
 
@@ -957,7 +957,7 @@ Account snapshot: *unavailable*
 
 ```
 🏆 *Your Nado Points Dashboard*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 *Snapshot*
 └ 📅 *Window:* 30d
 
@@ -971,7 +971,7 @@ Tip: increase real trading activity and check again after the next weekly epoch\
 
 ```
 🎁 *Referral Deck*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Snapshot*
 🌐 *Mode:* MAINNET
@@ -989,7 +989,7 @@ Codes are permanent and unlimited \- share freely\.
 • *@alpha\_ape* \| $260,400\.00 \| 120 trades
 • *ID 900002* \| $152,500\.00 \| 94 trades
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _Anyone can claim a code; each code is unique and tied to one Nadobro account\._
 ```
 
@@ -998,7 +998,7 @@ _Anyone can claim a code; each code is unique and tied to one Nadobro account\._
 
 ```
 🎁 *Referral Deck*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Snapshot*
 🌐 *Mode:* MAINNET
@@ -1012,7 +1012,7 @@ You don't have a referral code yet\. Pick a custom one \(3\-12 chars, A\-Z and 0
 *Direct Referrals*
 No referrals yet\. Drop your code in the group chats and watch the volume roll in here\.
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _Anyone can claim a code; each code is unique and tied to one Nadobro account\._
 ```
 
@@ -1021,7 +1021,7 @@ _Anyone can claim a code; each code is unique and tied to one Nadobro account\._
 
 ```
 ⚙️ *Settings*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Right now*
 ├ *Risk Profile:* BALANCED
@@ -1036,7 +1036,7 @@ _Buttons below change language, leverage, slippage, and risk preset\._
 
 ```
 🧠 *Managed AI Status*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 *Effective mode:* ON ✅
 *Global ops switch:* ENABLED ✅
@@ -1048,7 +1048,7 @@ _Buttons below change language, leverage, slippage, and risk preset\._
 
 ```
 🧠 *Trading Bro*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 BTC funding is mildly positive on Nado right now\.
 

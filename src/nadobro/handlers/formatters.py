@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from typing import Optional
 from src.nadobro.config import get_product_name, PRODUCTS
 from src.nadobro.i18n import get_active_language, localize_text
+from src.nadobro.handlers import ui as _ui
 
 logger = logging.getLogger(__name__)
 
@@ -17,28 +18,11 @@ def _loc_md(text):
     return escape_md(_loc(text))
 
 
-def escape_md(text):
-    if text is None:
-        return ""
-    text = str(text)
-    text = text.replace('\\', '\\\\')
-    special = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(r'([' + re.escape(special) + r'])', r'\\\1', text)
-
-
-def escape_md_code(text) -> str:
-    """Escape for the INSIDE of a MarkdownV2 ``code``/``pre`` entity.
-
-    Telegram only treats a backtick and a backslash as special inside a code
-    entity; every other reserved character is literal there. Passing such text
-    through :func:`escape_md` therefore injects backslashes that Telegram
-    renders VERBATIM — and for a tap-to-copy block that means the user copies a
-    corrupted value. A 1CT key is pure hex today, so ``escape_md`` happened to
-    be a no-op on it; this makes the guarantee explicit rather than incidental.
-    """
-    if text is None:
-        return ""
-    return str(text).replace("\\", "\\\\").replace("`", "\\`")
+# ``escape_md`` / ``escape_md_code`` now live in ``handlers/ui.py``, the leaf
+# that owns presentation primitives. Re-exported here so the 15 modules doing
+# ``from ...formatters import escape_md`` keep working unchanged.
+escape_md = _ui.escape_md
+escape_md_code = _ui.escape_md_code
 
 
 def format_ai_response(text: str) -> str:
@@ -350,7 +334,7 @@ def fmt_positions(positions, prices=None, mode_label: str | None = None):
             f"{_loc('Liq')}: {escape_md(liq_str)}"
         )
         if i < len(positions):
-            lines.extend(["", md2_rule(22), ""])
+            lines.extend(["", _ui.subrule(), ""])
 
     if any_estimated_pnl:
         lines.append("")
@@ -664,7 +648,7 @@ def fmt_alerts(alerts):
                 f"{_loc('Mode')}: *{mode_str}*"
             )
         if idx < len(alerts):
-            lines.extend(["", md2_rule(20), ""])
+            lines.extend(["", _ui.subrule(), ""])
 
     return "\n".join(lines)
 
@@ -841,7 +825,7 @@ def fmt_portfolio(stats, positions, prices=None, open_orders=None, mode_label: s
         rpnl_str = f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):,.2f}"
         lines.extend([
             "",
-            md2_rule(22),
+            md2_rule(),
             "",
             f"*{_loc('Bot Trading Stats')}*",
             f"💰 *{_loc('Volume:')}* 24h {escape_md(f'${volume_24h:,.2f}')} \\| 7d {escape_md(f'${volume_7d:,.2f}')}",
@@ -976,7 +960,7 @@ def fmt_trade_history(trades, page=0, page_size=10, mode_label: str | None = Non
         )
         lines.append(f"{_loc('Entry:')} {escape_md(price_str)} → {_loc('Exit:')} {escape_md(close_str)}")
         if idx < min(start + page_size, total):
-            lines.extend(["", md2_rule(20), ""])
+            lines.extend(["", _ui.subrule(), ""])
 
     return "\n".join(lines)
 
@@ -1022,7 +1006,7 @@ def fmt_analytics(stats, mode_label: str | None = None):
         f"📋 *{_loc('Total Trades:')}* {escape_md(str(total_trades))} \\| "
         f"✅ *{_loc('Wins:')}* {escape_md(str(wins))} \\| ❌ *{_loc('Losses:')}* {escape_md(str(losses))}",
         "",
-        md2_rule(22),
+        md2_rule(),
         "",
         f"*{_loc('Volume')}*",
         f"💰 *24h:* {escape_md(f'${volume_24h:,.2f}')} \\| *7d:* {escape_md(f'${volume_7d:,.2f}')}",
@@ -1032,7 +1016,7 @@ def fmt_analytics(stats, mode_label: str | None = None):
         f"💸 *{_loc('Fees:')}* {escape_md(f'${total_fees:,.2f}')} \\| "
         f"🌀 *{_loc('Funding:')}* {escape_md(f'${total_funding:,.2f}')}",
         "",
-        md2_rule(22),
+        md2_rule(),
         "",
         f"*{_loc('Outcomes')}*",
         f"✅ *{_loc('Filled:')}* {escape_md(str(filled))} \\| "
@@ -1054,11 +1038,13 @@ def fmt_analytics(stats, mode_label: str | None = None):
     return "\n".join(lines)
 
 
-def md2_rule(width: int = 30) -> str:
-    """Horizontal rule for Telegram MarkdownV2 (escaped, safe)."""
-    w = max(12, min(int(width), 40))
-    return escape_md("━" * w)
+def md2_rule(width: int | None = None) -> str:
+    """Horizontal rule for Telegram MarkdownV2 (escaped, safe).
 
+    Delegates to ``ui.rule``. Kept as a name because ~50 call sites use it;
+    calling it with no width now yields the single house width, not the old 30.
+    """
+    return _ui.rule(width)
 
 def _ui_header(title: str, subtitle: str | None = None, icon: str | None = None) -> str:
     lines = []
@@ -1137,12 +1123,12 @@ def fmt_home_command_center_card(network: str, balance_str: str) -> str:
     return "\n\n".join(
         [
             fmt_home_header(),
-            md2_rule(28),
+            md2_rule(),
             _fmt_network_balance_snapshot(network, balance_str),
-            md2_rule(28),
+            md2_rule(),
             f"*{_loc('Your toolkit')}*",
             _fmt_home_toolkit_tree(),
-            md2_rule(24),
+            md2_rule(),
             "_Tap a button, or just type\\. I'll answer questions and place trades in plain English\\._",
         ]
     )
@@ -1158,9 +1144,9 @@ def fmt_dashboard_home() -> str:
     return "\n\n".join(
         [
             fmt_home_header(),
-            md2_rule(28),
+            md2_rule(),
             status,
-            md2_rule(28),
+            md2_rule(),
             nxt,
         ]
     )
@@ -1171,7 +1157,7 @@ def fmt_getting_started() -> str:
     return "\n".join(
         [
             "🚀 *Getting Started*",
-            md2_rule(28),
+            md2_rule(),
             "",
             "Three quick steps and you're trading:",
             "",
@@ -1257,21 +1243,21 @@ def fmt_referral_dashboard(payload: dict) -> str:
 
     lines.extend([
         "",
-        md2_rule(24),
+        md2_rule(),
         "_Anyone can claim a code; each code is unique and tied to one Nadobro account\\._",
     ])
     return "\n".join(lines)
     return "\n\n".join(
         [
             fmt_home_header(),
-            md2_rule(28),
+            md2_rule(),
             status,
             "",
             nxt,
-            md2_rule(28),
+            md2_rule(),
             f"*{_loc('Your toolkit')}*",
             _fmt_home_toolkit_tree(),
-            md2_rule(24),
+            md2_rule(),
             "_Tap a button, or just type\\. I'll answer questions and place trades in plain English\\._",
         ]
     )
@@ -1281,7 +1267,7 @@ def fmt_strategy_hub_intro() -> str:
     return "\n\n".join(
         [
             _ui_header("Nadobro Strategy Lab", icon="🧠"),
-            md2_rule(28),
+            md2_rule(),
             _ui_section(
                 "How it works",
                 [

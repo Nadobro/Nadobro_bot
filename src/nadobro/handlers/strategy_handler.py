@@ -14,6 +14,7 @@ import logging
 from src.nadobro.config import get_dn_pair, get_dn_products, get_perp_products, get_product_id, get_product_max_leverage, get_spot_product_id, list_volume_spot_product_names, normalize_volume_spot_symbol
 from src.nadobro.handlers.commands import build_status_dashboard_parts
 from src.nadobro.handlers.formatters import escape_md, fmt_price
+from src.nadobro.utils.visual import money
 from src.nadobro.handlers.keyboards import back_kb, dn_funding_rates_kb, strategy_action_kb, strategy_product_picker_kb
 from src.nadobro.core.async_utils import run_blocking
 from src.nadobro.strategy.bot_runtime import stop_user_bot, get_user_bot_status
@@ -865,13 +866,15 @@ async def _handle_strategy(query, data, context, telegram_id):
         notional_after = collateral * float(target_lev)
         if notional_after >= venue_min:
             preflight_note = (
-                f"✅ ${collateral:.0f} × {int(target_lev)}× \\= ${notional_after:.0f} notional "
-                f"≥ pair minimum ${venue_min:.0f} \\(USDT0\\)\\. Cleared to quote\\."
+                f"✅ {money(collateral, decimals=0)} × {int(target_lev)}× \\= "
+                f"{money(notional_after, decimals=0)} notional "
+                f"≥ pair minimum {money(venue_min, decimals=0)} \\(USDT0\\)\\. Cleared to quote\\."
             )
         else:
             preflight_note = (
-                f"⚠️ ${collateral:.0f} × {int(target_lev)}× \\= ${notional_after:.0f} notional "
-                f"< pair minimum ${venue_min:.0f}\\. Add collateral or pick a smaller-min pair\\."
+                f"⚠️ {money(collateral, decimals=0)} × {int(target_lev)}× \\= "
+                f"{money(notional_after, decimals=0)} notional "
+                f"< pair minimum {money(venue_min, decimals=0)}\\. Add collateral or pick a smaller-min pair\\."
             )
         body = _strategy_config_section_text(strategy_id, conf, network, section)
         await _edit_loc(

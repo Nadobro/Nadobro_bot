@@ -7,6 +7,7 @@ from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.nadobro.utils.visual import b, divider, esc, money, pnl_dot, signed_money
+from src.nadobro.handlers import ui
 
 
 PAGE_SIZE = 5
@@ -125,13 +126,13 @@ def render_history_view(
 
     nav: list[InlineKeyboardButton] = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅ Back", callback_data=f"portfolio:history:{page - 1}"))
+        nav.append(InlineKeyboardButton(ui.NAV_NEWER, callback_data=f"portfolio:history:{page - 1}"))
     if page + 1 < total_pages:
-        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"portfolio:history:{page + 1}"))
+        nav.append(InlineKeyboardButton(ui.NAV_OLDER, callback_data=f"portfolio:history:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("📈 Performance", callback_data="portfolio:performance")])
-    rows.append([InlineKeyboardButton("⬅ Portfolio", callback_data="portfolio:view")])
+    rows.append([InlineKeyboardButton(ui.nav_back_to("Portfolio"), callback_data="portfolio:view")])
     return "\n".join(lines)[:3500], InlineKeyboardMarkup(rows)
 
 

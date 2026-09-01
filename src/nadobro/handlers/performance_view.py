@@ -10,6 +10,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.nadobro.db import query_all
 from src.nadobro.utils.visual import b, divider, esc, money, pnl_dot, signed, signed_money
+from src.nadobro.handlers import ui
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -61,16 +62,16 @@ def render_performance_view(
 
     nav: list[InlineKeyboardButton] = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅ Back", callback_data=f"portfolio:performance:{page - 1}"))
+        nav.append(InlineKeyboardButton(ui.NAV_NEWER, callback_data=f"portfolio:performance:{page - 1}"))
     if has_next:
-        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"portfolio:performance:{page + 1}"))
+        nav.append(InlineKeyboardButton(ui.NAV_OLDER, callback_data=f"portfolio:performance:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([
         InlineKeyboardButton("📜 History", callback_data="portfolio:history"),
         InlineKeyboardButton("📅 Best Hours", callback_data="portfolio:hours"),
     ])
-    rows.append([InlineKeyboardButton("⬅ Portfolio", callback_data="portfolio:view")])
+    rows.append([InlineKeyboardButton(ui.nav_back_to("Portfolio"), callback_data="portfolio:view")])
     return "\n".join(lines)[:3500], InlineKeyboardMarkup(rows)
 
 
@@ -261,6 +262,6 @@ def render_hours_view(user_id: int, network: str) -> tuple[str, InlineKeyboardMa
         lines.append(f"{total_n} finished sessions measured. Patterns drift, so re-check monthly.")
     rows = [
         [InlineKeyboardButton("📊 Performance", callback_data="portfolio:performance")],
-        [InlineKeyboardButton("⬅ Portfolio", callback_data="portfolio:view")],
+        [InlineKeyboardButton(ui.nav_back_to("Portfolio"), callback_data="portfolio:view")],
     ]
     return "\n".join(lines)[:3500], InlineKeyboardMarkup(rows)
