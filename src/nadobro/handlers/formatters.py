@@ -767,7 +767,7 @@ def fmt_points_dashboard(payload: dict) -> str:
             f"⭐ *Points:* {escape_md(f'{points:,.2f}')}",
             f"💰 *Volume:* {escape_md(f'${volume_usd:,.2f}')}",
             f"🧾 *Cost / Point:* {escape_md(f'${cpp:,.4f}')}",
-            f"💸 *Est. Costs:* {escape_md(f'${total_costs:,.2f}')}",
+            f"💸 *{_loc_md('Est. Costs')}:* {escape_md(f'${total_costs:,.2f}')}",
             f"📊 *Points / $1M:* {escape_md(f'{ppm:,.2f}')}",
         ]
     )
