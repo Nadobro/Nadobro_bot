@@ -557,7 +557,10 @@ class DynamicGridController(Controller):
             now = time.time()
             if (self.reset_threshold_bp > 0 and mid is not None
                     and self.realized_move_bp >= self.reset_threshold_bp
-                    and (now - self._last_recenter_ts) >= _DGRID_RECENTER_MIN_INTERVAL_S):
+                    and (now - self._last_recenter_ts) >= _DGRID_RECENTER_MIN_INTERVAL_S
+                    # AUDIT-DENY-2026-09-02-F3: never recenter (cancel+replace the
+                    # whole ladder) in a cycle whose status reads the venue denied.
+                    and self.adapter.reads_throttled_this_cycle() == 0):
                 self._last_recenter_ts = now
                 await self._recenter(mid)
             exposure = self.exposure_allowed_sides(pair, mid) if mid else {"buy": True, "sell": True}

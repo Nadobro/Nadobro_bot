@@ -1166,6 +1166,15 @@ class MarketMakingController(Controller):
             if ex is not None and not ex.is_terminated:
                 if self._should_hold(is_bid, target, slot):
                     return  # leave the resting quote — see _should_hold
+                # AUDIT-DENY-2026-09-02-F3: the venue is throttling our reads this
+                # cycle (a status poll came back denied). A requote is a cancel +
+                # place against the same budget — churning it now only deepens
+                # the contention that produced the hold. Leave the resting quote;
+                # reducing-side requotes (is_opening=False) still go through so
+                # exposure can always come down, and a fresh spawn on an EMPTY
+                # slot (below) is not a requote and stays allowed.
+                if is_opening and self.adapter.reads_throttled_this_cycle() > 0:
+                    return
                 # Phase 8: FUSE the cancel+replace into ONE atomic request. We
                 # were going to cancel this live quote and place a fresh one
                 # anyway, so cancel_and_place does both in one signed request —

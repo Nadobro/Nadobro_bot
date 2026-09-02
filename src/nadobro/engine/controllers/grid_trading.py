@@ -176,6 +176,13 @@ class GridController(Controller):
         now = time.time()
         if now - self._last_recenter_ts < _GRID_RECENTER_MIN_INTERVAL_S:
             return
+        # AUDIT-DENY-2026-09-02-F3: a recenter is a cancel+replace of the whole
+        # ladder against the same venue budget that just denied a status read.
+        # Under contention it only deepens the throttle; the move is measured
+        # again next cycle and the ladder recenters once the reads clear.
+        if self.adapter.reads_throttled_this_cycle() > 0:
+            logger.info("grid %s: recenter deferred — venue throttling reads this cycle", self.id)
+            return
         overlay = self._rebuild_bounds_for_side(_dec(mid))
         if not overlay:
             return

@@ -1021,6 +1021,45 @@ def _run_mm_start_guard(telegram_id: int, network: str, product: str, leverage: 
     return True, ""
 
 
+# AUDIT-DENY-2026-09-02-F3: the venue's per-wallet execute budget (600 weight/min,
+# see venue/gateway_budget) bounds how fast a ladder can be re-quoted. A place is
+# documented at 20 weight (perp order, no spot leverage) and a cancel at 1 per
+# digest, so a full re-quote of Q resting quotes costs about Q * 21 weight.
+# Surfaced at Start as a WARNING and never as an override (the user's levels and
+# interval stand — the #268 lesson): when the interval is shorter than one full
+# re-quote the venue throttles, resting quotes are HELD, and cycles run longer
+# than the interval.
+_VENUE_PLACE_WEIGHT = 20.0
+_VENUE_CANCEL_WEIGHT = 1.0
+
+
+def _venue_requote_budget_note(strategy: str, state: dict) -> str | None:
+    """A human note when the configured ladder cannot be fully re-quoted within
+    one interval under the venue's per-wallet execute budget; else ``None``."""
+    try:
+        from src.nadobro.venue import gateway_budget as _gb
+        wallet_rps = float(getattr(_gb, "_WALLET_RPS", 9.0) or 9.0)
+        levels = max(1, int(float(state.get("levels") or 2)))
+        interval = float(effective_interval_seconds(strategy, int(state.get("interval_seconds") or 60)))
+    except (TypeError, ValueError):
+        return None
+    two_sided = (
+        strategy == "mid"
+        or str(state.get("controller_override") or "") == "fill_anchored"
+        or bool(state.get("fill_anchored"))
+    )
+    quotes = levels * (2 if two_sided else 1)
+    full_requote_s = quotes * (_VENUE_PLACE_WEIGHT + _VENUE_CANCEL_WEIGHT) / max(wallet_rps, 0.1)
+    if full_requote_s <= interval:
+        return None
+    return (
+        f"⚠️ Venue budget: {quotes} resting quotes ≈ {full_requote_s:.0f}s of order budget per full "
+        f"re-quote vs a {interval:.0f}s interval. When the venue throttles, resting quotes are held "
+        f"(not re-quoted) and cycles run longer than the interval — fewer levels or a longer "
+        f"interval avoids it."
+    )
+
+
 def start_user_bot(
     telegram_id: int,
     strategy: str,
@@ -1487,11 +1526,15 @@ def start_user_bot(
         cycle_notional_cfg = float(state.get("cycle_notional_usd") or margin_usd or 0.0)
         cycle_notional = max(cycle_notional_cfg, margin_usd)
         spread_bp = float(state.get(spread_key) or state.get("spread_bp") or 0.0)
-        return (
-            True,
+        msg = (
             f"{_strategy_display_name(strategy)} bot started on {product.upper()}-PERP ({network}) "
-            f"| Maker-only quotes | Margin ${margin_usd:,.0f} | Notional ${cycle_notional:,.0f} / cycle | Spread {spread_bp:.0f}bp",
+            f"| Maker-only quotes | Margin ${margin_usd:,.0f} | Notional ${cycle_notional:,.0f} / cycle | Spread {spread_bp:.0f}bp"
         )
+        budget_note = _venue_requote_budget_note(strategy, state)
+        if budget_note:
+            logger.warning("start %s user=%s: %s", strategy, telegram_id, budget_note)
+            msg += "\n" + budget_note
+        return True, msg
     return (
         True,
         f"{_strategy_display_name(strategy)} bot started on {product.upper()}-PERP ({network}) "
