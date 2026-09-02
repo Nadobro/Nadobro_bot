@@ -1266,7 +1266,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             return
         if not is_new_onboarding_complete(telegram_id):
             await _edit_loc(query, 
-                "⚠️ Complete setup first (language + accept terms).",
+                "⚠️ Complete setup first \\(language \\+ accept terms\\)\\.",
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("▶ Complete setup", callback_data="onboarding:resume")],
@@ -1326,7 +1326,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 "Collateral is below the estimated minimum for one venue\\-sized resting quote\\.\n"
                 f"Each quote still carries roughly *{escape_md(f'${mm_min_order_notional:,.2f}')}* notional \\(exchange floor\\)\\.\n"
                 f"Configured collateral cap: *{escape_md(f'${mm_collateral_budget:,.2f}')}*\n"
-                f"Estimated margin per quote \\(~{escape_md(f'{strategy_leverage:.0f}x')}\\): "
+                f"Estimated margin per quote \\(\\~{escape_md(f'{strategy_leverage:.0f}x')}\\): "
                 f"*{escape_md(f'${mm_margin_per_quote_est:,.2f}')}* \\(incl\\. safety buffer\\)\n"
                 f"Need at least: *{escape_md(f'${mm_required_min_collateral:,.2f}')}*\n\n"
                 "Deposit USDT, raise configured margin, or pick a product with a lower minimum order size\\.",

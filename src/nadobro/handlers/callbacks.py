@@ -100,7 +100,7 @@ logger = logging.getLogger(__name__)
 async def _show_trading_readiness_block(query, readiness) -> None:
     if readiness.code == "onboarding_incomplete":
         await _edit_loc(query,
-            "⚠️ Complete setup first (language + accept terms).",
+            "⚠️ Complete setup first \\(language \\+ accept terms\\)\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("▶ Complete setup", callback_data="onboarding:resume")],
@@ -477,7 +477,7 @@ async def _handle_nav(query, data, telegram_id, context=None):
     elif target == "trade" and context is not None:
         if not is_new_onboarding_complete(telegram_id):
             await _edit_loc(query,
-                "⚠️ Complete setup first (language + accept terms).",
+                "⚠️ Complete setup first \\(language \\+ accept terms\\)\\.",
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("▶ Complete setup", callback_data="onboarding:resume")],

@@ -1681,12 +1681,12 @@ _TEXTS = {
         "ru": "🚀 Дашборд Nadobro — ты в эфире, легенда!\n\nЧто делаем сегодня?",
         "ko": "🚀 Nadobro 대시보드 준비 완료 — 지금 라이브입니다!\n\n오늘 무엇부터 시작할까요?",
     },
-    "⚠️ Complete setup first (language + accept terms).": {
-        "zh": "⚠️ 请先完成设置（选择语言 + 接受条款）。",
-        "fr": "⚠️ Terminez d'abord la configuration (langue + acceptation des conditions).",
-        "ar": "⚠️ أكمل الإعداد أولًا (اللغة + قبول الشروط).",
-        "ru": "⚠️ Сначала завершите настройку (язык + принятие условий).",
-        "ko": "⚠️ 먼저 설정을 완료하세요 (언어 + 약관 동의).",
+    "⚠️ Complete setup first \\(language \\+ accept terms\\)\\.": {
+        "zh": "⚠️ 请先完成设置（选择语言 \\+ 接受条款）。",
+        "fr": "⚠️ Terminez d'abord la configuration \\(langue \\+ acceptation des conditions\\)\\.",
+        "ar": "⚠️ أكمل الإعداد أولًا \\(اللغة \\+ قبول الشروط\\)\\.",
+        "ru": "⚠️ Сначала завершите настройку \\(язык \\+ принятие условий\\)\\.",
+        "ko": "⚠️ 먼저 설정을 완료하세요 \\(언어 \\+ 약관 동의\\)\\.",
     },
     "👛 Let's connect your wallet first.\n\nBefore trading, link your signer once. Tap below to start setup.": {
         "zh": "👛 先连接你的钱包。\n\n开始交易前，请先完成一次 signer 绑定。点击下方开始设置。",
@@ -1779,7 +1779,7 @@ _TEXTS = {
         "ru": "⚠️ Неизвестное действие\\. Попробуйте снова\\.",
         "ko": "⚠️ 알 수 없는 작업입니다\\. 다시 시도해 주세요\\.",
     },
-    "❌ Close-all request cancelled\\.": {
+    "❌ Close\\-all request cancelled\\.": {
         "zh": "❌ 已取消全部平仓请求\\。",
         "fr": "❌ Demande de fermeture totale annulée\\.",
         "ar": "❌ تم إلغاء طلب إغلاق جميع المراكز\\.",
