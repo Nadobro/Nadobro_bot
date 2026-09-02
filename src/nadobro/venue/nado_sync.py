@@ -531,6 +531,19 @@ async def sync_user(
                 client.get_trigger_orders(limit=200),
                 run_blocking_sdk(client.get_balance),
             )
+            # DENIED-vs-EMPTY (2026-09-02): ``None`` means this round could not
+            # read the book (budget-denied / venue error) — NOT an empty book.
+            # Keep the last known list for display and flag the snapshot so the
+            # DB writer skips the stale-order sweep, which would otherwise mark
+            # every live ladder row cancelled_or_filled on a throttled poll.
+            open_orders_unknown = orders is None
+            if open_orders_unknown:
+                logger.warning(
+                    "portfolio sync: open-orders read unavailable (denied/failed) user=%s "
+                    "network=%s — keeping the last known list, skipping the stale sweep",
+                    user_id, network,
+                )
+                orders = list(prior.get("open_orders") or [])
 
             if need_heavy:
                 matches, funding = await asyncio.gather(
@@ -581,6 +594,7 @@ async def sync_user(
                 "summary": summary or {},
                 "positions": positions,
                 "open_orders": all_orders,
+                "open_orders_unknown": open_orders_unknown,
                 "matches": matches or [],
                 "funding_payments": funding or [],
                 "stats": stats,
@@ -616,7 +630,15 @@ def _write_snapshot(snapshot: dict[str, Any], duration_ms: int) -> None:
     funding = list(snapshot.get("funding_payments") or [])
 
     _write_positions(user_id, network, positions)
-    _write_open_orders(user_id, network, orders)
+    if snapshot.get("open_orders_unknown"):
+        # The venue book could not be read this round (see sync_user): ``orders``
+        # is the last KNOWN list, so neither sweep nor re-upsert against it.
+        logger.warning(
+            "portfolio sync: open-orders unknown this round — stale-order sweep skipped user=%s network=%s",
+            user_id, network,
+        )
+    else:
+        _write_open_orders(user_id, network, orders)
     fills_inserted = _write_matches(user_id, network, matches)
     funding_inserted = _write_funding(user_id, network, funding)
 
