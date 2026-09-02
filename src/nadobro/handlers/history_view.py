@@ -122,7 +122,11 @@ def render_history_view(
         lines.append("")
         rows.append([InlineKeyboardButton(f"📤 Share PnL · #{idx}", callback_data=share_cb)])
     if not visible:
-        lines.append("No trades yet")
+        # F-06: the first screen a new user lands on must not be a dead end.
+        # Give it a human line, the reason, and one clear way to start.
+        lines.append("No closed trades yet.")
+        lines.append("Your fills land here once you've opened and closed a position.")
+        rows.append([InlineKeyboardButton("🤖 Make your first trade", callback_data="card:trade:start")])
 
     nav: list[InlineKeyboardButton] = []
     if page > 0:

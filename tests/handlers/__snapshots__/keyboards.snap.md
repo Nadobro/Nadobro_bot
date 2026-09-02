@@ -212,12 +212,13 @@ Each cell is `[label] → callback_data`.
 `home_card_kb`
 
 ```
-[🤖 Trade Console] → card:trade:start  |  [💬 Ask Nadobro] → desk:view
+[🤖 Trade Console] → card:trade:start
 [📁 Portfolio Deck] → portfolio:view  |  [🧠 Strategy Lab] → nav:strategy_hub
-[💼 Wallet Vault] → wallet:view  |  [🏆 Nado Points] → points:view
-[💰 Nado Vault] → vault:home  |  [🔔 Alerts] → alert:menu
-[🎁 Referrals] → refer:view  |  [⚙️ Settings] → settings:view
-[🔗 Official Links] → resources:home  |  [🌐 Execution Mode] → home:mode
+[💼 Wallet Vault] → wallet:view  |  [💬 Ask Nadobro] → desk:view
+[🏆 Nado Points] → points:view  |  [💰 Nado Vault] → vault:home
+[🔔 Alerts] → alert:menu  |  [🎁 Referrals] → refer:view
+[⚙️ Settings] → settings:view  |  [🌐 Execution Mode] → home:mode
+[🔗 Official Links] → resources:home
 ```
 
 ## mode_kb

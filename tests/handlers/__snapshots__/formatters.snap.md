@@ -429,7 +429,8 @@ _Mainnet trades real funds\. Testnet is your sandbox\. Flip anytime\._
 📋 *Open Positions*
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-No open positions\.
+You're flat — no open positions right now\.
+Open one from the Trade Console, or let a strategy work the book\.
 ```
 
 ## positions__empty_with_mode
@@ -441,7 +442,8 @@ No open positions\.
 *Snapshot*
 └ 🌐 *Mode:* 🌐 MAINNET
 
-No open positions\.
+You're flat — no open positions right now\.
+Open one from the Trade Console, or let a strategy work the book\.
 ```
 
 ## positions__two
@@ -635,9 +637,9 @@ Target: *$2,900\.00* \| ID: *\#12* \| Mode: *MAINNET*
 🔔 *Alerts*
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-No alerts set yet\.
+No alerts set yet — you'll never miss a move once you add one\.
 
-Tap *Set Alert* to add a price, funding, or PnL trigger\.
+Tap *Create Alert* to watch a price, funding, or PnL trigger\.
 ```
 
 ## alert_condition_prompt

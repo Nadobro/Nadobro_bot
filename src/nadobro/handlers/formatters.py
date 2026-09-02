@@ -269,7 +269,15 @@ def fmt_positions(positions, prices=None, mode_label: str | None = None):
         header = [_ui_header("Open Positions", icon="📋"), md2_rule()]
         if mode_label:
             header.append(_ui_section("Snapshot", [f"└ 🌐 *{_loc('Mode:')}* {escape_md(mode_label)}"]))
-        return "\n".join(header) + "\n\n" + _loc("No open positions\\.")
+        # F-06: a zero-state is a moment to guide, not a dead end. Say it plainly,
+        # say why, and point onward (the keyboard carries Trade / Strategy).
+        return (
+            "\n".join(header)
+            + "\n\n"
+            + _loc("You're flat — no open positions right now\\.")
+            + "\n"
+            + _loc("Open one from the Trade Console, or let a strategy work the book\\.")
+        )
 
     lines = [
         _ui_header("Open Positions", icon="📋"),
@@ -611,9 +619,9 @@ def fmt_alerts(alerts):
             + "\n"
             + md2_rule()
             + "\n\n"
-            + _loc("No alerts set yet\\.")
+            + _loc("No alerts set yet — you'll never miss a move once you add one\\.")
             + "\n\n"
-            + _loc("Tap *Set Alert* to add a price, funding, or PnL trigger\\.")
+            + _loc("Tap *Create Alert* to watch a price, funding, or PnL trigger\\.")
         )
 
     lines = [
