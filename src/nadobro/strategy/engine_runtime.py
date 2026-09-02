@@ -331,6 +331,14 @@ class EngineRuntime:
         controller = self._controllers.get(key)
         cid = deterministic_controller_id(strategy, user_id, network)
         if orch is not None and controller is not None:
+            # A stop is a fresh burst of status probes (cancel-confirm, flatten
+            # sizing). Open a new status epoch so a denial stored by the last
+            # tick is retried now rather than held for every probe — otherwise
+            # a refilled bucket is never consulted and the flatten is sized from
+            # stale fills (audit AUDIT-DENY-2026-09-02-STOP-EPOCH).
+            _begin = getattr(getattr(controller, "adapter", None), "begin_cycle", None)
+            if callable(_begin):
+                _begin()
             await orch.stop_controller(controller.id)
             self._persist_executors(orch)
         else:

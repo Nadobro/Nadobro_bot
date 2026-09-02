@@ -261,3 +261,31 @@ def test_mid_profile_quote_ttl_forces_refresh_when_target_is_unchanged():
         assert len(adapter.cancelled) >= 2
 
     asyncio.run(body())
+
+
+def test_failed_stop_with_order_still_resting_keeps_the_slot_bound():
+    """AUDIT-DENY-2026-09-02-F2 (controller half): when a requote's stop ends
+    FAILED because the cancel was rejected (rate-limited) and the confirm read
+    was denied, the quote may STILL rest on the venue. Clearing the slot would
+    spawn a second quote over it — the orphan through the cancel door. The slot
+    must stay bound; the next cycle retries the stop."""
+    async def body():
+        # Every cancel raises (venue rate-limited); status reads still answer.
+        adapter = MockNadoAdapter(mid=Decimal(100), fail_on=["cancel_order"], fail_times=999)
+        orch, c = _mm(adapter, InventoryRepository(), {
+            "trading_pair": "BTC", "spread_bp": "10", "order_amount_quote": "10",
+            "levels": "1", "leverage": "1",
+            "price_distance_tolerance": "0.0001",
+            "min_quote_lifetime_s": "0", "max_quote_lifetime_s": "0",
+        })
+        await orch.spawn_controller(c)
+        await c._reconcile(TradeType.BUY, Decimal("99"), True, Decimal("100"))
+        assert len(adapter.placed) == 1                         # first quote rests
+        first_ex_id = c._slot(True, 0).ex_id
+        # Target moves far enough to requote: stop fails (cancel raises), the
+        # executor ends FAILED with its order still OPEN.
+        await c._reconcile(TradeType.BUY, Decimal("95"), True, Decimal("100"))
+        assert len(adapter.placed) == 1                         # NO second quote
+        assert c._slot(True, 0).ex_id == first_ex_id            # slot still bound
+
+    asyncio.run(body())
