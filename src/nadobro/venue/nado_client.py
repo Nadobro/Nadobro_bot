@@ -317,6 +317,17 @@ def _pk_digest(private_key: str) -> str:
     return hashlib.sha256(pk.encode("utf-8")).hexdigest()[:32]
 
 
+def _cached_balance(cached: dict, reason: str) -> dict:
+    """A balance served from Redis because the venue read could not be made
+    right now (budget-denied or failed). Flagged so the portfolio sync can SAY
+    so (the freshness contract) instead of stamping a cached figure as freshly
+    synced — the "Refresh shows stale numbers" symptom of 2026-09-01."""
+    out = dict(cached)
+    out["_cached"] = True
+    out["_cached_reason"] = reason
+    return out
+
+
 def _track_user_key(user_id: Optional[int], cache_key: tuple) -> None:
     if user_id is None:
         return
@@ -1027,7 +1038,7 @@ class NadoClient:
                 # surrendering a misleading exists=False.
                 cached = self._read_balance_cache(redis_key)
                 if cached is not None:
-                    return cached
+                    return _cached_balance(cached, "venue_throttled")
                 return {"exists": False, "balances": {}}
             try:
                 from nado_protocol.utils.math import from_x18
@@ -1048,7 +1059,7 @@ class NadoClient:
                 # exists=False that downstream UI may render as "not linked".
                 cached = self._read_balance_cache(redis_key)
                 if cached is not None:
-                    return cached
+                    return _cached_balance(cached, "venue_error")
             finally:
                 self._gateway_release()
 
@@ -1071,7 +1082,7 @@ class NadoClient:
         # REST path also failed — last resort cache before exists=False.
         cached = self._read_balance_cache(redis_key)
         if cached is not None:
-            return cached
+            return _cached_balance(cached, "venue_error")
         return {"exists": False, "balances": {}}
 
     def _read_balance_cache(self, cache_key: str) -> Optional[dict]:

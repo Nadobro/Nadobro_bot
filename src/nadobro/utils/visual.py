@@ -141,6 +141,7 @@ def freshness_line(
     threshold_s: int,
     refreshing: bool = False,
     degraded: bool = False,
+    cached_reason: Optional[str] = None,
 ) -> str:
     """The one-line freshness declaration for a data card backed by a sync clock.
 
@@ -168,6 +169,10 @@ def freshness_line(
         return f"🔄 Refreshing · showing {time_ago(last_sync) if last_sync else 'cached'} data"
     if degraded:
         return f"⚠️ Sync issue · showing {time_ago(last_sync) if last_sync else 'cached'} data"
+    if cached_reason:
+        # The refresh ran but the venue would not answer (budget-denied / down)
+        # and the figures came from cache: say so, with the age of what is shown.
+        return f"🕔 Cached · {cached_reason} · showing {time_ago(last_sync) if last_sync else 'cached'} data"
     if last_sync is None:
         return "⚠️ Never synced"
     stale = stale_banner(last_sync, threshold_s)

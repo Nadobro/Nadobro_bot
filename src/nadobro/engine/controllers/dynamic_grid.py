@@ -976,7 +976,8 @@ class DynamicGridController(Controller):
         if self._trend is not None:
             await self._trend.on_tick()
 
-    async def _ensure_venue_flat_for_trend(self, mid: Decimal) -> bool:
+    async def _ensure_venue_flat_for_trend(self, mid: Decimal, *, before: str = "trend spawn",
+                                           lenient_unreadable: bool = False) -> bool:
         """Confirm the VENUE is flat before the trigger trend delegate arms.
 
         DGRID-GRIDRGRID-RESIDUAL (audit 2026-08-28): the GRID phase books via the
@@ -995,20 +996,23 @@ class DynamicGridController(Controller):
         try:
             held = await self.adapter.held_base(self.trading_pair)
         except Exception:  # noqa: BLE001 - can't confirm flat -> defer, retry next tick
-            logger.warning("dgrid %s: venue read failed before trend spawn — deferring",
-                           self.id, exc_info=True)
-            return False
+            logger.warning("dgrid %s: venue read failed before %s — deferring",
+                           self.id, before, exc_info=True)
+            return lenient_unreadable
         if held is None:
-            return False                       # unreadable -> never arm on a bad read
+            # Unreadable. The trigger delegate BASELINES OUT whatever it finds, so
+            # it must never arm on a bad read; the GRID ladder books via inventory
+            # and only a POSITIVE residual matters to it, so it may proceed.
+            return lenient_unreadable
         held = _dec(held)
         dust = (Decimal(1) / mid) if mid > 0 else Decimal(0)   # ~$1 notional
         if abs(held) <= dust:
             return True                        # venue already flat
         close_side = TradeType.SELL if held > 0 else TradeType.BUY
         logger.warning(
-            "dgrid %s: venue residual %s base before trend spawn (inventory read flat) "
-            "— closing reduce-only so the delegate arms from true flat (controller=%s)",
-            self.id, held, self.id,
+            "dgrid %s: venue residual %s base before %s (inventory read flat) "
+            "— closing reduce-only so the next phase starts from true flat (controller=%s)",
+            self.id, held, before, self.id,
         )
         try:
             await self.adapter.place_order(
@@ -1016,8 +1020,8 @@ class DynamicGridController(Controller):
                 reduce_only=True,
             )
         except Exception:  # noqa: BLE001 - close failed; defer and retry next tick
-            logger.warning("dgrid %s: residual close failed — deferring trend spawn",
-                           self.id, exc_info=True)
+            logger.warning("dgrid %s: residual close failed — deferring %s",
+                           self.id, before, exc_info=True)
             return False
         try:
             held2 = await self.adapter.held_base(self.trading_pair)
@@ -1090,6 +1094,16 @@ class DynamicGridController(Controller):
         if mid is None or mid <= 0:
             logger.warning("dgrid %s: no mid for spawn (phase=%s) — retry next tick",
                            self.id, phase)
+            return False
+        # DGRID-GRIDRGRID-RESIDUAL, the other direction (2026-09-02): the GRID
+        # ladder books via the shared inventory, so a venue residual the inventory
+        # does not know about (a partial the previous phase left behind) would be
+        # inherited silently by the new grid — invisible to the exposure cap, tier
+        # booking and /status. Same rule as the trend spawn: close it reduce-only
+        # and start from a venue-confirmed flat. An UNREADABLE venue does not block
+        # the grid (it does not baseline out a position the way the delegate does).
+        if not await self._ensure_venue_flat_for_trend(_dec(mid), before="grid spawn",
+                                                        lenient_unreadable=True):
             return False
         overlay = self._rebuild_bounds_for_side(side, _dec(mid))
         merged = {**self.configs, **overlay} if overlay else self.configs

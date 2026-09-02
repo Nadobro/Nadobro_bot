@@ -62,6 +62,23 @@ HL_WS_URL = env_str("NADO_HL_WS_URL", "wss://api.hyperliquid.xyz/ws")
 # Per-coin subscriptions we open. ``allMids`` is global and subscribed once.
 _COIN_STREAMS = ("l2Book", "trades", "activeAssetCtx")
 
+# 2026-09-02: HL DROPS THE SOCKET (no error frame, no close frame, ~1s after
+# the subscribe) when a subscription names a coin it does not list under that
+# exact spelling. Reproduced from a clean IP: allMids alone lives; one
+# ``l2Book`` for "AAPL" (an equity on another HL dex) or "KBONK" (HL spells it
+# "kBONK") kills the connection. Our stores are upper-cased, so the covered
+# check passed for the k-coins and every (re)connect resubscribed a name HL
+# rejects — the ~65s reconnect loop in production. Three defences:
+#   1. subscribe with HL's own spelling (``_hl_symbol``);
+#   2. pace the (re)subscribe so a drop stays attributable to the coin sent
+#      last, and randomise the order so an innocent neighbour is not blamed
+#      twice;
+#   3. quarantine a coin that is followed by a drop ``_QUARANTINE_STRIKES``
+#      times, so one bad name can never hold the whole feed in a loop.
+_SUBSCRIBE_GAP_S = env_float("NADO_HL_SUBSCRIBE_GAP_SECONDS", 0.1)
+_DROP_ATTRIBUTION_S = env_float("NADO_HL_DROP_ATTRIBUTION_SECONDS", 1.0)
+_QUARANTINE_STRIKES = env_int("NADO_HL_QUARANTINE_STRIKES", 2)
+
 # HL closes idle connections; the official SDK pings on a 50s timer
 # (``Event.wait(50)`` — seconds). Protocol-level pings are configured too, but
 # the app-level ping is what the venue documents.
@@ -88,6 +105,8 @@ def enabled() -> bool:
 _books: dict[str, dict] = {}
 _ctxs: dict[str, dict] = {}
 _mids: dict[str, dict] = {}
+# Our upper-cased key -> the symbol exactly as HL spells it ("KBONK" -> "kBONK").
+_hl_symbol: dict[str, str] = {}
 _trades: dict[str, Deque[dict]] = {}
 _trade_keys: dict[str, Deque[tuple]] = {}
 _trade_key_set: dict[str, set] = {}
@@ -251,7 +270,9 @@ def _on_all_mids(data: dict) -> None:
     for coin, px in mids.items():
         value = _f(px)
         if value is not None and value > 0:
-            _mids[str(coin).upper().strip()] = {"mid": value, "received_at": now}
+            key = str(coin).upper().strip()
+            _mids[key] = {"mid": value, "received_at": now}
+            _hl_symbol[key] = str(coin).strip()   # the spelling the wire needs
     if mids:
         _notify(_mids_listeners, "")
 
@@ -371,7 +392,7 @@ def health() -> dict:
 
 def reset_state() -> None:
     """Drop all cached feed state. Tests and reconnect-hygiene only."""
-    for store in (_books, _ctxs, _mids, _trades, _trade_keys, _trade_key_set):
+    for store in (_books, _ctxs, _mids, _hl_symbol, _trades, _trade_keys, _trade_key_set):
         store.clear()
 
 
@@ -394,6 +415,11 @@ class HyperliquidWs:
         self._desired: set = set()
         self._active: set = set()
         self._ws: Any = None
+        # Subscribe-safety state (see the _SUBSCRIBE_GAP_S comment above).
+        self._quarantined: set = set()
+        self._strikes: dict = {}
+        self._recent_subs: list = []            # [(coin, monotonic)] of the last sends
+        self._reconcile_lock: Optional[asyncio.Lock] = None
 
     def _on_mids_update(self, _coin: str) -> None:
         """allMids arrived -> some desired coin may now be known to be listed.
@@ -416,8 +442,9 @@ class HyperliquidWs:
         self._schedule_reconcile()
 
     def covered(self) -> set:
-        """Desired coins HL actually lists (empty until allMids arrives)."""
-        return {c for c in self._desired if c in _mids}
+        """Desired coins HL actually lists (empty until allMids arrives), minus
+        any the venue has shown it rejects (``_quarantined``)."""
+        return {c for c in self._desired if c in _mids and c not in self._quarantined}
 
     def _schedule_reconcile(self) -> None:
         if self._ws is None:
@@ -432,9 +459,37 @@ class HyperliquidWs:
             logger.debug("hl subscribe deferred to next connect")
 
     async def _reconcile_subs(self) -> None:
-        for coin in sorted(self.covered() - self._active):
-            await self._subscribe_coin(coin)
-            self._active.add(coin)
+        if self._reconcile_lock is None:
+            self._reconcile_lock = asyncio.Lock()
+        async with self._reconcile_lock:          # allMids fires this every ~1s
+            pending = list(self.covered() - self._active)
+            random.shuffle(pending)               # see _attribute_drop
+            for coin in pending:
+                if self._ws is None:
+                    return                        # dropped mid-way; next connect resumes
+                await self._subscribe_coin(coin)
+                self._active.add(coin)
+                if _SUBSCRIBE_GAP_S > 0:
+                    await asyncio.sleep(_SUBSCRIBE_GAP_S)
+
+    def _attribute_drop(self) -> None:
+        """A drop right after a subscription is HL rejecting that coin (an
+        unlisted / mis-spelled name earns no error frame — the socket simply
+        dies). Strike the coins sent within the attribution window; on the
+        ``_QUARANTINE_STRIKES``th strike quarantine them for the process."""
+        now = time.monotonic()
+        suspects = {c for c, ts in self._recent_subs if now - ts <= _DROP_ATTRIBUTION_S}
+        self._recent_subs.clear()
+        for coin in suspects:
+            n = self._strikes.get(coin, 0) + 1
+            self._strikes[coin] = n
+            if n >= _QUARANTINE_STRIKES and coin not in self._quarantined:
+                self._quarantined.add(coin)
+                self._active.discard(coin)
+                logger.warning(
+                    "hl ws: quarantining %s — the socket dropped right after its subscription "
+                    "%d times (HL does not list it under that name)", coin, n,
+                )
 
     def start(self) -> None:
         if not enabled():
@@ -463,11 +518,14 @@ class HyperliquidWs:
         await ws.send(json.dumps(payload))
 
     async def _subscribe_coin(self, coin: str) -> None:
+        wire = _hl_symbol.get(coin, coin)         # HL's spelling, never ours
+        self._recent_subs.append((coin, time.monotonic()))
+        del self._recent_subs[:-64]
         try:
             for stream in _COIN_STREAMS:
                 await self._send({
                     "method": "subscribe",
-                    "subscription": {"type": stream, "coin": coin},
+                    "subscription": {"type": stream, "coin": wire},
                 })
         except Exception:  # noqa: BLE001 - the reconnect loop owns recovery
             logger.debug("hl subscribe failed coin=%s", coin, exc_info=True)
@@ -482,6 +540,7 @@ class HyperliquidWs:
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning("hl ws disconnected: %s", exc)
+                self._attribute_drop()
                 await asyncio.sleep(backoff + random.uniform(0, backoff * 0.2))
                 backoff = min(60.0, backoff * 2)
             finally:
@@ -499,12 +558,20 @@ class HyperliquidWs:
             self._ws = ws
             self._active = set()
             logger.info("hl ws connected desired=%s", sorted(self._desired))
+            covered = self.covered()
+            logger.info(
+                "hl ws coverage: desired=%d covered=%d quarantined=%s unlisted=%d %s",
+                len(self._desired), len(covered), sorted(self._quarantined),
+                len(self._desired - covered - self._quarantined),
+                sorted(self._desired - covered - self._quarantined)[:12],
+            )
             # allMids first: it tells us which desired coins HL actually lists,
             # and its arrival drives per-coin subscription via the reconcile
             # listener. Anything already known from a previous connect is
-            # resubscribed immediately.
+            # resubscribed in the background (paced — see _reconcile_subs) so
+            # the read loop below starts draining frames right away.
             await self._send({"method": "subscribe", "subscription": {"type": "allMids"}})
-            await self._reconcile_subs()
+            self._schedule_reconcile()
 
             ping = asyncio.create_task(self._ping_loop(), name="hl-ws-ping")
             try:
