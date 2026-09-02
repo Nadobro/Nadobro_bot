@@ -734,3 +734,115 @@ def test_depth_book_drops_unusable_levels():
         assert [l.price for l in book.bids] == [Decimal("99.0")]
         assert book.asks == []
     asyncio.run(body())
+
+
+# ---------------------------------------------------------------------------
+# DENIED-vs-EMPTY (2026-09-02). A venue-budget-denied / failed open-orders read
+# must never be mistaken for "the order left the book". That misread marked
+# every resting quote CANCELLED, re-spawned duplicates while the originals still
+# rested on the venue (orphaned exposure, cancelled=0 in every session), and
+# turned a 40-quote fill-anchored ladder into 4-minute cycles.
+# ---------------------------------------------------------------------------
+from src.nadobro.engine.adapter.base import OrderState as _OS
+from src.nadobro.engine.adapter.nado import _OrderRef as _Ref
+
+
+class _DeniableClient(_FakeClient):
+    """get_open_orders that can report UNKNOWN (None = denied/failed) and counts
+    how many times the adapter actually went to the gateway."""
+
+    def __init__(self):
+        super().__init__()
+        self.deny = False
+        self.open_orders_calls = 0
+
+    def get_open_orders(self, product_id, refresh=False, sender=None):
+        self.open_orders_calls += 1
+        if self.deny:
+            return None
+        return list(self.open_orders)
+
+
+def _seed(a, oid, price="100"):
+    """Register a resting order the way place_order would, with a unique digest."""
+    a._orders[oid] = _Ref(PAIR, 2, TradeType.BUY, OrderType.LIMIT_MAKER,
+                          Decimal("1"), Decimal(price))
+    return oid
+
+
+def test_denied_open_orders_read_holds_order_never_cancels():
+    """First-ever poll denied: no snapshot to fall back on, so assume it still
+    rests (we placed it; no evidence otherwise). NOT cancelled, counted as throttled."""
+    async def body():
+        c = _DeniableClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "o-hold")
+        a.begin_cycle()
+        c.deny = True
+        st = await a.order_status(oid)
+        assert st.state is _OS.OPEN
+        assert a.reads_throttled_this_cycle() == 1
+
+    asyncio.run(body())
+
+
+def test_denied_read_returns_last_known_snapshot():
+    """A real read established OPEN; a later denied read must return that
+    snapshot unchanged rather than inventing a cancel."""
+    async def body():
+        c = _DeniableClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "o-known")
+        c.open_orders = [{"digest": oid, "amount": 1, "price": 100}]
+        a.begin_cycle()
+        assert (await a.order_status(oid)).state is _OS.OPEN      # real read
+        a.begin_cycle()
+        c.deny = True
+        assert (await a.order_status(oid)).state is _OS.OPEN      # HELD
+
+    asyncio.run(body())
+
+
+def test_status_polls_share_one_open_orders_read_per_cycle():
+    """Epoch coalescing: N per-level polls in one cycle = ONE gateway read."""
+    async def body():
+        c = _DeniableClient()
+        a = NadoAdapter(c, META)
+        ids = [_seed(a, f"o{i}", price=str(100 + i)) for i in range(5)]
+        c.open_orders = [{"digest": i, "amount": 1, "price": 100} for i in ids]
+        a.begin_cycle()
+        c.open_orders_calls = 0
+        for oid in ids:
+            assert (await a.order_status(oid)).state is _OS.OPEN
+        assert c.open_orders_calls == 1
+
+    asyncio.run(body())
+
+
+def test_denial_shared_within_cycle_then_retried_next_cycle():
+    """One denial serves every sibling poll this cycle (one bucket wait, not N),
+    every quote is HELD, and the NEXT cycle retries. A genuinely empty book on
+    that retry still resolves terminal — the real-gone path is untouched."""
+    async def body():
+        c = _DeniableClient()
+        a = NadoAdapter(c, META)
+        ids = [_seed(a, f"p{i}", price=str(100 + i)) for i in range(5)]
+        # Cycle 1: denied.
+        a.begin_cycle()
+        c.deny = True
+        c.open_orders_calls = 0
+        for oid in ids:
+            assert (await a.order_status(oid)).state is _OS.OPEN
+        assert c.open_orders_calls == 1                 # shared, not 5 waits
+        assert a.reads_throttled_this_cycle() == 1
+        # Cycle 2: the venue answers with a SUCCESSFUL empty book -> terminal.
+        a.begin_cycle()
+        c.deny = False
+        c.open_orders = []
+        c.open_orders_calls = 0
+        st = await a.order_status(ids[0])
+        assert c.open_orders_calls == 1                 # retried once
+        assert st.state in (_OS.CANCELLED, _OS.FILLED)
+        assert a.reads_throttled_this_cycle() == 0      # counter reset per cycle
+
+    asyncio.run(body())

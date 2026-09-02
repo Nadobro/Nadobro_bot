@@ -316,7 +316,10 @@ class NadoAdapter(NadoAdapterBase):
         self._status_cache: Dict[str, tuple[NadoOrder, int]] = {}
         # Per-product open-orders snapshot for intra-tick coalescing (see
         # _OPEN_ORDERS_SNAP_TTL_S): product_id -> (monotonic_ts, orders).
-        self._open_orders_snap: Dict[int, tuple[float, list]] = {}
+        # (monotonic_ts, orders_or_None, status_epoch). ``None`` = the read was
+        # DENIED/failed this epoch — shared by every sibling poll so a 40-quote
+        # ladder pays one bucket wait, not forty, and NO quote is marked gone.
+        self._open_orders_snap: Dict[int, tuple[float, Optional[list], int]] = {}
         # SEPARATE registry for venue PRICE-TRIGGER orders (Reverse Grid rungs).
         # Kept apart from ``_orders`` on purpose: a trigger digest is cancelled
         # through the venue's trigger service (``cancel_trigger_order``), NOT the
@@ -1054,26 +1057,52 @@ class NadoAdapter(NadoAdapterBase):
         self._status_cache[order_id] = (order, lc.seq if lc is not None else -1)
         return order
 
-    async def _open_orders_coalesced(self, product_id: int) -> list:
-        """get_open_orders(product_id) with a short intra-tick TTL so N per-level
-        order_status polls in one tick share ONE gateway (query_orders) call.
+    async def _open_orders_coalesced(self, product_id: int) -> Optional[list]:
+        """get_open_orders(product_id) coalesced per STATUS EPOCH (one engine
+        cycle) so N per-level order_status polls share ONE gateway read — and,
+        when the venue budget denies that read, share ONE denial (``None``)
+        instead of each sleeping on the bucket. Falls back to the short TTL
+        between epochs. Returns ``None`` = UNKNOWN (denied/failed); callers must
+        HOLD the order's last known state, never treat it as gone.
         Only the read-only status-poll path uses this; mutation-verification
         paths call get_open_orders directly for post-cancel/place truth."""
         pid = int(product_id)
         now = time.monotonic()
+        epoch = int(getattr(self, "_status_epoch", 0))
         hit = self._open_orders_snap.get(pid)
-        if hit is not None and (now - hit[0]) < _OPEN_ORDERS_SNAP_TTL_S:
-            return hit[1]
+        if hit is not None:
+            ts, snap, snap_epoch = hit
+            # Same cycle: reuse whatever this cycle already learned, including a
+            # denial. Across cycles a denial is retried; a real list survives the TTL.
+            if snap_epoch == epoch or (snap is not None and (now - ts) < _OPEN_ORDERS_SNAP_TTL_S):
+                return snap
         orders = await _sdk(self._client.get_open_orders, pid, True)
-        orders = list(orders or [])
-        self._open_orders_snap[pid] = (now, orders)
-        return orders
+        if orders is None:
+            self._open_orders_snap[pid] = (now, None, epoch)
+            self._note_read_throttled()
+            return None
+        snapshot = list(orders)
+        self._open_orders_snap[pid] = (now, snapshot, epoch)
+        return snapshot
 
     async def _order_status_rest(self, order_id: str, ref: _OrderRef) -> NadoOrder:
         try:
             open_orders = await self._open_orders_coalesced(ref.product_id)
         except Exception as exc:  # noqa: BLE001
             raise AdapterError(f"order_status failed: {exc}") from exc
+
+        if open_orders is None:
+            # DENIED-vs-EMPTY: the read could not be performed, so we know NOTHING
+            # new about this order. HOLD it: return the last snapshot we trusted,
+            # or — if we never got one — assume it still rests (we placed it and
+            # have no evidence otherwise). Reporting CANCELLED here is what
+            # re-spawned duplicates while the original still rested on the venue.
+            # The next cycle retries the read; a fill is caught by the WS
+            # lifecycle, the next successful poll, or nado_sync's archive backfill.
+            cached = self._status_cache.get(order_id)
+            if cached is not None and not cached[0].state.is_terminal:
+                return cached[0]
+            return self._mk_order(order_id, ref, OrderState.OPEN, Decimal(0), Decimal(0), Decimal(0))
 
         resting = self._find_open(open_orders, order_id)
         if resting is not None:

@@ -309,6 +309,21 @@ class EngineRuntime:
             begin_cycle()
         await orch.tick_controller(controller.id)
         self._persist_executors(orch)
+        # Venue read-budget visibility: the gateway bucket logs denials at DEBUG,
+        # which is how a 40-quote ladder ran 4-minute cycles in total silence.
+        # One WARNING per cycle, only when it happened, with what the engine did
+        # about it (held, not re-quoted) so the effect is never mistaken for a
+        # placement bug.
+        throttled = getattr(adapter, "reads_throttled_this_cycle", None)
+        if callable(throttled):
+            n = int(throttled() or 0)
+            if n:
+                logger.warning(
+                    "venue read budget denied %s open-orders read(s) this cycle "
+                    "user=%s network=%s strategy=%s — resting quotes HELD (not "
+                    "marked gone, not re-quoted); status retries next cycle",
+                    n, user_id, network, strategy,
+                )
 
     async def stop(self, user_id: int, network: str, strategy: str) -> None:
         key = self._key(user_id, network, strategy)
