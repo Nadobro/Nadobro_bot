@@ -734,3 +734,359 @@ def test_depth_book_drops_unusable_levels():
         assert [l.price for l in book.bids] == [Decimal("99.0")]
         assert book.asks == []
     asyncio.run(body())
+
+
+# ---------------------------------------------------------------------------
+# DENIED-vs-EMPTY (2026-09-02). A venue-budget-denied / failed open-orders read
+# must never be mistaken for "the order left the book". That misread marked
+# every resting quote CANCELLED, re-spawned duplicates while the originals still
+# rested on the venue (orphaned exposure, cancelled=0 in every session), and
+# turned a 40-quote fill-anchored ladder into 4-minute cycles.
+# ---------------------------------------------------------------------------
+from src.nadobro.engine.adapter.base import OrderState as _OS
+from src.nadobro.engine.adapter.nado import _OrderRef as _Ref
+
+
+class _DeniableClient(_FakeClient):
+    """get_open_orders that can report UNKNOWN (None = denied/failed) and counts
+    how many times the adapter actually went to the gateway."""
+
+    def __init__(self):
+        super().__init__()
+        self.deny = False
+        self.open_orders_calls = 0
+
+    def get_open_orders(self, product_id, refresh=False, sender=None):
+        self.open_orders_calls += 1
+        if self.deny:
+            return None
+        return list(self.open_orders)
+
+
+def _seed(a, oid, price="100"):
+    """Register a resting order the way place_order would, with a unique digest."""
+    a._orders[oid] = _Ref(PAIR, 2, TradeType.BUY, OrderType.LIMIT_MAKER,
+                          Decimal("1"), Decimal(price))
+    return oid
+
+
+def test_denied_open_orders_read_holds_order_never_cancels():
+    """First-ever poll denied: no snapshot to fall back on, so assume it still
+    rests (we placed it; no evidence otherwise). NOT cancelled, counted as throttled."""
+    async def body():
+        c = _DeniableClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "o-hold")
+        a.begin_cycle()
+        c.deny = True
+        st = await a.order_status(oid)
+        assert st.state is _OS.OPEN
+        assert a.reads_throttled_this_cycle() == 1
+
+    asyncio.run(body())
+
+
+def test_denied_read_returns_last_known_snapshot():
+    """A real read established OPEN; a later denied read must return that
+    snapshot unchanged rather than inventing a cancel."""
+    async def body():
+        from src.nadobro.engine.adapter import nado as _nado_mod
+
+        c = _DeniableClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "o-known")
+        c.open_orders = [{"digest": oid, "amount": 1, "price": 100}]
+        a.begin_cycle()
+        assert (await a.order_status(oid)).state is _OS.OPEN      # real read
+        # Force the held-from-cache branch: without this the previous epoch's
+        # REAL list is still inside the 2s TTL and would be served instead.
+        saved_ttl = _nado_mod._OPEN_ORDERS_SNAP_TTL_S
+        _nado_mod._OPEN_ORDERS_SNAP_TTL_S = 0.0
+        try:
+            a.begin_cycle()
+            c.deny = True
+            c.open_orders_calls = 0
+            assert (await a.order_status(oid)).state is _OS.OPEN  # HELD (from cache)
+            assert c.open_orders_calls == 1                       # it did try the read
+            assert a.reads_throttled_this_cycle() == 1            # ...and it was denied
+        finally:
+            _nado_mod._OPEN_ORDERS_SNAP_TTL_S = saved_ttl
+
+    asyncio.run(body())
+
+
+def test_status_polls_share_one_open_orders_read_per_cycle():
+    """Epoch coalescing: N per-level polls in one cycle = ONE gateway read."""
+    async def body():
+        c = _DeniableClient()
+        a = NadoAdapter(c, META)
+        ids = [_seed(a, f"o{i}", price=str(100 + i)) for i in range(5)]
+        c.open_orders = [{"digest": i, "amount": 1, "price": 100} for i in ids]
+        a.begin_cycle()
+        c.open_orders_calls = 0
+        for oid in ids:
+            assert (await a.order_status(oid)).state is _OS.OPEN
+        assert c.open_orders_calls == 1
+
+    asyncio.run(body())
+
+
+def test_denial_shared_within_cycle_then_retried_next_cycle():
+    """One denial serves every sibling poll this cycle (one bucket wait, not N),
+    every quote is HELD, and the NEXT cycle retries. A genuinely empty book on
+    that retry still resolves terminal — the real-gone path is untouched."""
+    async def body():
+        c = _DeniableClient()
+        a = NadoAdapter(c, META)
+        ids = [_seed(a, f"p{i}", price=str(100 + i)) for i in range(5)]
+        # Cycle 1: denied.
+        a.begin_cycle()
+        c.deny = True
+        c.open_orders_calls = 0
+        for oid in ids:
+            assert (await a.order_status(oid)).state is _OS.OPEN
+        assert c.open_orders_calls == 1                 # shared, not 5 waits
+        assert a.reads_throttled_this_cycle() == 1
+        # Cycle 2: the venue answers with a SUCCESSFUL empty book -> terminal.
+        a.begin_cycle()
+        c.deny = False
+        c.open_orders = []
+        c.open_orders_calls = 0
+        st = await a.order_status(ids[0])
+        assert c.open_orders_calls == 1                 # retried once
+        assert st.state in (_OS.CANCELLED, _OS.FILLED)
+        assert a.reads_throttled_this_cycle() == 0      # counter reset per cycle
+
+    asyncio.run(body())
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-DENY-2026-09-02 guardrails (mid+dn auditor findings).
+# ---------------------------------------------------------------------------
+import pytest as _pytest
+
+
+class _MarketClient(_DeniableClient):
+    """Unique MARKET digests (the shared fake returns a fixed 'm1', which
+    collides in the global order_lifecycle registry across tests)."""
+
+    _n = 0
+
+    def place_market_order(self, product_id, size, is_buy=True, reduce_only=False, **kwargs):
+        type(self)._n += 1
+        return {"digest": f"mk-{type(self)._n}", "status": "filled", "price": 100}
+
+
+def test_held_result_never_freezes_a_market_fill_behind_the_ws_short_circuit():
+    """F1 (High, verified by execution): a MARKET order is lifecycle-seeded
+    FILLED at placement, so the WS lifecycle reads permanently 'fresh'. If one
+    denied poll's HELD result were cached with that seq, the Phase-C short-
+    circuit would return it forever and the fill would never be polled again.
+    A held result must not enter the cache: the next allowed poll must resolve
+    the real FILLED state."""
+    async def body():
+        c = _MarketClient()
+        a = NadoAdapter(c, META)
+        # Archive not yet indexed at placement -> downgraded to PARTIAL(0), but
+        # the lifecycle was seeded FILLED (terminal => fresh forever).
+        c.matches = []
+        o = await a.place_order(PAIR, TradeType.BUY, OrderType.MARKET, Decimal("1"))
+        assert o.state is _OS.PARTIALLY_FILLED
+        # Cycle 1: the poll is denied -> HELD (OPEN), not cached.
+        a.begin_cycle()
+        c.deny = True
+        assert (await a.order_status(o.id)).state is _OS.OPEN
+        # Cycle 2: venue answers; the fill is now indexed -> must resolve FILLED.
+        a.begin_cycle()
+        c.deny = False
+        c.open_orders = []
+        c.matches = [{"digest": o.id, "amount": 1, "price": 100, "fee": "0.05"}]
+        c.open_orders_calls = 0
+        st = await a.order_status(o.id)
+        assert c.open_orders_calls == 1          # it POLLED (no frozen short-circuit)
+        assert st.state is _OS.FILLED
+
+    asyncio.run(body())
+
+
+class _MatchesDeniedClient(_DeniableClient):
+    async def get_matches(self, *, product_ids=None, limit=200, idx=None, max_time=None):
+        return None                              # the future denied-read contract
+
+
+@_pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "AUDIT-DENY-2026-09-02-F3: get_matches returns [] on archive-budget denial "
+        "and on failure, so a gone order whose fills are UNKNOWN is booked "
+        "CANCELLED(filled=0) — inventory blind, level re-quoted. Correct behaviour: "
+        "hold (OPEN / last known) until fills can be read. Fix: get_matches -> None "
+        "on denial and _fills_for propagates the unknown."
+    ),
+)
+def test_gone_order_with_unreadable_fills_is_held_not_booked_cancelled_zero():
+    async def body():
+        c = _MatchesDeniedClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "gone-unknown-fills")
+        a.begin_cycle()
+        c.open_orders = []                       # a SUCCESSFUL empty book: it is gone
+        st = await a.order_status(oid)
+        assert st.state is _OS.OPEN              # desired: held, not CANCELLED(0)
+
+    asyncio.run(body())
+
+
+# --- F2: the cancel door ------------------------------------------------------
+class _CancelRejectingClient(_DeniableClient):
+    """Venue rejects the cancel (rate-limited); the verify read is then denied."""
+
+    async def cancel_orders(self, *, product_id, digests):
+        return {"success": False, "error": "Rate limited", "rate_limited": True}
+
+
+def test_denied_verify_after_rejected_cancel_keeps_the_order_tracked():
+    """F2 (High, verified): a rejected cancel + a DENIED verify read must NOT be
+    reported as a successful cancel. The digest stays tracked and cancel_order
+    surfaces the failure, so recenter fails closed / the slot stays bound instead
+    of re-quoting over a quote that still rests on the venue."""
+    async def body():
+        c = _CancelRejectingClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "cancel-door")
+        c.deny = True                                   # verify read denied
+        with _pytest.raises(AdapterError):
+            await a.cancel_order(oid)
+        assert oid in a._orders                         # still tracked, not forgotten
+
+    asyncio.run(body())
+
+
+def test_denied_probe_after_acked_cancel_resolves_the_raced_fill():
+    """Grid-auditor Medium (new): after a venue-ACKED cancel, a denied probe must
+    not be HELD as 'still resting' (the book state is known: gone). It falls
+    through to fill resolution so a fill that raced the cancel is captured."""
+    async def body():
+        c = _DeniableClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "acked-raced")
+        assert await a.cancel_order(oid) is True         # venue acked
+        a.begin_cycle()
+        c.deny = True                                    # the probe is denied
+        c.matches = [{"digest": oid, "amount": 1, "price": 100, "fee": "0.05"}]
+        st = await a.order_status(oid)
+        assert st.state is _OS.FILLED                    # raced fill captured
+        assert st.filled_base == Decimal("1")
+
+    asyncio.run(body())
+
+
+def test_denial_marker_is_not_held_past_the_ttl_within_one_cycle():
+    """STOP-EPOCH / long-cycle finding: a stored denial must not pin every
+    remaining probe of a long cycle (or a stop) to a stale 'denied'. Past the
+    short TTL the next poll retries the read even without an epoch bump."""
+    async def body():
+        from src.nadobro.engine.adapter import nado as _nado_mod
+
+        c = _DeniableClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "ttl-retry")
+        a.begin_cycle()
+        c.deny = True
+        c.open_orders_calls = 0
+        assert (await a.order_status(oid)).state is _OS.OPEN     # denied -> held
+        assert c.open_orders_calls == 1
+        saved = _nado_mod._OPEN_ORDERS_SNAP_TTL_S
+        _nado_mod._OPEN_ORDERS_SNAP_TTL_S = 0.0                   # marker expired
+        try:
+            c.deny = False
+            c.open_orders = [{"digest": oid, "amount": 1, "price": 100}]
+            st = await a.order_status(oid)                       # same epoch, no bump
+            assert c.open_orders_calls == 2                      # it RETRIED
+            assert st.state is _OS.OPEN
+        finally:
+            _nado_mod._OPEN_ORDERS_SNAP_TTL_S = saved
+
+    asyncio.run(body())
+
+
+# --- sltp-tracer F1: a denied BOOK read must never hide a venue FILL ----------
+class _MatchCountingClient(_DeniableClient):
+    def __init__(self):
+        super().__init__()
+        self.matches_calls = 0
+        self.matches_raise = False
+
+    async def get_matches(self, *, product_ids=None, limit=200, idx=None, max_time=None):
+        self.matches_calls += 1
+        if self.matches_raise:
+            raise RuntimeError("archive unavailable")
+        return list(self.matches)
+
+
+def test_denied_book_read_reports_a_full_fill_with_real_amounts():
+    """The fills feed (archive bucket) still answers: positive evidence -> FILLED
+    with the matched amounts, never a blind OPEN/0 that hides the position."""
+    async def body():
+        c = _MatchCountingClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "denied-but-filled")
+        c.deny = True
+        c.matches = [{"digest": oid, "amount": 1, "price": 100, "fee": "0.05"}]
+        a.begin_cycle()
+        st = await a.order_status(oid)
+        assert st.state is _OS.FILLED
+        assert st.filled_base == Decimal("1")
+        assert st.fee_quote == Decimal("0.05")
+
+    asyncio.run(body())
+
+
+def test_denied_book_read_reports_a_partial_fill_and_keeps_the_order_live():
+    async def body():
+        c = _MatchCountingClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "denied-partial")
+        c.deny = True
+        c.matches = [{"digest": oid, "amount": "0.4", "price": 100, "fee": "0.02"}]
+        a.begin_cycle()
+        st = await a.order_status(oid)
+        assert st.state is _OS.PARTIALLY_FILLED          # still resting for the rest
+        assert st.filled_base == Decimal("0.4")
+
+    asyncio.run(body())
+
+
+def test_denied_book_read_with_unreadable_fills_feed_holds_never_cancels():
+    """No evidence either way (book denied AND archive unreadable) -> HOLD."""
+    async def body():
+        c = _MatchCountingClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "denied-both")
+        c.deny = True
+        c.matches_raise = True
+        a.begin_cycle()
+        st = await a.order_status(oid)
+        assert st.state is _OS.OPEN                       # held, not CANCELLED(0)
+
+    asyncio.run(body())
+
+
+def test_held_fill_check_is_coalesced_once_per_product_per_cycle():
+    """40 held quotes must not fan out into 40 archive reads."""
+    async def body():
+        c = _MatchCountingClient()
+        a = NadoAdapter(c, META)
+        ids = [_seed(a, f"h{i}", price=str(100 + i)) for i in range(5)]
+        c.deny = True
+        c.matches = []                                     # nothing filled
+        a.begin_cycle()
+        c.matches_calls = 0
+        for oid in ids:
+            assert (await a.order_status(oid)).state is _OS.OPEN
+        assert c.matches_calls == 1                        # one archive read
+        a.begin_cycle()                                    # next cycle re-checks
+        await a.order_status(ids[0])
+        assert c.matches_calls == 2
+
+    asyncio.run(body())

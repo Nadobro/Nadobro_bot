@@ -1113,7 +1113,19 @@ class NadoClient:
     def _write_shared_cache(cache_key: str, value, ttl_seconds: int) -> None:
         _shared_cache_set(cache_key, value, ttl_seconds)
 
-    def get_open_orders(self, product_id: int, refresh: bool = False, sender: Optional[str] = None) -> list:
+    def get_open_orders(self, product_id: int, refresh: bool = False, sender: Optional[str] = None) -> Optional[list]:
+        """Open orders for one product.
+
+        CONTRACT (DENIED-vs-EMPTY, 2026-09-02): ``[]`` means a SUCCESSFUL read of
+        an empty book. When the read could NOT be performed — our gateway budget
+        denied it, or the SDK and REST both failed — a ``refresh=True`` caller
+        (the engine's authoritative "is my quote still resting?" poll) gets
+        ``None`` = UNKNOWN. It used to get ``[]`` (or a frozen stale list), and
+        the adapter read that as "the order left the book" and re-spawned a
+        duplicate while the original still rested on the venue — the phantom-
+        cancel storm behind the orphaned orders and 4-minute cycles. Best-effort
+        ``refresh=False`` callers keep the old cached-or-``[]`` behaviour.
+        """
         eff_sender = (sender or "").strip() or self.subaccount_hex
         cache_key = (self.network, str(eff_sender or ""), int(product_id))
         if not refresh:
@@ -1123,6 +1135,12 @@ class NadoClient:
                 return list(cached.get("data") or [])
         if self._initialized and self.client:
             if not self._gateway_allowed(weight=2):  # subaccount_orders (1 product): IP weight 2
+                if refresh:
+                    # The caller demanded truth and we cannot provide it. A stale
+                    # cached list is NOT truth here: it is frozen at the last
+                    # successful read, so every quote placed since then is absent
+                    # from it and would read as "gone". Report UNKNOWN instead.
+                    return None
                 with _caches_lock:
                     cached = _open_orders_cache.get(cache_key)
                 if cached:
@@ -1201,9 +1219,12 @@ class NadoClient:
                 return orders
         except Exception as e:
             logger.error("REST get_open_orders failed: %s", e)
-        with _caches_lock:
-            _open_orders_cache[cache_key] = {"data": [], "ts": time.time()}
-        return []
+        # A failed read must NEVER be cached as an empty book. This used to write
+        # ``{"data": []}`` here, so ONE transient SDK/REST failure poisoned the
+        # (never-evicted) cache, and every later budget-denied call served that
+        # poisoned ``[]`` — every resting quote then read as "gone". The cache
+        # keeps its last SUCCESSFUL snapshot; the caller learns the read failed.
+        return None if refresh else []
 
     def _open_orders_for_sender_batched(
         self,

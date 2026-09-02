@@ -1187,6 +1187,22 @@ class MarketMakingController(Controller):
                     ):
                         return
                 await self.orchestrator.stop(cur_id)
+                # AUDIT-DENY-2026-09-02-F2 (controller half): orchestrator.stop
+                # returns True even when on_stop ended FAILED with the order still
+                # non-terminal (cancel rejected + confirm read denied). Clearing the
+                # slot then re-quotes OVER a quote that still rests on the venue —
+                # the orphan through the cancel door. Keep the slot bound (hold);
+                # the next cycle retries the stop. Only an executor that ended with
+                # a TERMINAL order frees the level.
+                from src.nadobro.engine.types import CloseType as _CT
+
+                _stopped_order = getattr(ex, "order", None)
+                if (
+                    getattr(ex, "close_type", None) is _CT.FAILED
+                    and _stopped_order is not None
+                    and not _stopped_order.state.is_terminal
+                ):
+                    return
                 self._set_quote(is_bid, None, None, level=level)
 
         # BUG-MM-3 fix: guard against ZeroDivisionError when target collapses

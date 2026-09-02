@@ -309,6 +309,21 @@ class EngineRuntime:
             begin_cycle()
         await orch.tick_controller(controller.id)
         self._persist_executors(orch)
+        # Venue read-budget visibility: the gateway bucket logs denials at DEBUG,
+        # which is how a 40-quote ladder ran 4-minute cycles in total silence.
+        # One WARNING per cycle, only when it happened, with what the engine did
+        # about it (held, not re-quoted) so the effect is never mistaken for a
+        # placement bug.
+        throttled = getattr(adapter, "reads_throttled_this_cycle", None)
+        if callable(throttled):
+            n = int(throttled() or 0)
+            if n:
+                logger.warning(
+                    "venue read budget denied %s open-orders read(s) this cycle "
+                    "user=%s network=%s strategy=%s — resting quotes HELD (not "
+                    "marked gone, not re-quoted); status retries next cycle",
+                    n, user_id, network, strategy,
+                )
 
     async def stop(self, user_id: int, network: str, strategy: str) -> None:
         key = self._key(user_id, network, strategy)
@@ -316,6 +331,14 @@ class EngineRuntime:
         controller = self._controllers.get(key)
         cid = deterministic_controller_id(strategy, user_id, network)
         if orch is not None and controller is not None:
+            # A stop is a fresh burst of status probes (cancel-confirm, flatten
+            # sizing). Open a new status epoch so a denial stored by the last
+            # tick is retried now rather than held for every probe — otherwise
+            # a refilled bucket is never consulted and the flatten is sized from
+            # stale fills (audit AUDIT-DENY-2026-09-02-STOP-EPOCH).
+            _begin = getattr(getattr(controller, "adapter", None), "begin_cycle", None)
+            if callable(_begin):
+                _begin()
             await orch.stop_controller(controller.id)
             self._persist_executors(orch)
         else:

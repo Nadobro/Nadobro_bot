@@ -132,9 +132,24 @@ class NadoAdapterBase(abc.ABC):
     # opening/requote via _note_opening_placement(); the simulator never
     # increments, so the cap is inert in backtests (as intended).
     def begin_cycle(self) -> None:
-        """Reset this session's per-cycle opening/requote counter. Called once
-        per engine cycle (the tick path) before the controller places anything."""
+        """Reset this session's per-cycle counters. Called once per engine cycle
+        (the tick path) before the controller places anything.
+
+        Also advances the STATUS EPOCH: within one cycle every per-level
+        order_status poll shares a single open-orders read (and a single
+        budget-denied result), so a 40-quote ladder costs one gateway read per
+        tick instead of forty — and a denial costs one bucket wait, not forty."""
         self._cycle_openings = 0
+        self._cycle_reads_throttled = 0
+        self._status_epoch = int(getattr(self, "_status_epoch", 0)) + 1
+
+    def _note_read_throttled(self) -> None:
+        """Record one open-orders read this cycle that the venue budget denied
+        (or the venue failed). The affected quotes are HELD, never marked gone."""
+        self._cycle_reads_throttled = getattr(self, "_cycle_reads_throttled", 0) + 1
+
+    def reads_throttled_this_cycle(self) -> int:
+        return int(getattr(self, "_cycle_reads_throttled", 0))
 
     def _note_opening_placement(self) -> None:
         """Record one successful exposure-growing / requoting placement."""

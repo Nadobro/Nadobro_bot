@@ -316,13 +316,27 @@ class NadoAdapter(NadoAdapterBase):
         self._status_cache: Dict[str, tuple[NadoOrder, int]] = {}
         # Per-product open-orders snapshot for intra-tick coalescing (see
         # _OPEN_ORDERS_SNAP_TTL_S): product_id -> (monotonic_ts, orders).
-        self._open_orders_snap: Dict[int, tuple[float, list]] = {}
+        # (monotonic_ts, orders_or_None, status_epoch). ``None`` = the read was
+        # DENIED/failed this epoch — shared by every sibling poll so a 40-quote
+        # ladder pays one bucket wait, not forty, and NO quote is marked gone.
+        self._open_orders_snap: Dict[int, tuple[float, Optional[list], int]] = {}
         # SEPARATE registry for venue PRICE-TRIGGER orders (Reverse Grid rungs).
         # Kept apart from ``_orders`` on purpose: a trigger digest is cancelled
         # through the venue's trigger service (``cancel_trigger_order``), NOT the
         # resting-order path — mixing them would route a trigger cancel to the
         # wrong endpoint and leak the trigger. digest -> _OrderRef.
         self._trigger_orders: Dict[str, _OrderRef] = {}
+        # Digests whose cancel the venue ACKED (or that a successful read showed
+        # gone). For these, a later budget-DENIED open-orders read must NOT be
+        # held as "still resting" — the book state is already known — but fall
+        # through to fill resolution, so a fill that raced the cancel is still
+        # captured (the old poisoned-[] path recovered it by accident).
+        self._cancel_acked: set[str] = set()
+        # Per-product matches snapshot for the HELD-quote fill check, keyed by
+        # status epoch: one ARCHIVE read serves every held quote on the product
+        # this cycle (a denied book read must not fan out into N archive reads).
+        # (matches_or_None, epoch); None = the feed was unreadable this epoch.
+        self._held_matches_snap: Dict[int, tuple[Optional[list], int]] = {}
 
     # -- product metadata -------------------------------------------------
     def _meta(self, trading_pair: str) -> ProductMeta:
@@ -717,6 +731,10 @@ class NadoAdapter(NadoAdapterBase):
         cancel_and_place. No venue call — the cancel already happened."""
         if not order_id:
             return
+        # The venue cancelled it inside the atomic replace: same invalidation
+        # and acked-marking as an explicit cancel.
+        self._status_cache.pop(order_id, None)
+        self._cancel_acked.add(order_id)
         ref = self._orders.pop(order_id, None) or self._registry.lookup(order_id)
         order_tags.forget(digest=order_id)
         try:
@@ -992,6 +1010,11 @@ class NadoAdapter(NadoAdapterBase):
             if verified:
                 self._registry.forget(order_id)
                 self._orders.pop(order_id, None)
+                # A verified-gone cancel: drop any pre-cancel status snapshot so
+                # the WS short-circuit can't serve it (<=8s window), and mark
+                # the digest acked so a denied probe resolves fills, not holds.
+                self._status_cache.pop(order_id, None)
+                self._cancel_acked.add(order_id)
                 return True
             raise AdapterError(f"cancel_order failed for {order_id}: {exc}") from exc
 
@@ -1005,18 +1028,34 @@ class NadoAdapter(NadoAdapterBase):
             if verified:
                 self._registry.forget(order_id)
                 self._orders.pop(order_id, None)
+                # A verified-gone cancel: drop any pre-cancel status snapshot so
+                # the WS short-circuit can't serve it (<=8s window), and mark
+                # the digest acked so a denied probe resolves fills, not holds.
+                self._status_cache.pop(order_id, None)
+                self._cancel_acked.add(order_id)
                 return True
             raise AdapterError(
                 f"cancel_order rejected by venue for {order_id}: {err}"
             )
 
         self._registry.forget(order_id)
+        # Venue acked the cancel: invalidate the pre-cancel status snapshot and
+        # mark the digest acked (see _cancel_acked / _order_status_rest).
+        self._status_cache.pop(order_id, None)
+        self._cancel_acked.add(order_id)
         return True
 
     async def _verify_no_longer_open(self, product_id: int, order_id: str) -> bool:
         try:
             open_orders = await _sdk(self._client.get_open_orders, product_id, True)
         except Exception:  # noqa: BLE001
+            return False
+        if open_orders is None:
+            # DENIED-vs-EMPTY: the read could not be performed — absence proves
+            # nothing. Reading a denied verify as "gone" made cancel_order report
+            # success and FORGET the digest while the quote still rested, and the
+            # controller re-quoted over it (audit AUDIT-DENY-2026-09-02-F2).
+            self._note_read_throttled()
             return False
         return self._find_open(open_orders, order_id) is None
 
@@ -1051,29 +1090,90 @@ class NadoAdapter(NadoAdapterBase):
                 self._open_orders_snap.pop(int(ref.product_id), None)
 
         order = await self._order_status_rest(order_id, ref)
-        self._status_cache[order_id] = (order, lc.seq if lc is not None else -1)
+        # DENIED-vs-EMPTY: a HELD result (this cycle's open-orders read was
+        # denied) is NOT authoritative — never write it into the status cache.
+        # Cached with the current lifecycle seq, a held OPEN would satisfy the
+        # Phase-C short-circuit above on every later call — the lifecycle is
+        # permanently "fresh" once terminal, which is every MARKET order (seeded
+        # FILLED at placement) — and the fill would never be polled again
+        # (audit AUDIT-DENY-2026-09-02-F1). Keep the last TRUSTED snapshot.
+        hit = self._open_orders_snap.get(int(ref.product_id))
+        held = (
+            hit is not None and hit[1] is None
+            and hit[2] == int(getattr(self, "_status_epoch", 0))
+        )
+        if not held:
+            self._status_cache[order_id] = (order, lc.seq if lc is not None else -1)
         return order
 
-    async def _open_orders_coalesced(self, product_id: int) -> list:
-        """get_open_orders(product_id) with a short intra-tick TTL so N per-level
-        order_status polls in one tick share ONE gateway (query_orders) call.
+    async def _open_orders_coalesced(self, product_id: int) -> Optional[list]:
+        """get_open_orders(product_id) coalesced per STATUS EPOCH (one engine
+        cycle) so N per-level order_status polls share ONE gateway read — and,
+        when the venue budget denies that read, share ONE denial (``None``)
+        instead of each sleeping on the bucket. Falls back to the short TTL
+        between epochs. Returns ``None`` = UNKNOWN (denied/failed); callers must
+        HOLD the order's last known state, never treat it as gone.
         Only the read-only status-poll path uses this; mutation-verification
         paths call get_open_orders directly for post-cancel/place truth."""
         pid = int(product_id)
         now = time.monotonic()
+        epoch = int(getattr(self, "_status_epoch", 0))
         hit = self._open_orders_snap.get(pid)
-        if hit is not None and (now - hit[0]) < _OPEN_ORDERS_SNAP_TTL_S:
-            return hit[1]
+        if hit is not None:
+            ts, snap, snap_epoch = hit
+            # Same cycle: reuse whatever this cycle already learned, including a
+            # denial. Across cycles a denial is retried; a real list survives the TTL.
+            same_epoch = snap_epoch == epoch
+            within_ttl = (now - ts) < _OPEN_ORDERS_SNAP_TTL_S
+            # A real list: reuse within the cycle, or within the TTL across cycles.
+            # A denial (None): reuse only within the cycle AND within the TTL, so a
+            # long cycle (or a stop) retries a refilled bucket after ~2s instead
+            # of holding every remaining probe on one stale denial.
+            if (snap is not None and (same_epoch or within_ttl)) or (
+                snap is None and same_epoch and within_ttl
+            ):
+                return snap
         orders = await _sdk(self._client.get_open_orders, pid, True)
-        orders = list(orders or [])
-        self._open_orders_snap[pid] = (now, orders)
-        return orders
+        if orders is None:
+            self._open_orders_snap[pid] = (now, None, epoch)
+            self._note_read_throttled()
+            return None
+        snapshot = list(orders)
+        self._open_orders_snap[pid] = (now, snapshot, epoch)
+        return snapshot
 
     async def _order_status_rest(self, order_id: str, ref: _OrderRef) -> NadoOrder:
         try:
             open_orders = await self._open_orders_coalesced(ref.product_id)
         except Exception as exc:  # noqa: BLE001
             raise AdapterError(f"order_status failed: {exc}") from exc
+
+        if open_orders is None and order_id not in self._cancel_acked:
+            # DENIED-vs-EMPTY: the BOOK read could not be performed, so the book
+            # state is unknown. Reporting CANCELLED here is what re-spawned
+            # duplicates while the original still rested on the venue. (A cancel-
+            # ACKED digest is exempt: its book state is already known — gone — and
+            # falls through below to resolve fills, capturing a fill that raced
+            # the cancel.)
+            #
+            # But never go BLIND: the fills feed charges the ARCHIVE bucket, a
+            # separate budget that usually still answers. Positive fill evidence
+            # means the order cannot be fully resting — report it with real
+            # amounts, so a filled quote is never hidden (the barrier stays live,
+            # the close leg is placed, the stop-out flatten is sized right — audit
+            # AUDIT-DENY-2026-09-02 sltp-F1). Only with NO fill evidence do we
+            # HOLD: the last trusted snapshot, else assume it still rests (we
+            # placed it and have no evidence otherwise); the next cycle retries.
+            fb, fq, fee = await self._fills_for_held(ref.product_id, order_id)
+            if fb > 0:
+                lot = self._meta(ref.trading_pair).lot_size
+                unfilled = ref.amount_base - fb
+                state = OrderState.FILLED if unfilled <= lot else OrderState.PARTIALLY_FILLED
+                return self._mk_order(order_id, ref, state, fb, fq, fee)
+            cached = self._status_cache.get(order_id)
+            if cached is not None and not cached[0].state.is_terminal:
+                return cached[0]
+            return self._mk_order(order_id, ref, OrderState.OPEN, Decimal(0), Decimal(0), Decimal(0))
 
         resting = self._find_open(open_orders, order_id)
         if resting is not None:
@@ -1114,6 +1214,7 @@ class NadoAdapter(NadoAdapterBase):
             state = OrderState.CANCELLED
         else:
             state = OrderState.CANCELLED
+        self._cancel_acked.discard(order_id)   # terminal: nothing left to resolve
         return self._mk_order(order_id, ref, state, filled_base, filled_quote, fee)
 
     async def _reconcile_order(self, order_id: str) -> Optional[_OrderRef]:
@@ -1127,6 +1228,13 @@ class NadoAdapter(NadoAdapterBase):
                     "reconcile: get_open_orders failed for %s (skipping product): %s",
                     pair, exc,
                 )
+                continue
+            if open_orders is None:
+                # DENIED-vs-EMPTY: the read could not be performed for this
+                # product, so absence proves nothing — skip it; never conclude
+                # an order is gone from a denied read.
+                logger.debug("reconcile: get_open_orders denied for %s (skipping product)", pair)
+                self._note_read_throttled()
                 continue
             resting = self._find_open(open_orders, order_id)
             if resting is None:
@@ -1168,11 +1276,37 @@ class NadoAdapter(NadoAdapterBase):
                 return o
         return None
 
-    async def _fills_for(self, product_id: int, digest: str) -> tuple[Decimal, Decimal, Decimal]:
-        try:
-            matches = await self._client.get_matches(product_ids=[product_id])
-        except Exception as exc:  # noqa: BLE001
-            raise AdapterError(f"order_status fills failed: {exc}") from exc
+    async def _fills_for_held(self, product_id: int, digest: str) -> tuple[Decimal, Decimal, Decimal]:
+        """Best-effort fills for a quote whose BOOK read was budget-denied.
+
+        The matches feed charges the ARCHIVE bucket — a separate budget that
+        usually still answers — so a filled quote need not be hidden behind a
+        denied gateway read. Coalesced per product per status epoch (one archive
+        read serves every held quote on the product this cycle) and NEVER raises:
+        an unreadable feed is "no evidence" (the caller holds), not "no fills"."""
+        pid = int(product_id)
+        epoch = int(getattr(self, "_status_epoch", 0))
+        hit = self._held_matches_snap.get(pid)
+        if hit is not None and hit[1] == epoch:
+            matches = hit[0]
+        else:
+            try:
+                matches = await self._client.get_matches(product_ids=[pid])
+            except Exception:  # noqa: BLE001 - unreadable feed => no evidence
+                matches = None
+            self._held_matches_snap[pid] = (matches, epoch)
+        if not matches:
+            return Decimal(0), Decimal(0), Decimal(0)
+        return await self._fills_for(pid, digest, matches=list(matches))
+
+    async def _fills_for(
+        self, product_id: int, digest: str, *, matches: Optional[list] = None
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        if matches is None:
+            try:
+                matches = await self._client.get_matches(product_ids=[product_id])
+            except Exception as exc:  # noqa: BLE001
+                raise AdapterError(f"order_status fills failed: {exc}") from exc
         fb = fq = fee = Decimal(0)
         for m in matches or []:
             if str(_first(m, _DIGEST_KEYS, "")) != digest:

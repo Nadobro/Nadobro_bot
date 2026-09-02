@@ -1142,3 +1142,56 @@ def test_dgrid_order_counts_include_the_trend_delegate_across_a_flip():
         )
 
     asyncio.run(body())
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-DENY-2026-09-02 (sltp-tracer F1) — exit-integrity invariant.
+# A venue-budget-DENIED open-orders read must never HIDE a venue fill from the
+# executor: a hidden fill leaves the grid barrier inert (avg entry None), skips
+# the close leg, and sizes the stop-out flatten from executor inventory (0)
+# while the venue holds the position. The adapter must consult the fills feed
+# (a separate budget) and report positive evidence with real amounts.
+# ---------------------------------------------------------------------------
+def test_denied_book_read_never_hides_a_venue_fill_from_the_executor():
+    # This invariant exercises the LIVE adapter, which imports the venue client
+    # (requests, psycopg2). The pytest-only CI job for this file installs no
+    # project deps, so skip there (visibly) and enforce it in the full pytest
+    # job + dev venv, where it runs. The same behaviour is also pinned in
+    # tests/engine/test_nado_adapter_logic.py.
+    pytest.importorskip("requests")
+    import asyncio
+
+    from src.nadobro.engine.adapter.base import OrderState
+    from src.nadobro.engine.adapter.nado import NadoAdapter, ProductMeta, _OrderRef
+    from src.nadobro.engine.types import OrderType, TradeType
+
+    class _Client:
+        def __init__(self):
+            self.matches = []
+
+        def get_open_orders(self, product_id, refresh=False, sender=None):
+            return None                                     # budget DENIED
+
+        async def get_matches(self, *, product_ids=None, limit=200, idx=None, max_time=None):
+            return list(self.matches)
+
+        def get_market_price(self, product_id):
+            return {"bid": 99.0, "ask": 101.0}
+
+    meta = {"BTC-PERP": ProductMeta(product_id=2, tick_size=Decimal("0.01"),
+                                    lot_size=Decimal("0.001"), min_notional=Decimal(1),
+                                    is_perp=True)}
+
+    async def body():
+        c = _Client()
+        a = NadoAdapter(c, meta)
+        oid = "filled-while-book-read-denied"
+        a._orders[oid] = _OrderRef("BTC-PERP", 2, TradeType.BUY, OrderType.LIMIT_MAKER,
+                                   Decimal("1"), Decimal("100"))
+        c.matches = [{"digest": oid, "amount": 1, "price": 100, "fee": "0.05"}]
+        a.begin_cycle()
+        st = await a.order_status(oid)
+        assert st.state is OrderState.FILLED                # the fill is NOT hidden
+        assert st.filled_base == Decimal("1")
+
+    asyncio.run(body())
