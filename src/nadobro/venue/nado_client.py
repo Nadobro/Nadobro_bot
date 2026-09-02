@@ -1395,14 +1395,21 @@ class NadoClient:
         limit: int = 200,
         idx: str | None = None,
         max_time: int | None = None,
-    ) -> list[dict]:
+    ) -> Optional[list[dict]]:
         """
         Fetch indexer match/fill events for this subaccount.
+
+        CONTRACT (DENIED-vs-EMPTY, 2026-09-02): ``[]`` means a SUCCESSFUL read
+        with no matches. ``None`` means the read could NOT be performed (no SDK
+        client, archive budget denied, or the SDK raised) = fills UNKNOWN. It
+        used to return ``[]`` for all three, so a gone order whose fills could
+        not be read was booked CANCELLED(filled=0): inventory blind, level
+        re-entered (audit AUDIT-DENY-2026-09-02-F3).
 
         SDK 0.3.3 aliases ``idx`` as ``submission_idx`` on IndexerBaseParams.
         """
         if not self._ensure_sdk_client():
-            return []
+            return None
         from src.nadobro.venue.nado_weights import query_weight
         # _gateway_allowed -> try_acquire can time.sleep() on a starved token
         # bucket. This runs in the coroutine body (not inside _call), so doing it
@@ -1413,7 +1420,7 @@ class NadoClient:
             url=self._archive_url(),
             user_scoped=False,
         ):
-            return []
+            return None
         try:
             from nado_protocol.indexer_client.types.query import IndexerMatchesParams
 
@@ -1435,7 +1442,7 @@ class NadoClient:
             return self._to_plain(rows or [])
         except Exception as e:
             logger.error("SDK get_matches failed: %s", _format_sdk_error(e))
-            return []
+            return None
 
     async def get_interest_and_funding_payments(
         self,
