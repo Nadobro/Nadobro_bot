@@ -179,9 +179,11 @@ class GridController(Controller):
         # AUDIT-DENY-2026-09-02-F3: a recenter is a cancel+replace of the whole
         # ladder against the same venue budget that just denied a status read.
         # Under contention it only deepens the throttle; the move is measured
-        # again next cycle and the ladder recenters once the reads clear.
-        if self.adapter.reads_throttled_this_cycle() > 0:
-            logger.info("grid %s: recenter deferred — venue throttling reads this cycle", self.id)
+        # again next cycle and the ladder recenters once the reads clear. This
+        # runs BEFORE the executor ticks (this cycle's polls have not happened
+        # yet), so the signal is the previous cycle's denials.
+        if self.adapter.venue_reads_contended():
+            logger.info("grid %s: recenter deferred — venue throttled status reads last cycle", self.id)
             return
         overlay = self._rebuild_bounds_for_side(_dec(mid))
         if not overlay:

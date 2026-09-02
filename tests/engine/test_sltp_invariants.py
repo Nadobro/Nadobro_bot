@@ -1197,7 +1197,6 @@ def test_denied_book_read_never_hides_a_venue_fill_from_the_executor():
     asyncio.run(body())
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-DENY-2026-09-02-F2b: a FAILED stop's slot is cleared on the next cycle")
 def test_a_failed_stop_never_frees_the_mid_slot_until_its_order_is_terminal():
     """AUDIT-DENY-2026-09-02-F2b (MID audit of 27e0926, finding 3).
 

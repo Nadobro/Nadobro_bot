@@ -29,11 +29,54 @@ MM_CFG = {
 }
 
 
-def _mm(adapter):
+def _mm(adapter, **over):
     orch = ExecutorOrchestrator()
     c = MarketMakingController(user_id=1, orchestrator=orch, adapter=adapter,
-                               inventory=InventoryRepository(), configs=dict(MM_CFG))
+                               inventory=InventoryRepository(), configs=dict(MM_CFG, **over))
     return orch, c
+
+
+def test_the_throttle_hold_never_outlives_the_quote_ttl():
+    """MID audit of 27e0926, finding 1: the hold must not override the profile's
+    max_quote_lifetime_s — the cadence's promised refresh still happens."""
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100))
+        orch, c = _mm(adapter, max_quote_lifetime_s="60")
+        clock = [1000.0]
+        c._now = lambda: clock[0]
+        await orch.spawn_controller(c)
+        await c._reconcile(TradeType.BUY, Decimal("99"), True, Decimal("100"))
+        first = c._slot(True, 0).ex_id
+        adapter._note_read_throttled()
+        clock[0] += 30                                    # inside the TTL: held
+        await c._reconcile(TradeType.BUY, Decimal("95"), True, Decimal("100"))
+        assert c._slot(True, 0).ex_id == first
+        clock[0] += 31                                    # TTL elapsed: refreshed even under contention
+        await c._reconcile(TradeType.BUY, Decimal("95"), True, Decimal("100"))
+        assert c._slot(True, 0).ex_id != first
+    asyncio.run(body())
+
+
+def test_a_profile_without_a_ttl_is_still_bounded(monkeypatch):
+    from src.nadobro.engine.controllers import market_making as mm
+    monkeypatch.setattr(mm, "_THROTTLE_HOLD_MAX_S", 100.0)
+
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100))
+        orch, c = _mm(adapter, max_quote_lifetime_s="0")
+        clock = [1000.0]
+        c._now = lambda: clock[0]
+        await orch.spawn_controller(c)
+        await c._reconcile(TradeType.BUY, Decimal("99"), True, Decimal("100"))
+        first = c._slot(True, 0).ex_id
+        adapter._note_read_throttled()
+        clock[0] += 50
+        await c._reconcile(TradeType.BUY, Decimal("95"), True, Decimal("100"))
+        assert c._slot(True, 0).ex_id == first             # held, inside the bound
+        clock[0] += 51
+        await c._reconcile(TradeType.BUY, Decimal("95"), True, Decimal("100"))
+        assert c._slot(True, 0).ex_id != first             # bound reached: refreshed
+    asyncio.run(body())
 
 
 # --- Mid / fill-anchored requotes ----------------------------------------------
@@ -82,7 +125,33 @@ def test_a_fresh_spawn_on_an_empty_slot_is_not_a_requote():
     asyncio.run(body())
 
 
-# --- Grid recenter --------------------------------------------------------------
+# --- Grid / dgrid recenters -----------------------------------------------------
+#
+# Both recenters are decided BEFORE the executor ticks (where the status polls
+# live), and EngineRuntime.tick zeroes the per-cycle counter right before the
+# tick — so "this cycle" always reads 0 at decision time (grid + dgrid audits of
+# 27e0926). The signal is the PREVIOUS cycle's denials (venue_reads_contended),
+# and these tests produce the denial where the live adapter does: inside
+# order_status, inside the tick.
+
+
+class _ThrottledPollsAdapter(MockNadoAdapter):
+    """Every status poll is budget-denied while ``deny`` is True. The live
+    adapter HOLDS the order (#274) and counts the denial; the mock counts it in
+    the same place — inside order_status — so the tick order is real."""
+
+    deny = True
+
+    async def order_status(self, order_id):
+        if self.deny:
+            self._note_read_throttled()
+        return await super().order_status(order_id)
+
+
+async def _cycle(adapter, orch, c):
+    adapter.begin_cycle()                    # what EngineRuntime.tick does first
+    await orch.tick_controller(c.id)
+
 
 _GRID = {
     "trading_pair": "BTC-PERP", "start_price": Decimal("99"), "end_price": Decimal("100"),
@@ -95,25 +164,38 @@ _GRID = {
 
 def test_a_grid_recenter_is_deferred_while_the_venue_throttles_reads():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal("100"), auto_fill_market=False)
+        adapter = _ThrottledPollsAdapter(mid=Decimal("100"), auto_fill_market=False)
         orch = ExecutorOrchestrator()
         c = GridController(user_id=1, orchestrator=orch, adapter=adapter,
                            inventory=InventoryRepository(), configs=dict(_GRID), controller_id="G")
         await orch.spawn_controller(c)
         assert orch.list(c.id, active_only=True), "ladder armed (gate off)"
+        await _cycle(adapter, orch, c)                 # cycle 1: polls denied INSIDE the tick
+        assert adapter.reads_throttled_this_cycle() > 0
         c._anchor_mid = Decimal("100")
-        moved = Decimal("101")                            # 100bp >= the reset threshold
-        adapter.set_mid(moved)
-        adapter._note_read_throttled()
-        await c._maybe_recenter(moved)
+        adapter.set_mid(Decimal("101"))                # 100bp >= the reset threshold
+        await _cycle(adapter, orch, c)                 # cycle 2: decided before its polls -> last cycle's denials
         assert c._last_recenter_ts == 0.0, "recenter under contention = cancel+replace against a denied budget"
-        adapter.begin_cycle()
-        await c._maybe_recenter(moved)
-        assert c._last_recenter_ts > 0.0                  # recentered once the reads cleared
+        adapter.deny = False
+        await _cycle(adapter, orch, c)                 # cycle 3: previous cycle still had denials
+        assert c._last_recenter_ts == 0.0
+        await _cycle(adapter, orch, c)                 # cycle 4: a clean previous cycle -> recenters
+        assert c._last_recenter_ts > 0.0
     asyncio.run(body())
 
 
-# --- Dynamic grid recenter ------------------------------------------------------
+def test_the_contention_signal_is_the_previous_cycles_denials():
+    adapter = MockNadoAdapter(mid=Decimal(100))
+    assert not adapter.venue_reads_contended()
+    adapter._note_read_throttled()
+    assert adapter.venue_reads_contended()             # this cycle
+    adapter.begin_cycle()
+    assert adapter.reads_throttled_this_cycle() == 0
+    assert adapter.reads_throttled_last_cycle() == 1
+    assert adapter.venue_reads_contended()             # carried one cycle
+    adapter.begin_cycle()
+    assert not adapter.venue_reads_contended()         # then cleared
+
 
 _DG = {
     "trading_pair": "BTC-PERP",
@@ -127,22 +209,24 @@ _DG = {
 
 def test_a_dgrid_recenter_is_deferred_while_the_venue_throttles_reads():
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal("63373.5"))
+        adapter = _ThrottledPollsAdapter(mid=Decimal("63373.5"))
         orch = ExecutorOrchestrator()
         c = DynamicGridController(
             user_id=1, orchestrator=orch, adapter=adapter, inventory=InventoryRepository(),
             configs=dict(_DG, candle_provider=lambda p: [{"close": 63300 + (i % 2) * 20} for i in range(200)]),
         )
         await orch.spawn_controller(c)
-        await orch.tick_controller(c.id)
-        before = [lv.open_price for lv in orch.list(c.id, active_only=True)[0].levels]
+        await _cycle(adapter, orch, c)                 # cycle 0: dgrid spawns its ladder inside the tick
+        await _cycle(adapter, orch, c)                 # cycle 1: the ladder's polls are denied inside the tick
+        assert adapter.reads_throttled_this_cycle() > 0
+        levels = lambda: [lv.open_price for lv in orch.list(c.id, active_only=True)[0].levels]  # noqa: E731
+        before = levels()
         adapter.set_mid(Decimal("63373.5") * (Decimal(1) + Decimal("0.0030")))   # 30bp: recenters normally
-        adapter._note_read_throttled()
-        await orch.tick_controller(c.id)
-        after = [lv.open_price for lv in orch.list(c.id, active_only=True)[0].levels]
-        assert after == before, "dgrid recentered in a cycle whose reads the venue denied"
-        adapter.begin_cycle()
-        await orch.tick_controller(c.id)
-        after2 = [lv.open_price for lv in orch.list(c.id, active_only=True)[0].levels]
-        assert after2 != before                           # and does once the reads clear
+        await _cycle(adapter, orch, c)                 # cycle 2: last cycle's denials -> deferred
+        assert levels() == before, "dgrid recentered while the venue was denying status reads"
+        adapter.deny = False
+        await _cycle(adapter, orch, c)                 # cycle 3: previous cycle still had denials
+        assert levels() == before
+        await _cycle(adapter, orch, c)                 # cycle 4: clean previous cycle -> recenters
+        assert levels() != before
     asyncio.run(body())

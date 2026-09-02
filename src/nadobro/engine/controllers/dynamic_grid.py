@@ -63,7 +63,8 @@ logger = logging.getLogger(__name__)
 _DGRID_AUTO_RESET_FLOOR_BP = LADDER_RECENTER_FLOOR_BP
 # Don't re-center more than once per this many seconds, so a fast move can
 # neither hammer the venue with cancel/replace bursts nor starve fill
-# processing (the re-center path returns before ticking the executor).
+# processing. The re-center runs AHEAD of the executor ticks in on_tick, which
+# is why its venue-contention check reads the previous cycle's denials.
 _DGRID_RECENTER_MIN_INTERVAL_S = LADDER_RECENTER_MIN_INTERVAL_S
 
 
@@ -559,8 +560,10 @@ class DynamicGridController(Controller):
                     and self.realized_move_bp >= self.reset_threshold_bp
                     and (now - self._last_recenter_ts) >= _DGRID_RECENTER_MIN_INTERVAL_S
                     # AUDIT-DENY-2026-09-02-F3: never recenter (cancel+replace the
-                    # whole ladder) in a cycle whose status reads the venue denied.
-                    and self.adapter.reads_throttled_this_cycle() == 0):
+                    # whole ladder) while the venue is denying status reads. This
+                    # runs BEFORE the executor ticks below, so the signal is the
+                    # previous cycle's denials (venue_reads_contended).
+                    and not self.adapter.venue_reads_contended()):
                 self._last_recenter_ts = now
                 await self._recenter(mid)
             exposure = self.exposure_allowed_sides(pair, mid) if mid else {"buy": True, "sell": True}
