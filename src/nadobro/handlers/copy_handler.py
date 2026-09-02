@@ -449,7 +449,7 @@ async def _handle_copy(query, data, context, telegram_id):
             return
         if not is_new_onboarding_complete(telegram_id):
             await _edit_loc(query,
-                "⚠️ Complete setup first (language + accept terms).",
+                "⚠️ Complete setup first \\(language \\+ accept terms\\)\\.",
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("▶ Complete setup", callback_data="onboarding:resume")],

@@ -7,6 +7,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.nadobro.handlers.orders_view import cancel_callback_for, order_kind_label, sorted_orders
 from src.nadobro.utils.visual import b, divider, esc, money, pct, pnl_dot, signed_money
+from src.nadobro.handlers import ui
 
 # Per the workflow plan: Positions and Orders share a single screen with
 # sub-headers so users see the full live exposure (open positions cross +
@@ -102,17 +103,17 @@ def render_positions_view(
     rows: list[list[InlineKeyboardButton]] = []
     pos_nav: list[InlineKeyboardButton] = []
     if pos_page > 0:
-        pos_nav.append(InlineKeyboardButton("⬅ Pos", callback_data=f"portfolio:positions:pos:{pos_page - 1}"))
+        pos_nav.append(InlineKeyboardButton(ui.pager("Positions")[0], callback_data=f"portfolio:positions:pos:{pos_page - 1}"))
     if pos_page + 1 < pos_total_pages:
-        pos_nav.append(InlineKeyboardButton("Pos ➡", callback_data=f"portfolio:positions:pos:{pos_page + 1}"))
+        pos_nav.append(InlineKeyboardButton(ui.pager("Positions")[1], callback_data=f"portfolio:positions:pos:{pos_page + 1}"))
     if pos_nav:
         rows.append(pos_nav)
 
     ord_nav: list[InlineKeyboardButton] = []
     if ord_page > 0:
-        ord_nav.append(InlineKeyboardButton("⬅ Orders", callback_data=f"portfolio:positions:ord:{ord_page - 1}"))
+        ord_nav.append(InlineKeyboardButton(ui.pager("Orders")[0], callback_data=f"portfolio:positions:ord:{ord_page - 1}"))
     if ord_page + 1 < ord_total_pages:
-        ord_nav.append(InlineKeyboardButton("Orders ➡", callback_data=f"portfolio:positions:ord:{ord_page + 1}"))
+        ord_nav.append(InlineKeyboardButton(ui.pager("Orders")[1], callback_data=f"portfolio:positions:ord:{ord_page + 1}"))
     if ord_nav:
         rows.append(ord_nav)
 
@@ -125,7 +126,7 @@ def render_positions_view(
         bulk_row.append(InlineKeyboardButton("🗑 Cancel All", callback_data="portfolio:cancel_all_confirm"))
     if bulk_row:
         rows.append(bulk_row)
-    rows.append([InlineKeyboardButton("⬅ Portfolio", callback_data="portfolio:view")])
+    rows.append([InlineKeyboardButton(ui.nav_back_to("Portfolio"), callback_data="portfolio:view")])
     return "\n".join(lines)[:3500], InlineKeyboardMarkup(rows)
 
 

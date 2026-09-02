@@ -465,7 +465,7 @@ async def handle_trade_card_callback(update: Update, context: CallbackContext, t
         if not is_new_onboarding_complete(telegram_id):
             await _edit_message_safely(
                 query,
-                "⚠️ Complete setup first (language + accept terms).",
+                "⚠️ Complete setup first \\(language \\+ accept terms\\)\\.",
                 InlineKeyboardMarkup([
                     [InlineKeyboardButton("▶ Complete setup", callback_data="onboarding:resume")],
                     [InlineKeyboardButton("Exit", callback_data="nav:main")],
@@ -558,7 +558,7 @@ async def handle_trade_card_callback(update: Update, context: CallbackContext, t
         try:
             session["size"] = float(value)
         except (TypeError, ValueError):
-            session["error"] = "Invalid size selected."
+            session["error"] = "That size didn't take — tap a preset or type an amount like 0.05."
             _set_trade_card_session(context, session)
             await _edit_message_safely(query, _build_trade_card_text(session), _card_keyboard(session))
             return True

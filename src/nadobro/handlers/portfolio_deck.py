@@ -10,7 +10,7 @@ from src.nadobro.handlers.orders_view import order_kind_label
 from src.nadobro.core.feature_flags import portfolio_sync_enabled, portfolio_sync_interval_seconds
 from src.nadobro.venue.nado_sync import sync_user
 from src.nadobro.users.user_service import get_user
-from src.nadobro.utils.visual import b, divider, esc, money, pct, pnl_dot, signed_money, stale_banner, time_ago
+from src.nadobro.utils.visual import b, divider, esc, freshness_line, money, pct, pnl_dot, signed_money, time_ago
 
 
 _VALID_WINDOWS = ("24h", "7d", "30d", "all")
@@ -133,7 +133,6 @@ def render_portfolio_deck(
     equity = snapshot.get("equity") or {}
     last_sync = _as_dt(snapshot.get("last_sync"))
     threshold = (portfolio_sync_interval_seconds() * 2) if portfolio_sync_enabled() else 300
-    stale = stale_banner(last_sync, threshold) if last_sync else "⚠️ Never synced"
 
     total_upnl = sum((_dec(p.get("est_pnl")) for p in positions if p.get("est_pnl") is not None), Decimal("0"))
     total_balance = _dec(equity.get("total")) if equity else Decimal("0")
@@ -148,16 +147,15 @@ def render_portfolio_deck(
     fees_window = _window_value(stats, "fees_windows", window)
     funding_window = _window_value(stats, "funding_windows", window)
 
-    if refreshing:
-        sync_line = f"🔄 Refreshing · showing {time_ago(last_sync) if last_sync else 'cached'} data"
-    elif snapshot.get("stale") and snapshot.get("error"):
-        # The last refresh ATTEMPT failed (gateway circuit, venue error).
-        # Don't claim "Live" — say what the user is actually looking at.
-        sync_line = f"⚠️ Sync issue · showing {time_ago(last_sync) if last_sync else 'cached'} data"
-    elif stale:
-        sync_line = stale
-    else:
-        sync_line = f"🟢 Live · synced {time_ago(last_sync)}"
+    # Shared freshness contract (utils.visual.freshness_line). Behaviour is
+    # byte-identical to the four states this deck pioneered; the degraded
+    # state fires when the last refresh ATTEMPT failed (gateway / venue error).
+    sync_line = freshness_line(
+        last_sync,
+        threshold_s=threshold,
+        refreshing=refreshing,
+        degraded=bool(snapshot.get("stale") and snapshot.get("error")),
+    )
 
     # Funding sign convention: positive = paid (a cost), negative = received.
     if funding_window > 0:
@@ -295,31 +293,3 @@ def _as_dt(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-# --- Engine v2 portfolio (per-controller PnL) -----------------------------
-async def fetch_engine_portfolio_state(user_id: int):
-    """Engine v2 portfolio state, sourced through engine.portfolio (no
-    handler-level PnL aggregation)."""
-    from src.nadobro.portfolio.portfolio_history_worker import build_db_portfolio
-
-    return await build_db_portfolio().state(user_id)
-
-
-def render_per_controller_pnl(state: Any) -> str:
-    """Render the per-controller PnL section from engine.portfolio.state().
-
-    Returns '' when there are no engine-managed controllers, so the existing
-    deck is unchanged until the engine is driving trades.
-    """
-    per = getattr(state, "per_controller", {}) or {}
-    if not per:
-        return ""
-    lines = ["", "*Strategy PnL (per controller)*"]
-    for cid, pnl in per.items():
-        lines.append(
-            f"`{cid}` · net ${pnl.net:.2f} "
-            f"(realized ${pnl.realized:.2f} · unrealized ${pnl.unrealized:.2f} · "
-            f"fees ${pnl.fees:.2f}) · {pnl.open_executors} open"
-        )
-    return "\n".join(lines)

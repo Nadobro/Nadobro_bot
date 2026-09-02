@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from typing import Optional
 from src.nadobro.config import get_product_name, PRODUCTS
 from src.nadobro.i18n import get_active_language, localize_text
+from src.nadobro.handlers import ui as _ui
 
 logger = logging.getLogger(__name__)
 
@@ -17,28 +18,11 @@ def _loc_md(text):
     return escape_md(_loc(text))
 
 
-def escape_md(text):
-    if text is None:
-        return ""
-    text = str(text)
-    text = text.replace('\\', '\\\\')
-    special = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(r'([' + re.escape(special) + r'])', r'\\\1', text)
-
-
-def escape_md_code(text) -> str:
-    """Escape for the INSIDE of a MarkdownV2 ``code``/``pre`` entity.
-
-    Telegram only treats a backtick and a backslash as special inside a code
-    entity; every other reserved character is literal there. Passing such text
-    through :func:`escape_md` therefore injects backslashes that Telegram
-    renders VERBATIM — and for a tap-to-copy block that means the user copies a
-    corrupted value. A 1CT key is pure hex today, so ``escape_md`` happened to
-    be a no-op on it; this makes the guarantee explicit rather than incidental.
-    """
-    if text is None:
-        return ""
-    return str(text).replace("\\", "\\\\").replace("`", "\\`")
+# ``escape_md`` / ``escape_md_code`` now live in ``handlers/ui.py``, the leaf
+# that owns presentation primitives. Re-exported here so the 15 modules doing
+# ``from ...formatters import escape_md`` keep working unchanged.
+escape_md = _ui.escape_md
+escape_md_code = _ui.escape_md_code
 
 
 def format_ai_response(text: str) -> str:
@@ -285,7 +269,15 @@ def fmt_positions(positions, prices=None, mode_label: str | None = None):
         header = [_ui_header("Open Positions", icon="📋"), md2_rule()]
         if mode_label:
             header.append(_ui_section("Snapshot", [f"└ 🌐 *{_loc('Mode:')}* {escape_md(mode_label)}"]))
-        return "\n".join(header) + "\n\n" + _loc("No open positions\\.")
+        # F-06: a zero-state is a moment to guide, not a dead end. Say it plainly,
+        # say why, and point onward (the keyboard carries Trade / Strategy).
+        return (
+            "\n".join(header)
+            + "\n\n"
+            + _loc("You're flat — no open positions right now\\.")
+            + "\n"
+            + _loc("Open one from the Trade Console, or let a strategy work the book\\.")
+        )
 
     lines = [
         _ui_header("Open Positions", icon="📋"),
@@ -350,7 +342,7 @@ def fmt_positions(positions, prices=None, mode_label: str | None = None):
             f"{_loc('Liq')}: {escape_md(liq_str)}"
         )
         if i < len(positions):
-            lines.extend(["", md2_rule(22), ""])
+            lines.extend(["", _ui.subrule(), ""])
 
     if any_estimated_pnl:
         lines.append("")
@@ -627,9 +619,9 @@ def fmt_alerts(alerts):
             + "\n"
             + md2_rule()
             + "\n\n"
-            + _loc("No alerts set yet\\.")
+            + _loc("No alerts set yet — you'll never miss a move once you add one\\.")
             + "\n\n"
-            + _loc("Tap *Set Alert* to add a price, funding, or PnL trigger\\.")
+            + _loc("Tap *Create Alert* to watch a price, funding, or PnL trigger\\.")
         )
 
     lines = [
@@ -664,7 +656,7 @@ def fmt_alerts(alerts):
                 f"{_loc('Mode')}: *{mode_str}*"
             )
         if idx < len(alerts):
-            lines.extend(["", md2_rule(20), ""])
+            lines.extend(["", _ui.subrule(), ""])
 
     return "\n".join(lines)
 
@@ -767,7 +759,7 @@ def fmt_points_dashboard(payload: dict) -> str:
             f"⭐ *Points:* {escape_md(f'{points:,.2f}')}",
             f"💰 *Volume:* {escape_md(f'${volume_usd:,.2f}')}",
             f"🧾 *Cost / Point:* {escape_md(f'${cpp:,.4f}')}",
-            f"💸 *Est. Costs:* {escape_md(f'${total_costs:,.2f}')}",
+            f"💸 *{_loc_md('Est. Costs')}:* {escape_md(f'${total_costs:,.2f}')}",
             f"📊 *Points / $1M:* {escape_md(f'{ppm:,.2f}')}",
         ]
     )
@@ -841,7 +833,7 @@ def fmt_portfolio(stats, positions, prices=None, open_orders=None, mode_label: s
         rpnl_str = f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):,.2f}"
         lines.extend([
             "",
-            md2_rule(22),
+            md2_rule(),
             "",
             f"*{_loc('Bot Trading Stats')}*",
             f"💰 *{_loc('Volume:')}* 24h {escape_md(f'${volume_24h:,.2f}')} \\| 7d {escape_md(f'${volume_7d:,.2f}')}",
@@ -976,7 +968,7 @@ def fmt_trade_history(trades, page=0, page_size=10, mode_label: str | None = Non
         )
         lines.append(f"{_loc('Entry:')} {escape_md(price_str)} → {_loc('Exit:')} {escape_md(close_str)}")
         if idx < min(start + page_size, total):
-            lines.extend(["", md2_rule(20), ""])
+            lines.extend(["", _ui.subrule(), ""])
 
     return "\n".join(lines)
 
@@ -1022,7 +1014,7 @@ def fmt_analytics(stats, mode_label: str | None = None):
         f"📋 *{_loc('Total Trades:')}* {escape_md(str(total_trades))} \\| "
         f"✅ *{_loc('Wins:')}* {escape_md(str(wins))} \\| ❌ *{_loc('Losses:')}* {escape_md(str(losses))}",
         "",
-        md2_rule(22),
+        md2_rule(),
         "",
         f"*{_loc('Volume')}*",
         f"💰 *24h:* {escape_md(f'${volume_24h:,.2f}')} \\| *7d:* {escape_md(f'${volume_7d:,.2f}')}",
@@ -1032,7 +1024,7 @@ def fmt_analytics(stats, mode_label: str | None = None):
         f"💸 *{_loc('Fees:')}* {escape_md(f'${total_fees:,.2f}')} \\| "
         f"🌀 *{_loc('Funding:')}* {escape_md(f'${total_funding:,.2f}')}",
         "",
-        md2_rule(22),
+        md2_rule(),
         "",
         f"*{_loc('Outcomes')}*",
         f"✅ *{_loc('Filled:')}* {escape_md(str(filled))} \\| "
@@ -1054,11 +1046,13 @@ def fmt_analytics(stats, mode_label: str | None = None):
     return "\n".join(lines)
 
 
-def md2_rule(width: int = 30) -> str:
-    """Horizontal rule for Telegram MarkdownV2 (escaped, safe)."""
-    w = max(12, min(int(width), 40))
-    return escape_md("━" * w)
+def md2_rule(width: int | None = None) -> str:
+    """Horizontal rule for Telegram MarkdownV2 (escaped, safe).
 
+    Delegates to ``ui.rule``. Kept as a name because ~50 call sites use it;
+    calling it with no width now yields the single house width, not the old 30.
+    """
+    return _ui.rule(width)
 
 def _ui_header(title: str, subtitle: str | None = None, icon: str | None = None) -> str:
     lines = []
@@ -1128,8 +1122,30 @@ def _fmt_network_balance_snapshot(network: str, balance_str: str) -> str:
             f"*{_loc('Quick snapshot')}*",
             f"├ {net_emoji} *Mode:* {escape_md(net_name)}",
             f"├ 💵 *USDT:* {escape_md(balance_str)}",
+            _fmt_balance_freshness(balance_str),
         ]
     )
+
+
+def _fmt_balance_freshness(balance_str: str) -> str:
+    """The tree-closing freshness line for the home balance snapshot.
+
+    Freshness contract (Phase 3), at the only fidelity this surface supports.
+    The home balance is served exclusively from cache (the click path never
+    touches the gateway) and the cache carries no timestamp, so there is no age
+    and it can never honestly claim "Live" — the Portfolio deck is the
+    age-bearing surface. This closes the ├ tree (previously open) and turns the
+    bare value sentinels into explained states:
+
+      • "updating…" → a background warm is in flight
+      • "$X"        → a cached snapshot; deck has the live, age-stamped figure
+      • "N/A"       → no cached value (not linked, throttled, or errored)
+    """
+    if balance_str == "updating…":
+        return f"└ 🔄 {_loc_md('Refreshing balance…')}"
+    if balance_str.startswith("$"):
+        return f"└ 🕔 {_loc_md('Cached')} · {_loc_md('open Portfolio for the live figure')}"
+    return f"└ ⚪ {_loc_md('Balance unavailable')}"
 
 
 def fmt_home_command_center_card(network: str, balance_str: str) -> str:
@@ -1137,12 +1153,12 @@ def fmt_home_command_center_card(network: str, balance_str: str) -> str:
     return "\n\n".join(
         [
             fmt_home_header(),
-            md2_rule(28),
+            md2_rule(),
             _fmt_network_balance_snapshot(network, balance_str),
-            md2_rule(28),
+            md2_rule(),
             f"*{_loc('Your toolkit')}*",
             _fmt_home_toolkit_tree(),
-            md2_rule(24),
+            md2_rule(),
             "_Tap a button, or just type\\. I'll answer questions and place trades in plain English\\._",
         ]
     )
@@ -1158,9 +1174,9 @@ def fmt_dashboard_home() -> str:
     return "\n\n".join(
         [
             fmt_home_header(),
-            md2_rule(28),
+            md2_rule(),
             status,
-            md2_rule(28),
+            md2_rule(),
             nxt,
         ]
     )
@@ -1171,7 +1187,7 @@ def fmt_getting_started() -> str:
     return "\n".join(
         [
             "🚀 *Getting Started*",
-            md2_rule(28),
+            md2_rule(),
             "",
             "Three quick steps and you're trading:",
             "",
@@ -1257,21 +1273,21 @@ def fmt_referral_dashboard(payload: dict) -> str:
 
     lines.extend([
         "",
-        md2_rule(24),
+        md2_rule(),
         "_Anyone can claim a code; each code is unique and tied to one Nadobro account\\._",
     ])
     return "\n".join(lines)
     return "\n\n".join(
         [
             fmt_home_header(),
-            md2_rule(28),
+            md2_rule(),
             status,
             "",
             nxt,
-            md2_rule(28),
+            md2_rule(),
             f"*{_loc('Your toolkit')}*",
             _fmt_home_toolkit_tree(),
-            md2_rule(24),
+            md2_rule(),
             "_Tap a button, or just type\\. I'll answer questions and place trades in plain English\\._",
         ]
     )
@@ -1281,7 +1297,7 @@ def fmt_strategy_hub_intro() -> str:
     return "\n\n".join(
         [
             _ui_header("Nadobro Strategy Lab", icon="🧠"),
-            md2_rule(28),
+            md2_rule(),
             _ui_section(
                 "How it works",
                 [
@@ -1609,6 +1625,35 @@ def _fmt_age_seconds(ts: float) -> str:
         return "—"
 
 
+def _fmt_heartbeat_freshness(worker_last_heartbeat, interval_seconds: int) -> str | None:
+    """One MarkdownV2 line declaring whether a running worker is ticking.
+
+    Three honest states, keyed off the worker heartbeat epoch:
+      • warming up — heartbeat 0.0 (no cycle completed yet); assert neither
+        live nor stale, just that the first cycle is pending.
+      • live — heartbeat within ~2 cycles; the numbers above are current.
+      • stalling — heartbeat older than that; at least one scheduled tick was
+        missed, so the numbers are last-known, not live.
+
+    The stale cutoff is ``max(2 * interval, 90)`` — two missed cycles, with a
+    90s floor so a fast strategy (rgrid/mid/vol at an ~8s cadence) doesn't flag
+    stale during a single slow render. Returns ``None`` if the heartbeat is
+    unusable, so a malformed value drops the line rather than lying.
+    """
+    try:
+        hb = float(worker_last_heartbeat or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if hb <= 0:
+        return f"{_loc('Feed')}: *{_loc('warming up')}* · {_loc('first cycle pending')}"
+    age = max(0, int(time.time() - hb))
+    cutoff = max(2 * int(interval_seconds or 0), 90)
+    age_str = _fmt_age_seconds(hb)
+    if age <= cutoff:
+        return f"{_loc('Feed')}: *{_loc('live')}* ✅ · {_loc('heartbeat')} {escape_md(age_str)}"
+    return f"{_loc('Feed')}: *{_loc('stalling')}* ⚠️ · {_loc('last heartbeat')} {escape_md(age_str)}"
+
+
 def _fmt_progress_bar(done: float, total: float, width: int = 12) -> str:
     total_v = max(0.0, float(total or 0.0))
     done_v = max(0.0, float(done or 0.0))
@@ -1732,6 +1777,15 @@ def fmt_status_overview(status: dict, onboarding: dict):
         f"*{escape_md(strategy)} · {escape_md(product_label)}*",
         f"{_loc('Status')}: *{escape_md(state_label)}* \\| {runtime_summary}",
     ])
+    # Freshness contract (Phase 3): a running strategy declares whether its
+    # worker is actually ticking. worker_last_heartbeat is written once per
+    # cycle (bot_runtime), so a heartbeat older than ~2 cycles means at least
+    # one scheduled tick was missed — the numbers above are then last-known,
+    # not live. Additive: a new line, no existing field touched. Stopped
+    # strategies never reach here, so no dead "heartbeat" line on an OFF card.
+    hb_line = _fmt_heartbeat_freshness(status.get("worker_last_heartbeat"), interval)
+    if hb_line:
+        lines.append(hb_line)
     # GATE-VISIBILITY (2026-07-31): while the regime gate pauses quoting, the
     # card used to read "LIVE … Last cycle: OK" with zero orders — dark quoting
     # was invisible. Name the state, the reason, and how long it has held.

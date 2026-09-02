@@ -19,8 +19,10 @@ class _FakeQuery:
     def __init__(self, data="nav:main"):
         self.data = data
         self.answered = asyncio.Event()
+        self.answer_text = None
 
-    async def answer(self, *_a, **_k):
+    async def answer(self, *_a, text=None, **_k):
+        self.answer_text = text
         self.answered.set()
 
 
@@ -81,6 +83,58 @@ def test_points_cancel_is_not_pre_acked():
     wrapped = us.with_callback_ack(handler)
     assert asyncio.run(wrapped(_update(query), None)) == "done"
     assert not query.answered.is_set()
+
+
+def _ack_and_capture(data):
+    """Run the pre-ack for one callback and return the toast text it emitted."""
+    _reset_state()
+    query = _FakeQuery(data)
+
+    async def handler(_update, _context):
+        return "ok"
+
+    wrapped = us.with_callback_ack(handler)
+
+    async def scenario():
+        await wrapped(_update(query), None)
+        await asyncio.wait_for(query.answered.wait(), timeout=1.0)
+
+    asyncio.run(scenario())
+    return query.answer_text
+
+
+def test_action_taps_get_a_present_tense_toast():
+    """The Phase 2 win: a tap that does real work says so, instantly."""
+    assert _ack_and_capture("exec_trade:abc") == "Placing your order…"
+    assert _ack_and_capture("pos:close:BTC") == "Closing position…"
+    assert _ack_and_capture("strategy:stop") == "Stopping strategy…"
+    assert _ack_and_capture("portfolio:view") == "Loading portfolio…"
+
+
+def test_unmapped_tap_keeps_the_silent_bare_ack():
+    """No regression: an unmapped callback still acks, with no toast text."""
+    assert _ack_and_capture("nav:main") is None
+    # A sub-flow micro-step must stay silent — toasting each one would be noise.
+    assert _ack_and_capture("card:trade:sess-1:size:0.05") is None
+
+
+def test_confirm_screen_is_not_mislabelled_as_the_action():
+    """pos:close_all only OPENS a confirm dialog; it must not say 'Closing…'."""
+    assert _ack_and_capture("pos:close_all") is None
+    assert _ack_and_capture("pos:confirm_close_all") == "Closing everything…"
+
+
+def test_toast_resolution_does_no_io():
+    """The toast must be a pure map — the pre-ack path stays free of DB/venue.
+
+    A blocking lookup here would reintroduce exactly the round-trip the pre-ack
+    was built to remove.
+    """
+    import src.nadobro.handlers.ui as ui_mod
+
+    src = __import__("inspect").getsource(ui_mod.toast_for)
+    for forbidden in ("get_user", "query_", "await", "requests", "get_balance"):
+        assert forbidden not in src, f"toast_for must not reference {forbidden!r}"
 
 
 def test_lock_wait_is_bounded_and_the_user_is_told(monkeypatch):

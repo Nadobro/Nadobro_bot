@@ -170,31 +170,34 @@ def getting_started_kb():
 
 
 def home_card_kb():
+    # Hierarchy via row width — Telegram's only weighting lever (F-09). The
+    # primary action is full-width and alone; the two "do stuff" areas pair
+    # under it; setup + AI next; the rest descend to utilities last. Same
+    # twelve destinations as before, reordered and reweighted only — the
+    # callback set is asserted stable by test_home_card_destinations_are_stable.
     rows = [
-        [
-            InlineKeyboardButton("🤖 Trade Console", callback_data="card:trade:start"),
-            InlineKeyboardButton("💬 Ask Nadobro", callback_data="desk:view"),
-        ],
+        [InlineKeyboardButton("🤖 Trade Console", callback_data="card:trade:start")],
         [
             InlineKeyboardButton("📁 Portfolio Deck", callback_data="portfolio:view"),
             InlineKeyboardButton("🧠 Strategy Lab", callback_data="nav:strategy_hub"),
         ],
         [
             InlineKeyboardButton("💼 Wallet Vault", callback_data="wallet:view"),
+            InlineKeyboardButton("💬 Ask Nadobro", callback_data="desk:view"),
+        ],
+        [
             InlineKeyboardButton("🏆 Nado Points", callback_data="points:view"),
-        ],
-        [
             InlineKeyboardButton("💰 Nado Vault", callback_data="vault:home"),
+        ],
+        [
             InlineKeyboardButton("🔔 Alerts", callback_data="alert:menu"),
-        ],
-        [
             InlineKeyboardButton("🎁 Referrals", callback_data="refer:view"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="settings:view"),
         ],
         [
-            InlineKeyboardButton("🔗 Official Links", callback_data="resources:home"),
+            InlineKeyboardButton("⚙️ Settings", callback_data="settings:view"),
             InlineKeyboardButton("🌐 Execution Mode", callback_data="home:mode"),
         ],
+        [InlineKeyboardButton("🔗 Official Links", callback_data="resources:home")],
     ]
     return InlineKeyboardMarkup(rows)
 

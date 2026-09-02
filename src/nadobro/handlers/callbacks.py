@@ -100,7 +100,7 @@ logger = logging.getLogger(__name__)
 async def _show_trading_readiness_block(query, readiness) -> None:
     if readiness.code == "onboarding_incomplete":
         await _edit_loc(query,
-            "⚠️ Complete setup first (language + accept terms).",
+            "⚠️ Complete setup first \\(language \\+ accept terms\\)\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("▶ Complete setup", callback_data="onboarding:resume")],
@@ -108,10 +108,21 @@ async def _show_trading_readiness_block(query, readiness) -> None:
             ]),
         )
         return
+    # F-09: don't strand the user at a bare wall. The common not-ready case is a
+    # wallet that isn't linked/funded yet — hand them the button that fixes it
+    # instead of only "Back". Other codes (e.g. admin pause) have no user action,
+    # so those keep the plain Back.
+    if readiness.code == "wallet_not_ready":
+        wall_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💼 Link Wallet", callback_data="wallet:view")],
+            [InlineKeyboardButton("🏠 Home", callback_data="nav:main")],
+        ])
+    else:
+        wall_kb = back_kb()
     await _edit_loc(query,
         f"⚠️ {escape_md(readiness.reason)}",
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=back_kb(),
+        reply_markup=wall_kb,
     )
 
 
@@ -325,13 +336,17 @@ async def _handle_callback_inner(update, context, query, data, telegram_id, star
 
 
 # New onboarding (language → ToS) message text
-_ONB_WELCOME_LANG_MSG = """Welcome to Nadobro 👋
+_ONB_WELCOME_LANG_MSG = """Step 1 of 2 · Language
+
+Welcome to Nadobro 👋
 
 Trade perps on Nado straight from Telegram. Type the trade, tap to confirm, done. Automation, portfolio, and AI are all here too.
 
 Pick your language:"""
 
-_ONB_WELCOME_CARD = """🔥 You're in.
+_ONB_WELCOME_CARD = """Step 2 of 2 · Accept terms
+
+🔥 You're in.
 
 Tapping *"Let's Get It"* means you're good with the Terms of Use & Privacy Policy.
 
@@ -462,7 +477,7 @@ async def _handle_nav(query, data, telegram_id, context=None):
     elif target == "trade" and context is not None:
         if not is_new_onboarding_complete(telegram_id):
             await _edit_loc(query,
-                "⚠️ Complete setup first (language + accept terms).",
+                "⚠️ Complete setup first \\(language \\+ accept terms\\)\\.",
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("▶ Complete setup", callback_data="onboarding:resume")],

@@ -636,7 +636,7 @@ async def _dispatch_reply_button(update, context, telegram_id, callback_data, te
         clear_pending_user_state(context, telegram_id)
         if not is_new_onboarding_complete(telegram_id):
             await _reply_loc(update.message,
-                "⚠️ Complete setup first (language + accept terms).",
+                "⚠️ Complete setup first \\(language \\+ accept terms\\)\\.",
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("▶ Complete setup", callback_data="onboarding:resume")],
@@ -2107,7 +2107,7 @@ async def _handle_pending_text_close_all_confirmation(update, context, telegram_
     if normalized in ("cancel", "no", "n", "abort"):
         context.user_data.pop(PENDING_TEXT_CLOSE_ALL_KEY, None)
         await _reply_loc(update.message, 
-            "❌ Close-all request cancelled\\.",
+            "❌ Close\\-all request cancelled\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=persistent_menu_kb(),
         )
