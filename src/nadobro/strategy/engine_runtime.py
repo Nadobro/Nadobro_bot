@@ -856,7 +856,37 @@ _LIVE_CONFIG_SIGNATURE_EXCLUDE = frozenset({
     # Controller-derived, persisted only to recover a Mid session after a
     # worker restart. It must not force live quote resets every cycle.
     "restore_expected_budget_used_usd",
+    # AUDIT-DENY-2026-09-02-F5: the overlay's chop posture. apply_overrides_to_configs
+    # writes both on chop and drops them on range; routing that edge through the
+    # signature re-placed the WHOLE ladder (grid recenter / Mid quote reset) on
+    # every regime flip. They reach the controller via _push_overlay_posture
+    # instead, and are read live (evaluate_quote_gate / _apply_entry_suppression).
+    "suppress_new_entries",
+    "regime_gate_enabled",
 })
+
+# The overlay posture keys pushed straight onto the controller each cycle.
+_OVERLAY_POSTURE_KEYS = ("suppress_new_entries", "regime_gate_enabled")
+
+
+def _push_overlay_posture(controller: object, configs: dict) -> None:
+    """Per-cycle push of the overlay's chop posture (AUDIT-DENY-2026-09-02-F5).
+
+    Mirrors the signal push right below the signature exclusion: the mapped
+    ``configs`` carry this cycle's posture (the user's own value, or the
+    overlay's chop override, or nothing); the controller's live ``configs`` are
+    made to agree BEFORE it ticks. A key absent from the mapped configs is
+    removed so the controller falls back to its own default — never a stale
+    override from the previous regime.
+    """
+    live = getattr(controller, "configs", None)
+    if not isinstance(live, dict):
+        return
+    for key in _OVERLAY_POSTURE_KEYS:
+        if key in configs:
+            live[key] = configs[key]
+        else:
+            live.pop(key, None)
 
 
 def engine_v2_enabled() -> bool:
@@ -3318,6 +3348,8 @@ async def _run_engine_cycle_locked(
                 _sig_ctrl.signal_confidence = float(configs.get("signal_confidence", 0.0) or 0.0)
             except (TypeError, ValueError):
                 _sig_ctrl.signal_confidence = 0.0
+        if _sig_ctrl is not None:
+            _push_overlay_posture(_sig_ctrl, configs)
     except Exception:  # noqa: BLE001  # policy: degrade-ok(advisory read; the tick must run)
         logger.debug("overlay signal push failed", exc_info=True)
 

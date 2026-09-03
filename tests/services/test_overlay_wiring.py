@@ -524,3 +524,54 @@ def test_no_overlay_scaled_size_key_can_exceed_the_risk_cap(strategy):
                 f"{strategy}: {key}={val} exceeds max_single_order_quote={cap}; the "
                 "risk gate refuses the spawn and the session goes LIVE with 0 orders"
             )
+
+
+# ==========================================================================
+# AUDIT-DENY-2026-09-02-F5: the overlay's chop posture must not re-place the
+# ladder through the live-config signature; it is pushed onto the controller
+# directly each cycle (the controllers read both keys live).
+# ==========================================================================
+
+
+def test_overlay_posture_keys_never_flip_the_live_config_signature():
+    from src.nadobro.strategy.engine_runtime import _live_config_signature
+    base = {"trading_pair": "BTC-PERP", "spread_bid_pct": "0.001", "step_pct": "0.0008"}
+    chop = dict(base, suppress_new_entries=True, regime_gate_enabled=True)
+    assert _live_config_signature(base) == _live_config_signature(chop), (
+        "a chop<->range edge re-placed the whole ladder every regime flip"
+    )
+    # A REAL parameter change still must.
+    assert _live_config_signature(base) != _live_config_signature(dict(base, step_pct="0.001"))
+
+
+def test_the_posture_is_pushed_onto_the_controller_each_cycle():
+    from types import SimpleNamespace
+    from src.nadobro.strategy.engine_runtime import _push_overlay_posture
+    # The user's own value: Mid regime gate off.
+    ctrl = SimpleNamespace(configs={"trading_pair": "BTC-PERP", "regime_gate_enabled": 0.0})
+    # Chop: the overlay overrides both keys in this cycle's mapped configs.
+    _push_overlay_posture(ctrl, {"trading_pair": "BTC-PERP",
+                                 "suppress_new_entries": True, "regime_gate_enabled": True})
+    assert ctrl.configs["suppress_new_entries"] is True
+    assert ctrl.configs["regime_gate_enabled"] is True
+    # Range again: the mapped configs carry the user's value once more, and the
+    # overlay's suppress flag is gone — the controller must not keep either.
+    _push_overlay_posture(ctrl, {"trading_pair": "BTC-PERP", "regime_gate_enabled": 0.0})
+    assert "suppress_new_entries" not in ctrl.configs
+    assert ctrl.configs["regime_gate_enabled"] == 0.0
+    assert ctrl.configs["trading_pair"] == "BTC-PERP"         # nothing else touched
+    # A key absent from the mapped configs is removed (controller default), never
+    # left as a stale override.
+    _push_overlay_posture(ctrl, {"trading_pair": "BTC-PERP"})
+    assert "regime_gate_enabled" not in ctrl.configs
+    # A controller without a configs dict is left alone.
+    _push_overlay_posture(SimpleNamespace(), {"suppress_new_entries": True})
+
+
+def test_the_runtime_pushes_the_posture_before_ticking():
+    import inspect
+    from src.nadobro.strategy import engine_runtime as er
+    source = inspect.getsource(er._run_engine_cycle_locked)
+    assert source.index("_push_overlay_posture(") < source.index("await RUNTIME.tick("), (
+        "the posture must reach the controller before it ticks"
+    )

@@ -1244,20 +1244,30 @@ class NadoClient:
         *,
         refresh: bool = False,
         strict: bool = False,
-    ) -> list[dict]:
+    ) -> Optional[list[dict]]:
         """One gateway call that returns open orders for ``sender`` across
         every product in ``product_ids``. Replaces the per-product fan-out
-        that previously issued N requests per sender."""
+        that previously issued N requests per sender.
+
+        DENIED-vs-EMPTY contract (2026-09-02, the stale-order-sweep half of the
+        phantom-cancel storm): ``[]`` means a SUCCESSFUL read of an empty book.
+        A read this process could not make — SDK unavailable, denied by our own
+        gateway budget, or failed at the venue — returns ``None`` when
+        non-strict (strict callers still get the exception). The portfolio
+        sync's stale-order sweep marks every DB row the venue list omits as
+        ``cancelled_or_filled``; feeding it ``[]`` for a denied round wiped a
+        live ladder's rows on every throttled poll.
+        """
         if not sender or not product_ids:
             return []
         if not self._ensure_sdk_client():
             if strict:
                 raise RuntimeError("SDK client unavailable for open-order sync")
-            return []
+            return None
 
         # "Orders" query: IP weight = 2 * product_ids.length
         if not self._gateway_allowed(weight=2 * max(1, len(product_ids))):
-            return []
+            return None
 
         try:
             from nado_protocol.utils.math import from_x18
@@ -1275,7 +1285,7 @@ class NadoClient:
                 raise RuntimeError(
                     f"SDK get_subaccount_multi_products_open_orders failed: {_format_sdk_error(e)}"
                 ) from e
-            return []
+            return None
         finally:
             self._gateway_release()
 
@@ -1357,10 +1367,15 @@ class NadoClient:
         include_isolated: bool = True,
         include_spot: bool = True,
         strict: bool = False,
-    ) -> list[dict]:
+    ) -> Optional[list[dict]]:
         """Fetch open orders for every tracked product on a single sender in **one**
         gateway call (per sender), instead of the previous ``products × senders``
         ThreadPool fan-out.
+
+        Returns ``None`` (never ``[]``) when ANY sender's book could not be read
+        this round — see ``_open_orders_for_sender_batched``. Callers that only
+        display use ``or []``; the portfolio sync treats ``None`` as "unknown"
+        and skips its stale-order sweep.
 
         ``include_isolated=False`` (used by the background portfolio poller
         when the user has no known isolated positions) skips the archive query
@@ -1376,7 +1391,10 @@ class NadoClient:
         rows: list[dict] = []
         parent = self.subaccount_hex or ""
         if parent:
-            rows.extend(self._open_orders_for_sender_batched(parent, product_ids, refresh=refresh, strict=strict))
+            parent_rows = self._open_orders_for_sender_batched(parent, product_ids, refresh=refresh, strict=strict)
+            if parent_rows is None:
+                return None                # unreadable round: NOT an empty book
+            rows.extend(parent_rows)
         elif strict:
             raise RuntimeError("subaccount unavailable for open-order sync")
 
@@ -1393,7 +1411,10 @@ class NadoClient:
         for iso in isolated:
             if not iso or iso.lower() == parent.lower():
                 continue
-            for order in self._open_orders_for_sender_batched(iso, product_ids, refresh=refresh, strict=strict):
+            iso_rows = self._open_orders_for_sender_batched(iso, product_ids, refresh=refresh, strict=strict)
+            if iso_rows is None:
+                return None                # a child's book is unknown -> the whole list is
+            for order in iso_rows:
                 order.setdefault("isolated", True)
                 order.setdefault("subaccount", iso)
                 rows.append(order)
@@ -1406,14 +1427,21 @@ class NadoClient:
         limit: int = 200,
         idx: str | None = None,
         max_time: int | None = None,
-    ) -> list[dict]:
+    ) -> Optional[list[dict]]:
         """
         Fetch indexer match/fill events for this subaccount.
+
+        CONTRACT (DENIED-vs-EMPTY, 2026-09-02): ``[]`` means a SUCCESSFUL read
+        with no matches. ``None`` means the read could NOT be performed (no SDK
+        client, archive budget denied, or the SDK raised) = fills UNKNOWN. It
+        used to return ``[]`` for all three, so a gone order whose fills could
+        not be read was booked CANCELLED(filled=0): inventory blind, level
+        re-entered (audit AUDIT-DENY-2026-09-02-F3).
 
         SDK 0.3.3 aliases ``idx`` as ``submission_idx`` on IndexerBaseParams.
         """
         if not self._ensure_sdk_client():
-            return []
+            return None
         from src.nadobro.venue.nado_weights import query_weight
         # _gateway_allowed -> try_acquire can time.sleep() on a starved token
         # bucket. This runs in the coroutine body (not inside _call), so doing it
@@ -1424,7 +1452,7 @@ class NadoClient:
             url=self._archive_url(),
             user_scoped=False,
         ):
-            return []
+            return None
         try:
             from nado_protocol.indexer_client.types.query import IndexerMatchesParams
 
@@ -1446,7 +1474,7 @@ class NadoClient:
             return self._to_plain(rows or [])
         except Exception as e:
             logger.error("SDK get_matches failed: %s", _format_sdk_error(e))
-            return []
+            return None
 
     async def get_interest_and_funding_payments(
         self,

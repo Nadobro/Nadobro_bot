@@ -347,6 +347,12 @@ async def _backfill_older_matches(
             page = await client.get_matches(limit=_BACKFILL_PAGE_LIMIT, idx=str(next_idx))
         except Exception:  # policy: degrade-ok(one page failure; retry next sync)
             break
+        if page is None:
+            # DENIED-vs-EMPTY: the archive budget denied this page (or the feed
+            # failed). That is a KNOWN throttle, not evidence of the true start —
+            # retry next sync without counting a stall, so a denial storm can
+            # never persist done=True and truncate the ledger for good.
+            break
         page_idxs = [i for i in (_safe_idx(m.get("submission_idx")) for m in (page or [])) if i is not None]
         if not page_idxs:
             # Empty page: a transient gateway throttle OR the true start. Count a
@@ -525,16 +531,39 @@ async def sync_user(
                 client.get_trigger_orders(limit=200),
                 run_blocking_sdk(client.get_balance),
             )
-            # Freshness (2026-09-02, F6): a balance the client served from Redis
-            # because the venue read was denied/failed must not be stamped
-            # "synced now" — the deck says "Cached · venue throttled" instead.
+            # DENIED-vs-EMPTY (2026-09-02): ``None`` means this round could not
+            # read the book (budget-denied / venue error) — NOT an empty book.
+            # Keep the last known list for display and flag the snapshot so the
+            # DB writer skips the stale-order sweep, which would otherwise mark
+            # every live ladder row cancelled_or_filled on a throttled poll.
+            open_orders_unknown = orders is None
+            if open_orders_unknown:
+                logger.warning(
+                    "portfolio sync: open-orders read unavailable (denied/failed) user=%s "
+                    "network=%s — keeping the last known list, skipping the stale sweep",
+                    user_id, network,
+                )
+                orders = list(prior.get("open_orders") or [])
+            # Freshness (2026-09-02, F6): figures the venue would not serve this
+            # round — a balance the client served from Redis (budget-denied /
+            # failed) or an unknown open-orders book — must not be stamped
+            # "synced now"; the deck says "Cached · venue throttled" instead.
             balance_cached = isinstance(balance, dict) and bool(balance.get("_cached"))
+            venue_throttled = bool(balance_cached or open_orders_unknown)
 
             if need_heavy:
                 matches, funding = await asyncio.gather(
                     client.get_matches(limit=200),
                     client.get_interest_and_funding_payments(limit=200),
                 )
+                if matches is None:
+                    # DENIED-vs-EMPTY: the fills feed could not be read this round
+                    # (archive budget denied / feed down). Serve the LAST KNOWN
+                    # ledger rather than an empty one — otherwise the user's
+                    # stats/volume read as zero for the round and the ledger
+                    # write sees nothing to add. The backfill pager below treats
+                    # an unreadable page the same way (retry, never 'done').
+                    matches = list(prior.get("matches") or [])
                 last_heavy_monotonic = time.time()
                 # Complete the fill ledger: page backward beyond the newest 200 so
                 # the account realized-PnL replay has full per-product basis (a
@@ -571,13 +600,14 @@ async def sync_user(
                 "summary": summary or {},
                 "positions": positions,
                 "open_orders": all_orders,
+                "open_orders_unknown": open_orders_unknown,
                 "matches": matches or [],
                 "funding_payments": funding or [],
                 "stats": stats,
                 "equity": equity,
                 "spot_balances": spot_balances,
-                "last_sync": (prior.get("last_sync") or _now()) if balance_cached else _now(),
-                "venue_throttled": balance_cached,
+                "last_sync": (prior.get("last_sync") or _now()) if venue_throttled else _now(),
+                "venue_throttled": venue_throttled,
                 "monotonic_ts": time.time(),
                 "last_heavy_monotonic": last_heavy_monotonic,
                 "last_reconcile_monotonic": time.monotonic() if str(reason).startswith("ws") or force else float(
@@ -607,7 +637,15 @@ def _write_snapshot(snapshot: dict[str, Any], duration_ms: int) -> None:
     funding = list(snapshot.get("funding_payments") or [])
 
     _write_positions(user_id, network, positions)
-    _write_open_orders(user_id, network, orders)
+    if snapshot.get("open_orders_unknown"):
+        # The venue book could not be read this round (see sync_user): ``orders``
+        # is the last KNOWN list, so neither sweep nor re-upsert against it.
+        logger.warning(
+            "portfolio sync: open-orders unknown this round — stale-order sweep skipped user=%s network=%s",
+            user_id, network,
+        )
+    else:
+        _write_open_orders(user_id, network, orders)
     fills_inserted = _write_matches(user_id, network, matches)
     funding_inserted = _write_funding(user_id, network, funding)
 
