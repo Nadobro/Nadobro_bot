@@ -13,7 +13,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, AsyncIterator, Deque, Dict, List, Optional
+from typing import TYPE_CHECKING, AsyncIterator, Callable, Deque, Dict, List, Optional
 
 from src.nadobro.engine.executor_base import Executor, ExecutorFailed, TradeRecorder
 from src.nadobro.engine.risk import ExecutorRequest, RiskEngine
@@ -99,6 +99,43 @@ class ExecutorEvent:
     ts: float = field(default_factory=time.time)
 
 
+# TERMINATED executors kept per controller after their tick (2026-09-03). The
+# orchestrator used to hold every executor a session ever spawned — 1,500+ for a
+# re-quoting 20-level ladder within a day — and the runtime persisted ALL of
+# them every tick. Controllers read recently terminated executors (fill
+# absorption / anchors, order counts), so a bounded window is kept and counts
+# are banked on the controller before anything is dropped.
+DEFAULT_TERMINATED_RETENTION = _env_int("NADO_TERMINATED_EXECUTOR_RETENTION", 50)
+
+
+def _order_may_still_rest(ex: Executor) -> bool:
+    """True when the executor's venue order might still rest. Such an executor
+    is never pruned: the Mid slot logic retries its stop through it (F2b).
+
+    Any known non-terminal ``order`` / ``close_order`` keeps it. A stop that
+    ended FAILED keeps it only while an order is not confirmed terminal — once
+    the F2b retry confirms the cancel, or when nothing was ever placed, the
+    executor becomes prunable (its close_type stays FAILED forever, so that
+    alone must not pin it). A FAILED executor with no order handles at all (a
+    grid) is kept: nothing proves its levels are clear."""
+    handles = ("order", "close_order", "entry_order")
+    has_handle = False
+    for attr in handles:
+        if not hasattr(ex, attr):
+            continue
+        has_handle = True
+        order = getattr(ex, attr, None)
+        state = getattr(order, "state", None)
+        if order is not None and state is not None and not getattr(state, "is_terminal", True):
+            return True
+    if getattr(ex, "close_type", None) is CloseType.FAILED:
+        # An executor that exposes order handles and has none resting (never
+        # placed, or confirmed terminal) holds nothing on the venue. Only an
+        # executor without handles (a grid) is kept on FAILED alone.
+        return not has_handle
+    return False
+
+
 class ExecutorOrchestrator:
     def __init__(
         self,
@@ -127,6 +164,10 @@ class ExecutorOrchestrator:
         self._event_log_limit = max(1, event_log_limit)
         self._event_log_deque: Deque[ExecutorEvent] = deque(maxlen=self._event_log_limit)
         self._queue_overflows = 0
+        # Set by the runtime: an executor this returns True for is NOT pruned
+        # yet (its terminal row has not been persisted — a failed batch is
+        # retried next tick and must still find the executor).
+        self.prune_keep_predicate: Optional[Callable[[Executor], bool]] = None
         self._killed = False
         self._kill_reason: Optional[str] = None
         # BUG-TICK-1: per-controller transient-failure tracking. We keep a
@@ -410,6 +451,9 @@ class ExecutorOrchestrator:
             if not ok:
                 self._emit(ExecutorEvent(kind="controller_skipped", controller_id=controller_id, reason=reason))
                 return
+        # Executors already terminated BEFORE this tick: the controller gets this
+        # tick to read them (fills, anchors, counts); after it they are prunable.
+        terminated_before = {e.id for e in self.list(controller_id) if e.is_terminated}
         try:
             await controller.on_tick()
         except Exception as exc:  # noqa: BLE001
@@ -419,6 +463,51 @@ class ExecutorOrchestrator:
         self._controller_fail_counts.pop(controller_id, None)
         self._controller_backoff_until.pop(controller_id, None)
         self._emit(ExecutorEvent(kind="controller_tick", controller_id=controller_id))
+        self.prune_terminated(controller_id, eligible=terminated_before)
+
+    def prune_terminated(
+        self,
+        controller_id: str,
+        *,
+        eligible: Optional[set] = None,
+        keep: Optional[int] = None,
+    ) -> int:
+        """Drop TERMINATED executors of ``controller_id`` beyond the newest
+        ``keep`` (default ``NADO_TERMINATED_EXECUTOR_RETENTION``), banking their
+        order counts on the controller first. Only executors in ``eligible``
+        (terminated before the tick that just ran) are dropped, never one whose
+        order may still rest. Returns the number pruned."""
+        keep = DEFAULT_TERMINATED_RETENTION if keep is None else max(0, int(keep))
+        terminated = [e for e in self.list(controller_id) if e.is_terminated]
+        if len(terminated) <= keep:
+            return 0
+        terminated.sort(key=lambda e: float(getattr(e, "terminated_at", 0.0) or 0.0), reverse=True)
+        controller = self._controllers.get(controller_id)
+        bank = getattr(controller, "bank_executor_counts", None)
+        pruned = 0
+        for ex in terminated[keep:]:
+            if eligible is not None and ex.id not in eligible:
+                continue
+            if _order_may_still_rest(ex):
+                continue
+            keep_pred = self.prune_keep_predicate
+            if keep_pred is not None:
+                try:
+                    if keep_pred(ex):
+                        continue
+                except Exception:  # policy: degrade-ok(a predicate error keeps the executor one more tick; the tick itself is unaffected)
+                    logger.warning("prune keep-predicate failed for %s — executor kept", ex.id, exc_info=True)
+                    continue
+            if callable(bank):
+                try:
+                    bank(ex)
+                except Exception:  # noqa: BLE001 - telemetry only; never lose the prune
+                    logger.warning("bank_executor_counts failed for %s", ex.id, exc_info=True)
+            self._executors.pop(ex.id, None)
+            pruned += 1
+        if pruned:
+            logger.debug("pruned %d terminated executor(s) for %s (kept %d)", pruned, controller_id, keep)
+        return pruned
 
     def _handle_controller_tick_error(
         self, controller: "Controller", controller_id: str, exc: Exception

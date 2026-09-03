@@ -529,48 +529,89 @@ def _config_json(executor: object) -> str:
     return "{}"
 
 
+_EXECUTOR_UPSERT_SQL = """
+    INSERT INTO engine_executors
+      (id, user_id, controller_id, strategy_type, trading_pair, side, config_json,
+       state, close_type, net_pnl_quote, fees_paid_quote, volume_quote,
+       duration_seconds, keep_position, created_at, terminated_at, strategy_session_id)
+    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s,
+            to_timestamp(%s), to_timestamp(%s), %s)
+    ON CONFLICT (id) DO UPDATE SET
+      state = EXCLUDED.state,
+      close_type = EXCLUDED.close_type,
+      net_pnl_quote = EXCLUDED.net_pnl_quote,
+      fees_paid_quote = EXCLUDED.fees_paid_quote,
+      volume_quote = EXCLUDED.volume_quote,
+      duration_seconds = EXCLUDED.duration_seconds,
+      terminated_at = EXCLUDED.terminated_at,
+      strategy_session_id = COALESCE(engine_executors.strategy_session_id, EXCLUDED.strategy_session_id)
+"""
+
+
+def executor_persist_signature(executor: object) -> tuple:
+    """The stored fields that can CHANGE after the first insert — the dirty
+    key for per-tick persistence (2026-09-03). Everything else (config, side,
+    pair, created_at) is immutable, so an executor whose signature is unchanged
+    since its last successful write has nothing to persist. A TERMINATED
+    executor's signature is frozen, so it is written exactly once after it
+    terminates instead of on every tick for the rest of the session."""
+    m = executor.metrics()  # type: ignore[attr-defined]
+    close_type = getattr(executor, "close_type", None)
+    # duration_seconds is deliberately NOT part of the signature: it advances
+    # every second for a live executor, which would make every idle tick a
+    # write. A row is written whenever anything else changes and the terminal
+    # write carries the final duration.
+    return (
+        executor.state.value,  # type: ignore[attr-defined]
+        getattr(close_type, "value", None),
+        str(m["net_pnl_quote"]), str(m["fees_paid_quote"]), str(m["volume_quote"]),
+        bool(executor.keep_position),  # type: ignore[attr-defined]
+        executor.terminated_at,  # type: ignore[attr-defined]
+    )
+
+
+def executor_row(executor: object, session_id: Optional[int]) -> tuple:
+    """The upsert parameter tuple for ``_EXECUTOR_UPSERT_SQL``. Pure — safe to
+    build on the event loop thread; only the write goes to a DB worker."""
+    m = executor.metrics()  # type: ignore[attr-defined]
+    close_type = getattr(executor, "close_type", None)
+    return (
+        executor.id, executor.user_id, executor.controller_id,  # type: ignore[attr-defined]
+        _strategy_type(executor), executor.trading_pair, _side(executor),  # type: ignore[attr-defined]
+        _config_json(executor), executor.state.value,  # type: ignore[attr-defined]
+        getattr(close_type, "value", None),
+        m["net_pnl_quote"], m["fees_paid_quote"], m["volume_quote"],
+        int(m["duration_seconds"]), executor.keep_position,  # type: ignore[attr-defined]
+        executor.created_at, executor.terminated_at,  # type: ignore[attr-defined]
+        session_id,
+    )
+
+
 class DbExecutorStore:
     def save(self, executor: object) -> None:
+        """One executor, one statement (tests / ad-hoc). The engine tick uses
+        ``save_rows`` — one batched round trip for every dirty executor."""
         from src.nadobro.db import execute
-
-        m = executor.metrics()  # type: ignore[attr-defined]
-        close_type = getattr(executor, "close_type", None)
-        close_type_val: Optional[str] = None
-        if close_type is not None:
-            close_type_val = close_type.value
         # Tag the executor with the RUN's unique session id so per-run order
         # counts don't bleed across runs (controller_id is stable across runs).
         # Resolved once at first insert; ON CONFLICT never overwrites it.
         session_id = resolve_session_id_for_controller(executor.controller_id)  # type: ignore[attr-defined]
-        execute(
-            """
-            INSERT INTO engine_executors
-              (id, user_id, controller_id, strategy_type, trading_pair, side, config_json,
-               state, close_type, net_pnl_quote, fees_paid_quote, volume_quote,
-               duration_seconds, keep_position, created_at, terminated_at, strategy_session_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s,
-                    to_timestamp(%s), to_timestamp(%s), %s)
-            ON CONFLICT (id) DO UPDATE SET
-              state = EXCLUDED.state,
-              close_type = EXCLUDED.close_type,
-              net_pnl_quote = EXCLUDED.net_pnl_quote,
-              fees_paid_quote = EXCLUDED.fees_paid_quote,
-              volume_quote = EXCLUDED.volume_quote,
-              duration_seconds = EXCLUDED.duration_seconds,
-              terminated_at = EXCLUDED.terminated_at,
-              strategy_session_id = COALESCE(engine_executors.strategy_session_id, EXCLUDED.strategy_session_id)
-            """,
-            (
-                executor.id, executor.user_id, executor.controller_id,  # type: ignore[attr-defined]
-                _strategy_type(executor), executor.trading_pair, _side(executor),  # type: ignore[attr-defined]
-                _config_json(executor), executor.state.value,  # type: ignore[attr-defined]
-                close_type_val,
-                m["net_pnl_quote"], m["fees_paid_quote"], m["volume_quote"],
-                int(m["duration_seconds"]), executor.keep_position,  # type: ignore[attr-defined]
-                executor.created_at, executor.terminated_at,  # type: ignore[attr-defined]
-                session_id,
-            ),
-        )
+        execute(_EXECUTOR_UPSERT_SQL, executor_row(executor, session_id))
+
+    def save_rows(self, rows: list, controller_ids: list) -> int:
+        """Batched upsert of prebuilt ``executor_row`` tuples — ONE session-id
+        lookup per controller (not per executor) and one round trip per page.
+        Blocking: call it from the DB worker pool, never on the event loop."""
+        from src.nadobro.db import execute_batch
+        if not rows:
+            return 0
+        session_ids: dict = {}
+        resolved = []
+        for row, cid in zip(rows, controller_ids):
+            if cid not in session_ids:
+                session_ids[cid] = resolve_session_id_for_controller(cid)
+            resolved.append((*row[:-1], session_ids[cid]))
+        return execute_batch(_EXECUTOR_UPSERT_SQL, resolved)
 
     def get(self, executor_id: str) -> Optional[dict]:
         from src.nadobro.db import query_one

@@ -109,6 +109,13 @@ class Controller(abc.ABC):
         # Set by the orchestrator when on_start raises, so the runtime can
         # surface why a start failed (e.g. a leg rejected by the risk gate).
         self._start_error: Optional[str] = None
+        # Order counts of TERMINATED executors the orchestrator has since pruned
+        # (bounded retention, 2026-09-03): banked here so order_counts() stays a
+        # whole-run figure while the orchestrator no longer holds every executor
+        # the session ever spawned (1,500+ for a re-quoting ladder in a day).
+        self._banked_counts: Dict[str, int] = {
+            "orders_placed": 0, "orders_filled": 0, "orders_cancelled": 0,
+        }
 
     # -- state transitions (called by the orchestrator) -------------------
     @property
@@ -142,12 +149,25 @@ class Controller(abc.ABC):
         this worker's lifetime. The engine cycle result carries no per-order
         count, so this is how /status and the per-cycle log get a true placed/
         filled/cancelled figure instead of 0."""
-        placed = filled = cancelled = 0
+        banked = getattr(self, "_banked_counts", None) or {}
+        placed = int(banked.get("orders_placed", 0))
+        filled = int(banked.get("orders_filled", 0))
+        cancelled = int(banked.get("orders_cancelled", 0))
         for ex in self.my_executors(active_only=False):
             placed += int(getattr(ex, "orders_placed", 0) or 0)
             filled += int(getattr(ex, "orders_filled", 0) or 0)
             cancelled += int(getattr(ex, "orders_cancelled", 0) or 0)
         return {"orders_placed": placed, "orders_filled": filled, "orders_cancelled": cancelled}
+
+    def bank_executor_counts(self, executor: Executor) -> None:
+        """Called by the orchestrator right before it prunes a TERMINATED
+        executor, so its venue-order activity survives in ``order_counts``."""
+        banked = getattr(self, "_banked_counts", None)
+        if banked is None:
+            self._banked_counts = banked = {"orders_placed": 0, "orders_filled": 0, "orders_cancelled": 0}
+        banked["orders_placed"] += int(getattr(executor, "orders_placed", 0) or 0)
+        banked["orders_filled"] += int(getattr(executor, "orders_filled", 0) or 0)
+        banked["orders_cancelled"] += int(getattr(executor, "orders_cancelled", 0) or 0)
 
     def cfg(self, key: str, default: Any = None) -> Any:
         return self.configs.get(key, default)
