@@ -1910,6 +1910,39 @@ def get_open_position_rows_for_product(user_id: int, network: str, product_id: i
         return []
 
 
+def get_open_order_product_ids(user_id: int, network: str) -> list[int]:
+    """Products that hold an open/pending/armed order row for this user — the
+    products a cancel sweep must at least look at when the whole-account read
+    cannot be made (2026-09-03). Read-only, [] on any error."""
+    try:
+        rows = query_all(
+            """
+            SELECT DISTINCT product_id FROM open_orders
+            WHERE user_id = %s AND network = %s
+              AND status IN ('open', 'pending', 'armed') AND product_id IS NOT NULL
+            """,
+            (user_id, network),
+        )
+        return [int(r["product_id"]) for r in rows if r.get("product_id") is not None]
+    except Exception:  # policy: degrade-ok(best-effort scope hint; the caller fails loud when the book stays unknown)
+        return []
+
+
+def get_open_position_product_ids(user_id: int, network: str) -> list[int]:
+    """Products with an open position row for this user (cross + isolated)."""
+    try:
+        rows = query_all(
+            """
+            SELECT DISTINCT product_id FROM positions
+            WHERE user_id = %s AND network = %s AND status = 'open' AND closed_at IS NULL
+            """,
+            (user_id, network),
+        )
+        return [int(r["product_id"]) for r in rows if r.get("product_id") is not None]
+    except Exception:  # policy: degrade-ok(best-effort scope hint; the caller fails loud when the book stays unknown)
+        return []
+
+
 def count_open_orders_for_product(user_id: int, network: str, product_id: int) -> int:
     """Resting order count for one product from the nado_sync-maintained
     ``open_orders`` table. Returns 0 on any error."""

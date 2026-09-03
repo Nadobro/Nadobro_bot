@@ -149,3 +149,91 @@ def test_remaining_orders_fail_the_close():
 
     assert result.get("success") is False
     assert "open orders remain" in str(result.get("error"))
+
+
+# ---------------------------------------------------------------------------
+# DENIED-vs-EMPTY at the cancel sweep (prod 2026-09-03, session 312).
+# ``get_all_open_orders`` returned None on EVERY call for a user with isolated
+# children; ``None or []`` read that as an empty book -> cancelled nothing ->
+# success=True -> the session rail sent "TP hit" over orders that kept filling.
+# ---------------------------------------------------------------------------
+
+class _DeniedBatchClient(_FakeClient):
+    """The whole-account read is UNKNOWN; the per-product single read works for
+    the default sender and holds the resting asks."""
+
+    def get_all_open_orders(self, *a, **k):
+        self.calls.append("get_all_open_orders")
+        return None
+
+    def get_open_orders(self, product_id, sender=None, refresh=False):
+        self.calls.append("get_open_orders")
+        if sender is not None or self._flat:
+            return []
+        return [dict(o) for o in self._resting if int(o.get("product_id")) == int(product_id)]
+
+
+def _known_pids(pids):
+    return patch("src.nadobro.models.database.get_open_order_product_ids", return_value=list(pids)), \
+           patch("src.nadobro.models.database.get_open_position_product_ids", return_value=[])
+
+
+def test_an_unknown_book_falls_back_to_per_product_reads_and_cancels():
+    client = _DeniedBatchClient(resting=[
+        {"product_id": BTC_PID, "digest": "0xA"}, {"product_id": BTC_PID, "digest": "0xB"},
+    ])
+    p1, p2 = _known_pids([BTC_PID])
+    with p1, p2:
+        result = _close_all(client)
+    assert result.get("success") is True
+    assert client.cancelled and {d for _, d, _ in client.cancelled} == {"0xA", "0xB"}
+    assert "get_open_orders" in client.calls, "the per-product fallback must run when the batched read is unknown"
+
+
+def test_an_unreadable_book_with_an_unreadable_fallback_fails_loud():
+    class _AllDenied(_DeniedBatchClient):
+        def get_open_orders(self, product_id, sender=None, refresh=False):
+            self.calls.append("get_open_orders")
+            return None
+
+    client = _AllDenied()
+    client._flat = True                                   # venue reports no position
+    p1, p2 = _known_pids([BTC_PID])
+    with p1, p2:
+        result = _close_all(client)
+    assert result.get("success") is False
+    assert "unavailable" in str(result.get("error", ""))
+    assert "cancel_order" not in client.calls
+
+
+def test_cancelling_nothing_with_no_known_products_is_not_success():
+    client = _DeniedBatchClient()
+    client._flat = True
+    p1, p2 = _known_pids([])
+    with p1, p2:
+        result = _close_all(client)
+    assert result.get("success") is False
+
+
+def test_a_readable_empty_book_on_a_flat_account_is_still_success():
+    client = _FakeClient()
+    client._flat = True                                   # batched read -> [] (READ, empty)
+    p1, p2 = _known_pids([BTC_PID])
+    with p1, p2:
+        result = _close_all(client)
+    assert result.get("success") is True and "cancel_order" not in client.calls
+
+
+def test_cancel_only_entry_point_reports_an_unknown_book():
+    class _AllDenied(_DeniedBatchClient):
+        def get_open_orders(self, product_id, sender=None, refresh=False):
+            return None
+
+    client = _AllDenied()
+    p1, p2 = _known_pids([BTC_PID])
+    with p1, p2, patch.object(trade_service, "get_user", return_value=_FakeUser()), \
+         patch.object(trade_service, "get_user_nado_client", return_value=client), \
+         patch.object(trade_service, "get_product_name", return_value="BTC-PERP"), \
+         patch.object(trade_service, "_order_sender_params", return_value=[None]):
+        out = trade_service.cancel_resting_orders_for_user(1234, "mainnet", only_pid=BTC_PID)
+    assert out["success"] is False and "unavailable" in out["error"]

@@ -443,8 +443,52 @@ def _net_abs_for_subaccount(positions: list, product_id: int, subaccount: str | 
     return 0.0, 0
 
 
+_UNKNOWN_BOOK = "open-orders read unavailable"
+
+
+def _book_unknown(errors: list[str]) -> bool:
+    """True when the resting-order sweep could not READ the book (as opposed to
+    read it and fail to cancel something). DENIED-vs-EMPTY: an unreadable book
+    must never be treated as an empty one."""
+    return any(str(e).startswith(_UNKNOWN_BOOK) for e in errors)
+
+
+def _resting_orders_fallback(
+    client, network: str, only_pid: int | None, known_pids, errors: list[str]
+) -> tuple[dict[tuple[int, str | None], list[str]], list[str]]:
+    """Per-product, per-sender single reads (weight 2 each) for the products
+    that can hold an order, used when the whole-account batched read is
+    UNKNOWN. ``refresh=True`` so a denied single read is ``None`` (unknown)
+    rather than a stale cache or ``[]``."""
+    grouped: dict[tuple[int, str | None], list[str]] = {}
+    pids = [int(only_pid)] if only_pid is not None else sorted({int(p) for p in (known_pids or [])})
+    if not pids:
+        errors.append(f"{_UNKNOWN_BOOK} and no known products to fall back on")
+        return grouped, errors
+    try:
+        senders = _order_sender_params(client, network)
+    except Exception as exc:  # policy: degrade-ok(sender enumeration failed; a parent-only fallback still reads the default subaccount and any unreadable sender is reported below)
+        logger.debug("sender enumeration failed during cancel fallback: %s", exc)
+        senders = [None]
+    for pid in pids:
+        for sender in senders:
+            try:
+                rows = client.get_open_orders(pid, refresh=True, sender=sender)
+            except Exception as exc:  # policy: degrade-ok(a raised single read is recorded as an UNKNOWN book for that product/sender, which fails the close loud below)
+                rows = None
+                logger.debug("fallback open-orders read raised pid=%s sender=%s: %s", pid, sender, exc)
+            if rows is None:
+                errors.append(f"{_UNKNOWN_BOOK} for {get_product_name(pid)} (sender={str(sender or 'default')[:10]})")
+                continue
+            for row in rows:
+                digest = str(row.get("digest") or "").strip()
+                if digest:
+                    grouped.setdefault((pid, sender), []).append(digest)
+    return grouped, errors
+
+
 def _resting_orders_by_sender(
-    client, only_pid: int | None = None
+    client, only_pid: int | None = None, *, known_pids=None, network: str = "mainnet"
 ) -> tuple[dict[tuple[int, str | None], list[str]], list[str]]:
     """Every resting order as ``{(product_id, sender): [digests]}`` in ONE
     gateway call per sender.
@@ -457,16 +501,27 @@ def _resting_orders_by_sender(
     exposes a batched multi-product read, which ``get_all_open_orders`` already
     uses for the portfolio poller — same senders (both derive from
     ``query_isolated_subaccounts_for_parent``), same coverage, 1 call each.
-
     ``sender`` is ``None`` for the parent subaccount, matching
     ``_order_sender_params`` and ``cancel_order(sender=...)``.
+
+    DENIED-vs-EMPTY (prod 2026-09-03, session 312): ``get_all_open_orders``
+    returns ``None`` when the book could not be read — and for any user with an
+    isolated child subaccount that was EVERY call (the 168-weight parent read
+    drained the per-user bucket, the child read timed out). ``None or []`` here
+    turned that into "empty book": cancelled nothing, reported success, and the
+    session rail sent "TP hit" while the asks kept filling. An unknown book now
+    falls back to per-product single reads on every sender, and whatever stays
+    unreadable is reported as an error the caller must fail loud on.
     """
     grouped: dict[tuple[int, str | None], list[str]] = {}
     errors: list[str] = []
     try:
-        rows = client.get_all_open_orders() or []
+        rows = client.get_all_open_orders()
     except Exception as e:
-        return {}, [f"open-orders lookup failed ({e})"]
+        rows = None
+        errors.append(f"{_UNKNOWN_BOOK} (batched read raised: {e})")
+    if rows is None:
+        return _resting_orders_fallback(client, network, only_pid, known_pids, errors)
     for row in rows:
         try:
             pid = int(row.get("product_id"))
@@ -508,9 +563,11 @@ def _cancel_open_orders_for_product(
     cancelled = 0
     errors: list[str] = []
     try:
-        open_orders = client.get_open_orders(product_id, sender=sender) or []
+        open_orders = client.get_open_orders(product_id, refresh=True, sender=sender)
     except Exception as e:
         return 0, [f"{get_product_name(product_id)}: open-orders lookup failed ({e})"]
+    if open_orders is None:                      # DENIED-vs-EMPTY: unknown, not empty
+        return 0, [f"{_UNKNOWN_BOOK} for {get_product_name(product_id)}"]
     for order in open_orders:
         digest = order.get("digest")
         if not digest:
@@ -2763,6 +2820,41 @@ def close_delta_neutral_legs(
     }
 
 
+def cancel_resting_orders_for_user(
+    telegram_id: int, network: str | None = None, *, only_pid: int | None = None
+) -> dict:
+    """Cancel every resting order for the user (optionally one product) WITHOUT
+    flattening positions — the venue half of an engine stop that has no local
+    controller to do it (a redeploy stand-down, a cross-process stop). Same
+    DENIED-vs-EMPTY discipline as ``close_all_positions``: an unreadable book is
+    reported, never treated as clear."""
+    user = get_user(telegram_id)
+    active_network = user.network_mode.value if user else "mainnet"
+    selected_network = str(network or active_network)
+    client = get_user_nado_client(telegram_id, network=selected_network)
+    if not client:
+        return {"success": False, "error": "Wallet not initialized or key migration required."}
+    known_pids: list[int] = []
+    try:
+        from src.nadobro.models.database import get_open_order_product_ids, get_open_position_product_ids
+        known_pids = list(get_open_order_product_ids(telegram_id, selected_network))
+        known_pids += list(get_open_position_product_ids(telegram_id, selected_network))
+    except Exception:  # policy: degrade-ok(scope hint only; an unknown book still fails loud below)
+        pass
+    if only_pid is not None:
+        known_pids.append(int(only_pid))
+    resting, errors = _resting_orders_by_sender(
+        client, only_pid=only_pid, known_pids=known_pids, network=selected_network,
+    )
+    cancelled, cancel_errors = _cancel_resting_orders(client, resting)
+    errors.extend(cancel_errors)
+    ok = not _book_unknown(errors) and not (cancelled == 0 and errors)
+    out = {"success": ok, "cancelled_orders": cancelled, "order_errors": errors}
+    if not ok:
+        out["error"] = "Could not confirm the order book is clear: " + "; ".join(errors[:4])
+    return out
+
+
 def close_all_positions(
     telegram_id: int, network: str | None = None, only_product: str | None = None,
     strategy_session_id: int | None = None, **kwargs
@@ -2787,12 +2879,38 @@ def close_all_positions(
     # Cancel on default + isolated margin subaccounts (orders rest on the same
     # sender as quotes). ONE batched read per sender — see
     # ``_resting_orders_by_sender`` for why this must not fan out per product.
-    resting, order_errors = _resting_orders_by_sender(client, only_pid=only_pid)
+    # Products that can hold an order (for the fallback when the batched read is
+    # unknown): the DB's open rows + open positions + the scoped product.
+    known_pids: list[int] = []
+    try:
+        from src.nadobro.models.database import get_open_order_product_ids, get_open_position_product_ids
+        known_pids = list(get_open_order_product_ids(telegram_id, selected_network))
+        known_pids += list(get_open_position_product_ids(telegram_id, selected_network))
+    except Exception:  # policy: degrade-ok(scope hint only; an unknown book still fails loud below)
+        pass
+    if only_pid is not None:
+        known_pids.append(int(only_pid))
+    resting, order_errors = _resting_orders_by_sender(
+        client, only_pid=only_pid, known_pids=known_pids, network=selected_network,
+    )
     cancelled_orders, cancel_errors = _cancel_resting_orders(client, resting)
     order_errors.extend(cancel_errors)
 
     net_positions = _normalize_net_positions(client.get_all_positions() or [])
     if not net_positions:
+        # FAIL LOUD (2026-09-03): "no positions" is only a clean result when the
+        # book was actually READ. An unreadable book, or errors with nothing
+        # cancelled, must not report success — the session rail turns success
+        # into a "TP hit / cleanup done" message over orders that still rest.
+        if _book_unknown(order_errors) or (cancelled_orders == 0 and order_errors):
+            return {
+                "success": False,
+                "cancelled": 0.0,
+                "products": [],
+                "cancelled_orders": cancelled_orders,
+                "order_errors": order_errors,
+                "error": "Could not confirm the order book is clear: " + "; ".join(order_errors[:4]),
+            }
         if cancelled_orders > 0 and not order_errors:
             return {
                 "success": True,
