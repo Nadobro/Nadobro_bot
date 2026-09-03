@@ -347,6 +347,12 @@ async def _backfill_older_matches(
             page = await client.get_matches(limit=_BACKFILL_PAGE_LIMIT, idx=str(next_idx))
         except Exception:  # policy: degrade-ok(one page failure; retry next sync)
             break
+        if page is None:
+            # DENIED-vs-EMPTY: the archive budget denied this page (or the feed
+            # failed). That is a KNOWN throttle, not evidence of the true start —
+            # retry next sync without counting a stall, so a denial storm can
+            # never persist done=True and truncate the ledger for good.
+            break
         page_idxs = [i for i in (_safe_idx(m.get("submission_idx")) for m in (page or [])) if i is not None]
         if not page_idxs:
             # Empty page: a transient gateway throttle OR the true start. Count a
@@ -531,6 +537,14 @@ async def sync_user(
                     client.get_matches(limit=200),
                     client.get_interest_and_funding_payments(limit=200),
                 )
+                if matches is None:
+                    # DENIED-vs-EMPTY: the fills feed could not be read this round
+                    # (archive budget denied / feed down). Serve the LAST KNOWN
+                    # ledger rather than an empty one — otherwise the user's
+                    # stats/volume read as zero for the round and the ledger
+                    # write sees nothing to add. The backfill pager below treats
+                    # an unreadable page the same way (retry, never 'done').
+                    matches = list(prior.get("matches") or [])
                 last_heavy_monotonic = time.time()
                 # Complete the fill ledger: page backward beyond the newest 200 so
                 # the account realized-PnL replay has full per-product basis (a

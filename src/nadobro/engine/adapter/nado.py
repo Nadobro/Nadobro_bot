@@ -337,6 +337,9 @@ class NadoAdapter(NadoAdapterBase):
         # this cycle (a denied book read must not fan out into N archive reads).
         # (matches_or_None, epoch); None = the feed was unreadable this epoch.
         self._held_matches_snap: Dict[int, tuple[Optional[list], int]] = {}
+        # Set by _held_status for the duration of one order_status call: a HELD
+        # result must never be written into _status_cache (see order_status).
+        self._last_status_held: bool = False
 
     # -- product metadata -------------------------------------------------
     def _meta(self, trading_pair: str) -> ProductMeta:
@@ -581,7 +584,8 @@ class NadoAdapter(NadoAdapterBase):
         # Reconcile fills if the venue claims FILLED but didn't include sizes.
         if order.state is OrderState.FILLED and order.filled_base <= 0:
             try:
-                fb, fq, fee = await self._fills_for(meta.product_id, order.id)
+                _fills = await self._fills_for(meta.product_id, order.id)
+                fb, fq, fee = _fills if _fills is not None else (Decimal(0), Decimal(0), Decimal(0))
                 if fb > 0:
                     order = NadoOrder(
                         id=order.id, trading_pair=trading_pair, side=side,
@@ -1089,6 +1093,7 @@ class NadoAdapter(NadoAdapterBase):
             if lc is not None and lc.fresh and lc.seq != seen_seq:
                 self._open_orders_snap.pop(int(ref.product_id), None)
 
+        self._last_status_held = False
         order = await self._order_status_rest(order_id, ref)
         # DENIED-vs-EMPTY: a HELD result (this cycle's open-orders read was
         # denied) is NOT authoritative — never write it into the status cache.
@@ -1101,7 +1106,7 @@ class NadoAdapter(NadoAdapterBase):
         held = (
             hit is not None and hit[1] is None
             and hit[2] == int(getattr(self, "_status_epoch", 0))
-        )
+        ) or self._last_status_held
         if not held:
             self._status_cache[order_id] = (order, lc.seq if lc is not None else -1)
         return order
@@ -1170,10 +1175,7 @@ class NadoAdapter(NadoAdapterBase):
                 unfilled = ref.amount_base - fb
                 state = OrderState.FILLED if unfilled <= lot else OrderState.PARTIALLY_FILLED
                 return self._mk_order(order_id, ref, state, fb, fq, fee)
-            cached = self._status_cache.get(order_id)
-            if cached is not None and not cached[0].state.is_terminal:
-                return cached[0]
-            return self._mk_order(order_id, ref, OrderState.OPEN, Decimal(0), Decimal(0), Decimal(0))
+            return self._held_status(order_id, ref)
 
         resting = self._find_open(open_orders, order_id)
         if resting is not None:
@@ -1188,7 +1190,8 @@ class NadoAdapter(NadoAdapterBase):
             # ticks. With this fix the executor records the true quote / fee
             # delta into Inventory.
             if filled_base > 0:
-                fb, fq, fee = await self._fills_for(ref.product_id, order_id)
+                _fills = await self._fills_for(ref.product_id, order_id)
+                fb, fq, fee = _fills if _fills is not None else (Decimal(0), Decimal(0), Decimal(0))
                 if fb > 0:
                     # The matches feed should agree with what's in the book; if
                     # there's drift, trust the matches feed (it's the source of
@@ -1202,7 +1205,15 @@ class NadoAdapter(NadoAdapterBase):
             return self._mk_order(order_id, ref, state, filled_base, Decimal(0), Decimal(0))
 
         # No longer resting -> aggregate fills for this digest.
-        filled_base, filled_quote, fee = await self._fills_for(ref.product_id, order_id)
+        _fills = await self._fills_for(ref.product_id, order_id)
+        if _fills is None:
+            # DENIED-vs-EMPTY for the FILLS feed: the order is off the book but
+            # its fills could not be read (archive budget denied / feed down).
+            # Booking CANCELLED(filled=0) here hid real fills — inventory went
+            # blind and the level was re-entered on top of a filled rung
+            # (audit AUDIT-DENY-2026-09-02-F3). HOLD until the feed answers.
+            return self._held_status(order_id, ref)
+        filled_base, filled_quote, fee = _fills
         lot = self._meta(ref.trading_pair).lot_size
         unfilled = ref.amount_base - filled_base
         if unfilled <= lot:
@@ -1276,6 +1287,19 @@ class NadoAdapter(NadoAdapterBase):
                 return o
         return None
 
+    def _held_status(self, order_id: str, ref: _OrderRef) -> NadoOrder:
+        """The HOLD result for an order whose truth could not be read this call
+        (book read denied, or off-book with an unreadable fills feed): the last
+        TRUSTED non-terminal snapshot, else assume it still rests — we placed it
+        and have no evidence otherwise. Never CANCELLED: that re-spawned duplicates
+        over still-resting quotes and booked unknown fills as zero. Flags the
+        result as held so order_status never writes it into the status cache."""
+        self._last_status_held = True
+        cached = self._status_cache.get(order_id)
+        if cached is not None and not cached[0].state.is_terminal:
+            return cached[0]
+        return self._mk_order(order_id, ref, OrderState.OPEN, Decimal(0), Decimal(0), Decimal(0))
+
     async def _fills_for_held(self, product_id: int, digest: str) -> tuple[Decimal, Decimal, Decimal]:
         """Best-effort fills for a quote whose BOOK read was budget-denied.
 
@@ -1297,16 +1321,21 @@ class NadoAdapter(NadoAdapterBase):
             self._held_matches_snap[pid] = (matches, epoch)
         if not matches:
             return Decimal(0), Decimal(0), Decimal(0)
-        return await self._fills_for(pid, digest, matches=list(matches))
+        res = await self._fills_for(pid, digest, matches=list(matches))
+        return res if res is not None else (Decimal(0), Decimal(0), Decimal(0))
 
     async def _fills_for(
         self, product_id: int, digest: str, *, matches: Optional[list] = None
-    ) -> tuple[Decimal, Decimal, Decimal]:
+    ) -> Optional[tuple[Decimal, Decimal, Decimal]]:
+        """Aggregate fills for ``digest``. ``None`` = the feed could not be read
+        (UNKNOWN) — callers must HOLD, never treat it as zero fills."""
         if matches is None:
             try:
                 matches = await self._client.get_matches(product_ids=[product_id])
             except Exception as exc:  # noqa: BLE001
                 raise AdapterError(f"order_status fills failed: {exc}") from exc
+            if matches is None:
+                return None
         fb = fq = fee = Decimal(0)
         for m in matches or []:
             if str(_first(m, _DIGEST_KEYS, "")) != digest:

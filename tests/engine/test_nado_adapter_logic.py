@@ -914,16 +914,6 @@ class _MatchesDeniedClient(_DeniableClient):
         return None                              # the future denied-read contract
 
 
-@_pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "AUDIT-DENY-2026-09-02-F3: get_matches returns [] on archive-budget denial "
-        "and on failure, so a gone order whose fills are UNKNOWN is booked "
-        "CANCELLED(filled=0) — inventory blind, level re-quoted. Correct behaviour: "
-        "hold (OPEN / last known) until fills can be read. Fix: get_matches -> None "
-        "on denial and _fills_for propagates the unknown."
-    ),
-)
 def test_gone_order_with_unreadable_fills_is_held_not_booked_cancelled_zero():
     async def body():
         c = _MatchesDeniedClient()
@@ -1088,5 +1078,67 @@ def test_held_fill_check_is_coalesced_once_per_product_per_cycle():
         a.begin_cycle()                                    # next cycle re-checks
         await a.order_status(ids[0])
         assert c.matches_calls == 2
+
+    asyncio.run(body())
+
+
+# --- AUDIT-DENY-2026-09-02-F3: the fills feed is DENIED-vs-EMPTY too -----------
+class _MatchesDeniedMarketClient(_MatchesDeniedClient):
+    _n = 0
+
+    def place_market_order(self, product_id, size, is_buy=True, reduce_only=False, **kwargs):
+        type(self)._n += 1
+        return {"digest": f"mdm-{type(self)._n}", "status": "filled", "price": 100}
+
+
+def test_place_order_follow_up_with_unreadable_fills_stays_partial_without_error():
+    """A MARKET placement whose fills cannot be read at placement is left
+    PARTIALLY_FILLED(0) (the existing degrade path) — no exception, no FILLED
+    fabricated from an unreadable feed."""
+    async def body():
+        c = _MatchesDeniedMarketClient()
+        a = NadoAdapter(c, META)
+        o = await a.place_order(PAIR, TradeType.BUY, OrderType.MARKET, Decimal("1"))
+        assert o.state is _OS.PARTIALLY_FILLED
+        assert o.filled_base == Decimal(0)
+
+    asyncio.run(body())
+
+
+def test_resting_partial_with_unreadable_fills_uses_the_book_estimate():
+    """Resting with a partial fill reported by the BOOK but an unreadable fills
+    feed: keep the book's amount (the pre-existing fallback), never zero it."""
+    async def body():
+        c = _MatchesDeniedClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "resting-partial-unknown")
+        c.open_orders = [{"digest": oid, "amount": 1, "price": 100, "filled": "0.4"}]
+        a.begin_cycle()
+        st = await a.order_status(oid)
+        assert st.state is _OS.PARTIALLY_FILLED
+        assert st.filled_base == Decimal("0.4")
+
+    asyncio.run(body())
+
+
+def test_off_book_hold_is_not_cached_and_resolves_when_the_feed_answers():
+    """The off-book hold must not enter the status cache (it would satisfy the
+    WS short-circuit forever). When the archive answers next cycle, the order
+    resolves to its real terminal state."""
+    async def body():
+        c = _MatchesDeniedClient()
+        a = NadoAdapter(c, META)
+        oid = _seed(a, "off-book-then-readable")
+        c.open_orders = []                                   # gone from the book
+        a.begin_cycle()
+        assert (await a.order_status(oid)).state is _OS.OPEN  # held (fills unknown)
+        assert oid not in a._status_cache                     # NOT cached
+        # Next cycle: the feed answers — a full fill.
+        c.get_matches = _DeniableClient.get_matches.__get__(c, _DeniableClient)
+        c.matches = [{"digest": oid, "amount": 1, "price": 100, "fee": "0.05"}]
+        a.begin_cycle()
+        st = await a.order_status(oid)
+        assert st.state is _OS.FILLED
+        assert st.filled_base == Decimal("1")
 
     asyncio.run(body())
