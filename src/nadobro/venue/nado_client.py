@@ -159,6 +159,18 @@ _REST_RETRY_JITTER_SECONDS = env_float("NADO_REST_RETRY_JITTER_SECONDS", 0.2)
 _REST_POOL_CONNECTIONS = env_int("NADO_HTTP_POOL_CONNECTIONS", 64)
 _REST_POOL_MAXSIZE = env_int("NADO_HTTP_POOL_MAXSIZE", 64)
 _OPEN_ORDERS_CACHE_TTL = env_float("NADO_OPEN_ORDERS_CACHE_TTL_SECONDS", 5.0)
+# Per-user gateway weight for ONE multi-product open-orders read (prod
+# 2026-09-03, session 312). The batched endpoint returns every product's book
+# in a SINGLE SDK call, but it was charged ``2 * len(product_ids)`` — 168 weight
+# for 84 products — against the per-user fair-share bucket (burst 24). The
+# bucket clamps a 168-cost request to its whole 24-token burst, so ONE read
+# drained it and the next subaccount's read (isolated children) was denied
+# within max_wait, making get_all_open_orders return None on EVERY call for any
+# user with an isolated child — the portfolio open-order view, the stale-order
+# sweep and (pre-fix) the cancel sweep all went permanently "unknown". It is one
+# request, so charge the per-user bucket for one query, capped well under the
+# burst so parent + every isolated child read all fit.
+_OPEN_ORDERS_READ_WEIGHT = float(env_int("NADO_OPEN_ORDERS_READ_WEIGHT", 4))
 _POSITIONS_FALLBACK_TTL = env_float("NADO_POSITIONS_FALLBACK_TTL_SECONDS", 6.0)
 _POSITIONS_FALLBACK_MAX_PRODUCTS = env_int("NADO_POSITIONS_FALLBACK_MAX_PRODUCTS", 16)
 
@@ -1266,7 +1278,10 @@ class NadoClient:
             return None
 
         # "Orders" query: IP weight = 2 * product_ids.length
-        if not self._gateway_allowed(weight=2 * max(1, len(product_ids))):
+        # ONE multi-product SDK call -> ONE query's weight (not 2*products), so
+        # parent + every isolated child read fit inside the per-user burst
+        # (see _OPEN_ORDERS_READ_WEIGHT).
+        if not self._gateway_allowed(weight=_OPEN_ORDERS_READ_WEIGHT):
             return None
 
         try:
