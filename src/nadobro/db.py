@@ -210,6 +210,41 @@ def execute(sql, params=None):
     _run_statement(sql, params, lambda cur: None)
 
 
+def execute_batch(sql, rows, *, page_size: int = 200) -> int:
+    """Run ONE statement for MANY parameter tuples on one pooled connection in
+    one transaction — ``psycopg2.extras.execute_batch`` sends a page of
+    statements per round trip instead of one round trip per row.
+
+    Built for the engine's per-tick executor persistence (2026-09-03): it used
+    to issue one ``execute()`` per executor, on the event loop, for every
+    executor a session had ever held — ~1,500 sequential ~70 ms round trips
+    per tick. Same disconnect hygiene as ``_run_statement``; no disconnect
+    retry (writes must never double-apply). Returns the number of rows sent.
+    """
+    rows = list(rows)
+    if not rows:
+        return 0
+    conn = get_db()
+    broken = False
+    try:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=max(1, int(page_size)))
+        conn.commit()
+        return len(rows)
+    except _DISCONNECT_ERRORS:
+        broken = True
+        raise
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception as rb_exc:
+            broken = True
+            logger.warning("rollback failed on errored connection: %s", rb_exc)
+        raise
+    finally:
+        put_db(conn, close=broken)
+
+
 def execute_returning(sql, params=None):
     def _consume(cur):
         row = cur.fetchone()

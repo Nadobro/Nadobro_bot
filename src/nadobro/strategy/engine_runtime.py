@@ -190,6 +190,10 @@ class EngineRuntime:
         self._orchestrators: Dict[tuple, ExecutorOrchestrator] = {}
         self._executor_store = executor_store
         self._trade_recorder = trade_recorder
+        # Per-session dirty tracking for executor persistence: executor id ->
+        # the signature last written successfully (see _persist_executors).
+        self._persisted_sig: Dict[tuple, Dict[str, tuple]] = {}
+        self._persist_inflight: set = set()
 
     def _key(self, user_id: int, network: str, strategy: str) -> tuple:
         return (user_id, network, strategy)
@@ -308,7 +312,7 @@ class EngineRuntime:
         if callable(begin_cycle):
             begin_cycle()
         await orch.tick_controller(controller.id)
-        self._persist_executors(orch)
+        await self._persist_executors(orch, key)
         # Venue read-budget visibility: the gateway bucket logs denials at DEBUG,
         # which is how a 40-quote ladder ran 4-minute cycles in total silence.
         # One WARNING per cycle, only when it happened, with what the engine did
@@ -340,7 +344,7 @@ class EngineRuntime:
             if callable(_begin):
                 _begin()
             await orch.stop_controller(controller.id)
-            self._persist_executors(orch)
+            await self._persist_executors(orch, key)
         else:
             # Cross-process stop: this process doesn't own the orchestrator, so
             # mark the controller's non-terminated engine_executors rows
@@ -348,29 +352,88 @@ class EngineRuntime:
             # process leaves stale ACTIVE rows that _remote_active would treat as
             # "still running" — blocking the next run from ever building.
             try:
+                from src.nadobro.core.async_utils import run_blocking_db as _run_db
                 from src.nadobro.trading.engine_persistence import terminate_engine_executors
-                terminate_engine_executors(cid)
+                await _run_db(terminate_engine_executors, cid)
             except Exception:  # noqa: BLE001
                 logger.debug("cross-process executor terminate sweep failed for %s", cid, exc_info=True)
         self._controllers.pop(key, None)
         self._orchestrators.pop(key, None)
+        self._persisted_sig.pop(key, None)
         # Clear the live-progress row so a stopped strategy doesn't leave stale
         # cycles/funding behind for the next start. Best-effort.
         try:
             from src.nadobro.trading.engine_persistence import clear_controller_progress
 
-            clear_controller_progress(deterministic_controller_id(strategy, user_id, network))
+            from src.nadobro.core.async_utils import run_blocking_db as _run_db
+            await _run_db(clear_controller_progress, deterministic_controller_id(strategy, user_id, network))
         except Exception:  # noqa: BLE001
             logger.debug("clear dn progress failed", exc_info=True)
 
-    def _persist_executors(self, orch: ExecutorOrchestrator) -> None:
-        if self._executor_store is None:
+    async def _persist_executors(self, orch: ExecutorOrchestrator, key: tuple) -> None:
+        """Persist executor lifecycle rows — DIRTY ones only, batched, OFF the loop.
+
+        2026-09-03 (py-spy on the live process): this used to upsert EVERY
+        executor the orchestrator had ever held, one blocking execute() each,
+        ON THE EVENT LOOP, every tick — 1,532 executors × ~135 ms (a session-id
+        lookup plus the upsert, ~67 ms a round trip to the pooler) ≈ 207 s per
+        tick for the 20-level fill-anchored ladder, growing ~2.7 s a cycle. The
+        frozen loop was the 180 s cycle timeouts, the scheduler jobs missed by
+        minutes, the dropped taps, the stale Portfolio refresh and the websocket
+        drops. Now an executor is written only when its stored fields changed
+        (a terminated one exactly once), the session id is resolved once per
+        controller, and the batch runs on the DB worker pool in one transaction,
+        so the loop never blocks on the database and a cycle timeout can cancel.
+        A pass still in flight (a cancelled tick) is not stacked: the dirty
+        state simply carries to the next tick.
+        """
+        store = self._executor_store
+        if store is None:
             return
-        for ex in orch.list():
+        if key in self._persist_inflight:
+            logger.debug("executor persistence still in flight for %s — deferred to next tick", key)
+            return
+        from src.nadobro.core.async_utils import run_blocking_db as _run_db
+        from src.nadobro.trading.engine_persistence import executor_persist_signature, executor_row
+        sigs = self._persisted_sig.setdefault(key, {})
+        executors = orch.list()
+        rows: list = []
+        cids: list = []
+        pending: list = []
+        for ex in executors:
             try:
-                self._executor_store.save(ex)  # type: ignore[attr-defined]
+                sig = executor_persist_signature(ex)
+                if sigs.get(ex.id) == sig:
+                    continue
+                rows.append(executor_row(ex, None))
             except Exception:  # noqa: BLE001 - persistence must not break a tick
-                logger.warning("executor persistence failed for %s", ex.id, exc_info=True)
+                logger.warning("executor row build failed for %s", ex.id, exc_info=True)
+                continue
+            cids.append(ex.controller_id)
+            pending.append((ex.id, sig))
+        live_ids = {ex.id for ex in executors}
+        for gone in [eid for eid in sigs if eid not in live_ids]:
+            sigs.pop(gone, None)                 # pruned by the orchestrator
+        if not rows:
+            return
+        self._persist_inflight.add(key)
+        try:
+            save_rows = getattr(store, "save_rows", None)
+            if callable(save_rows):
+                await _run_db(save_rows, rows, cids)
+            else:                                # a save()-only store: still off the loop
+                by_id = {ex.id: ex for ex in executors}
+                for eid, _sig in pending:
+                    ex = by_id.get(eid)
+                    if ex is not None:
+                        await _run_db(store.save, ex)  # type: ignore[attr-defined]
+            for eid, sig in pending:
+                sigs[eid] = sig
+        except Exception:  # noqa: BLE001 - persistence must not break a tick
+            logger.warning("executor persistence failed for %s (%d rows) — retried next tick",
+                           key, len(rows), exc_info=True)
+        finally:
+            self._persist_inflight.discard(key)
 
 
 def _should_build_controller(
