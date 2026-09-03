@@ -544,6 +544,12 @@ async def sync_user(
                     user_id, network,
                 )
                 orders = list(prior.get("open_orders") or [])
+            # Freshness (2026-09-02, F6): figures the venue would not serve this
+            # round — a balance the client served from Redis (budget-denied /
+            # failed) or an unknown open-orders book — must not be stamped
+            # "synced now"; the deck says "Cached · venue throttled" instead.
+            balance_cached = isinstance(balance, dict) and bool(balance.get("_cached"))
+            venue_throttled = bool(balance_cached or open_orders_unknown)
 
             if need_heavy:
                 matches, funding = await asyncio.gather(
@@ -600,7 +606,8 @@ async def sync_user(
                 "stats": stats,
                 "equity": equity,
                 "spot_balances": spot_balances,
-                "last_sync": _now(),
+                "last_sync": (prior.get("last_sync") or _now()) if venue_throttled else _now(),
+                "venue_throttled": venue_throttled,
                 "monotonic_ts": time.time(),
                 "last_heavy_monotonic": last_heavy_monotonic,
                 "last_reconcile_monotonic": time.monotonic() if str(reason).startswith("ws") or force else float(

@@ -933,6 +933,39 @@ class PhantomFillPriceTests(unittest.TestCase):
         self.assertAlmostEqual(float(params[9]), 250.29 / 0.00395, places=2)
 
 
+class ThrottledBalanceFreshnessTests(unittest.IsolatedAsyncioTestCase):
+    """2026-09-02 (F6): a balance the client served from Redis because the venue
+    read was denied/failed must not be stamped "synced now"; the snapshot is
+    flagged so the deck renders "Cached · venue throttled"."""
+
+    def _patches(self, client):
+        return (
+            patch.object(nado_sync, "get_user", return_value=SimpleNamespace(network_mode=SimpleNamespace(value="testnet"))),
+            patch.object(nado_sync, "get_user_nado_client", return_value=client),
+            patch.object(nado_sync, "_write_snapshot"),
+            patch.object(nado_sync, "_write_sync_log_error"),
+        )
+
+    async def test_a_cached_balance_keeps_the_prior_last_sync_and_flags_the_snapshot(self):
+        class ThrottledBalanceClient(_Client):
+            def get_balance(self):
+                return {"exists": True, "balances": {0: "1500.00"}, "_cached": True, "_cached_reason": "venue_throttled"}
+
+        prior_sync = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        nado_sync.set_cached_snapshot(42, "testnet", {"user_id": 42, "network": "testnet", "last_sync": prior_sync, "positions": []})
+        p1, p2, p3, p4 = self._patches(ThrottledBalanceClient())
+        with p1, p2, p3, p4:
+            result = await nado_sync.sync_user(42, network="testnet", force=True)
+        assert result["venue_throttled"] is True
+        assert result["last_sync"] == prior_sync, "not stamped 'synced now' on a throttled round"
+        assert result["stale"] is False                     # positions ARE fresh (summary read ok)
+
+    async def test_a_fresh_balance_is_stamped_now_and_not_flagged(self):
+        p1, p2, p3, p4 = self._patches(_Client())
+        with p1, p2, p3, p4:
+            result = await nado_sync.sync_user(42, network="testnet", force=True)
+        assert result["venue_throttled"] is False
+        assert result["last_sync"] is not None
 class DeniedOpenOrdersSweepTests(unittest.IsolatedAsyncioTestCase):
     """DENIED-vs-EMPTY for the stale-order sweep (2026-09-02, AUDIT-DENY).
 
@@ -994,3 +1027,23 @@ class DeniedOpenOrdersSweepTests(unittest.IsolatedAsyncioTestCase):
         assert self._write(dict(snap, open_orders_unknown=True)).call_count == 0
         assert self._write(dict(snap, open_orders_unknown=False)).call_count == 1
         assert self._write(dict(snap)).call_count == 1          # legacy snapshots: unchanged
+
+
+class UnknownOrdersAreThrottledFreshnessTests(unittest.IsolatedAsyncioTestCase):
+    """#276 + F6 together: an unreadable open-orders round is a venue-throttled
+    round for the freshness contract too — the deck must not say "Live"."""
+
+    async def test_an_unknown_open_orders_round_is_flagged_throttled_and_keeps_last_sync(self):
+        class DeniedOrdersClient(_Client):
+            def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False):
+                return None
+
+        prior_sync = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        nado_sync.set_cached_snapshot(42, "testnet", {"user_id": 42, "network": "testnet", "last_sync": prior_sync, "positions": [], "open_orders": []})
+        with patch.object(nado_sync, "get_user", return_value=SimpleNamespace(network_mode=SimpleNamespace(value="testnet"))), patch.object(
+            nado_sync, "get_user_nado_client", return_value=DeniedOrdersClient()
+        ), patch.object(nado_sync, "_write_snapshot"), patch.object(nado_sync, "_write_sync_log_error"):
+            result = await nado_sync.sync_user(42, network="testnet", force=True)
+        assert result["open_orders_unknown"] is True
+        assert result["venue_throttled"] is True
+        assert result["last_sync"] == prior_sync

@@ -155,6 +155,7 @@ def render_portfolio_deck(
         threshold_s=threshold,
         refreshing=refreshing,
         degraded=bool(snapshot.get("stale") and snapshot.get("error")),
+        cached_reason="venue throttled" if snapshot.get("venue_throttled") else None,
     )
 
     # Funding sign convention: positive = paid (a cost), negative = received.
