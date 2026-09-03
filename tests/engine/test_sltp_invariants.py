@@ -1246,7 +1246,6 @@ def test_a_failed_stop_never_frees_the_mid_slot_until_its_order_is_terminal():
     asyncio.run(body())
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-PERSIST-2026-09-03-MM4: a not-allowed stop that FAILS frees the Mid slot over a resting order")
 def test_a_not_allowed_stop_that_fails_keeps_the_mid_slot_bound():
     """AUDIT-PERSIST-2026-09-03-MM4 (Mid audit of a555e0e, finding 4; pre-existing).
 

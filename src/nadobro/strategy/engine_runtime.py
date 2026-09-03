@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import fields, is_dataclass
 from enum import Enum
+import asyncio
 import logging
 import os
 import time
@@ -193,7 +194,7 @@ class EngineRuntime:
         # Per-session dirty tracking for executor persistence: executor id ->
         # the signature last written successfully (see _persist_executors).
         self._persisted_sig: Dict[tuple, Dict[str, tuple]] = {}
-        self._persist_inflight: set = set()
+        self._persist_inflight: Dict[tuple, "asyncio.Future"] = {}
 
     def _key(self, user_id: int, network: str, strategy: str) -> tuple:
         return (user_id, network, strategy)
@@ -311,6 +312,7 @@ class EngineRuntime:
         begin_cycle = getattr(adapter, "begin_cycle", None)
         if callable(begin_cycle):
             begin_cycle()
+        orch.prune_keep_predicate = lambda ex, _key=key: self._unpersisted(_key, ex)
         await orch.tick_controller(controller.id)
         await self._persist_executors(orch, key)
         # Venue read-budget visibility: the gateway bucket logs denials at DEBUG,
@@ -344,7 +346,17 @@ class EngineRuntime:
             if callable(_begin):
                 _begin()
             await orch.stop_controller(controller.id)
-            await self._persist_executors(orch, key)
+            # Final rows are written UNCONDITIONALLY (a tick's pass may be in
+            # flight — wait for it, then write), and any row the batch could not
+            # reach is swept TERMINATED so is_running/_remote_active never sees a
+            # stopped session as live (audit 2026-09-03, finding 9).
+            await self._persist_executors(orch, key, force=True)
+            try:
+                from src.nadobro.core.async_utils import run_blocking_db as _run_db
+                from src.nadobro.trading.engine_persistence import terminate_engine_executors
+                await _run_db(terminate_engine_executors, cid)
+            except Exception:  # noqa: BLE001
+                logger.debug("post-stop executor terminate sweep failed for %s", cid, exc_info=True)
         else:
             # Cross-process stop: this process doesn't own the orchestrator, so
             # mark the controller's non-terminated engine_executors rows
@@ -370,7 +382,9 @@ class EngineRuntime:
         except Exception:  # noqa: BLE001
             logger.debug("clear dn progress failed", exc_info=True)
 
-    async def _persist_executors(self, orch: ExecutorOrchestrator, key: tuple) -> None:
+    async def _persist_executors(
+        self, orch: ExecutorOrchestrator, key: tuple, *, force: bool = False
+    ) -> None:
         """Persist executor lifecycle rows — DIRTY ones only, batched, OFF the loop.
 
         2026-09-03 (py-spy on the live process): this used to upsert EVERY
@@ -383,17 +397,28 @@ class EngineRuntime:
         drops. Now an executor is written only when its stored fields changed
         (a terminated one exactly once), the session id is resolved once per
         controller, and the batch runs on the DB worker pool in one transaction,
-        so the loop never blocks on the database and a cycle timeout can cancel.
-        A pass still in flight (a cancelled tick) is not stacked: the dirty
-        state simply carries to the next tick.
+        so the loop no longer blocks on executor persistence and a cycle
+        timeout can cancel. (The per-fill trade recorder still writes on the
+        loop — bounded per fill, tracked as the next follow-up.)
+
+        The batch is a shielded task: a cancelled tick does NOT release the
+        in-flight guard (the DB thread keeps running; the guard clears when it
+        lands), a tick that finds a pass in flight defers (the dirty state
+        carries over), and ``stop()`` passes ``force=True`` to wait for the
+        pass and then write the final TERMINATED rows unconditionally.
         """
         store = self._executor_store
         if store is None:
             return
-        if key in self._persist_inflight:
-            logger.debug("executor persistence still in flight for %s — deferred to next tick", key)
-            return
-        from src.nadobro.core.async_utils import run_blocking_db as _run_db
+        inflight = self._persist_inflight.get(key)
+        if inflight is not None and not inflight.done():
+            if not force:
+                logger.debug("executor persistence still in flight for %s — deferred to next tick", key)
+                return
+            try:
+                await asyncio.shield(inflight)
+            except Exception:  # noqa: BLE001 - already logged by the task
+                pass
         from src.nadobro.trading.engine_persistence import executor_persist_signature, executor_row
         sigs = self._persisted_sig.setdefault(key, {})
         executors = orch.list()
@@ -416,7 +441,30 @@ class EngineRuntime:
             sigs.pop(gone, None)                 # pruned by the orchestrator
         if not rows:
             return
-        self._persist_inflight.add(key)
+        task = asyncio.ensure_future(
+            self._write_executor_rows(store, key, rows, cids, pending, executors)
+        )
+        self._persist_inflight[key] = task
+
+        def _clear(t: "asyncio.Future", _key: tuple = key) -> None:
+            if self._persist_inflight.get(_key) is t:
+                self._persist_inflight.pop(_key, None)
+
+        task.add_done_callback(_clear)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise                                # the batch lands on its own
+        except Exception:  # noqa: BLE001 - logged inside the task
+            pass
+
+    async def _write_executor_rows(
+        self, store: object, key: tuple, rows: list, cids: list, pending: list, executors: list
+    ) -> None:
+        """The off-loop half of ``_persist_executors``: one batched write, then
+        the signatures are recorded ONLY on success so a failed batch is
+        retried with the same rows next tick."""
+        from src.nadobro.core.async_utils import run_blocking_db as _run_db
         try:
             save_rows = getattr(store, "save_rows", None)
             if callable(save_rows):
@@ -427,14 +475,26 @@ class EngineRuntime:
                     ex = by_id.get(eid)
                     if ex is not None:
                         await _run_db(store.save, ex)  # type: ignore[attr-defined]
-            for eid, sig in pending:
-                sigs[eid] = sig
         except Exception:  # noqa: BLE001 - persistence must not break a tick
             logger.warning("executor persistence failed for %s (%d rows) — retried next tick",
                            key, len(rows), exc_info=True)
-        finally:
-            self._persist_inflight.discard(key)
+            return
+        sigs = self._persisted_sig.get(key)
+        if sigs is not None:                     # stop() may have dropped the session already
+            for eid, sig in pending:
+                sigs[eid] = sig
 
+    def _unpersisted(self, key: tuple, ex: object) -> bool:
+        """True while an executor's CURRENT signature has not been written —
+        the orchestrator must not prune it yet (a failed batch is retried)."""
+        if self._executor_store is None:
+            return False
+        from src.nadobro.trading.engine_persistence import executor_persist_signature
+        sigs = self._persisted_sig.get(key) or {}
+        try:
+            return sigs.get(getattr(ex, "id", None)) != executor_persist_signature(ex)
+        except Exception:  # noqa: BLE001
+            return True
 
 def _should_build_controller(
     *, needs_recovery: bool, has_local_active: bool, worker_mode: bool, is_running: bool

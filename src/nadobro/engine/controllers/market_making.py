@@ -354,11 +354,11 @@ class MarketMakingController(Controller):
         Used by the live-config path when sizing changes: with a ladder, walking
         only the level-0 attributes would strand levels 1..N as orphan orders.
         """
-        for slot in list(self._slots.values()):
+        for (slot_is_bid, level), slot in list(self._slots.items()):
             if slot.ex_id is not None:
-                await self.orchestrator.stop(slot.ex_id)
-            slot.ex_id = None
-            slot.price = None
+                await self._stop_and_release(slot_is_bid, level, slot.ex_id)
+            else:
+                slot.price = None
 
     async def on_start(self) -> None:
         return None
@@ -980,9 +980,7 @@ class MarketMakingController(Controller):
         for (slot_is_bid, level), slot in list(self._slots.items()):
             if slot_is_bid is not is_bid or level < count or slot.ex_id is None:
                 continue
-            await self.orchestrator.stop(slot.ex_id)
-            slot.ex_id = None
-            slot.price = None
+            await self._stop_and_release(slot_is_bid, level, slot.ex_id)
 
     async def _quote_side(
         self, side: TradeType, base_target: Decimal, allowed: bool, mid: Decimal,
@@ -1163,8 +1161,7 @@ class MarketMakingController(Controller):
 
         if not allowed:
             if cur_id is not None:
-                await self.orchestrator.stop(cur_id)
-                self._set_quote(is_bid, None, None, level=level)
+                await self._stop_and_release(is_bid, level, cur_id)
             return
 
         # Per-cycle opening budget: once this cycle has spent its opening/requote
@@ -1412,6 +1409,23 @@ class MarketMakingController(Controller):
             return True
         limit = self.max_quote_lifetime_s if self.max_quote_lifetime_s > 0 else _THROTTLE_HOLD_MAX_S
         return (self._now() - slot.placed_at) >= limit
+
+    async def _stop_and_release(self, is_bid: bool, level: int, ex_id: str) -> bool:
+        """Stop the executor on a slot and release the slot ONLY when its order
+        is confirmed gone (AUDIT-PERSIST-2026-09-03-MM4). A stop that ends
+        FAILED with the order still resting keeps the slot bound: a released
+        slot would re-quote OVER the resting order next cycle (2x notional on
+        that level, invisible to the exposure projection); a bound one is
+        retried — through this same path on the next retire/resize pass, or
+        through _reconcile's terminated-quote check (F2b). True when released."""
+        await self.orchestrator.stop(ex_id)
+        ex = self.orchestrator.get(ex_id)
+        if ex is not None and self._failed_stop_left_order_resting(ex):
+            logger.warning("mm %s: stop of %s ended FAILED with its order still resting — slot stays bound",
+                           self.id, ex_id)
+            return False
+        self._set_quote(is_bid, None, None, level=level)
+        return True
 
     @staticmethod
     def _failed_stop_left_order_resting(ex: object) -> bool:

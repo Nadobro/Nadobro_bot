@@ -557,11 +557,14 @@ def executor_persist_signature(executor: object) -> tuple:
     terminates instead of on every tick for the rest of the session."""
     m = executor.metrics()  # type: ignore[attr-defined]
     close_type = getattr(executor, "close_type", None)
+    # duration_seconds is deliberately NOT part of the signature: it advances
+    # every second for a live executor, which would make every idle tick a
+    # write. A row is written whenever anything else changes and the terminal
+    # write carries the final duration.
     return (
         executor.state.value,  # type: ignore[attr-defined]
         getattr(close_type, "value", None),
         str(m["net_pnl_quote"]), str(m["fees_paid_quote"]), str(m["volume_quote"]),
-        int(m["duration_seconds"]),
         bool(executor.keep_position),  # type: ignore[attr-defined]
         executor.terminated_at,  # type: ignore[attr-defined]
     )

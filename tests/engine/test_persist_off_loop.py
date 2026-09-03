@@ -152,12 +152,128 @@ def test_a_pass_still_in_flight_is_not_stacked():
         store = _SpyStore()
         rt, orch, c, key = _runtime(store, MockNadoAdapter(mid=Decimal(100)))
         await orch.spawn_controller(c)
-        rt._persist_inflight.add(key)                         # a cancelled tick's pass still running
+        pending = asyncio.get_running_loop().create_future()  # a cancelled tick's pass still running
+        rt._persist_inflight[key] = pending
         await rt.tick(*key)
         assert not store.batches
-        rt._persist_inflight.discard(key)
+        pending.set_result(None)
         await rt.tick(*key)
         assert store.batches                                  # the dirty state carried over
+    asyncio.run(body())
+
+
+def test_stop_writes_the_final_rows_even_while_a_pass_is_in_flight(monkeypatch):
+    """Audit 2026-09-03 finding 9: a user stop landing while a tick's batch was
+    still in flight skipped the final write and left the session's rows ACTIVE
+    forever (is_running/_remote_active then saw a stopped session as live)."""
+    from src.nadobro.trading import engine_persistence as ep
+    swept: list = []
+    monkeypatch.setattr(ep, "terminate_engine_executors", lambda cid: swept.append(cid) or 0)
+
+    async def body():
+        store = _SpyStore()
+        rt, orch, c, key = _runtime(store, MockNadoAdapter(mid=Decimal(100)))
+        await orch.spawn_controller(c)
+        await rt.tick(*key)                                   # quotes rest, rows written ACTIVE
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()
+        rt._persist_inflight[key] = pending                   # a tick's batch still landing
+        loop.call_later(0.05, pending.set_result, None)
+        await rt.stop(*key)                                   # waits for it, then writes
+        final = {r[0]: r[7] for r in store.batches[-1]}
+        assert final and all(state == "TERMINATED" for state in final.values()), final
+        assert swept, "the post-stop TERMINATED sweep must run on the local branch too"
+    asyncio.run(body())
+
+
+def test_a_cancelled_tick_keeps_the_guard_until_the_batch_lands():
+    """Audit 2026-09-03 finding 10: cancelling the tick at the await must not
+    release the in-flight guard while the DB thread is still writing."""
+    gate = threading.Event()
+
+    class _BlockingStore(_SpyStore):
+        def save_rows(self, rows, controller_ids):
+            gate.wait(5.0)
+            return super().save_rows(rows, controller_ids)
+
+    async def body():
+        store = _BlockingStore()
+        rt, orch, c, key = _runtime(store, MockNadoAdapter(mid=Decimal(100)))
+        await orch.spawn_controller(c)
+        tick = asyncio.ensure_future(rt.tick(*key))
+        for _ in range(50):                                   # until the batch is in flight
+            await asyncio.sleep(0.01)
+            if key in rt._persist_inflight:
+                break
+        assert key in rt._persist_inflight
+        tick.cancel()
+        try:
+            await tick
+        except asyncio.CancelledError:
+            pass
+        assert key in rt._persist_inflight, "guard released while the DB thread still runs"
+        gate.set()
+        await asyncio.wait_for(asyncio.shield(rt._persist_inflight[key]), 5.0)
+        await asyncio.sleep(0)                                # let the done-callback run
+        assert key not in rt._persist_inflight
+        assert store.batches and rt._persisted_sig[key], "the landed batch must record its signatures"
+    asyncio.run(body())
+
+
+def test_pruning_waits_for_a_failed_write_to_be_retried(monkeypatch):
+    """Audit 2026-09-03 finding 7: a failed batch must not be outrun by the
+    prune — an executor whose terminal row is not yet written stays until the
+    retry lands, then goes."""
+    monkeypatch.setattr(orch_mod, "DEFAULT_TERMINATED_RETENTION", 5)
+
+    class _FlakyStore(_SpyStore):
+        fail_next = True
+
+        def save_rows(self, rows, controller_ids):
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("db down")
+            return super().save_rows(rows, controller_ids)
+
+    async def body():
+        store = _FlakyStore()
+        adapter = MockNadoAdapter(mid=Decimal(100))
+        rt, orch, c, key = _runtime(store, adapter)
+        await orch.spawn_controller(c)
+        ids = []
+        for _ in range(12):
+            ex = _market_executor(adapter, c.id)
+            assert await orch.spawn(ex)
+            ids.append(ex.id)
+        await rt.tick(*key)                                   # write FAILS; the 12 are unpersisted
+        assert not store.batches
+        await rt.tick(*key)                                   # prune must skip them; retry lands
+        assert set(ids) <= set(store.writes), "a terminated executor was pruned before its row was written"
+        await rt.tick(*key)                                   # now persisted -> pruned to the window
+        assert len([e for e in orch.list(c.id) if e.is_terminated]) == 5
+    asyncio.run(body())
+
+
+def test_a_failed_executor_is_prunable_once_its_order_is_terminal():
+    """Audit 2026-09-03 finding 3: close_type stays FAILED forever (terminate is
+    a no-op once terminated), so FAILED alone must not pin an executor whose
+    cancel the F2b retry has since confirmed."""
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100))
+        orch = ExecutorOrchestrator()
+        c = MarketMakingController(user_id=1, orchestrator=orch, adapter=adapter,
+                                   inventory=InventoryRepository(), configs=dict(MM_CFG))
+        await orch.spawn_controller(c)
+        cfg = OrderExecutorConfig(PAIR, TradeType.BUY, Decimal(1), ExecutionStrategy.LIMIT_MAKER,
+                                  price=Decimal(90))
+        ex = OrderExecutor(cfg, user_id=1, controller_id=c.id, adapter=adapter)
+        await orch.spawn(ex)
+        ex._terminate(CloseType.FAILED)
+        assert orch.prune_terminated(c.id, keep=0) == 0       # order still OPEN: pinned
+        await adapter.cancel_order(ex.order.id)
+        ex.order = await adapter.order_status(ex.order.id)    # the retried stop confirmed the cancel
+        assert ex.order.state.is_terminal
+        assert orch.prune_terminated(c.id, keep=0) == 1       # FAILED but nothing rests: prunable
     asyncio.run(body())
 
 
@@ -232,4 +348,23 @@ def test_an_executor_whose_order_may_still_rest_is_never_pruned():
         ex._terminate(CloseType.FAILED)                       # a stop that could not confirm the cancel
         assert orch.prune_terminated(c.id, keep=0) == 0
         assert orch.get(ex.id) is ex                          # F2b can still retry through it
+    asyncio.run(body())
+
+
+def test_a_never_placed_failed_executor_is_prunable():
+    """Grid-family audit of a555e0e, finding 1: an executor whose placement
+    failed ends FAILED with no order at all — nothing rests, so FAILED alone
+    must not hold it for the whole session (under sustained post-only
+    rejection that regrows the 1,500-executor shape, minus the DB writes)."""
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100), fail_on=["place_order"], fail_times=999)
+        orch = ExecutorOrchestrator()
+        c = MarketMakingController(user_id=1, orchestrator=orch, adapter=adapter,
+                                   inventory=InventoryRepository(), configs=dict(MM_CFG))
+        await orch.spawn_controller(c)
+        for _ in range(3):
+            await orch.spawn(_market_executor(adapter, c.id))   # placement raises -> FAILED
+        failed = [e for e in orch.list(c.id) if e.is_terminated and e.close_type is CloseType.FAILED]
+        assert len(failed) == 3 and all(e.order is None for e in failed)
+        assert orch.prune_terminated(c.id, keep=0) == 3
     asyncio.run(body())
