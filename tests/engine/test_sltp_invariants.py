@@ -1302,3 +1302,107 @@ def test_a_not_allowed_stop_that_fails_keeps_the_mid_slot_bound():
         assert adapter._orders[adapter.placed[0].id].state.is_terminal
 
     asyncio.run(body())
+
+
+# --------------------------------------------------------------------------- #
+# AUDIT-SLTP-2026-09-03-PHANTOM-ENTRY — the session rail must not fire the      #
+# user's SL/TP on a physically impossible position read, nor on a single       #
+# transient snapshot. Prod session 312 fired a +195%-of-margin "TP" off a      #
+# positions row whose avg_entry (105,635) was ~35% from mark (78,260); the     #
+# spike was gone by the next poll and the real realized was -$4.20.            #
+# --------------------------------------------------------------------------- #
+def _drive_rail(snap: dict, *, tp_pct=100.0, sl_pct=10.0):
+    """Run _evaluate_session_pnl_rail against a fixed snapshot; return the spy on
+    _finalize_session (called only when the rail actually FIRES)."""
+    import asyncio
+    from contextlib import ExitStack
+    from unittest import mock
+
+    br = pytest.importorskip("src.nadobro.strategy.bot_runtime")
+
+    finalize = mock.MagicMock()
+
+    async def _noop_async(*a, **k):
+        return None
+
+    async def _passthrough(func, *a, **k):
+        return func(*a, **k)
+
+    async def _close_ok():
+        return {"success": True}
+
+    sess = {"id": 424242, "product_id": 2, "status": "running", "config_snapshot": {}}
+
+    with ExitStack() as st:
+        p = st.enter_context
+        p(mock.patch("src.nadobro.strategy.strategy_registry.effective_sl_tp_pct", return_value=(sl_pct, tp_pct)))
+        p(mock.patch("src.nadobro.strategy.strategy_registry.sltp_is_explicit", return_value=(True, True)))
+        p(mock.patch("src.nadobro.strategy.overlay_actuator.overlay_applies", return_value=False))
+        p(mock.patch("src.nadobro.trading.session_resolver.resolve_current_strategy_session", return_value=sess))
+        p(mock.patch("src.nadobro.trading.live_session.get_live_session_snapshot", return_value=snap))
+        p(mock.patch.object(br, "run_blocking", _passthrough))
+        p(mock.patch.object(br, "_liq_proximity_tripped", return_value=False))
+        p(mock.patch.object(br, "_finalize_session", finalize))
+        p(mock.patch.object(br, "_save_state_async", _noop_async))
+        p(mock.patch.object(br, "_notify", _noop_async))
+        p(mock.patch("src.nadobro.strategy.engine_runtime.RUNTIME.stop", _noop_async))
+        state = {"running": True, "strategy": "grid", "notional_usd": 150.0, "strategy_session_id": 424242}
+        asyncio.run(br._evaluate_session_pnl_rail(
+            111, "mainnet", state, "grid", "BTC",
+            client=object(), close_coro=_close_ok, market_label="BTC-PERP",
+        ))
+    return finalize
+
+
+def test_rail_does_not_fire_tp_on_a_physically_impossible_entry():
+    """AUDIT-SLTP-2026-09-03-PHANTOM-ENTRY: a short whose avg_entry is 35% from
+    mark reports a huge phantom +uPnL. The rail must HOLD, not fire tp_hit."""
+    phantom = {
+        "product_id": 2, "margin": 150.0,
+        "session_pnl": 291.0, "session_pnl_pct": 194.0,
+        "session_pnl_net": 292.71, "session_pnl_pct_net": 195.14,
+        "unrealized_pnl": 295.65, "realized_pnl": -4.2,
+        "position_size": 0.0108, "position_value": 845.0,
+        "entry_price": 105635.0, "mark": 78260.0, "leverage": 50.0,
+        "fees": 4.26, "has_position": True,
+    }
+    assert _drive_rail(phantom).called is False, "rail fired a phantom TP on a corrupt position read"
+
+
+def test_rail_does_not_fire_tp_on_a_transient_mark_spike():
+    """A transient mark spike (correct entry, mark momentarily far away) makes the
+    entry diverge from mark and must be held, not fired as a phantom TP."""
+    mark_spike = {
+        "product_id": 2, "margin": 150.0,
+        "session_pnl_net": 292.71, "session_pnl_pct_net": 195.14,
+        "unrealized_pnl": 300.0, "realized_pnl": 2.0,
+        "position_size": 0.02, "position_value": 1200.0,
+        "entry_price": 78000.0, "mark": 60000.0, "leverage": 50.0,
+        "fees": 1.0, "has_position": True,
+    }
+    assert _drive_rail(mark_spike).called is False, "rail fired on a transient mark-spike phantom"
+
+
+def test_rail_still_fires_a_clean_tp_and_the_guard_is_load_bearing(monkeypatch):
+    """No false-negative: a clean, reliable TP breach still fires immediately (a
+    stop must not be delayed). And proof the guard is load-bearing — relaxing the
+    divergence limit lets the SAME corrupt snapshot fire
+    (AUDIT-SLTP-2026-09-03-PHANTOM-ENTRY)."""
+    br = pytest.importorskip("src.nadobro.strategy.bot_runtime")
+    clean = {
+        "product_id": 2, "margin": 150.0,
+        "session_pnl_net": 165.0, "session_pnl_pct_net": 110.0,
+        "unrealized_pnl": 160.0, "realized_pnl": 5.0,
+        "position_size": 0.02, "position_value": 1560.0,
+        "entry_price": 78000.0, "mark": 79000.0, "leverage": 50.0,
+        "fees": 1.0, "has_position": True,
+    }
+    assert _drive_rail(clean).called is True, "a clean, reliable TP must still fire"
+
+    phantom = dict(clean, entry_price=105635.0, mark=78260.0, position_size=0.0108,
+                   position_value=845.0, session_pnl_pct_net=195.14, unrealized_pnl=295.65)
+    assert _drive_rail(phantom).called is False, "the divergence guard must hold the phantom"
+    # Relax the guard -> the exact same corrupt snapshot now fires: the guard is
+    # what stops it.
+    monkeypatch.setattr(br, "_SLTP_MAX_ENTRY_MARK_DIVERGENCE", 10.0)
+    assert _drive_rail(phantom).called is True, "with the divergence guard relaxed the phantom fires -> guard is load-bearing"
