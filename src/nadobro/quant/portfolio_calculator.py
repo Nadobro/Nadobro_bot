@@ -134,7 +134,7 @@ def derive_unrealized_pnl(
     return None
 
 
-_UPNL_RECONCILE_FRACTION = env_float("NADO_UPNL_RECONCILE_NOTIONAL_FRACTION", 0.03)
+_UPNL_RECONCILE_FRACTION = env_float("NADO_UPNL_RECONCILE_NOTIONAL_FRACTION", 0.10)
 _UPNL_RECONCILE_FLOOR = env_float("NADO_UPNL_RECONCILE_ABS_FLOOR", 10.0)
 
 
@@ -144,14 +144,18 @@ def reconcile_unrealized_pnl(
     """The trustworthy unrealized PnL for a cross position (prod 2026-09-03,
     session 312). A cross position carries TWO uPnL figures: ``est_pnl``
     (indexer: amount*oracle - net_entry_unrealized) and ``unsettled`` (on-chain:
-    amount*oracle + v_quote_balance). They normally differ only by settled
-    funding (a fraction of a percent of notional); when the indexer's
-    net_entry_unrealized is corrupt they diverge wildly (312: est_pnl +$295.65
-    from a fabricated avg_entry 105,635 vs mark 78,260, while unsettled was
-    ~-$6 — a phantom that fired a +195%-of-margin TP). ``unsettled`` is
-    on-chain-authoritative, so when the two disagree beyond a funding-sized band,
-    trust it. Leverage-agnostic: it never overrides a legitimate PnL (the two
-    agree), only a corrupt one."""
+    amount*oracle + v_quote_balance). They differ by EXACTLY the accumulated
+    fees + settled funding (est_pnl is price-only; unsettled carries funding via
+    v_quote_balance), which over even a long high-turnover session stays a few
+    percent of notional. When the indexer's net_entry_unrealized is corrupt they
+    diverge FAR beyond that (312: est_pnl +$295.65 from a fabricated avg_entry
+    105,635 vs mark 78,260 — 35% of notional — while unsettled was ~-$6). The band
+    (default 10% of notional, well above any real fees+funding) separates the
+    two: below it, keep the funding-separated ``est_pnl`` the rail's
+    "price - fees - funding" basis wants (so the rail's own ``- funding_paid`` is
+    not double-counted); above it, ``est_pnl`` is provably corrupt and the
+    on-chain ``unsettled`` is the only trustworthy figure. Leverage-agnostic: it
+    never overrides a legitimate PnL, only a corrupt one."""
     if unsettled is None:
         return est_pnl                       # isolated / no on-chain figure
     if est_pnl is None:

@@ -283,3 +283,16 @@ def test_reconcile_absolute_floor_catches_a_tiny_notional_phantom():
     from src.nadobro.quant.portfolio_calculator import reconcile_unrealized_pnl
     # tiny notional so the fractional band is below the $10 floor; a $50 gap is corrupt
     assert reconcile_unrealized_pnl(D("48"), D("-2"), D("50")) == D("-2")
+
+
+def test_reconcile_does_not_override_on_legitimate_funding_drift():
+    """AUDIT re-check: est_pnl - unsettled == accumulated fees + funding. A
+    long-running/high-funding session where that gap is large but still a
+    plausible % of notional must KEEP est_pnl — overriding to unsettled would
+    double-count funding in the rail's `realized + unrealized - funding_paid`."""
+    from decimal import Decimal as D
+    from src.nadobro.quant.portfolio_calculator import reconcile_unrealized_pnl
+    # $120 of fees+funding on a $3462 notional (3.5%) is legit -> keep est_pnl.
+    assert reconcile_unrealized_pnl(D("-20"), D("-140"), D("3462")) == D("-20")
+    # even a $300 funding gap on a $3462 notional (8.7%) is under the 10% band.
+    assert reconcile_unrealized_pnl(D("10"), D("-290"), D("3462")) == D("10")
