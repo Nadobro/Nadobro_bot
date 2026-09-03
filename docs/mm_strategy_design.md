@@ -148,6 +148,8 @@ The quoting math is half the strategy; the other half is the hard bounds that ke
 
 **Max placement rate**. Self-throttle to 5 re-quotes per second per side per market, leaving 100× headroom under the 600/min Nado limit. Implemented with a token-bucket on the `execute_limit_order` call.
 
+**Venue-contention hold (2026-09-02)**. When a status poll in the current cycle was budget-denied by our own gateway (the venue's per-user query budget is contended), an *opening-side* re-quote is held instead of cancel+replaced — a re-quote spends the same execute budget that is already starved, and deepens the contention that produced the hold. Reducing-side re-quotes, fresh quotes on empty levels, safety cancels, and the stop path are never held. The hold is time-bounded: a profile's `max_quote_lifetime_s` still wins, and a profile without one is bounded by `NADO_THROTTLE_HOLD_MAX_SECONDS` (120s). Ladder re-centers (grid / dgrid) apply the same rule using the *previous* cycle's denials, because they are decided ahead of the executor ticks.
+
 **Stale-quote watchdog**. If a posted quote has rested > `stale_seconds` (default 8s) AND mid has moved > `max_stale_drift_bp` (default `0.5 × spread`), cancel and re-quote. Prevents the bot from being picked off by latency arbs after a price move. The existing `_update_reference_price` / `STALE_DRIFT_MULTIPLIER` plumbing in `mm_bot.py` already does this; we reuse it.
 
 **Reduce-only exit**. When `running=False` or circuit breaker fires, all inventory is flattened via reduce-only IOC. Same primitive as the volume_bot escalation path.

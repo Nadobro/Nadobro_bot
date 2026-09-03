@@ -399,6 +399,16 @@ cadence, capped at 30 s) bounds churn on top of that. Safety cancels —
 inventory ceiling, exposure cap, regime gate — are evaluated *before* the hold
 rules and are never delayed.
 
+**Venue-contention hold (2026-09-02).** After the queue rules, an opening-side
+re-quote is also held while the venue is denying our status reads this cycle
+(`adapter.reads_throttled_this_cycle() > 0`): a re-quote is cancel+place
+against the same budget, and churning it only deepens the contention. The hold
+never outlives `max_quote_lifetime_s` (a profile without one is bounded by
+`NADO_THROTTLE_HOLD_MAX_SECONDS`), never applies to the reducing side or to an
+empty level, and never touches the stop path. A stop that ends FAILED with its
+order still resting keeps the level bound across cycles — each cycle retries
+the stop — until the order is confirmed terminal (AUDIT-DENY-2026-09-02-F2b).
+
 **Phase 2 — the ladder.** `quant/ladder.py` is a pure planner: deployment in,
 `(offset_bp, size_quote)` levels out, sizes summing exactly to the deployment
 with the rounding remainder on the *deepest* level so the near-touch level is

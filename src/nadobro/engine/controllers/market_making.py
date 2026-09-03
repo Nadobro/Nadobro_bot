@@ -48,7 +48,15 @@ _AUTO_LADDER_STEP_FLOOR_BP = Decimal("1")
 # non-positive for bias in [-1, 1].
 _BIAS_SKEW_STRENGTH = Decimal("0.2")
 
+from src.nadobro.utils.env import env_float
+
 logger = logging.getLogger(__name__)
+
+# AUDIT-DENY-2026-09-02-F3 (MID audit of 27e0926): the venue-contention hold in
+# _reconcile never extends a quote past its profile TTL (max_quote_lifetime_s);
+# a profile WITHOUT a TTL is bounded by this instead, so a held quote is always
+# refreshed within a known horizon even under sustained throttling.
+_THROTTLE_HOLD_MAX_S = env_float("NADO_THROTTLE_HOLD_MAX_SECONDS", 120.0)
 
 
 def _safe_levels(value: object) -> int:
@@ -1140,6 +1148,16 @@ class MarketMakingController(Controller):
         if cur_id is not None:
             ex_existing = self.orchestrator.get(cur_id)
             if ex_existing is None or ex_existing.is_terminated:
+                # AUDIT-DENY-2026-09-02-F2b: a stop that ended FAILED with its order
+                # still resting kept the slot bound for one cycle (F2, below), but
+                # the executor is TERMINATED, so this check freed the slot on the
+                # NEXT cycle and re-quoted over the live order — the orphan door,
+                # one cycle later. Retry the stop first (cancel + confirm + fill
+                # ingest, the executor's own path); only a terminal order frees
+                # the level. Unknown/still-resting -> the slot stays bound.
+                if ex_existing is not None and self._failed_stop_left_order_resting(ex_existing):
+                    if not await self._retry_failed_stop(ex_existing):
+                        return
                 self._set_quote(is_bid, None, None, level=level)
                 cur_id, cur_price = None, None
 
@@ -1166,6 +1184,16 @@ class MarketMakingController(Controller):
             if ex is not None and not ex.is_terminated:
                 if self._should_hold(is_bid, target, slot):
                     return  # leave the resting quote — see _should_hold
+                # AUDIT-DENY-2026-09-02-F3: the venue is throttling our reads this
+                # cycle (a status poll came back denied). A requote is a cancel +
+                # place against the same budget — churning it now only deepens
+                # the contention that produced the hold. Leave the resting quote;
+                # reducing-side requotes (is_opening=False) still go through so
+                # exposure can always come down, and a fresh spawn on an EMPTY
+                # slot (below) is not a requote and stays allowed.
+                if (is_opening and self.adapter.reads_throttled_this_cycle() > 0
+                        and not self._throttle_hold_expired(slot)):
+                    return
                 # Phase 8: FUSE the cancel+replace into ONE atomic request. We
                 # were going to cancel this live quote and place a fresh one
                 # anyway, so cancel_and_place does both in one signed request —
@@ -1374,6 +1402,44 @@ class MarketMakingController(Controller):
             behind = price > self._touch_ask
             target_is_better = target > price      # sell higher
         return not behind and not target_is_better
+
+    def _throttle_hold_expired(self, slot: _QuoteSlot) -> bool:
+        """The venue-contention hold is time-bounded (MID audit of 27e0926,
+        finding 1): a Mid profile's ``max_quote_lifetime_s`` wins — the
+        cadence's promised refresh still happens — and a profile without a TTL
+        is bounded by ``_THROTTLE_HOLD_MAX_S``."""
+        if slot.placed_at <= 0:
+            return True
+        limit = self.max_quote_lifetime_s if self.max_quote_lifetime_s > 0 else _THROTTLE_HOLD_MAX_S
+        return (self._now() - slot.placed_at) >= limit
+
+    @staticmethod
+    def _failed_stop_left_order_resting(ex: object) -> bool:
+        from src.nadobro.engine.types import CloseType as _CT
+        order = getattr(ex, "order", None)
+        return (
+            getattr(ex, "close_type", None) is _CT.FAILED
+            and order is not None
+            and not order.state.is_terminal
+        )
+
+    async def _retry_failed_stop(self, ex: object) -> bool:
+        """Re-run a FAILED stop through the executor's own ``on_stop`` (cancel,
+        confirm, fill ingest — re-entrant on a terminated executor). True only
+        once the order is confirmed terminal, i.e. the level may be reused."""
+        from src.nadobro.engine.types import CloseType as _CT
+        try:
+            await ex.on_stop(_CT.EARLY_STOP)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - the venue may still be throttling; retry next cycle
+            logger.warning("mm %s: retry of a FAILED stop raised — slot stays bound",
+                           self.id, exc_info=True)
+            return False
+        order = getattr(ex, "order", None)
+        if order is not None and not order.state.is_terminal:
+            logger.warning("mm %s: order %s still rests after a retried stop — slot stays bound",
+                           self.id, getattr(order, "id", "?"))
+            return False
+        return True
 
     def _should_hold(self, is_bid: bool, target: Decimal, slot: _QuoteSlot) -> bool:
         """Leave the resting quote alone?

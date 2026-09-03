@@ -140,6 +140,11 @@ class NadoAdapterBase(abc.ABC):
         budget-denied result), so a 40-quote ladder costs one gateway read per
         tick instead of forty — and a denial costs one bucket wait, not forty."""
         self._cycle_openings = 0
+        # AUDIT-DENY-2026-09-02-F3 (grid + dgrid audits): a ladder recenter is
+        # decided BEFORE the cycle's status polls run, so "this cycle" always
+        # reads 0 there. Keep the previous cycle's count as the signal such
+        # early decisions use (venue_reads_contended()).
+        self._reads_throttled_last_cycle = int(getattr(self, "_cycle_reads_throttled", 0))
         self._cycle_reads_throttled = 0
         self._status_epoch = int(getattr(self, "_status_epoch", 0)) + 1
 
@@ -150,6 +155,20 @@ class NadoAdapterBase(abc.ABC):
 
     def reads_throttled_this_cycle(self) -> int:
         return int(getattr(self, "_cycle_reads_throttled", 0))
+
+    def reads_throttled_last_cycle(self) -> int:
+        return int(getattr(self, "_reads_throttled_last_cycle", 0))
+
+    def venue_reads_contended(self) -> bool:
+        """A status read was budget-denied this cycle OR the previous one.
+
+        The signal for decisions taken BEFORE this cycle's polls — the grid and
+        dgrid recenters run ahead of the executor ticks, so the previous
+        cycle's denials are the freshest evidence they can have. Decisions
+        taken AFTER the polls (Mid requotes in ``_reconcile``) use
+        ``reads_throttled_this_cycle`` directly.
+        """
+        return self.reads_throttled_this_cycle() > 0 or self.reads_throttled_last_cycle() > 0
 
     def _note_opening_placement(self) -> None:
         """Record one successful exposure-growing / requoting placement."""

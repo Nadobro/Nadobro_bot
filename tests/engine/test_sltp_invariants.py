@@ -1195,3 +1195,52 @@ def test_denied_book_read_never_hides_a_venue_fill_from_the_executor():
         assert st.filled_base == Decimal("1")
 
     asyncio.run(body())
+
+
+def test_a_failed_stop_never_frees_the_mid_slot_until_its_order_is_terminal():
+    """AUDIT-DENY-2026-09-02-F2b (MID audit of 27e0926, finding 3).
+
+    #274's F2 guard keeps the slot bound when a requote's stop ends FAILED with
+    the order still resting — for ONE cycle. The executor is TERMINATED, so the
+    next cycle's "forget a terminated quote" check cleared the slot and spawned
+    a fresh quote OVER the still-resting one: the orphan door, one cycle later.
+    A level may be reused only once its order is confirmed terminal; until then
+    every cycle retries the stop (cancel + confirm + fill ingest).
+    """
+    import asyncio
+    from decimal import Decimal
+
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    from src.nadobro.engine.controllers.market_making import MarketMakingController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from src.nadobro.engine.types import TradeType
+
+    async def body():
+        # Every cancel is rejected (venue rate-limited); status reads still answer.
+        adapter = MockNadoAdapter(mid=Decimal(100), fail_on=["cancel_order"], fail_times=999)
+        orch = ExecutorOrchestrator()
+        c = MarketMakingController(
+            user_id=1, orchestrator=orch, adapter=adapter, inventory=InventoryRepository(),
+            configs={"trading_pair": "BTC", "spread_bp": "10", "order_amount_quote": "10",
+                     "levels": "1", "leverage": "1", "price_distance_tolerance": "0.0001",
+                     "min_quote_lifetime_s": "0", "max_quote_lifetime_s": "0"},
+        )
+        await orch.spawn_controller(c)
+        await c._reconcile(TradeType.BUY, Decimal("99"), True, Decimal("100"))
+        first = c._slot(True, 0).ex_id
+        # cycle 1: requote -> the stop FAILS (cancel rejected), order still OPEN -> slot bound (F2)
+        await c._reconcile(TradeType.BUY, Decimal("95"), True, Decimal("100"))
+        assert len(adapter.placed) == 1 and c._slot(True, 0).ex_id == first
+        # cycle 2: the executor is TERMINATED — the slot must STILL not be freed while the order rests
+        await c._reconcile(TradeType.BUY, Decimal("95"), True, Decimal("100"))
+        assert len(adapter.placed) == 1, "a second quote was spawned over the still-resting one"
+        assert c._slot(True, 0).ex_id == first
+        # the venue accepts cancels again: the retried stop confirms terminal and the level is reused
+        adapter.fail_remaining = 0
+        await c._reconcile(TradeType.BUY, Decimal("95"), True, Decimal("100"))
+        assert len(adapter.placed) == 2
+        assert adapter._orders[adapter.placed[0].id].state.is_terminal
+
+    asyncio.run(body())
