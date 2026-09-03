@@ -1244,3 +1244,62 @@ def test_a_failed_stop_never_frees_the_mid_slot_until_its_order_is_terminal():
         assert adapter._orders[adapter.placed[0].id].state.is_terminal
 
     asyncio.run(body())
+
+
+@pytest.mark.xfail(strict=True, reason="AUDIT-PERSIST-2026-09-03-MM4: a not-allowed stop that FAILS frees the Mid slot over a resting order")
+def test_a_not_allowed_stop_that_fails_keeps_the_mid_slot_bound():
+    """AUDIT-PERSIST-2026-09-03-MM4 (Mid audit of a555e0e, finding 4; pre-existing).
+
+    Three Mid paths clear a slot unconditionally right after ``orchestrator.stop``:
+    the not-allowed branch of ``_reconcile``, ``_retire_levels_beyond`` and
+    ``stop_all_quotes``. When that stop ends FAILED with the order still resting
+    (cancel rejected + confirm read denied), nothing references the resting
+    order any more, and the next cycle spawns a fresh quote OVER it — 2x notional
+    on that level, invisible to the exposure projection. A slot whose stop left
+    an order resting must stay bound (and be retried), on all three paths.
+    """
+    import asyncio
+    from decimal import Decimal
+
+    from tests.engine._mock_nado import MockNadoAdapter
+
+    from src.nadobro.engine.controllers.market_making import MarketMakingController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from src.nadobro.engine.types import TradeType
+
+    cfg = {"trading_pair": "BTC", "spread_bp": "10", "order_amount_quote": "10",
+           "levels": "1", "leverage": "1", "price_distance_tolerance": "0.0001",
+           "min_quote_lifetime_s": "0", "max_quote_lifetime_s": "0"}
+
+    async def body():
+        adapter = MockNadoAdapter(mid=Decimal(100))
+        orch = ExecutorOrchestrator()
+        c = MarketMakingController(user_id=1, orchestrator=orch, adapter=adapter,
+                                   inventory=InventoryRepository(), configs=dict(cfg))
+        await orch.spawn_controller(c)
+        await c._reconcile(TradeType.BUY, Decimal("99"), True, Decimal("100"))
+        first = c._slot(True, 0).ex_id
+        assert first is not None and len(adapter.placed) == 1
+        # The venue rejects every cancel from here on (rate-limited).
+        adapter.fail_on = {"cancel_order"}
+        adapter.fail_remaining = 999
+        # --- path 1: the not-allowed branch (gate PAUSE / exposure cap) ---
+        await c._reconcile(TradeType.BUY, Decimal("99"), False, Decimal("100"))
+        assert c._slot(True, 0).ex_id == first, "slot freed while the order still rests"
+        # Next cycle the side is allowed again: no second quote over the first.
+        await c._reconcile(TradeType.BUY, Decimal("99"), True, Decimal("100"))
+        assert len(adapter.placed) == 1
+        # --- path 2: retiring a level that the plan no longer contains ---
+        await c._retire_levels_beyond(True, 0)
+        assert c._slot(True, 0).ex_id == first
+        # --- path 3: the live-config resize stop ---
+        await c.stop_all_quotes()
+        assert c._slot(True, 0).ex_id == first
+        # The venue accepts cancels again: the retried stop confirms, the slot frees.
+        adapter.fail_remaining = 0
+        await c.stop_all_quotes()
+        assert c._slot(True, 0).ex_id is None
+        assert adapter._orders[adapter.placed[0].id].state.is_terminal
+
+    asyncio.run(body())
