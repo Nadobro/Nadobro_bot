@@ -417,7 +417,7 @@ class EngineRuntime:
                 return
             try:
                 await asyncio.shield(inflight)
-            except Exception:  # noqa: BLE001 - already logged by the task
+            except Exception:  # policy: degrade-ok(the batch task already logged its WARNING; the forced pass below rewrites every dirty row)
                 pass
         from src.nadobro.trading.engine_persistence import executor_persist_signature, executor_row
         sigs = self._persisted_sig.setdefault(key, {})
@@ -455,7 +455,7 @@ class EngineRuntime:
             await asyncio.shield(task)
         except asyncio.CancelledError:
             raise                                # the batch lands on its own
-        except Exception:  # noqa: BLE001 - logged inside the task
+        except Exception:  # policy: degrade-ok(the batch task logged the failure at WARNING; the same rows are retried next tick)
             pass
 
     async def _write_executor_rows(
@@ -493,7 +493,7 @@ class EngineRuntime:
         sigs = self._persisted_sig.get(key) or {}
         try:
             return sigs.get(getattr(ex, "id", None)) != executor_persist_signature(ex)
-        except Exception:  # noqa: BLE001
+        except Exception:  # policy: degrade-ok(an unreadable signature keeps the executor — never prune what could not be persisted)
             return True
 
 def _should_build_controller(

@@ -1419,7 +1419,8 @@ class MarketMakingController(Controller):
         retried — through this same path on the next retire/resize pass, or
         through _reconcile's terminated-quote check (F2b). True when released."""
         await self.orchestrator.stop(ex_id)
-        ex = self.orchestrator.get(ex_id)
+        get = getattr(self.orchestrator, "get", None)   # test doubles may lack it
+        ex = get(ex_id) if callable(get) else None
         if ex is not None and self._failed_stop_left_order_resting(ex):
             logger.warning("mm %s: stop of %s ended FAILED with its order still resting — slot stays bound",
                            self.id, ex_id)

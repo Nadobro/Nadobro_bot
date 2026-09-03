@@ -495,7 +495,8 @@ class ExecutorOrchestrator:
                 try:
                     if keep_pred(ex):
                         continue
-                except Exception:  # noqa: BLE001 - a predicate error must not break the tick
+                except Exception:  # policy: degrade-ok(a predicate error keeps the executor one more tick; the tick itself is unaffected)
+                    logger.warning("prune keep-predicate failed for %s — executor kept", ex.id, exc_info=True)
                     continue
             if callable(bank):
                 try:
