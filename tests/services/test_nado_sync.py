@@ -931,3 +931,66 @@ class PhantomFillPriceTests(unittest.TestCase):
                                     venue_quote="-250.29", venue_fee="0.05")
         self.assertAlmostEqual(float(params[7]), 0.00395, places=8)
         self.assertAlmostEqual(float(params[9]), 250.29 / 0.00395, places=2)
+
+
+class DeniedOpenOrdersSweepTests(unittest.IsolatedAsyncioTestCase):
+    """DENIED-vs-EMPTY for the stale-order sweep (2026-09-02, AUDIT-DENY).
+
+    ``get_all_open_orders`` returns ``None`` for a round it could not read.
+    The sync must keep the last known list for display, flag the snapshot, and
+    the DB writer must NOT run the sweep that marks every row the (unknown)
+    venue list omits as ``cancelled_or_filled``.
+    """
+
+    _WRITER_PATCHES = (
+        ("src.nadobro.venue.nado_sync._write_positions", {}),
+        ("src.nadobro.venue.nado_sync._write_matches", {"return_value": 0}),
+        ("src.nadobro.venue.nado_sync._write_funding", {"return_value": 0}),
+        ("src.nadobro.venue.nado_sync.execute", {}),
+        ("src.nadobro.models.database.settle_closed_manual_positions", {}),
+        ("src.nadobro.models.database.get_account_realized_pnl_windows", {"return_value": {}}),
+        ("src.nadobro.models.database.get_analytics_fills", {"return_value": []}),
+    )
+
+    async def test_denied_open_orders_read_keeps_the_last_known_list_and_flags_unknown(self):
+        class DeniedOrdersClient(_Client):
+            def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False):
+                return None            # unreadable this round — NOT an empty book
+
+        prior_orders = [{"product_id": 1, "product_name": "BTC", "digest": "0xlive", "amount": "1", "price": "100"}]
+        nado_sync.set_cached_snapshot(42, "testnet", {
+            "user_id": 42, "network": "testnet", "last_sync": datetime.now(timezone.utc),
+            "positions": [], "open_orders": prior_orders,
+        })
+        with patch.object(nado_sync, "get_user", return_value=SimpleNamespace(network_mode=SimpleNamespace(value="testnet"))), patch.object(
+            nado_sync, "get_user_nado_client", return_value=DeniedOrdersClient()
+        ), patch.object(nado_sync, "_write_snapshot") as write_snapshot, patch.object(nado_sync, "_write_sync_log_error"):
+            result = await nado_sync.sync_user(42, network="testnet", force=True)
+
+        assert result["open_orders_unknown"] is True
+        assert "0xlive" in {o.get("digest") for o in result["open_orders"]}, "last known list kept for display"
+        written = write_snapshot.call_args[0][0]
+        assert written["open_orders_unknown"] is True
+
+    async def test_a_successful_read_is_not_flagged(self):
+        with patch.object(nado_sync, "get_user", return_value=SimpleNamespace(network_mode=SimpleNamespace(value="testnet"))), patch.object(
+            nado_sync, "get_user_nado_client", return_value=_Client()
+        ), patch.object(nado_sync, "_write_snapshot"), patch.object(nado_sync, "_write_sync_log_error"):
+            result = await nado_sync.sync_user(42, network="testnet", force=True)
+        assert result["open_orders_unknown"] is False
+
+    def _write(self, snapshot):
+        from contextlib import ExitStack
+        with ExitStack() as st:
+            for target, kw in self._WRITER_PATCHES:
+                st.enter_context(patch(target, **kw))
+            sweep = st.enter_context(patch.object(nado_sync, "_write_open_orders"))
+            nado_sync._write_snapshot(snapshot, 1)
+            return sweep
+
+    def test_write_snapshot_skips_the_stale_sweep_when_the_book_is_unknown(self):
+        snap = {"user_id": 42, "network": "testnet", "positions": [], "stats": {},
+                "open_orders": [{"digest": "0xlive"}], "matches": [], "funding_payments": []}
+        assert self._write(dict(snap, open_orders_unknown=True)).call_count == 0
+        assert self._write(dict(snap, open_orders_unknown=False)).call_count == 1
+        assert self._write(dict(snap)).call_count == 1          # legacy snapshots: unchanged
