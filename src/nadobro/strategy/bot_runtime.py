@@ -2862,37 +2862,6 @@ def _liq_proximity_tripped(strategy: str, snap: dict) -> bool:
 # which the buffer bounds anyway.
 _SLTP_MARK_CACHE: dict[int, float] = {}
 
-# Session-rail sanity (prod 2026-09-03, session 312 — the phantom +195%-of-margin
-# TP). A stop must never fire on a physically impossible live-PnL snapshot.
-_SLTP_MAX_ENTRY_MARK_DIVERGENCE = env_float("NADO_SLTP_MAX_ENTRY_MARK_DIVERGENCE", 0.20)
-
-
-def _position_pnl_reliable(snap: dict) -> bool:
-    """False when the snapshot's position PnL is physically impossible, so the
-    rail HOLDS instead of firing a stop on corrupt venue data.
-
-    Prod 2026-09-03 (session 312): a ``positions`` row carried
-    ``avg_entry_price`` 105,635 while BTC marked ~78,260 — a ~35% "in the money"
-    short whose venue ``est_pnl`` was reported as +$295 (internally consistent
-    with that bogus entry, since both derive from the indexer's
-    ``net_entry_unrealized``) and fired a phantom +195%-of-margin TP. A real
-    leveraged perp entry is always within a few % of mark — an armed barrier
-    fires at a fraction of a percent move, and the position liquidates well
-    before a 20% adverse excursion — so an entry that far from mark means the
-    basis is corrupt for this poll. A transient MARK spike is caught the same
-    way (mark diverges from the true entry). Holds only this poll; the next
-    clean read decides.
-    """
-    try:
-        size = abs(float(snap.get("position_size") or 0.0))
-        entry = float(snap.get("entry_price") or 0.0)
-        mark = float(snap.get("mark") or 0.0)
-    except (TypeError, ValueError):
-        return True
-    if size <= 0 or entry <= 0 or mark <= 0:
-        return True   # no position / no basis -> uPnL ~0, nothing to distrust
-    return abs(entry - mark) / mark <= _SLTP_MAX_ENTRY_MARK_DIVERGENCE
-
 
 async def _evaluate_session_pnl_rail(
     telegram_id: int,
@@ -3146,22 +3115,6 @@ async def _evaluate_session_pnl_rail(
                 await _save_state_async(telegram_id, network, state)
         except Exception:  # noqa: BLE001 - backstop must never break the rail
             logger.debug("venue stop sync failed", exc_info=True)
-        return None
-
-    # SANITY (prod 2026-09-03, session 312): never fire the user's stop on a
-    # physically impossible position read (a corrupt entry / phantom uPnL, or a
-    # transient mark spike). Both show up as an entry far from mark. Hold this
-    # poll; the next clean read fires if the breach is real. Applies to every
-    # reason including the liquidation guard — its liq_price is derived from the
-    # same basis, so a corrupt read must not trigger a protective flatten either.
-    if not _position_pnl_reliable(snap):
-        logger.warning(
-            "session rail HELD reason=%s strategy=%s user=%s: position PnL implausible "
-            "(entry=%.2f vs mark=%.2f size=%s uPnL=$%.2f) — not firing on corrupt venue data",
-            reason, strategy, telegram_id,
-            float(snap.get("entry_price") or 0.0), float(snap.get("mark") or 0.0),
-            snap.get("position_size"), float(snap.get("unrealized_pnl") or 0.0),
-        )
         return None
 
     # Visibility: log the NET loss the stop judged (= the user's real loss) with the
