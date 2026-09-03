@@ -834,6 +834,104 @@ def _finalize_session(state: dict, stop_reason: str = "stopped"):
         logger.warning("Failed to finalize session #%s: %s", session_id, e)
 
 
+async def boot_stand_down_strategies() -> int:
+    """Redeploy rule (prod 2026-09-03, session 312): boot NEVER auto-resumes a
+    strategy. The engine controller already stands down (it is not rebuilt on
+    boot), but the DB session stayed 'running', bot_state.running stayed True, and
+    the resting orders stayed LIVE on the venue — so a stood-down grid kept
+    filling unmanaged for hours after the restart and the safety rail fired a
+    phantom TP on that orphaned position. Stand every running engine strategy
+    FULLY down: cancel its resting venue orders (leaving the open position for the
+    user to manage), terminate its executor rows, finalize the session, clear the
+    running flag, and notify the owner that resuming is user-initiated. Returns
+    the number of sessions stood down.
+    """
+    if not env_bool("NADO_BOOT_STAND_DOWN_STRATEGIES", True):
+        return 0
+    try:
+        from src.nadobro.strategy.engine_runtime import ENGINE_MAPPED_STRATEGIES
+        rows = await run_blocking_db(
+            query_all, "SELECT key, value FROM bot_state WHERE key LIKE %s", (f"{STATE_PREFIX}%",)
+        )
+    except Exception:  # noqa: BLE001 - boot must proceed even if the sweep can't enumerate
+        logger.warning("boot strategy stand-down: could not enumerate running sessions", exc_info=True)
+        return 0
+    stood = 0
+    for row in rows or []:
+        try:
+            key = str(row.get("key") or "")
+            state = json.loads(row.get("value") or "{}")
+            if not isinstance(state, dict) or not state.get("running"):
+                continue
+            strategy = str(state.get("strategy") or "").lower().strip()
+            if strategy not in ENGINE_MAPPED_STRATEGIES:
+                continue
+            user_network = key.replace(STATE_PREFIX, "")
+            telegram_id_str, network = user_network.split(":", 1)
+            telegram_id = int(telegram_id_str)
+        except Exception:  # policy: degrade-ok(a malformed bot_state row is skipped so the boot sweep stands down every other user)
+            continue
+        try:
+            if await _boot_stand_down_one(telegram_id, network, state, strategy):
+                stood += 1
+        except Exception:  # noqa: BLE001 - one user's failure must not block the rest
+            logger.warning("boot strategy stand-down failed for %s", key, exc_info=True)
+    return stood
+
+
+async def _boot_stand_down_one(telegram_id: int, network: str, state: dict, strategy: str) -> bool:
+    from src.nadobro.strategy.engine_runtime import deterministic_controller_id
+    from src.nadobro.trading.trade_service import cancel_resting_orders_for_user
+
+    # 1) Cancel resting venue orders (fail-loud). Leave the open position — the
+    #    user decides its fate; a redeploy must never flatten it.
+    cancel = await run_blocking_sdk(cancel_resting_orders_for_user, telegram_id, network)
+    order_ok = bool(cancel.get("success"))
+    # 2) Terminate stale executor rows + clear engine progress so the next run
+    #    builds cleanly (mirrors the cross-process stop path).
+    try:
+        from src.nadobro.trading.engine_persistence import (
+            clear_controller_progress,
+            terminate_engine_executors,
+        )
+        cid = deterministic_controller_id(strategy, telegram_id, network)
+        await run_blocking_db(terminate_engine_executors, cid)
+        await run_blocking_db(clear_controller_progress, cid)
+    except Exception:  # noqa: BLE001 - best-effort DB cleanup
+        logger.debug("boot stand-down executor cleanup failed user=%s", telegram_id, exc_info=True)
+    # 3) Finalize the session + clear the running flag so the SLTP safety poll and
+    #    the rail no longer treat it as live (the zombie's fuel).
+    state["running"] = False
+    if not order_ok:
+        state["last_error"] = (
+            "Stopped by a restart. Some resting orders may remain on Nado — "
+            "please check and cancel them. Tap Start to resume."
+        )
+    await run_blocking_db(_finalize_session, state, "redeploy_stand_down")
+    await _save_state_async(telegram_id, network, state)
+    # 4) Notify the owner. Resuming is strictly user-initiated.
+    product = str(state.get("product") or "").upper()
+    if order_ok:
+        await _notify(
+            telegram_id,
+            "🔄 {strategy} on {product} ({network}) was stopped by a restart — resting orders "
+            "cancelled; any open position is untouched. Tap Start to resume.",
+            strategy=_strategy_display_name(strategy), product=product or "your market", network=network,
+        )
+    else:
+        await _notify(
+            telegram_id,
+            "⚠️ {strategy} on {product} ({network}) was stopped by a restart, but resting orders "
+            "could not be confirmed cancelled — please check Nado. Tap Start to resume.",
+            strategy=_strategy_display_name(strategy), product=product or "your market", network=network,
+        )
+    logger.info(
+        "boot stand-down: %s user=%s network=%s (orders_cancelled=%s)",
+        strategy, telegram_id, network, order_ok,
+    )
+    return True
+
+
 def _available_quote_balance_for_network(client) -> float | None:
     """Return the available quote balance for ``client``.
 

@@ -546,6 +546,19 @@ async def run_bot():
         await start_copy_polling()
         logger.info("Copy trading polling started")
 
+    # Redeploy rule (prod 2026-09-03, session 312): boot = stand-down for engine
+    # strategies too, not just copy. The controller is never rebuilt on boot, so
+    # a still-'running' session's resting orders would keep filling unmanaged and
+    # the SLTP safety poll would keep the rail alive on that orphaned position.
+    # Cancel the resting orders, finalize, clear the flag; resume is user-tapped.
+    try:
+        from src.nadobro.strategy.bot_runtime import boot_stand_down_strategies
+        stood = await boot_stand_down_strategies()
+        if stood:
+            logger.info("Strategy boot stand-down: stopped %d running session(s); resume is user-initiated", stood)
+    except Exception:
+        logger.warning("Strategy boot stand-down failed", exc_info=True)
+
     from telegram import BotCommand
     await bot_app.bot.set_my_commands([
         BotCommand("start", "Open your home dashboard"),
