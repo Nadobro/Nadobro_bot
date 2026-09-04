@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from src.nadobro.utils.env import env_float
 from src.nadobro.utils.x18 import from_x18
 
 
@@ -99,8 +100,13 @@ def derive_unrealized_pnl(
     neither can be evaluated, so callers can tell "no data" from "zero PnL".
     """
     explicit = optional_decimal(_pick(row, "est_pnl", "unrealized_pnl", "unrealized_pnl_usd"))
+    _unsettled = optional_decimal(_pick(row, "unsettled"))
     if explicit is not None:
-        return explicit
+        # Prefer the on-chain ``unsettled`` when the indexer est_pnl diverges from
+        # it (corrupt basis; see reconcile_unrealized_pnl / session 312).
+        return reconcile_unrealized_pnl(explicit, _unsettled, optional_decimal(_pick(row, "notional_value", "value")))
+    if _unsettled is not None:
+        return _unsettled
 
     signed = signed_position_size(row)
     if signed == ZERO:
@@ -128,10 +134,48 @@ def derive_unrealized_pnl(
     return None
 
 
+_UPNL_RECONCILE_FRACTION = env_float("NADO_UPNL_RECONCILE_NOTIONAL_FRACTION", 0.10)
+_UPNL_RECONCILE_FLOOR = env_float("NADO_UPNL_RECONCILE_ABS_FLOOR", 10.0)
+
+
+def reconcile_unrealized_pnl(
+    est_pnl: "Decimal | None", unsettled: "Decimal | None", notional: "Decimal | None"
+) -> "Decimal | None":
+    """The trustworthy unrealized PnL for a cross position (prod 2026-09-03,
+    session 312). A cross position carries TWO uPnL figures: ``est_pnl``
+    (indexer: amount*oracle - net_entry_unrealized) and ``unsettled`` (on-chain:
+    amount*oracle + v_quote_balance). They differ by EXACTLY the accumulated
+    fees + settled funding (est_pnl is price-only; unsettled carries funding via
+    v_quote_balance), which over even a long high-turnover session stays a few
+    percent of notional. When the indexer's net_entry_unrealized is corrupt they
+    diverge FAR beyond that (312: est_pnl +$295.65 from a fabricated avg_entry
+    105,635 vs mark 78,260 — 35% of notional — while unsettled was ~-$6). The band
+    (default 10% of notional, well above any real fees+funding) separates the
+    two: below it, keep the funding-separated ``est_pnl`` the rail's
+    "price - fees - funding" basis wants (so the rail's own ``- funding_paid`` is
+    not double-counted); above it, ``est_pnl`` is provably corrupt and the
+    on-chain ``unsettled`` is the only trustworthy figure. Leverage-agnostic: it
+    never overrides a legitimate PnL, only a corrupt one."""
+    if unsettled is None:
+        return est_pnl                       # isolated / no on-chain figure
+    if est_pnl is None:
+        return unsettled
+    band = _UPNL_RECONCILE_FLOOR
+    if notional is not None:
+        band = max(band, abs(notional) * Decimal(str(_UPNL_RECONCILE_FRACTION)))
+    if abs(est_pnl - unsettled) > band:
+        return unsettled                     # indexer est_pnl is corrupt -> trust the chain
+    return est_pnl
+
+
 def normalize_position(row: dict[str, Any], *, isolated: bool) -> PortfolioPosition:
     amount = _position_amount(row)
     notional = decimal_value(_pick(row, "notional_value", "value", default=0))
-    est_pnl = optional_decimal(_pick(row, "est_pnl", "unrealized_pnl"))
+    est_pnl = reconcile_unrealized_pnl(
+        optional_decimal(_pick(row, "est_pnl", "unrealized_pnl")),
+        optional_decimal(_pick(row, "unsettled")),
+        optional_decimal(_pick(row, "notional_value", "value")),
+    )
     margin_used = optional_decimal(_pick(row, "margin_used", "net_margin"))
     leverage = optional_decimal(_pick(row, "leverage"))
     avg_entry = optional_decimal(_pick(row, "avg_entry_price", "entry_price"))

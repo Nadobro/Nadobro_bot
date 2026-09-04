@@ -252,3 +252,47 @@ def test_compute_total_equity_treats_borrows_as_a_liability():
         {"total_spot_deposits": "1000", "total_spot_borrows": "200"}, spot_balances={}
     )
     assert equity["spot"] == Decimal("800")
+
+
+# AUDIT-SLTP-2026-09-03-PHANTOM-ENTRY: reconcile a corrupt indexer est_pnl
+# against the on-chain unsettled.
+def test_reconcile_prefers_unsettled_on_a_wild_divergence():
+    from decimal import Decimal as D
+    from src.nadobro.quant.portfolio_calculator import reconcile_unrealized_pnl
+    # phantom: +295.65 (indexer) vs -6 (chain) on 845 notional -> chain wins
+    assert reconcile_unrealized_pnl(D("295.65"), D("-6.0"), D("845")) == D("-6.0")
+
+
+def test_reconcile_keeps_est_pnl_within_the_funding_band():
+    from decimal import Decimal as D
+    from src.nadobro.quant.portfolio_calculator import reconcile_unrealized_pnl
+    # -82.47 vs -90.61 (an $8 funding diff) on 3462 notional -> band ~$104 -> keep
+    assert reconcile_unrealized_pnl(D("-82.47"), D("-90.61"), D("3462")) == D("-82.47")
+
+
+def test_reconcile_handles_missing_figures():
+    from decimal import Decimal as D
+    from src.nadobro.quant.portfolio_calculator import reconcile_unrealized_pnl
+    assert reconcile_unrealized_pnl(D("5"), None, D("100")) == D("5")     # isolated: no chain figure
+    assert reconcile_unrealized_pnl(None, D("-3"), D("100")) == D("-3")   # only chain
+    assert reconcile_unrealized_pnl(None, None, D("100")) is None
+
+
+def test_reconcile_absolute_floor_catches_a_tiny_notional_phantom():
+    from decimal import Decimal as D
+    from src.nadobro.quant.portfolio_calculator import reconcile_unrealized_pnl
+    # tiny notional so the fractional band is below the $10 floor; a $50 gap is corrupt
+    assert reconcile_unrealized_pnl(D("48"), D("-2"), D("50")) == D("-2")
+
+
+def test_reconcile_does_not_override_on_legitimate_funding_drift():
+    """AUDIT re-check: est_pnl - unsettled == accumulated fees + funding. A
+    long-running/high-funding session where that gap is large but still a
+    plausible % of notional must KEEP est_pnl — overriding to unsettled would
+    double-count funding in the rail's `realized + unrealized - funding_paid`."""
+    from decimal import Decimal as D
+    from src.nadobro.quant.portfolio_calculator import reconcile_unrealized_pnl
+    # $120 of fees+funding on a $3462 notional (3.5%) is legit -> keep est_pnl.
+    assert reconcile_unrealized_pnl(D("-20"), D("-140"), D("3462")) == D("-20")
+    # even a $300 funding gap on a $3462 notional (8.7%) is under the 10% band.
+    assert reconcile_unrealized_pnl(D("10"), D("-290"), D("3462")) == D("10")

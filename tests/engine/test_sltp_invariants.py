@@ -1302,3 +1302,41 @@ def test_a_not_allowed_stop_that_fails_keeps_the_mid_slot_bound():
         assert adapter._orders[adapter.placed[0].id].state.is_terminal
 
     asyncio.run(body())
+
+
+# --------------------------------------------------------------------------- #
+# AUDIT-SLTP-2026-09-03-PHANTOM-ENTRY — a cross position's unrealized PnL must  #
+# be reconciled against the ON-CHAIN ``unsettled`` before it can drive the      #
+# session SL/TP rail. Prod session 312 fired a +195%-of-margin phantom TP off a #
+# positions row whose indexer ``est_pnl`` (+$295.65, from a fabricated          #
+# avg_entry 105,635 vs mark 78,260) disagreed with the on-chain ``unsettled``   #
+# (~-$6). The rail reads the persisted est_pnl; correcting it at the source     #
+# (normalize_position) fixes every downstream consumer, leverage-agnostically.  #
+# Pure — no DB/network; runs in the deps-free CI job.                           #
+# --------------------------------------------------------------------------- #
+def test_a_phantom_indexer_est_pnl_is_corrected_to_the_onchain_unsettled():
+    from src.nadobro.quant.portfolio_calculator import normalize_position
+    phantom = {
+        "product_id": 2, "symbol": "BTC-PERP", "position_size": "-0.0108",
+        "notional_value": "845", "avg_entry_price": "105635", "est_pnl": "295.65",
+        "unsettled": "-6.0", "margin_used": "17", "leverage": "50",
+    }
+    pos = normalize_position(dict(phantom), isolated=False)
+    assert pos.est_pnl == Decimal("-6.0"), "phantom indexer est_pnl was not corrected to the on-chain unsettled"
+
+
+def test_a_normal_funding_sized_difference_keeps_the_indexer_est_pnl():
+    from src.nadobro.quant.portfolio_calculator import normalize_position
+    normal = {
+        "product_id": 2, "symbol": "BTC-PERP", "position_size": "-0.0428",
+        "notional_value": "3462.52", "avg_entry_price": "78973", "est_pnl": "-82.47",
+        "unsettled": "-90.61", "margin_used": "69", "leverage": "50",
+    }
+    pos = normalize_position(dict(normal), isolated=False)
+    assert pos.est_pnl == Decimal("-82.47"), "a normal funding-sized est_pnl/unsettled diff must be preserved"
+
+
+def test_an_isolated_position_without_unsettled_is_unchanged():
+    from src.nadobro.quant.portfolio_calculator import normalize_position
+    iso = {"product_id": 3, "symbol": "SOL-PERP", "position_size": "1", "est_pnl": "5.0"}
+    assert normalize_position(dict(iso), isolated=True).est_pnl == Decimal("5.0")
