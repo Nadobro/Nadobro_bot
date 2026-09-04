@@ -2518,13 +2518,24 @@ def close_position(
     net_positions = _normalize_net_positions(client.get_all_positions() or [])
     product_pos = net_positions.get(product_id)
     if not product_pos:
+        # AUDIT-SWEEP-2026-09-04-PARTIAL-CANCEL-FALSE-SUCCESS: fail loud on ANY order
+        # error (an unreadable book -> _UNKNOWN_BOOK, or a rejected/rate-limited cancel)
+        # rather than report a clean cancel-only close over orders that may still rest.
+        if order_errors:
+            return {
+                "success": False,
+                "cancelled": 0.0,
+                "product": get_product_name(product_id, network=selected_network),
+                "cancelled_orders": cancelled_orders,
+                "order_errors": order_errors,
+                "error": "Could not confirm the order book is clear: " + "; ".join(order_errors[:4]),
+            }
         if cancelled_orders > 0:
             return {
                 "success": True,
                 "cancelled": 0.0,
                 "product": get_product_name(product_id, network=selected_network),
                 "cancelled_orders": cancelled_orders,
-                "order_errors": order_errors if order_errors else None,
             }
         return {"success": False, "error": f"No open positions on {product}."}
 
@@ -2635,17 +2646,33 @@ def close_position(
 
     post_positions = _normalize_net_positions(client.get_all_positions() or [])
     post_pos = post_positions.get(product_id)
-    post_open_orders = 0
-    for snd in _order_sender_params(client, selected_network):
-        post_open_orders += len(client.get_open_orders(product_id, sender=snd) or [])
+    # Order-book verify with the DENIED-vs-EMPTY discipline: get_open_orders returns
+    # None on a budget-denied read, so the old `len(get_open_orders(...) or [])` loop
+    # collapsed an UNREADABLE book to "0 remaining" and reported a clean close over
+    # orders that still rest (session-312 class; the isolated-child read is denied
+    # while the parent read drains the per-user bucket). _resting_orders_by_sender does
+    # ONE batched read scoped to this product, falls back to per-sender reads on the
+    # product, and marks an unreadable book with _UNKNOWN_BOOK. (get_all_positions uses
+    # a cache/empty fallback and never returns None, so the position side cannot fail
+    # loud here — the order side is the session-312 mechanism.)
+    # AUDIT-SWEEP-2026-09-04-CLOSE-ALL-UNKNOWN-BOOK-POS-BRANCH
+    still_resting, verify_errors = _resting_orders_by_sender(
+        client, only_pid=product_id, known_pids=[product_id], network=selected_network,
+    )
+    post_open_orders = sum(len(d) for d in still_resting.values())
+    for err in verify_errors:
+        logger.warning("close verify: open-orders read failed for %s — %s", product, err)
     if full_close_requested:
         still_open = bool(post_pos and abs(float(post_pos.get("signed_amount", 0) or 0)) > 0)
-        if still_open or post_open_orders:
+        book_unreadable = _book_unknown(verify_errors)
+        if still_open or post_open_orders or book_unreadable:
             detail = []
             if still_open:
                 detail.append("position still open")
             if post_open_orders:
                 detail.append(f"{post_open_orders} open orders remain")
+            if book_unreadable:
+                detail.append("could not confirm the order book is clear")
             return {
                 "success": False,
                 "error": f"Close verification failed for {product}: {', '.join(detail)}.",
