@@ -2848,7 +2848,13 @@ def cancel_resting_orders_for_user(
     )
     cancelled, cancel_errors = _cancel_resting_orders(client, resting)
     errors.extend(cancel_errors)
-    ok = not _book_unknown(errors) and not (cancelled == 0 and errors)
+    # AUDIT-SWEEP-2026-09-04-PARTIAL-CANCEL-FALSE-SUCCESS: fail loud on ANY error.
+    # ``errors`` is non-empty only when the book was unreadable OR a per-digest
+    # cancel was rejected/rate-limited (an order may still rest) — either way the
+    # venue half of the stop must not report the book clear. The old gate
+    # (``not _book_unknown and not (cancelled == 0 and errors)``) let a PARTIAL
+    # cancel (cancelled>=1 with a rejected sibling) report success=True.
+    ok = not errors
     out = {"success": ok, "cancelled_orders": cancelled, "order_errors": errors}
     if not ok:
         out["error"] = "Could not confirm the order book is clear: " + "; ".join(errors[:4])
@@ -2899,10 +2905,14 @@ def close_all_positions(
     net_positions = _normalize_net_positions(client.get_all_positions() or [])
     if not net_positions:
         # FAIL LOUD (2026-09-03): "no positions" is only a clean result when the
-        # book was actually READ. An unreadable book, or errors with nothing
-        # cancelled, must not report success — the session rail turns success
-        # into a "TP hit / cleanup done" message over orders that still rest.
-        if _book_unknown(order_errors) or (cancelled_orders == 0 and order_errors):
+        # book was actually READ and every resting order was actually cancelled.
+        # AUDIT-SWEEP-2026-09-04-PARTIAL-CANCEL-FALSE-SUCCESS: fail on ANY order
+        # error. ``order_errors`` is non-empty only when the book was unreadable
+        # OR a resting order's cancel was rejected/rate-limited (it may still
+        # rest). The old branch reported success=True for a PARTIAL cancel
+        # (cancelled>0 with errors), so the session rail turned it into a
+        # "TP hit / cleanup done" message over orders that still rest.
+        if order_errors:
             return {
                 "success": False,
                 "cancelled": 0.0,
@@ -2911,25 +2921,11 @@ def close_all_positions(
                 "order_errors": order_errors,
                 "error": "Could not confirm the order book is clear: " + "; ".join(order_errors[:4]),
             }
-        if cancelled_orders > 0 and not order_errors:
-            return {
-                "success": True,
-                "cancelled": 0.0,
-                "products": [],
-                "cancelled_orders": cancelled_orders,
-            }
-        if cancelled_orders > 0:
-            return {
-                "success": True,
-                "cancelled": 0.0,
-                "products": [],
-                "cancelled_orders": cancelled_orders,
-                "order_errors": order_errors,
-            }
         return {
             "success": True,
             "cancelled": 0.0,
             "products": [],
+            "cancelled_orders": cancelled_orders,
         }
 
     from src.nadobro.users.settings_service import get_user_settings
@@ -3059,13 +3055,27 @@ def close_all_positions(
             "Close-all verification failed: open positions remain on "
             + ", ".join(get_product_name(pid, network=selected_network) for pid in post_positions.keys())
         )
-    still_resting, verify_errors = _resting_orders_by_sender(client, only_pid=only_pid)
+    still_resting, verify_errors = _resting_orders_by_sender(
+        client, only_pid=only_pid, known_pids=known_pids, network=selected_network,
+    )
     remaining_orders = sum(len(d) for d in still_resting.values())
     for err in verify_errors:
         logger.warning(
             "open-orders read failed during stop-all report — remaining-orders "
             "count may understate: %s", err,
         )
+    if _book_unknown(verify_errors):
+        # AUDIT-SWEEP-2026-09-04-CLOSE-ALL-UNKNOWN-BOOK-POS-BRANCH: an UNREADABLE
+        # verify read must FAIL the report, not merely log. Previously this call
+        # passed no known_pids/network, so the fallback returned empty and a
+        # budget-denied read collapsed to "0 remaining" -> success=True over
+        # orders that still rest (session 312, isolated child subaccount whose
+        # per-sender read was denied while the parent read drained the bucket).
+        result["success"] = False
+        existing_error = result.get("error", "")
+        result["error"] = (
+            f"{existing_error} Could not confirm the order book is clear after close."
+        ).strip()
     if remaining_orders > 0:
         result["success"] = False
         existing_error = result.get("error", "")
