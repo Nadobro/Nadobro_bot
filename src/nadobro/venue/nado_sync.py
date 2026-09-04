@@ -1182,6 +1182,41 @@ def _write_matches(user_id: int, network: str, matches: list[dict[str, Any]]) ->
         fill_leverage = _fill_leverage_from_positions(
             int(user_id), network, insert_pid, bool(match.get("isolated"))
         )
+        # Fill dedup by digest (prod 2026-09-03, session 312). A manual/strategy
+        # CLOSE is recorded immediately by _record_close_in_db with the digest but
+        # NO submission_idx (it carries our realized-PnL attribution, which the
+        # venue omits per fill). The venue match for the SAME fill then arrives
+        # with a submission_idx; keyed only on submission_idx it was inserted as a
+        # SECOND row -> the close volume was double-counted (session 312: rows
+        # 6576 manual + 6577 venue, same digest 0xc15a6c2f..., +0.0184 phantom
+        # base). Reconcile the placeholder with the venue's authoritative amounts +
+        # submission_idx (KEEPING its realized_pnl) instead of inserting a
+        # duplicate. Single-fill closes (the common case) dedup exactly; a
+        # partially-filled close reconciles its first match and inserts the rest.
+        if digest:
+            _placeholder = query_one(
+                f"SELECT id FROM {table} WHERE user_id = %s "
+                f"AND order_digest = %s AND submission_idx IS NULL ORDER BY id DESC LIMIT 1",
+                (int(user_id), digest),
+            )
+            if _placeholder:
+                execute(
+                    f"""
+                    UPDATE {table}
+                    SET submission_idx = %s, fill_fee = %s, fee_x18 = %s,
+                        base_filled_x18 = %s, quote_filled_x18 = %s,
+                        product_id = COALESCE(NULLIF(product_id, 0), %s),
+                        product_name = COALESCE(NULLIF(product_name, ''), %s),
+                        strategy_session_id = COALESCE(strategy_session_id, %s)
+                    WHERE id = %s
+                    """,
+                    (submission_idx, f"{fee_h:f}", fee_x18, base_x18, quote_x18,
+                     insert_pid, insert_pname, session_id, _placeholder["id"]),
+                )
+                if session_id:
+                    touched_sessions.add(int(session_id))
+                continue
+
         execute(
             f"""
             INSERT INTO {table} (
