@@ -176,6 +176,24 @@ def build_controller(
 # --------------------------------------------------------------------------
 # runtime manager
 # --------------------------------------------------------------------------
+def _cancel_resting_for_stop(user_id: int, network: str, strategy: str) -> dict:
+    """Blocking: cancel the strategy's resting venue orders when the engine stop
+    has no local controller. Scoped to the running session's product when it can
+    be resolved, else to every product the user has open rows/positions on."""
+    only_pid = None
+    try:
+        from src.nadobro.models.database import get_strategy_session_by_id
+        from src.nadobro.trading.engine_persistence import resolve_running_session_id
+        sid = resolve_running_session_id(strategy, user_id, network)
+        row = get_strategy_session_by_id(int(sid)) if sid else None
+        if row and row.get("product_id") is not None:
+            only_pid = int(row["product_id"])
+    except Exception:  # policy: degrade-ok(scope only; falls back to every known product)
+        only_pid = None
+    from src.nadobro.trading.trade_service import cancel_resting_orders_for_user
+    return cancel_resting_orders_for_user(int(user_id), network, only_pid=only_pid)
+
+
 class EngineRuntime:
     """Owns live controllers keyed by (user_id, network, strategy). Driven from
     bot_runtime's async loop: ``start`` once, ``tick`` each cycle, ``stop`` on
@@ -369,6 +387,22 @@ class EngineRuntime:
                 await _run_db(terminate_engine_executors, cid)
             except Exception:  # noqa: BLE001
                 logger.debug("cross-process executor terminate sweep failed for %s", cid, exc_info=True)
+            # The VENUE half (2026-09-03, session 312): with no local controller
+            # there is no GridExecutor._stop_out to cancel the resting quotes, and
+            # a DB-only terminate left a stood-down ladder filling for hours after
+            # its "completion". Cancel the strategy's resting orders on the venue
+            # here; an unreadable book is a WARNING, never silently "clear".
+            try:
+                from src.nadobro.core.async_utils import run_blocking_sdk as _run_sdk
+                res = await _run_sdk(_cancel_resting_for_stop, user_id, network, strategy)
+                if not res.get("success"):
+                    logger.warning(
+                        "cross-process stop could not confirm the venue book is clear user=%s "
+                        "network=%s strategy=%s: %s", user_id, network, strategy, res.get("error"),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning("cross-process venue cancel failed user=%s strategy=%s",
+                               user_id, strategy, exc_info=True)
         self._controllers.pop(key, None)
         self._orchestrators.pop(key, None)
         self._persisted_sig.pop(key, None)
