@@ -254,6 +254,33 @@ def test_sltp_fast_poll_is_wired_into_the_cycle_and_scheduler():
     assert '{"dn", "bro", "vol", ""}' in sched
 
 
+def test_sltp_safety_poll_is_gated_behind_boot_standdown():
+    """AUDIT-BOOT-2026-09-04-POLL-FLATTEN-RACE: the fast SL/TP safety poll can FLATTEN
+    a position on a breach cycle, and start_scheduler() arms it early in boot —
+    ~100 lines before boot_stand_down_strategies() clears orphaned 'running'
+    sessions. It must stay parked until stand-down signals complete, so it cannot
+    flatten an orphaned session during the boot window (session 312). Verified by
+    reading source (no import) so it runs in the pytest-only CI job; the runtime
+    behaviour is proven in tests/strategy/test_boot_stand_down_strategies.py."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    sched = (repo / "src" / "nadobro" / "runtime" / "scheduler.py").read_text()
+    main_py = (repo / "main.py").read_text()
+    # The poll checks the boot gate before enqueuing, plus a hard grace-ceiling fallback.
+    assert "if not _sltp_safety_poll_armed():" in sched
+    assert "def mark_boot_standdown_complete()" in sched
+    assert "def note_boot_standdown_started()" in sched
+    assert "NADO_BOOT_STANDDOWN_GRACE_SECONDS" in sched
+    # main.py re-anchors the grace BEFORE the stand-down and re-arms the poll AFTER it.
+    assert "mark_boot_standdown_complete()" in main_py
+    i_standdown = main_py.index("boot_stand_down_strategies()")
+    i_mark = main_py.index("mark_boot_standdown_complete()")
+    i_note = main_py.index("note_boot_standdown_started()")
+    assert i_note < i_standdown, "the grace timer must be re-anchored before boot stand-down runs"
+    assert i_mark > i_standdown, "the poll must be re-armed only AFTER boot stand-down runs"
+
+
 def test_vol_open_base_reaches_state_so_the_spot_sweep_guard_is_live():
     """VOL-OPEN-BASE-MERGE: the vol controller publishes ``vol_open_base``
     (still-held base; 0 when flat) so the spot-sweep sizer sells the exact held

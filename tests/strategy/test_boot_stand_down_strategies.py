@@ -27,7 +27,7 @@ def _rows():
 
 
 def _run(monkeypatch, *, cancel_success=True):
-    calls = {"cancel": [], "finalize": [], "notify": [], "saved": [], "terminated": []}
+    calls = {"cancel": [], "cancel_pid": [], "finalize": [], "notify": [], "saved": [], "terminated": []}
 
     async def _pass_db(func, *a, **k):
         return func(*a, **k)
@@ -35,8 +35,9 @@ def _run(monkeypatch, *, cancel_success=True):
     async def _pass_sdk(func, *a, **k):
         return func(*a, **k)
 
-    def _cancel(uid, network, **k):
+    def _cancel(uid, network, only_pid=None, **k):
         calls["cancel"].append((uid, network))
+        calls["cancel_pid"].append((uid, only_pid))
         return {"success": cancel_success, "error": None if cancel_success else "open-orders read unavailable"}
 
     async def _notify(uid, text, **fmt):
@@ -51,6 +52,7 @@ def _run(monkeypatch, *, cancel_success=True):
     with ExitStack() as es:
         p = es.enter_context
         p(mock.patch.object(br, "query_all", lambda *a, **k: _rows()))
+        p(mock.patch.object(br, "get_product_id", lambda product, network=None, **k: 2 if str(product).upper() == "BTC" else None))
         p(mock.patch.object(br, "run_blocking_db", _pass_db))
         p(mock.patch.object(br, "run_blocking_sdk", _pass_sdk))
         p(mock.patch("src.nadobro.trading.trade_service.cancel_resting_orders_for_user", _cancel))
@@ -95,3 +97,70 @@ def test_the_env_gate_disables_the_sweep(monkeypatch):
     monkeypatch.setattr(br, "env_bool", lambda name, default=True: False if name == "NADO_BOOT_STAND_DOWN_STRATEGIES" else default)
     stood = asyncio.run(br.boot_stand_down_strategies())
     assert stood == 0
+
+
+def test_cancel_is_scoped_for_perp_strategies_but_unscoped_for_vol_dn(monkeypatch):
+    """AUDIT-BOOT-2026-09-04-UNSCOPED-CANCEL: the single-perp maker strategies scope
+    the boot cancel to their product (only_pid) so a user's manual order on another
+    market survives a restart. vol (spot) and dn (two-leg) stay UNSCOPED — a perp-pid
+    scope would miss their spot / second-leg orders and orphan them."""
+    stood, calls = _run(monkeypatch)
+    pid_by_uid = dict(calls["cancel_pid"])
+    assert pid_by_uid[111] == 2, "the grid (single-perp) session must scope its boot cancel to only_pid"
+    assert pid_by_uid[444] is None, "the dn (two-leg) session must stay unscoped so no leg is orphaned"
+
+
+# --------------------------------------------------------------------------- #
+# AUDIT-BOOT-2026-09-04-POLL-FLATTEN-RACE — the fast SL/TP safety poll enqueues a
+# rails-only cycle for every running session, and a breach cycle FLATTENS the
+# position. It is armed by start_scheduler() ~100 lines before boot stand-down
+# clears orphaned 'running' rows, so without a boot gate an orphaned session is
+# flattened during the boot window (session 312). Runtime proof (imports scheduler,
+# so it lives here in the full-deps suite, not the deps-free invariants file).
+# --------------------------------------------------------------------------- #
+def test_sltp_safety_poll_is_parked_until_boot_standdown_completes():
+    import time as _time
+    import src.nadobro.runtime.scheduler as sched
+
+    running = [{
+        "key": "strategy_bot:1234:mainnet",
+        "value": json.dumps({"running": True, "strategy": "grid", "product": "BTC-PERP"}),
+    }]
+
+    async def _pass(fn, *a, **k):
+        return fn(*a, **k)
+
+    enq = mock.AsyncMock(return_value=True)
+    prev = (sched._boot_standdown_done, sched._scheduler_started_at)
+    try:
+        with mock.patch.object(sched, "run_blocking", _pass), \
+             mock.patch("src.nadobro.db.query_all", lambda *a, **k: running), \
+             mock.patch("src.nadobro.trading.execution_queue.enqueue_strategy", enq):
+            # Boot window: scheduler just started, stand-down NOT signalled yet.
+            sched._boot_standdown_done = False
+            sched._scheduler_started_at = _time.time()
+            asyncio.run(sched.tick_sltp_safety())
+            assert enq.await_count == 0, "the poll must not enqueue an orphaned session during the boot window"
+            # Stand-down completes -> the poll resumes immediately.
+            sched.mark_boot_standdown_complete()
+            asyncio.run(sched.tick_sltp_safety())
+            assert enq.await_count == 1, "the poll must resume once boot stand-down is complete"
+    finally:
+        sched._boot_standdown_done, sched._scheduler_started_at = prev
+
+
+def test_sltp_safety_poll_grace_ceiling_rearms_if_never_signalled():
+    """Fail-safe: if the stand-down signal never arrives (crash / alt entrypoint), the
+    SL/TP backstop must re-arm after the grace ceiling rather than staying off."""
+    import time as _time
+    import src.nadobro.runtime.scheduler as sched
+
+    prev = (sched._boot_standdown_done, sched._scheduler_started_at)
+    try:
+        sched._boot_standdown_done = False
+        sched._scheduler_started_at = _time.time()            # just booted
+        assert sched._sltp_safety_poll_armed() is False, "parked during the boot window"
+        sched._scheduler_started_at = _time.time() - 10_000   # past the grace ceiling
+        assert sched._sltp_safety_poll_armed() is True, "the backstop must re-arm after the grace ceiling"
+    finally:
+        sched._boot_standdown_done, sched._scheduler_started_at = prev
