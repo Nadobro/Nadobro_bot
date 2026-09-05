@@ -314,7 +314,10 @@ class GridExecutor(Executor):
             # and places them (identical to the suppress_new_entries / batch-cap
             # deferral: no state mutates, size is unchanged, close legs and stops keep
             # running). Bounds the deep-ladder signing burst without resizing orders.
-            if self.adapter.opening_budget_exhausted():
+            # EXECUTE-BUDGET-BACKOFF: also stop laying rungs once a placement this cycle
+            # was throttled by the execute budget — the bucket is drained, so the rest
+            # would 429 anyway. Remaining rungs are placed next tick once it refills.
+            if self.adapter.opening_budget_exhausted() or self.adapter.execute_budget_exhausted():
                 break
             if level.state is GridLevelState.NOT_ACTIVE and self._within_bounds(level.open_price, mid):
                 await self._place_open(level)

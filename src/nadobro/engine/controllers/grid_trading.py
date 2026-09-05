@@ -182,8 +182,15 @@ class GridController(Controller):
         # again next cycle and the ladder recenters once the reads clear. This
         # runs BEFORE the executor ticks (this cycle's polls have not happened
         # yet), so the signal is the previous cycle's denials.
-        if self.adapter.venue_reads_contended():
-            logger.info("grid %s: recenter deferred — venue throttled status reads last cycle", self.id)
+        # EXECUTE-BUDGET-BACKOFF (adversarial audit 2026-09-05): also defer the recenter
+        # when the EXECUTE budget was throttled this cycle. Recenter runs BEFORE the
+        # per-executor SL/TP tick loop and calls place_order directly (not via
+        # orchestrator.tick), so a throttle here would propagate uncaught out of on_tick —
+        # skipping this cycle's stop-out evaluation and, after a streak, risking a
+        # controller FAILED. Deferring keeps the ladder as-is and lets the executor ticks
+        # (incl. SL/TP) run; the recenter retries next cycle once the bucket refills.
+        if self.adapter.venue_reads_contended() or self.adapter.execute_budget_contended():
+            logger.info("grid %s: recenter deferred — venue budget throttled this/last cycle", self.id)
             return
         overlay = self._rebuild_bounds_for_side(_dec(mid))
         if not overlay:

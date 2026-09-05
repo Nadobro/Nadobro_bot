@@ -52,6 +52,17 @@ class AdapterError(Exception):
     executor retry policy (3 attempts, exponential backoff)."""
 
 
+class AdapterThrottled(AdapterError):
+    """A CLIENT-SIDE budget throttle: the per-wallet EXECUTE bucket is drained, so
+    the placement was NOT sent to the venue (no round trip). Distinct from a venue
+    rejection because (a) retrying immediately is pointless — the bucket refills over
+    seconds, not milliseconds — and (b) it must NOT fail the executor: the placement
+    is simply DEFERRED to a later cycle. The executor retry policy skips its 3-attempt
+    loop for this, and controllers back off the rest of the cycle via
+    ``execute_budget_exhausted()`` instead of spamming ~40 doomed placements that drain
+    the budget until reads also 429 and the gateway circuit opens (prod 2026-09-04)."""
+
+
 @dataclass
 class NadoOrder:
     id: str
@@ -140,6 +151,15 @@ class NadoAdapterBase(abc.ABC):
         budget-denied result), so a 40-quote ladder costs one gateway read per
         tick instead of forty — and a denial costs one bucket wait, not forty."""
         self._cycle_openings = 0
+        # EXECUTE-BUDGET-BACKOFF (prod 2026-09-04): a placement throttled by the
+        # per-wallet execute bucket this cycle. Once one is throttled the bucket is
+        # drained and every further placement this cycle would throttle too, so
+        # controllers DEFER further openings (see execute_budget_exhausted). Carry the
+        # previous cycle's count (like reads) so a recenter — which runs BEFORE any
+        # placement sets this cycle's flag — can defer on last cycle's throttle
+        # (execute_budget_contended) instead of escaping uncaught.
+        self._executes_throttled_last_cycle = int(getattr(self, "_cycle_executes_throttled", 0))
+        self._cycle_executes_throttled = 0
         # AUDIT-DENY-2026-09-02-F3 (grid + dgrid audits): a ladder recenter is
         # decided BEFORE the cycle's status polls run, so "this cycle" always
         # reads 0 there. Keep the previous cycle's count as the signal such
@@ -186,6 +206,46 @@ class NadoAdapterBase(abc.ABC):
         if cap <= 0:
             return False
         return int(getattr(self, "_cycle_openings", 0)) >= cap
+
+    def _note_execute_throttled(self) -> None:
+        """Record one placement this cycle that the per-wallet EXECUTE budget denied
+        (the client-side bucket was drained; the order never reached the venue)."""
+        self._cycle_executes_throttled = getattr(self, "_cycle_executes_throttled", 0) + 1
+
+    def executes_throttled_this_cycle(self) -> int:
+        return int(getattr(self, "_cycle_executes_throttled", 0))
+
+    def executes_throttled_last_cycle(self) -> int:
+        return int(getattr(self, "_executes_throttled_last_cycle", 0))
+
+    def execute_budget_contended(self) -> bool:
+        """A placement was throttled by the execute budget THIS cycle OR the previous
+        one — the signal for a decision taken BEFORE this cycle's own placements run
+        (the grid / dgrid RECENTER, which places directly ahead of the executor tick
+        loop). Because the recenter is the first placement, ``execute_budget_exhausted``
+        (this-cycle only) still reads 0 there; using last cycle's throttle instead lets
+        a sustained storm defer the recenter from its second cycle on, so it cannot keep
+        escaping ``on_tick`` and skipping the SL/TP tick. Mirrors ``venue_reads_contended``."""
+        return self.executes_throttled_this_cycle() > 0 or self.executes_throttled_last_cycle() > 0
+
+    def execute_budget_exhausted(self) -> bool:
+        """True once a placement this cycle was throttled by the per-wallet EXECUTE
+        budget. The bucket refills over seconds, so once drained EVERY further
+        placement this cycle would throttle too — controllers DEFER further OPENING
+        placements to the next cycle instead of spamming ~40 doomed placements.
+        Deferral is safe: an empty slot is re-spawned next cycle and a resting quote is
+        left in place; no order is resized. (prod 2026-09-04: the un-capped requote burst
+        drained the budget until reads also 429'd and the gateway circuit opened, which
+        then broke Stop/close.)
+
+        Scope note: this GATE never defers a reducing/exit placement (controllers gate
+        only ``is_opening``). It is not a venue guarantee, though — a genuinely drained
+        bucket cannot place ANYTHING, close included, so a maker close / stop-out flatten
+        under a throttle storm is ATTEMPTED, throttles, and is retried next cycle (the
+        executor stays ACTIVE, never FAILED). The HARD rails are unaffected: cancel_order
+        and place_stop_order never raise AdapterThrottled, and the session SL/TP rail runs
+        outside the engine on_tick path."""
+        return int(getattr(self, "_cycle_executes_throttled", 0)) > 0
 
     @abc.abstractmethod
     async def place_order(

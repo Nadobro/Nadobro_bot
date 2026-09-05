@@ -30,6 +30,7 @@ from typing import Any, AsyncIterator, Callable, Dict, Iterable, Optional, Seque
 from src.nadobro.utils.env import env_float
 from src.nadobro.engine.adapter.base import (
     AdapterError,
+    AdapterThrottled,
     Fill,
     NadoAdapterBase,
     NadoOrder,
@@ -544,6 +545,14 @@ class NadoAdapter(NadoAdapterBase):
         ok, err = _client_call_succeeded(resp)
         if not ok:
             order_tags.forget(tag=tag)
+            # EXECUTE-BUDGET-BACKOFF (prod 2026-09-04): a client-side execute-budget
+            # throttle (the order never reached the venue) is transient, not a venue
+            # rejection. Note it so controllers defer further openings this cycle, and
+            # raise AdapterThrottled so the executor does NOT burn its 3-attempt retry
+            # budget or go FAILED (which churned into a respawn storm).
+            if isinstance(resp, dict) and resp.get("rate_limited"):
+                self._note_execute_throttled()
+                raise AdapterThrottled(f"place_order throttled by execute budget: {err}")
             raise AdapterError(f"place_order rejected by venue: {err}")
 
         order = self._order_from_response(resp, trading_pair, side, order_type, amount_base, price)
@@ -698,6 +707,11 @@ class NadoAdapter(NadoAdapterBase):
             # Atomic failure: nothing placed, OLD order still resting. Forget the
             # NEW tag; the caller falls back to cancel-then-place.
             order_tags.forget(tag=tag)
+            # EXECUTE-BUDGET-BACKOFF: a throttled fused requote (atomic — the old order
+            # is untouched) is a transient defer, not a venue rejection.
+            if isinstance(resp, dict) and resp.get("rate_limited"):
+                self._note_execute_throttled()
+                raise AdapterThrottled(f"cancel_and_place throttled by execute budget: {err}")
             raise AdapterError(f"cancel_and_place rejected by venue: {err}")
 
         try:

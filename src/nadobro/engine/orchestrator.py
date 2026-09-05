@@ -15,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncIterator, Callable, Deque, Dict, List, Optional
 
+from src.nadobro.engine.adapter.base import AdapterThrottled
 from src.nadobro.engine.executor_base import Executor, ExecutorFailed, TradeRecorder
 from src.nadobro.engine.risk import ExecutorRequest, RiskEngine
 from src.nadobro.engine.types import CloseType, RiskState
@@ -76,6 +77,8 @@ def _is_transient_error(exc: BaseException) -> bool:
     """True when an on_tick exception looks like a recoverable venue/network
     hiccup rather than a fatal logic error. Conservative: unknown errors are
     treated as fatal so real bugs still surface as FAILED."""
+    if isinstance(exc, AdapterThrottled):
+        return True  # EXECUTE-BUDGET-BACKOFF: a budget throttle is never a fatal error
     if isinstance(exc, (asyncio.TimeoutError, ConnectionError)):
         return True
     text = str(exc).lower()
@@ -273,6 +276,29 @@ class ExecutorOrchestrator:
             executor.trade_recorder = self._trade_recorder
         try:
             await executor.on_create()
+        except AdapterThrottled as exc:
+            # EXECUTE-BUDGET-BACKOFF: the entry placement was throttled by the per-wallet
+            # execute budget — a transient DEFER, not a failure. Do NOT mark the executor
+            # FAILED (that churned into a respawn storm); the slot is left empty and
+            # re-spawned a later cycle once the budget refills. The controller defers the
+            # rest of this cycle's openings via execute_budget_exhausted().
+            # REMOVE the executor: it was inserted above and on_create flipped it ACTIVE
+            # before the placement raised, so its order is None. An ACTIVE, order-less
+            # executor never terminates -> prune_terminated can't reap it -> it leaks into
+            # executor_count and eventually saturates max_open_executors, taking the
+            # strategy dark (both sides) even after the budget refills (strategy-auditor
+            # 2026-09-05). Popping it keeps the slot genuinely empty for a clean re-spawn.
+            self._executors.pop(executor.id, None)
+            self._last_spawn_reason[executor.controller_id] = f"execute_throttled:{exc}"
+            self._emit(
+                ExecutorEvent(
+                    kind="spawn_rejected",
+                    executor_id=executor.id,
+                    controller_id=executor.controller_id,
+                    reason=f"execute_throttled:{exc}",
+                )
+            )
+            return False
         except ExecutorFailed as exc:
             self._last_spawn_reason[executor.controller_id] = f"executor_failed:{exc}"
             self._emit(
@@ -307,6 +333,11 @@ class ExecutorOrchestrator:
             return
         try:
             await ex.on_tick()
+        except AdapterThrottled:
+            # EXECUTE-BUDGET-BACKOFF: a requote/placement this tick was throttled by the
+            # execute budget — transient. Leave the executor ACTIVE (retries next cycle);
+            # never emit FAILED over a budget throttle.
+            return
         except ExecutorFailed as exc:
             self._emit(
                 ExecutorEvent(

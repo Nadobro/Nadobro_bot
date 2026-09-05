@@ -563,7 +563,13 @@ class DynamicGridController(Controller):
                     # whole ladder) while the venue is denying status reads. This
                     # runs BEFORE the executor ticks below, so the signal is the
                     # previous cycle's denials (venue_reads_contended).
-                    and not self.adapter.venue_reads_contended()):
+                    and not self.adapter.venue_reads_contended()
+                    # EXECUTE-BUDGET-BACKOFF (2026-09-05): also skip the recenter under an
+                    # execute-budget throttle — same recenter-runs-before-executor-ticks
+                    # escape as grid_trading. Use *contended* (this OR last cycle) because
+                    # the recenter runs before this cycle's own placements set the flag, so
+                    # a sustained storm defers it from the second cycle on.
+                    and not self.adapter.execute_budget_contended()):
                 self._last_recenter_ts = now
                 await self._recenter(mid)
             exposure = self.exposure_allowed_sides(pair, mid) if mid else {"buy": True, "sell": True}
