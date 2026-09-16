@@ -487,6 +487,58 @@ def _resting_orders_fallback(
     return grouped, errors
 
 
+def _clear_book_by_product_cancel(
+    client, pids, network: str
+) -> tuple[list[int], list[str]]:
+    """READ-FREE cleanup for an UNREADABLE book (2026-09-16 storm): cancel every
+    resting order on ``pids`` for every sender (parent + isolated children) with
+    the venue's ``cancel_product_orders`` execute — one call per sender on the
+    wallet budget, no open-orders read at all.
+
+    Why: the fail-loud sweep (DENIED-vs-EMPTY) must READ the book before it can
+    cancel by digest. Under a per-IP query storm that read was denied on every
+    attempt, so a stop could never clean up and left 18 quotes + a short resting
+    on Nado. A successful ``cancel_product_orders`` is the venue's OWN
+    confirmation that those products hold no orders for that sender — it does
+    not assume an unreadable book is empty, it commands the venue to make it so.
+
+    CANCEL-ONLY: never used on a close/verify path where a working maker close
+    could be resting (it would cancel that too). Returns ``(cleared, errors)``;
+    ``cleared`` is the scope only when EVERY sender's execute succeeded."""
+    scope = sorted({int(p) for p in (pids or []) if p is not None})
+    if not scope:
+        return [], []
+    cancel_fn = getattr(client, "cancel_product_orders", None)
+    if cancel_fn is None:
+        return [], ["read-free cancel_product_orders unavailable on this client"]
+    errors: list[str] = []
+    cleared_all = True
+    try:
+        senders = _order_sender_params(client, network)
+    except Exception as exc:  # policy: degrade-ok(the default subaccount is still cleared; children are reported unknown)
+        logger.debug("sender enumeration failed during product cancel: %s", exc)
+        senders = [None]
+        cleared_all = False
+        errors.append(f"isolated sender discovery failed ({exc}); only the default subaccount was cleared")
+    for sender in senders:
+        try:
+            r = cancel_fn(scope, sender=sender) or {}
+        except Exception as exc:  # policy: degrade-ok(recorded; the caller keeps failing loud)
+            r = {"success": False, "error": str(exc)}
+        if r.get("success"):
+            logger.info(
+                "cancel_product_orders cleared products=%s sender=%s (read-free cleanup)",
+                scope, str(sender or "default")[:10],
+            )
+            continue
+        cleared_all = False
+        errors.append(
+            f"cancel_product_orders failed (sender={str(sender or 'default')[:10]}): "
+            f"{r.get('error', 'unknown')}"
+        )
+    return (scope if cleared_all else []), errors
+
+
 def _resting_orders_by_sender(
     client, only_pid: int | None = None, *, known_pids=None, network: str = "mainnet"
 ) -> tuple[dict[tuple[int, str | None], list[str]], list[str]]:
@@ -2875,6 +2927,19 @@ def cancel_resting_orders_for_user(
     )
     cancelled, cancel_errors = _cancel_resting_orders(client, resting)
     errors.extend(cancel_errors)
+    cleared_by_product: list[int] = []
+    if _book_unknown(errors):
+        # READ-FREE FALLBACK (2026-09-16): the book could not be read, so cancel
+        # by PRODUCT on every sender for the products this sweep is responsible
+        # for (the same scope the per-product fallback tried). A confirmed
+        # cancel_product_orders resolves those unknown-book errors — the venue
+        # itself cleared the products. Anything else still fails loud below.
+        cleared_by_product, product_errors = _clear_book_by_product_cancel(
+            client, [only_pid] if only_pid is not None else known_pids, selected_network,
+        )
+        if cleared_by_product:
+            errors = [e for e in errors if not str(e).startswith(_UNKNOWN_BOOK)]
+        errors.extend(product_errors)
     # AUDIT-SWEEP-2026-09-04-PARTIAL-CANCEL-FALSE-SUCCESS: fail loud on ANY error.
     # ``errors`` is non-empty only when the book was unreadable OR a per-digest
     # cancel was rejected/rate-limited (an order may still rest) — either way the
@@ -2883,6 +2948,8 @@ def cancel_resting_orders_for_user(
     # cancel (cancelled>=1 with a rejected sibling) report success=True.
     ok = not errors
     out = {"success": ok, "cancelled_orders": cancelled, "order_errors": errors}
+    if cleared_by_product:
+        out["cleared_by_product_cancel"] = cleared_by_product
     if not ok:
         out["error"] = "Could not confirm the order book is clear: " + "; ".join(errors[:4])
     return out
@@ -2928,6 +2995,18 @@ def close_all_positions(
     )
     cancelled_orders, cancel_errors = _cancel_resting_orders(client, resting)
     order_errors.extend(cancel_errors)
+    if _book_unknown(order_errors):
+        # READ-FREE FALLBACK (2026-09-16): clear the scoped products with
+        # cancel_product_orders BEFORE flattening, so resting quotes cannot fill
+        # into the position we are about to close. Cancel-only here — no close
+        # order rests yet. The post-close verify below stays read-based and
+        # fails loud on an unreadable book (a resting maker close must survive).
+        cleared, product_errors = _clear_book_by_product_cancel(
+            client, [only_pid] if only_pid is not None else known_pids, selected_network,
+        )
+        if cleared:
+            order_errors = [e for e in order_errors if not str(e).startswith(_UNKNOWN_BOOK)]
+        order_errors.extend(product_errors)
 
     net_positions = _normalize_net_positions(client.get_all_positions() or [])
     if not net_positions:

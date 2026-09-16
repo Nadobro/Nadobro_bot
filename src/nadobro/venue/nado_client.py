@@ -159,18 +159,16 @@ _REST_RETRY_JITTER_SECONDS = env_float("NADO_REST_RETRY_JITTER_SECONDS", 0.2)
 _REST_POOL_CONNECTIONS = env_int("NADO_HTTP_POOL_CONNECTIONS", 64)
 _REST_POOL_MAXSIZE = env_int("NADO_HTTP_POOL_MAXSIZE", 64)
 _OPEN_ORDERS_CACHE_TTL = env_float("NADO_OPEN_ORDERS_CACHE_TTL_SECONDS", 5.0)
-# Per-user gateway weight for ONE multi-product open-orders read (prod
-# 2026-09-03, session 312). The batched endpoint returns every product's book
-# in a SINGLE SDK call, but it was charged ``2 * len(product_ids)`` — 168 weight
-# for 84 products — against the per-user fair-share bucket (burst 24). The
-# bucket clamps a 168-cost request to its whole 24-token burst, so ONE read
-# drained it and the next subaccount's read (isolated children) was denied
-# within max_wait, making get_all_open_orders return None on EVERY call for any
-# user with an isolated child — the portfolio open-order view, the stale-order
-# sweep and (pre-fix) the cancel sweep all went permanently "unknown". It is one
-# request, so charge the per-user bucket for one query, capped well under the
-# burst so parent + every isolated child read all fit.
-_OPEN_ORDERS_READ_WEIGHT = float(env_int("NADO_OPEN_ORDERS_READ_WEIGHT", 4))
+# Isolated-subaccount discovery (archive ``isolated_subaccounts``, weight 2) is
+# cached per (network, parent) so every positions / open-orders read does not
+# re-query the indexer; ``refresh=True`` readers (the 30s portfolio sync) bypass
+# it, so in practice it is never older than one sync.
+_ISOLATED_DISCOVERY_TTL = env_float("NADO_ISOLATED_DISCOVERY_TTL_SECONDS", 30.0)
+# Read-through TTL for the bulk perp price snapshot (edge ``cached_prices``).
+# The alert scan, price tracker, home card and portfolio valuation all call
+# get_all_market_prices(); a short TTL collapses their concurrent calls into one
+# edge read without making the snapshot noticeably stale.
+_ALL_PRICES_TTL = env_float("NADO_ALL_PRICES_CACHE_TTL_SECONDS", 2.0)
 _POSITIONS_FALLBACK_TTL = env_float("NADO_POSITIONS_FALLBACK_TTL_SECONDS", 6.0)
 _POSITIONS_FALLBACK_MAX_PRODUCTS = env_int("NADO_POSITIONS_FALLBACK_MAX_PRODUCTS", 16)
 
@@ -232,6 +230,24 @@ def _install_session_timeout(session, timeout) -> bool:
 
 _open_orders_cache: dict[tuple[str, str, int], dict] = {}
 _positions_fallback_cache: dict[tuple[str, str], dict] = {}
+# (network, parent_hex) -> {"data": [(child_hex, product_id | None), ...], "ts": t}
+_isolated_subaccounts_cache: dict[tuple[str, str], dict] = {}
+
+
+def _payload_is_rate_limited(data) -> bool:
+    """True for a venue rate-limit REJECTION delivered as a JSON body — HTTP 200
+    with ``{"status":"failure","error_code":1000,"error":"Too Many Requests"}``.
+    ``requests`` never raises on it, so it has to be recognised by content."""
+    if not isinstance(data, dict):
+        return False
+    if str(data.get("status") or "").lower() != "failure":
+        return False
+    try:
+        if int(data.get("error_code") or 0) == 1000:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return "too many requests" in str(data.get("error") or "").lower()
 
 # verify_linked_signer is called on every order placement via
 # ensure_active_wallet_ready. The result is stable across a session and the
@@ -644,6 +660,15 @@ class NadoClient:
                         resp = _rest_session.get(url, params=params, headers=headers, timeout=_REQUEST_TIMEOUT_SECONDS)
                     data = self._parse_json_response(resp)
                     if data is not None:
+                        if _payload_is_rate_limited(data):
+                            # A venue 429 is an HTTP 200 with a JSON body: it never
+                            # raised, so it never reached the breaker — the circuit
+                            # stayed closed while every read was rejected and
+                            # callers fell into their fallbacks on top (2026-09-16
+                            # storm). Record it so the host circuit opens.
+                            self._record_gateway_error(
+                                RuntimeError(f'error_code=1000 {data.get("error")} type={query_type}')
+                            )
                         return data
                     if attempt < (max_attempts - 1):
                         sleep_s = (_REST_RETRY_BASE_SECONDS * (2 ** attempt)) + random.uniform(0.0, _REST_RETRY_JITTER_SECONDS)
@@ -663,6 +688,37 @@ class NadoClient:
             return None
         finally:
             self._gateway_release()
+
+    def _edge_url(self) -> str:
+        return f"{self._rest_url()}/edge/query"
+
+    def _query_edge(self, query_type: str, extra_params: Optional[dict] = None) -> Optional[dict]:
+        """Gateway EDGE query (``/edge/query``): in-gateway cached, eventually-
+        consistent reads for market/reference data (``cached_prices``,
+        ``cached_all_products``, ...). Weight 1 per request on a SEPARATE
+        12000/min per-IP bucket, so bulk price polling no longer competes with
+        order/margin reads for the 400/10s live budget. NOT for order, margin or
+        settlement decisions (docs: developer-resources/api/gateway/edge).
+        Returns the JSON envelope, or ``None`` when the edge lane is unavailable."""
+        from src.nadobro.venue.gateway_budget import try_acquire
+
+        url = self._edge_url()
+        if not try_acquire(url, kind="edge"):
+            return None
+        params = {"type": query_type}
+        if extra_params:
+            params.update(extra_params)
+        try:
+            resp = _rest_session.post(
+                url, json=params, headers={"Accept-Encoding": "gzip"}, timeout=_REQUEST_TIMEOUT_SECONDS,
+            )
+            return self._parse_json_response(resp)
+        except requests.RequestException as e:
+            logger.warning("edge query failed type=%s: %s", query_type, e)
+            return None
+        except Exception as e:
+            logger.error("edge query failed type=%s unexpected: %s", query_type, e)
+            return None
 
     @staticmethod
     def _to_plain(value):
@@ -705,6 +761,13 @@ class NadoClient:
             return (cached or {}).get("data") or {"bid": 0, "ask": 0, "mid": 0}
 
         if self._initialized and self.client:
+            # market_price: IP weight 1. Budgeted + breaker-recorded like every
+            # other gateway read (2026-09-16: this SDK path bypassed both, so
+            # price reads kept firing into a 429 storm). A denied read is UNKNOWN
+            # (zeros) — never a stale quote dressed as fresh — and the REST path
+            # below is budgeted the same way, so it is skipped too.
+            if not self._gateway_allowed(weight=1):
+                return {"bid": 0, "ask": 0, "mid": 0}
             try:
                 from nado_protocol.utils.math import from_x18
                 mp = self.client.context.engine_client.get_market_price(product_id)
@@ -715,7 +778,10 @@ class NadoClient:
                     _price_cache[cache_key] = {"data": result, "ts": time.time()}
                 return result
             except Exception as e:
+                self._record_gateway_error(e)
                 logger.error("SDK get_market_price failed: %s", _format_sdk_error(e))
+            finally:
+                self._gateway_release()
 
         try:
             data = self._query_rest("market_price", {"product_id": product_id}) or {}
@@ -901,75 +967,95 @@ class NadoClient:
             logger.warning("SDK get_candlesticks failed product_id=%s timeframe=%s: %s", product_id, timeframe, e)
             return []
 
+    def _parse_market_prices_payload(self, data: Optional[dict]) -> dict:
+        """``{"BTC": {"bid","ask","mid"}, ...}`` from a ``market_prices`` /
+        ``cached_prices`` envelope (both carry ``data.market_prices`` rows).
+        Empty on any failure envelope."""
+        prices: dict = {}
+        if not isinstance(data, dict) or data.get("status") != "success":
+            return prices
+        payload = data.get("data", {}) or {}
+        rows = payload.get("market_prices") if isinstance(payload, dict) else None
+        if rows is None and isinstance(payload, list):
+            rows = payload
+        if rows is None and isinstance(payload, dict):
+            rows = payload.get("prices") or payload.get("markets")
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                pid = int(row.get("product_id"))
+            except Exception:  # policy: degrade-ok(malformed price row; skipped)
+                continue
+            name = str(get_product_name(pid, network=self.network, client=self)).replace("-PERP", "")
+            bid = self._from_x18_dynamic(row.get("bid_x18") or row.get("bid") or row.get("price_x18") or row.get("price"))
+            ask = self._from_x18_dynamic(row.get("ask_x18") or row.get("ask") or row.get("price_x18") or row.get("price"))
+            if bid <= 0 and ask > 0:
+                bid = ask
+            if ask <= 0 and bid > 0:
+                ask = bid
+            mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 0.0
+            if mid > 0:
+                prices[name] = {"bid": float(bid), "ask": float(ask), "mid": float(mid)}
+        return prices
+
     def get_all_market_prices(self) -> dict:
-        prices = {}
+        """Bulk perp price snapshot ``{"BTC": {"bid","ask","mid"}, ...}``.
+
+        Budget contract (2026-09-16 storm: this read was ~41% of the live IP
+        budget on its own, and its fallback fanned out to one unbudgeted SDK
+        call per product whenever the venue rejected it):
+
+          1. read-through cache (``_ALL_PRICES_TTL``) — concurrent callers share one read;
+          2. EDGE ``cached_prices`` — weight 1 on the separate 12000/min bucket,
+             effectively live (updated on every best-bid/offer change);
+          3. live ``market_prices`` (weight = N products, ~82) ONLY if the edge lane
+             was unavailable and the live lane is not blocked;
+          4. the last good snapshot (stale) — NEVER a per-product fan-out.
+        """
+        with _caches_lock:
+            cached = _ALL_PRICES_CACHE.get(self.network)
+        if cached and (time.time() - float(cached.get("ts", 0))) < _ALL_PRICES_TTL:
+            return dict(cached["data"])
+
+        product_ids: list[int] = []
         try:
-            product_ids = []
             for name in get_perp_products(network=self.network, client=self):
                 pid = get_product_id(name, network=self.network, client=self)
                 if pid is not None:
                     product_ids.append(int(pid))
-            if product_ids:
-                data = self._query_rest("market_prices", {"product_ids": product_ids}) or {}
-            else:
-                data = {}
-            if data.get("status") == "success":
-                payload = data.get("data", {}) or {}
-                rows = payload.get("market_prices")
-                if rows is None and isinstance(payload, list):
-                    rows = payload
-                if rows is None and isinstance(payload, dict):
-                    rows = payload.get("prices") or payload.get("markets")
-                if isinstance(rows, dict):
-                    rows = list(rows.values())
-                for row in rows or []:
-                    if not isinstance(row, dict):
-                        continue
+        except Exception as e:  # policy: degrade-ok(no catalog -> serve the last good snapshot below)
+            logger.debug("perp catalog unavailable for the price snapshot: %s", e)
+
+        prices: dict = {}
+        if product_ids:
+            try:
+                prices = self._parse_market_prices_payload(
+                    self._query_edge("cached_prices", {"product_ids": product_ids})
+                )
+            except Exception as e:  # policy: degrade-ok(edge snapshot is best-effort; the live read is the fallback)
+                logger.debug("edge cached_prices unavailable: %s", e)
+            if not prices:
+                from src.nadobro.venue.gateway_budget import is_gateway_blocked
+                if not is_gateway_blocked(self._rest_url()):
                     try:
-                        pid = int(row.get("product_id"))
-                    except Exception:  # policy: degrade-ok(malformed price row; skipped)
-                        continue
-                    name = str(get_product_name(pid, network=self.network, client=self)).replace("-PERP", "")
-                    bid = self._from_x18_dynamic(row.get("bid_x18") or row.get("bid") or row.get("price_x18") or row.get("price"))
-                    ask = self._from_x18_dynamic(row.get("ask_x18") or row.get("ask") or row.get("price_x18") or row.get("price"))
-                    if bid <= 0 and ask > 0:
-                        bid = ask
-                    if ask <= 0 and bid > 0:
-                        ask = bid
-                    mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 0.0
-                    if mid > 0:
-                        prices[name] = {"bid": float(bid), "ask": float(ask), "mid": float(mid)}
-                if prices:
-                    with _caches_lock:
-                        _ALL_PRICES_CACHE[self.network] = {"data": prices, "ts": time.time()}
-                    return prices
-        except Exception as e:
-            logger.debug("market_prices bulk query unavailable, falling back to fanout: %s", e)
-
-        # The batched single-request path came back empty. If the gateway is
-        # throttling/blocking this host, the budget contract requires us to
-        # back off and serve cached data — NOT fan out to one REST call per
-        # product, which would amplify load exactly when we must reduce it.
-        from src.nadobro.venue.gateway_budget import is_gateway_blocked
-        if is_gateway_blocked(self._rest_url()):
+                        prices = self._parse_market_prices_payload(
+                            self._query_rest("market_prices", {"product_ids": product_ids})
+                        )
+                    except Exception as e:  # policy: degrade-ok(falls through to the last good snapshot)
+                        logger.debug("market_prices bulk query unavailable: %s", e)
+        if prices:
             with _caches_lock:
-                cached = _ALL_PRICES_CACHE.get(self.network)
-            return dict(cached["data"]) if cached else {}
-
-        perp_products = []
-        for name in get_perp_products(network=self.network, client=self):
-            pid = get_product_id(name, network=self.network, client=self)
-            if pid is not None:
-                perp_products.append((name, pid))
-        with ThreadPoolExecutor(max_workers=max(1, _FANOUT_WORKERS)) as pool:
-            futures = {pool.submit(self.get_market_price, pid): name for name, pid in perp_products}
-            for fut in as_completed(futures):
-                name = futures[fut]
-                try:
-                    prices[name] = fut.result()
-                except Exception:
-                    prices[name] = {"bid": 0, "ask": 0, "mid": 0}
-        return prices
+                _ALL_PRICES_CACHE[self.network] = {"data": prices, "ts": time.time()}
+            return dict(prices)
+        # Throttled / blocked / failed: serve the last good snapshot — the budget
+        # contract forbids amplifying into one call per product exactly when the
+        # venue is telling us to back off.
+        with _caches_lock:
+            cached = _ALL_PRICES_CACHE.get(self.network)
+        return dict(cached["data"]) if cached else {}
 
     def get_perp_contracts(self) -> dict:
         """Best-effort contracts/tickers payload used by miniapp quotes.
@@ -1277,11 +1363,16 @@ class NadoClient:
                 raise RuntimeError("SDK client unavailable for open-order sync")
             return None
 
-        # "Orders" query: IP weight = 2 * product_ids.length
-        # ONE multi-product SDK call -> ONE query's weight (not 2*products), so
-        # parent + every isolated child read fit inside the per-user burst
-        # (see _OPEN_ORDERS_READ_WEIGHT).
-        if not self._gateway_allowed(weight=_OPEN_ORDERS_READ_WEIGHT):
+        # "orders" query: IP weight = 2 * product_ids.length — MEASURED, not just
+        # documented (2026-09-16, from an independent IP: two 82-product reads
+        # pass, the third is rejected; 25 eight-product reads all pass). The flat
+        # per-call charge that replaced this (#282) under-counted ~40x, so the
+        # bot believed it was under budget while the venue rejected every read.
+        # Keep N small instead (scoped parent read, one product per isolated
+        # child — see get_all_open_orders) rather than under-charging.
+        from src.nadobro.venue.nado_weights import query_weight
+
+        if not self._gateway_allowed(weight=query_weight("orders", {"product_ids": product_ids})):
             return None
 
         try:
@@ -1382,51 +1473,66 @@ class NadoClient:
         include_isolated: bool = True,
         include_spot: bool = True,
         strict: bool = False,
+        product_ids: Optional[list[int]] = None,
     ) -> Optional[list[dict]]:
-        """Fetch open orders for every tracked product on a single sender in **one**
-        gateway call (per sender), instead of the previous ``products × senders``
-        ThreadPool fan-out.
+        """Open orders for this account in ONE gateway call per sender.
+
+        ``product_ids`` scopes the PARENT read (``None`` = the whole catalog,
+        ~96 ids). The venue charges ``2 * len(product_ids)`` per read, so a
+        whole-catalog read is ~192 weight against a 400/10s per-IP budget: the
+        30s portfolio poll passes the products that can hold one of its rows
+        and leaves whole-catalog discovery to its heavy pass. An EMPTY scope
+        skips the parent read (a successful read of nothing).
+
+        Isolated-margin children are per-market subaccounts: each is read for
+        exactly its own product (weight 2), never the catalog — for a user with
+        6 children that is 12 weight instead of 6 x 192.
 
         Returns ``None`` (never ``[]``) when ANY sender's book could not be read
-        this round — see ``_open_orders_for_sender_batched``. Callers that only
-        display use ``or []``; the portfolio sync treats ``None`` as "unknown"
-        and skips its stale-order sweep.
-
-        ``include_isolated=False`` (used by the background portfolio poller
-        when the user has no known isolated positions) skips the archive query
-        AND the extra batched call per child subaccount, dropping the
-        per-user cost to a single round-trip.
+        this round — including a failed child discovery with nothing cached —
+        see ``_open_orders_for_sender_batched``. Callers that only display use
+        ``or []``; the portfolio sync treats ``None`` as "unknown" and skips its
+        stale-order sweep.
         """
-        product_ids = self._open_order_product_ids(include_spot=include_spot, refresh=refresh)
-        if not product_ids:
-            if strict:
-                raise RuntimeError("product catalog unavailable for open-order sync")
-            return []
+        if product_ids is None:
+            parent_ids = self._open_order_product_ids(include_spot=include_spot, refresh=refresh)
+            if not parent_ids:
+                if strict:
+                    raise RuntimeError("product catalog unavailable for open-order sync")
+                return []
+        else:
+            parent_ids = sorted({int(p) for p in product_ids})
 
         rows: list[dict] = []
         parent = self.subaccount_hex or ""
         if parent:
-            parent_rows = self._open_orders_for_sender_batched(parent, product_ids, refresh=refresh, strict=strict)
-            if parent_rows is None:
-                return None                # unreadable round: NOT an empty book
-            rows.extend(parent_rows)
+            if parent_ids:
+                parent_rows = self._open_orders_for_sender_batched(parent, parent_ids, refresh=refresh, strict=strict)
+                if parent_rows is None:
+                    return None                # unreadable round: NOT an empty book
+                rows.extend(parent_rows)
         elif strict:
             raise RuntimeError("subaccount unavailable for open-order sync")
 
         if not include_isolated:
             return rows
 
-        isolated: list[str] = []
         try:
-            isolated = self._isolated_subaccount_hexes() or []
+            isolated = self._isolated_subaccounts(refresh=refresh)
         except Exception as exc:
-            logger.debug("isolated open-order discovery skipped: %s", exc, exc_info=True)
+            # DENIED-vs-EMPTY: children we cannot enumerate are children we cannot
+            # read — the whole list is unknown, never "parent only".
+            logger.warning("isolated open-order discovery failed: %s", exc)
             if strict:
                 raise RuntimeError(f"isolated open-order discovery failed: {exc}") from exc
-        for iso in isolated:
+            return None
+        for iso, iso_pid in isolated:
             if not iso or iso.lower() == parent.lower():
                 continue
-            iso_rows = self._open_orders_for_sender_batched(iso, product_ids, refresh=refresh, strict=strict)
+            child_ids = [int(iso_pid)] if iso_pid is not None else parent_ids
+            if not child_ids:
+                continue
+            iso_rows = self._open_orders_for_sender_batched(iso, child_ids, refresh=refresh, strict=strict)
             if iso_rows is None:
                 return None                # a child's book is unknown -> the whole list is
             for order in iso_rows:
@@ -1552,6 +1658,23 @@ class NadoClient:
         """
         if not self._ensure_sdk_client():
             raise RuntimeError("SDK client unavailable for account summary")
+        # Budget (2026-09-16): MarginManager.from_client issues subaccount_info
+        # (IP weight 2) + isolated_positions (IP weight 10) on the gateway and a
+        # multi-subaccount snapshots query on the archive — none of which the SDK
+        # gates. Reserve them here so the portfolio sync backs off (stale
+        # snapshot) instead of 429ing every round; a denied reserve is a
+        # throttle, not a venue error.
+        from src.nadobro.venue.nado_weights import query_weight
+
+        if not await run_blocking_sdk(self._gateway_allowed, weight=12, user_scoped=False):
+            raise RuntimeError("venue throttled: account summary budget denied (gateway)")
+        if not await run_blocking_sdk(
+            self._gateway_allowed,
+            weight=query_weight("subaccount_snapshots", {"limit": 1, "subaccounts": [self.subaccount_hex]}),
+            url=self._archive_url(),
+            user_scoped=False,
+        ):
+            raise RuntimeError("venue throttled: account summary budget denied (archive)")
         try:
             from nado_protocol.utils.margin_manager import MarginManager
 
@@ -1566,6 +1689,7 @@ class NadoClient:
 
             return self._to_plain(await run_blocking_sdk(_call)) or {}
         except Exception as e:
+            self._record_gateway_error(e)
             logger.error("SDK calculate_account_summary failed: %s", _format_sdk_error(e))
             raise RuntimeError(f"SDK calculate_account_summary failed: {_format_sdk_error(e)}") from e
 
@@ -2367,25 +2491,39 @@ class NadoClient:
         subaccount_hex = (subaccount_hex or "").strip()
 
         subaccount_info_succeeded = False
+        budget_denied = False
         if self._initialized and self.client:
-            try:
-                info = self.client.context.engine_client.get_subaccount_info(subaccount_hex)
-                subaccount_info_succeeded = True
-                sdk_positions = self._extract_positions_from_sdk_info(info)
-                if sdk_positions:
-                    return sdk_positions
-                # Drop to REST silently — this fires every cycle for users on
-                # isolated-only products (no positions in the parent
-                # subaccount) and was flooding the logs.
-                logger.debug(
-                    "SDK subaccount_info: no positions in parent subaccount; trying REST (subaccount=%s)",
-                    subaccount_hex[:22],
-                )
-            except Exception as e:
-                logger.warning("SDK positions for subaccount failed: %s", e)
+            # subaccount_info: IP weight 2. Budgeted + breaker-recorded like every
+            # other gateway read (2026-09-16: this path bypassed both, so
+            # get_all_positions kept walking parent + every isolated child into
+            # a 429 storm — 7 unbudgeted reads per call).
+            if not self._gateway_allowed(weight=2):
+                budget_denied = True
+            else:
+                try:
+                    info = self.client.context.engine_client.get_subaccount_info(subaccount_hex)
+                    subaccount_info_succeeded = True
+                    sdk_positions = self._extract_positions_from_sdk_info(info)
+                    if sdk_positions:
+                        return sdk_positions
+                    # A successful SDK read with no positions IS the answer: the
+                    # REST path below asks the same subaccount_info query, so
+                    # re-asking cost another 2 weight per flat subaccount per cycle.
+                    logger.debug(
+                        "SDK subaccount_info: no positions in subaccount %s",
+                        subaccount_hex[:22],
+                    )
+                except Exception as e:
+                    self._record_gateway_error(e)
+                    logger.warning("SDK positions for subaccount failed: %s", e)
+                finally:
+                    self._gateway_release()
 
         try:
-            data = self._query_rest("subaccount_info", {"subaccount": subaccount_hex}) or {}
+            data = (
+                {} if (subaccount_info_succeeded or budget_denied)
+                else (self._query_rest("subaccount_info", {"subaccount": subaccount_hex}) or {})
+            )
             if data.get("status") == "success":
                 subaccount_info_succeeded = True
                 payload = data.get("data", {}) or {}
@@ -2421,27 +2559,68 @@ class NadoClient:
         _positions_fallback_cache[fallback_key] = {"data": positions, "ts": time.time()}
         return positions
 
-    def _isolated_subaccount_hexes(self) -> list[str]:
+    def _isolated_subaccounts(self, *, refresh: bool = False) -> list[tuple[str, Optional[int]]]:
+        """``(child_hex, product_id)`` for every isolated-margin child of this
+        parent (archive ``isolated_subaccounts``, weight 2). An isolated child is
+        a per-market subaccount — its orders and positions can only be on that
+        one product — which is what lets the open-orders sweep read ONE product
+        per child (weight 2) instead of the whole catalog (2 x ~96).
+
+        Cached ``_ISOLATED_DISCOVERY_TTL`` per (network, parent); ``refresh``
+        bypasses the cache. A FAILED discovery serves the last known list; with
+        nothing cached it RAISES — children we cannot enumerate are children we
+        cannot read, and callers must treat the account as unknown, never as
+        "parent only".
+        """
+        parent = (self.subaccount_hex or "").strip()
+        key = (self.network, parent)
+        if not refresh:
+            with _caches_lock:
+                cached = _isolated_subaccounts_cache.get(key)
+            if cached and (time.time() - float(cached.get("ts", 0))) < _ISOLATED_DISCOVERY_TTL:
+                return list(cached.get("data") or [])
         try:
             from src.nadobro.venue.nado_archive import (
                 isolated_subaccount_from_row,
                 query_isolated_subaccounts_for_parent,
             )
 
-            rows = query_isolated_subaccounts_for_parent(self.network, self.subaccount_hex or "") or []
+            rows = query_isolated_subaccounts_for_parent(self.network, parent) or []
         except Exception as e:
-            logger.warning("isolated subaccount discovery failed: %s", e)
-            return []
+            with _caches_lock:
+                cached = _isolated_subaccounts_cache.get(key)
+            if cached:
+                logger.warning("isolated subaccount discovery failed (serving last known list): %s", e)
+                return list(cached.get("data") or [])
+            raise RuntimeError(f"isolated subaccount discovery failed: {e}") from e
 
-        out: list[str] = []
+        out: list[tuple[str, Optional[int]]] = []
         seen: set[str] = set()
         for row in rows:
-            iso = isolated_subaccount_from_row(row, self.subaccount_hex or "")
+            iso = isolated_subaccount_from_row(row, parent)
             if not iso or iso in seen:
                 continue
             seen.add(iso)
-            out.append(iso)
+            pid: Optional[int]
+            try:
+                raw_pid = row.get("product_id") if isinstance(row, dict) else None
+                pid = int(raw_pid) if raw_pid is not None else None
+            except (TypeError, ValueError):
+                pid = None
+            out.append((iso, pid))
+        with _caches_lock:
+            _isolated_subaccounts_cache[key] = {"data": list(out), "ts": time.time()}
         return out
+
+    def _isolated_subaccount_hexes(self, *, refresh: bool = False) -> list[str]:
+        """Child subaccount hexes only (see ``_isolated_subaccounts``). Keeps the
+        old contract for positions readers: a failed discovery with nothing
+        cached logs and returns ``[]`` rather than raising."""
+        try:
+            return [iso for iso, _ in self._isolated_subaccounts(refresh=refresh)]
+        except Exception as e:
+            logger.warning("isolated subaccount discovery failed: %s", e)
+            return []
 
     def get_all_positions(self) -> list:
         # Default (cross / main) subaccount.
@@ -3817,6 +3996,70 @@ class NadoClient:
         is_blocked = "blocked" in lowered or "reason" in lowered
         compact = lowered.replace("_", "").replace("-", "")
         return (is_failure or is_blocked) and "ipqueryonly" in compact
+
+    def cancel_product_orders(self, product_ids: list[int], sender: Optional[str] = None) -> dict:
+        """Cancel EVERY resting order on ``product_ids`` for one sender in ONE
+        execute (``cancel_product_orders``) — the venue's READ-FREE cleanup.
+
+        Used when the book cannot be READ (budget-denied / 429) so a stop can
+        still clear its product instead of failing loud forever (2026-09-16:
+        the 2 x N multi-product read could never fit the per-IP budget, so the
+        fail-loud sweep left 18 quotes + a short resting). A success response
+        is the venue's own confirmation that those products hold no orders for
+        this sender — it does not assume an unreadable book is empty.
+        Wallet execute budget; never touches positions."""
+        if not self._initialized or not self.client:
+            return {"success": False, "error": "Client not initialized"}
+        pids = sorted({int(p) for p in (product_ids or []) if p is not None})
+        if not pids:
+            return {"success": False, "error": "no products to cancel"}
+        eff_sender = (sender or "").strip() or self.subaccount_hex
+        from src.nadobro.venue.nado_weights import execute_weight
+
+        weight = execute_weight("cancel_product_orders", {"product_ids": pids})
+        if not self._gateway_allowed(weight=weight, kind="execute", wallet=eff_sender, user_scoped=False):
+            return {"success": False, "error": "Rate limited — please retry in a moment.", "rate_limited": True}
+        try:
+            from nado_protocol.engine_client.types.execute import CancelProductOrdersParams
+
+            params = CancelProductOrdersParams(sender=eff_sender, productIds=pids)
+            result = self.client.market.cancel_product_orders(params)
+            if self._result_is_ip_query_only(result):
+                try:
+                    from src.nadobro.venue.gateway_budget import record_ip_query_only
+                    record_ip_query_only(self._rest_url())
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("record_ip_query_only failed — write circuit not armed: %s", e)
+                logger.warning(
+                    "cancel_product_orders rejected ip_query_only (write circuit armed) "
+                    "products=%s host=%s raw=%s",
+                    pids, self._rest_url(), _mask_payload(result),
+                )
+                return {
+                    "success": False,
+                    "error": self._friendly_error(str(result)),
+                    "rate_limited": True,
+                    "ip_query_only": True,
+                }
+            try:
+                from src.nadobro.venue.gateway_budget import clear_write_ban
+                clear_write_ban(self._rest_url())
+            except Exception as e:  # noqa: BLE001
+                logger.warning("clear_write_ban failed after confirmed product cancel: %s", e)
+            return {"success": True, "product_ids": pids, "sender": eff_sender}
+        except Exception as e:
+            err_str = str(e)
+            compact_err = err_str.lower().replace("_", "").replace("-", "")
+            if "ipqueryonly" in compact_err:
+                try:
+                    from src.nadobro.venue.gateway_budget import record_ip_query_only
+                    record_ip_query_only(self._rest_url())
+                except Exception as e2:  # noqa: BLE001
+                    logger.warning("record_ip_query_only failed — write circuit not armed: %s", e2)
+                return {"success": False, "error": err_str, "rate_limited": True, "ip_query_only": True}
+            self._record_gateway_error(e)
+            logger.error("cancel_product_orders failed products=%s: %s", pids, _mask_payload(err_str))
+            return {"success": False, "error": err_str}
 
     def cancel_order(
         self, product_id: int, digest: str, sender: Optional[str] = None, _retry_count: int = 0
