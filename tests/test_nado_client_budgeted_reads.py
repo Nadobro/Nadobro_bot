@@ -51,18 +51,55 @@ def test_payload_recogniser():
 
 # ------------------------------------------------------------ market price ---
 
-def test_market_price_sdk_read_is_budgeted_and_denied_reads_are_unknown():
+def _denied_price_client(hits: list):
     c = _client()
-    hits: list = []
     c.client = SimpleNamespace(context=SimpleNamespace(engine_client=SimpleNamespace(
         get_market_price=lambda pid: hits.append(pid) or SimpleNamespace(bid_x18=10**18, ask_x18=2 * 10**18))))
     with nc._caches_lock:
         nc._price_cache.pop("mainnet:1", None)
+    return c
+
+
+def test_market_price_sdk_read_is_budgeted_and_a_denied_read_never_hits_the_live_lane():
+    hits: list = []
+    c = _denied_price_client(hits)
     with mock.patch.object(NadoClient, "_gateway_allowed", return_value=False) as allowed, \
+         mock.patch.object(NadoClient, "_query_edge", return_value=None), \
          mock.patch.object(NadoClient, "_query_rest", side_effect=AssertionError("REST must not run on a denied read")):
         assert c.get_market_price(1) == {"bid": 0, "ask": 0, "mid": 0}
     assert allowed.call_args.kwargs.get("weight") == 1
     assert hits == []
+
+
+def test_a_denied_live_quote_is_answered_by_the_edge_lane():
+    """A stop must not be refused a price during our own breaker cooldown: the
+    edge lane (separate bucket, effectively live) answers instead."""
+    hits: list = []
+    c = _denied_price_client(hits)
+    edge = {"status": "success", "data": {"market_prices": [{"product_id": 1, "bid_x18": str(10**18), "ask_x18": str(3 * 10**18)}]}}
+    with mock.patch.object(NadoClient, "_gateway_allowed", return_value=False), \
+         mock.patch.object(NadoClient, "_query_edge", return_value=edge) as q, \
+         mock.patch.object(NadoClient, "_query_rest", side_effect=AssertionError("REST must not run on a denied read")):
+        assert c.get_market_price(1) == {"bid": 1.0, "ask": 3.0, "mid": 2.0}
+    assert q.call_args.args == ("cached_prices", {"product_ids": [1]})
+    assert hits == []
+
+
+def test_a_denied_quote_with_no_edge_serves_a_bounded_age_stale_quote_marked_stale():
+    hits: list = []
+    c = _denied_price_client(hits)
+    import time as _t
+    with nc._caches_lock:
+        nc._price_cache["mainnet:1"] = {"data": {"bid": 5.0, "ask": 5.0, "mid": 5.0}, "ts": _t.time() - nc._PRICE_CACHE_TTL - 1}
+    with mock.patch.object(NadoClient, "_gateway_allowed", return_value=False), \
+         mock.patch.object(NadoClient, "_query_edge", return_value=None):
+        out = c.get_market_price(1)
+    assert out["mid"] == 5.0 and out.get("stale") is True
+    with nc._caches_lock:
+        nc._price_cache["mainnet:1"] = {"data": {"bid": 5.0, "ask": 5.0, "mid": 5.0}, "ts": _t.time() - nc._PRICE_STALE_MAX - 1}
+    with mock.patch.object(NadoClient, "_gateway_allowed", return_value=False), \
+         mock.patch.object(NadoClient, "_query_edge", return_value=None):
+        assert c.get_market_price(1) == {"bid": 0, "ask": 0, "mid": 0}      # too old: unknown
 
 
 def test_market_price_sdk_failure_feeds_the_breaker():
@@ -93,16 +130,47 @@ def _positions_engine(info, calls: list):
     return SimpleNamespace(context=SimpleNamespace(engine_client=SimpleNamespace(get_subaccount_info=_read)))
 
 
-def test_positions_read_is_budgeted_and_a_denied_read_never_hits_the_venue():
+def test_positions_read_is_budgeted_and_a_denied_read_is_unknown_not_flat():
+    """DENIED-vs-EMPTY: a budget-denied positions read RAISES — it must never
+    come back as [] ("flat"), which let a throttled close-all report success over
+    an open position and the session rail read uPnL as 0."""
     c = _client()
     calls: list = []
     c.client = _positions_engine(SimpleNamespace(perp_balances=[]), calls)
     nc._positions_fallback_cache.clear()
     with mock.patch.object(NadoClient, "_gateway_allowed", return_value=False) as allowed, \
          mock.patch.object(NadoClient, "_query_rest", side_effect=AssertionError("REST must not run on a denied read")):
-        c._positions_for_subaccount_hex(SUB, allow_empty_cache_fallback=True)
+        with pytest.raises(nc.PositionsUnavailable):
+            c._positions_for_subaccount_hex(SUB, allow_empty_cache_fallback=True)
     assert allowed.call_args.kwargs.get("weight") == 2
     assert calls == []
+    assert not nc._positions_fallback_cache.get(("mainnet", SUB))        # a denial is not cached as a failure
+
+
+def test_get_all_positions_raises_when_a_child_or_its_discovery_is_unknown():
+    c = _client()
+    calls: list = []
+    c.client = _positions_engine(SimpleNamespace(perp_balances=[]), calls)
+    nc._positions_fallback_cache.clear()
+    with mock.patch.object(NadoClient, "_gateway_allowed", return_value=True), \
+         mock.patch.object(NadoClient, "_gateway_release", return_value=None), \
+         mock.patch.object(NadoClient, "_extract_positions_from_sdk_info", return_value=[]), \
+         mock.patch.object(NadoClient, "_isolated_subaccounts", side_effect=RuntimeError("archive denied")):
+        with pytest.raises(nc.PositionsUnavailable):
+            c.get_all_positions()
+    child = "0x" + "22" * 32
+    with mock.patch.object(NadoClient, "_gateway_allowed", side_effect=[True, False]), \
+         mock.patch.object(NadoClient, "_gateway_release", return_value=None), \
+         mock.patch.object(NadoClient, "_extract_positions_from_sdk_info", return_value=[{"product_id": 1}]), \
+         mock.patch.object(NadoClient, "_isolated_subaccounts", return_value=[(child, 7)]):
+        with pytest.raises(nc.PositionsUnavailable):
+            c.get_all_positions()                                          # parent ok, child denied
+    with mock.patch.object(NadoClient, "_gateway_allowed", return_value=True), \
+         mock.patch.object(NadoClient, "_gateway_release", return_value=None), \
+         mock.patch.object(NadoClient, "_extract_positions_from_sdk_info", return_value=[{"product_id": 1}]), \
+         mock.patch.object(NadoClient, "_isolated_subaccounts", return_value=[(child, 7)]):
+        out = c.get_all_positions()
+    assert len(out) == 2 and out[1]["subaccount"] == child
 
 
 def test_a_successful_empty_sdk_positions_read_is_not_re_asked_over_rest():
@@ -117,7 +185,7 @@ def test_a_successful_empty_sdk_positions_read_is_not_re_asked_over_rest():
     assert calls == [SUB]
 
 
-def test_positions_sdk_failure_feeds_the_breaker_then_tries_rest():
+def test_positions_sdk_failure_feeds_the_breaker_then_tries_rest_then_is_unknown():
     c = _client()
     calls: list = []
     c.client = _positions_engine(RuntimeError('{"error_code":1000,"error":"Too Many Requests"}'), calls)
@@ -127,9 +195,14 @@ def test_positions_sdk_failure_feeds_the_breaker_then_tries_rest():
          mock.patch.object(NadoClient, "_gateway_release", return_value=None), \
          mock.patch.object(NadoClient, "_record_gateway_error", side_effect=lambda e: recorded.append(e)), \
          mock.patch.object(NadoClient, "_query_rest", return_value=None) as rest:
-        c._positions_for_subaccount_hex(SUB, allow_empty_cache_fallback=True)
-    assert len(recorded) == 1
-    assert rest.called
+        with pytest.raises(nc.PositionsUnavailable):
+            c._positions_for_subaccount_hex(SUB, allow_empty_cache_fallback=True)
+        assert len(recorded) == 1
+        assert rest.called
+        # The failure is remembered briefly: the next call is UNKNOWN without a venue hit.
+        with pytest.raises(nc.PositionsUnavailable):
+            c._positions_for_subaccount_hex(SUB, allow_empty_cache_fallback=True)
+    assert calls == [SUB]
 
 
 # --------------------------------------------------------- account summary ---
@@ -148,8 +221,9 @@ def test_account_summary_reserves_the_margin_managers_hidden_reads():
         mm.from_client.return_value.calculate_account_summary.return_value = {"ok": 1}
         out = asyncio.run(c.calculate_account_summary(ts=1))
     assert out == {"ok": 1}
-    assert seen[0][0] == 12                      # subaccount_info (2) + isolated_positions (10)
-    assert seen[1][1] == c._archive_url()        # the indexer snapshots query, archive lane
+    assert seen[0][1] == c._archive_url()        # the indexer snapshots query first (cheaper), archive lane
+    assert seen[1][0] == 12                      # subaccount_info (2) + isolated_positions (10)
+    assert seen[1][1] is None
 
 
 def test_account_summary_denied_budget_raises_a_throttle_without_calling_the_venue():

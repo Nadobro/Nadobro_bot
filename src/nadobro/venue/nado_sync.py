@@ -549,7 +549,23 @@ async def sync_user(
                 ),
                 client.get_trigger_orders(limit=200),
                 run_blocking_sdk(client.get_balance),
+                return_exceptions=True,
             )
+            # A summary OUR budget declined this round is a throttle, not a venue
+            # error: keep the prior summary/positions and flag the round
+            # "Cached · venue throttled" instead of failing the whole sync and
+            # discarding the other three reads (review 2026-09-16). Any other
+            # failure still takes the error path below.
+            summary_throttled = False
+            if isinstance(summary, BaseException):
+                if "venue throttled" in str(summary):
+                    summary_throttled = True
+                    summary = prior.get("summary") or {}
+                else:
+                    raise summary
+            for _res in (orders, trigger_orders, balance):
+                if isinstance(_res, BaseException):
+                    raise _res
             # DENIED-vs-EMPTY (2026-09-02): ``None`` means this round could not
             # read the book (budget-denied / venue error) — NOT an empty book.
             # Keep the last known list for display and flag the snapshot so the
@@ -568,7 +584,7 @@ async def sync_user(
             # failed) or an unknown open-orders book — must not be stamped
             # "synced now"; the deck says "Cached · venue throttled" instead.
             balance_cached = isinstance(balance, dict) and bool(balance.get("_cached"))
-            venue_throttled = bool(balance_cached or open_orders_unknown)
+            venue_throttled = bool(balance_cached or open_orders_unknown or summary_throttled)
 
             if need_heavy:
                 matches, funding = await asyncio.gather(
@@ -648,22 +664,56 @@ async def sync_user(
             return stale
 
 
+def _running_strategy_product_id(user_id: int, network: str) -> int | None:
+    """The product of this user's running strategy (bot_state ``strategy_bot:``
+    row), read directly so the venue layer does not import strategy/. A fresh
+    grid's resting ladder has no DB order row until the sync writes one — the
+    scope must still include its product or the deck shows 0 orders until the
+    heavy pass."""
+    try:
+        row = query_one("SELECT value FROM bot_state WHERE key = %s", (f"strategy_bot:{int(user_id)}:{network}",))
+        if not row:
+            return None
+        import json
+
+        state = json.loads(row.get("value") or "{}")
+        if not state.get("running"):
+            return None
+        product = str(state.get("product") or "").strip()
+        if not product or product.upper() == "MULTI":
+            return None
+        from src.nadobro.config import get_product_id
+
+        pid = get_product_id(product, network=network)
+        return int(pid) if pid is not None else None
+    except Exception:  # policy: degrade-ok(scope hint only)
+        return None
+
+
 def _open_orders_scope_for_user(user_id: int, network: str, prior: dict[str, Any] | None) -> list[int]:
     """Products that can hold one of this user's open-order rows: DB open-order
-    rows, DB open positions, and the last known snapshot's orders/positions.
-    The regular poll reads (and sweeps) exactly these; anything placed outside
-    the bot on another product is discovered by the heavy whole-catalog pass."""
+    rows, DB open positions, products traded in the last 24h, the running
+    strategy's product, and the last known snapshot's orders/positions. The
+    regular poll reads (and sweeps) exactly these; anything placed outside the
+    bot on another product is discovered by the heavy whole-catalog pass."""
     scope: set[int] = set()
     try:
-        from src.nadobro.models.database import get_open_order_product_ids, get_open_position_product_ids
+        from src.nadobro.models.database import (
+            get_open_order_product_ids,
+            get_open_position_product_ids,
+            get_recent_trade_product_ids,
+        )
 
-        for fn in (get_open_order_product_ids, get_open_position_product_ids):
+        for fn in (get_open_order_product_ids, get_open_position_product_ids, get_recent_trade_product_ids):
             try:
                 scope.update(int(p) for p in fn(int(user_id), network))
             except Exception:  # policy: degrade-ok(scope hint; the heavy pass still sweeps the whole catalog)
                 continue
     except Exception:  # policy: degrade-ok(DB helpers unavailable; the snapshot-derived scope below still applies)
         pass
+    strategy_pid = _running_strategy_product_id(int(user_id), network)
+    if strategy_pid is not None:
+        scope.add(strategy_pid)
     for key in ("open_orders", "positions"):
         for row in (prior or {}).get(key) or []:
             if not isinstance(row, dict):

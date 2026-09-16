@@ -62,7 +62,7 @@ except RuntimeError as e:
 # Build stamp (Dockerfile ARG GIT_SHA -> NADOBRO_GIT_SHA): the one line that says
 # which commit is actually running. "unknown" means the image was built without
 # `--build-arg GIT_SHA=$(git rev-parse HEAD)` — see deploy.md.
-logger.info("Build: NADOBRO_GIT_SHA=%s", os.environ.get("NADOBRO_GIT_SHA", "unknown"))
+logger.info("Build: NADOBRO_GIT_SHA=%s", env_str("NADOBRO_GIT_SHA", "unknown"))
 
 
 def check_config():

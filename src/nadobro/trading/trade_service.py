@@ -400,19 +400,30 @@ def _build_logical_trade_rows(trades: list[dict]) -> list[dict]:
 
 
 def _order_sender_params(client, network: str) -> list[str | None]:
+    """Subaccounts that may hold perp orders: ``None`` = default subaccount,
+    else an isolated child hex.
+
+    Uses the client's cached child discovery when it has one (one archive read
+    per TTL instead of one per sweep). RAISES when the children cannot be
+    enumerated — an archive denial/failure with nothing cached. Callers on the
+    cancel / verify paths must record that as an UNKNOWN book: the old
+    swallow-and-continue returned the parent only, and a sweep that cannot see
+    a child's ladder reported a clean book over it (review 2026-09-16).
     """
-    Subaccounts that may hold perp orders: None = default subaccount, else isolated child hex.
-    """
+    parent = (getattr(client, "subaccount_hex", "") or "").lower()
+    out: list[str | None] = [None]
+    discover = getattr(client, "_isolated_subaccounts", None)
+    if callable(discover):
+        for iso, _pid in discover() or []:
+            if iso and str(iso).lower() != parent:
+                out.append(iso)
+        return out
     from src.nadobro.venue.nado_archive import isolated_subaccount_from_row, query_isolated_subaccounts_for_parent
 
-    out: list[str | None] = [None]
-    try:
-        for row in query_isolated_subaccounts_for_parent(network, client.subaccount_hex or "") or []:
-            iso = isolated_subaccount_from_row(row, client.subaccount_hex or "")
-            if iso:
-                out.append(iso)
-    except Exception as e:
-        logger.debug("order_sender_params isolated list failed: %s", e)
+    for row in query_isolated_subaccounts_for_parent(network, client.subaccount_hex or "") or []:
+        iso = isolated_subaccount_from_row(row, client.subaccount_hex or "")
+        if iso:
+            out.append(iso)
     return out
 
 
@@ -467,8 +478,10 @@ def _resting_orders_fallback(
         return grouped, errors
     try:
         senders = _order_sender_params(client, network)
-    except Exception as exc:  # policy: degrade-ok(sender enumeration failed; a parent-only fallback still reads the default subaccount and any unreadable sender is reported below)
-        logger.debug("sender enumeration failed during cancel fallback: %s", exc)
+    except Exception as exc:
+        # DENIED-vs-EMPTY: children we cannot enumerate are books we cannot read.
+        # Still sweep the default subaccount, but the round stays UNKNOWN.
+        errors.append(f"{_UNKNOWN_BOOK}: isolated senders could not be enumerated ({exc})")
         senders = [None]
     for pid in pids:
         for sender in senders:
@@ -485,6 +498,30 @@ def _resting_orders_fallback(
                 if digest:
                     grouped.setdefault((pid, sender), []).append(digest)
     return grouped, errors
+
+
+def _product_cancel_targets(client, network: str, scope: list[int]) -> list[tuple[str | None, list[int]]]:
+    """``(sender, product_ids)`` pairs for a read-free cleanup of ``scope``: the
+    parent may hold any scoped product; an isolated child is a per-market
+    subaccount, so it is cancelled for its own product only (5 weight, not
+    5 x scope — a whole-scope cancel on every child drained the 90-token wallet
+    burst on exactly the multi-child accounts this exists for). RAISES when
+    the children cannot be enumerated."""
+    parent = (getattr(client, "subaccount_hex", "") or "").lower()
+    targets: list[tuple[str | None, list[int]]] = [(None, list(scope))]
+    discover = getattr(client, "_isolated_subaccounts", None)
+    if callable(discover):
+        for iso, pid in discover() or []:
+            if not iso or str(iso).lower() == parent:
+                continue
+            if pid is None:
+                targets.append((iso, list(scope)))
+            elif int(pid) in scope:
+                targets.append((iso, [int(pid)]))
+        return targets
+    for sender in _order_sender_params(client, network)[1:]:
+        targets.append((sender, list(scope)))
+    return targets
 
 
 def _clear_book_by_product_cancel(
@@ -504,31 +541,29 @@ def _clear_book_by_product_cancel(
 
     CANCEL-ONLY: never used on a close/verify path where a working maker close
     could be resting (it would cancel that too). Returns ``(cleared, errors)``;
-    ``cleared`` is the scope only when EVERY sender's execute succeeded."""
+    ``cleared`` is the scope only when EVERY sender's execute succeeded AND the
+    sender list itself was known."""
     scope = sorted({int(p) for p in (pids or []) if p is not None})
     if not scope:
         return [], []
     cancel_fn = getattr(client, "cancel_product_orders", None)
-    if cancel_fn is None:
+    if not callable(cancel_fn):
         return [], ["read-free cancel_product_orders unavailable on this client"]
+    try:
+        targets = _product_cancel_targets(client, network, scope)
+    except Exception as exc:
+        return [], [f"cancel_product_orders skipped: isolated senders could not be enumerated ({exc})"]
     errors: list[str] = []
     cleared_all = True
-    try:
-        senders = _order_sender_params(client, network)
-    except Exception as exc:  # policy: degrade-ok(the default subaccount is still cleared; children are reported unknown)
-        logger.debug("sender enumeration failed during product cancel: %s", exc)
-        senders = [None]
-        cleared_all = False
-        errors.append(f"isolated sender discovery failed ({exc}); only the default subaccount was cleared")
-    for sender in senders:
+    for sender, target_pids in targets:
         try:
-            r = cancel_fn(scope, sender=sender) or {}
+            r = cancel_fn(target_pids, sender=sender) or {}
         except Exception as exc:  # policy: degrade-ok(recorded; the caller keeps failing loud)
             r = {"success": False, "error": str(exc)}
         if r.get("success"):
             logger.info(
                 "cancel_product_orders cleared products=%s sender=%s (read-free cleanup)",
-                scope, str(sender or "default")[:10],
+                target_pids, str(sender or "default")[:10],
             )
             continue
         cleared_all = False
@@ -537,6 +572,41 @@ def _clear_book_by_product_cancel(
             f"{r.get('error', 'unknown')}"
         )
     return (scope if cleared_all else []), errors
+
+
+def _resolve_unknown_book(
+    client, errors: list[str], scope, network: str, *, scoped: bool
+) -> tuple[list[int], list[str]]:
+    """The one owner of the read-free fallback policy for cancel-only sweeps.
+
+    When the sweep could not READ the book, clear ``scope`` by product and
+    resolve the unknown-book errors that clearing covers: a per-product error
+    ("... for BTC-PERP ...") for a cleared product, and the account-wide errors
+    (batched read raised / nothing to fall back on) only for a SCOPED sweep —
+    an unscoped sweep that could not read the whole account still fails loud,
+    because an order on a product outside the scope may rest (a manual order
+    placed on the Nado app has no DB row to put it in scope)."""
+    if not _book_unknown(errors):
+        return [], errors
+    cleared, product_errors = _clear_book_by_product_cancel(client, scope, network)
+    if cleared:
+        names: set[str] = set()
+        for pid in cleared:
+            names.add(str(get_product_name(pid)))
+            names.add(str(get_product_name(pid, network=network)))
+        kept: list[str] = []
+        for err in errors:
+            text = str(err)
+            if not text.startswith(_UNKNOWN_BOOK):
+                kept.append(err)
+            elif " for " in text:
+                if not any(f" for {name}" in text for name in names):
+                    kept.append(err)
+            elif not scoped:
+                kept.append(err)
+        errors = kept
+    errors.extend(product_errors)
+    return cleared, errors
 
 
 def _resting_orders_by_sender(
@@ -1916,7 +1986,10 @@ def apply_tp_sl_to_open_position(
     leverage = float(settings.get("default_leverage", 3) or 3)
     leverage = max(1.0, leverage)
 
-    net_positions = _normalize_net_positions(client.get_all_positions() or [])
+    try:
+        net_positions = _normalize_net_positions(client.get_all_positions() or [])
+    except Exception as exc:  # DENIED-vs-EMPTY: an unreadable position book is UNKNOWN, never flat
+        return {"success": False, "error": f"Venue positions unavailable — please retry in a moment ({exc})"}
     product_pos = net_positions.get(product_id)
     if not product_pos:
         return {"success": False, "error": f"No open position on {get_product_name(product_id, network=network)}."}
@@ -2038,7 +2111,10 @@ def limit_close_position(
     leverage = float(settings.get("default_leverage", 3) or 3)
     leverage = max(1.0, leverage)
 
-    net_positions = _normalize_net_positions(client.get_all_positions() or [])
+    try:
+        net_positions = _normalize_net_positions(client.get_all_positions() or [])
+    except Exception as exc:  # DENIED-vs-EMPTY: an unreadable position book is UNKNOWN, never flat
+        return {"success": False, "error": f"Venue positions unavailable — please retry in a moment ({exc})"}
     product_pos = net_positions.get(product_id)
     if not product_pos:
         return {"success": False, "error": f"No open position on {get_product_name(product_id, network=network)}."}
@@ -2562,12 +2638,20 @@ def close_position(
 
     cancelled_orders = 0
     order_errors: list[str] = []
-    for snd in _order_sender_params(client, selected_network):
+    try:
+        pre_close_senders = _order_sender_params(client, selected_network)
+    except Exception as exc:
+        order_errors.append(f"{_UNKNOWN_BOOK}: isolated senders could not be enumerated ({exc})")
+        pre_close_senders = [None]
+    for snd in pre_close_senders:
         c_count, c_errs = _cancel_open_orders_for_product(client, product_id, sender=snd)
         cancelled_orders += c_count
         order_errors.extend(c_errs)
 
-    net_positions = _normalize_net_positions(client.get_all_positions() or [])
+    try:
+        net_positions = _normalize_net_positions(client.get_all_positions() or [])
+    except Exception as exc:  # DENIED-vs-EMPTY: an unreadable position book is UNKNOWN, never flat
+        return {"success": False, "error": f"Venue positions unavailable — please retry in a moment ({exc})"}
     product_pos = net_positions.get(product_id)
     if not product_pos:
         # AUDIT-SWEEP-2026-09-04-PARTIAL-CANCEL-FALSE-SUCCESS: fail loud on ANY order
@@ -2927,19 +3011,12 @@ def cancel_resting_orders_for_user(
     )
     cancelled, cancel_errors = _cancel_resting_orders(client, resting)
     errors.extend(cancel_errors)
-    cleared_by_product: list[int] = []
-    if _book_unknown(errors):
-        # READ-FREE FALLBACK (2026-09-16): the book could not be read, so cancel
-        # by PRODUCT on every sender for the products this sweep is responsible
-        # for (the same scope the per-product fallback tried). A confirmed
-        # cancel_product_orders resolves those unknown-book errors — the venue
-        # itself cleared the products. Anything else still fails loud below.
-        cleared_by_product, product_errors = _clear_book_by_product_cancel(
-            client, [only_pid] if only_pid is not None else known_pids, selected_network,
-        )
-        if cleared_by_product:
-            errors = [e for e in errors if not str(e).startswith(_UNKNOWN_BOOK)]
-        errors.extend(product_errors)
+    # READ-FREE FALLBACK (2026-09-16): an unreadable book is cleared by PRODUCT
+    # (see _resolve_unknown_book); whatever it cannot vouch for still fails loud.
+    cleared_by_product, errors = _resolve_unknown_book(
+        client, errors, [only_pid] if only_pid is not None else known_pids, selected_network,
+        scoped=only_pid is not None,
+    )
     # AUDIT-SWEEP-2026-09-04-PARTIAL-CANCEL-FALSE-SUCCESS: fail loud on ANY error.
     # ``errors`` is non-empty only when the book was unreadable OR a per-digest
     # cancel was rejected/rate-limited (an order may still rest) — either way the
@@ -2995,18 +3072,15 @@ def close_all_positions(
     )
     cancelled_orders, cancel_errors = _cancel_resting_orders(client, resting)
     order_errors.extend(cancel_errors)
-    if _book_unknown(order_errors):
-        # READ-FREE FALLBACK (2026-09-16): clear the scoped products with
-        # cancel_product_orders BEFORE flattening, so resting quotes cannot fill
-        # into the position we are about to close. Cancel-only here — no close
-        # order rests yet. The post-close verify below stays read-based and
-        # fails loud on an unreadable book (a resting maker close must survive).
-        cleared, product_errors = _clear_book_by_product_cancel(
-            client, [only_pid] if only_pid is not None else known_pids, selected_network,
-        )
-        if cleared:
-            order_errors = [e for e in order_errors if not str(e).startswith(_UNKNOWN_BOOK)]
-        order_errors.extend(product_errors)
+    # READ-FREE FALLBACK (2026-09-16): clear the scoped products by
+    # cancel_product_orders BEFORE flattening, so resting quotes cannot fill into
+    # the position we are about to close. Cancel-only here — no close order rests
+    # yet. The post-close verify below stays read-based and fails loud on an
+    # unreadable book (a resting maker close must survive).
+    _cleared_pre_close, order_errors = _resolve_unknown_book(
+        client, order_errors, [only_pid] if only_pid is not None else known_pids, selected_network,
+        scoped=only_pid is not None,
+    )
 
     net_positions = _normalize_net_positions(client.get_all_positions() or [])
     if not net_positions:

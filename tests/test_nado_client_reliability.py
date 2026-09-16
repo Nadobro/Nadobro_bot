@@ -355,6 +355,7 @@ class NadoClientReliabilityTests(unittest.TestCase):
              patch.object(pc, "get_spot_catalog", return_value=spot_catalog), \
              patch.object(client, "_gateway_allowed", return_value=True), \
              patch.object(client, "_gateway_release"), \
+             patch.object(client, "_isolated_subaccounts", return_value=[]), \
              patch.dict(sys.modules, {
                  "nado_protocol": nado_mod,
                  "nado_protocol.utils": utils_mod,

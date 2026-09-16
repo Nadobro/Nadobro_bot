@@ -109,7 +109,10 @@ def process_stop_losses(prices: dict) -> list[dict]:
 
         from src.nadobro.trading.trade_service import close_position
 
-        close_result = close_position(user_id, product, network=network)
+        try:
+            close_result = close_position(user_id, product, network=network)
+        except Exception as exc:  # an unreadable position book (DENIED-vs-EMPTY) is a failed close, retried next scan
+            close_result = {"success": False, "error": str(exc)}
         if close_result.get("success"):
             rule["active"] = False
             rule["triggered_at"] = _now_iso()

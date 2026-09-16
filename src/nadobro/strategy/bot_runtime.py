@@ -1798,7 +1798,10 @@ def stop_user_bot(telegram_id: int, cancel_orders: bool = True) -> tuple[bool, s
     engine_ok, engine_error = _stop_engine_runtime_for_state(telegram_id, network, state)
 
     if cancel_orders:
-        close_res = cleanup_strategy_positions(telegram_id, network, state)
+        try:
+            close_res = cleanup_strategy_positions(telegram_id, network, state)
+        except Exception as e:  # an unreadable position book (DENIED-vs-EMPTY) is a failed cleanup, retriable
+            close_res = {"success": False, "error": str(e)}
         if not close_res.get("success"):
             return False, f"Strategy loop stopped, but cleanup failed: {close_res.get('error', 'unknown')}"
     if not engine_ok:
@@ -1896,7 +1899,10 @@ def stop_all_user_bots(telegram_id: int, cancel_orders: bool = True) -> tuple[bo
             if not engine_ok:
                 close_errors.append(f"{network}: engine cleanup failed: {engine_error or 'unknown'}")
             if cancel_orders:
-                close_res = cleanup_strategy_positions(telegram_id, network, state)
+                try:
+                    close_res = cleanup_strategy_positions(telegram_id, network, state)
+                except Exception as e:  # an unreadable position book (DENIED-vs-EMPTY) is a failed cleanup, retriable
+                    close_res = {"success": False, "error": str(e)}
                 if not close_res.get("success"):
                     close_errors.append(f"{network}: {close_res.get('error', 'close_all_positions failed')}")
             stopped += 1

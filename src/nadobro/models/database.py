@@ -1928,6 +1928,24 @@ def get_open_order_product_ids(user_id: int, network: str) -> list[int]:
         return []
 
 
+def get_recent_trade_product_ids(user_id: int, network: str, *, hours: int = 24) -> list[int]:
+    """Products this user traded in the last ``hours`` — the scope hint for the
+    portfolio poll's open-orders read (a running strategy's product shows up
+    here from its first fill even before the sync has written an order row)."""
+    try:
+        rows = query_all(
+            f"""
+            SELECT DISTINCT product_id FROM {_trades_table(network)}
+            WHERE user_id = %s AND product_id IS NOT NULL
+              AND created_at > now() - (%s * interval '1 hour')
+            """,
+            (user_id, int(hours)),
+        )
+        return [int(r["product_id"]) for r in rows if r.get("product_id") is not None]
+    except Exception:  # policy: degrade-ok(scope hint only; the heavy pass still sweeps the whole catalog)
+        return []
+
+
 def get_open_position_product_ids(user_id: int, network: str) -> list[int]:
     """Products with an open position row for this user (cross + isolated)."""
     try:

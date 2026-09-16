@@ -960,6 +960,33 @@ class ThrottledBalanceFreshnessTests(unittest.IsolatedAsyncioTestCase):
         assert result["last_sync"] == prior_sync, "not stamped 'synced now' on a throttled round"
         assert result["stale"] is False                     # positions ARE fresh (summary read ok)
 
+    async def test_a_budget_throttled_summary_degrades_instead_of_failing_the_round(self):
+        """Review 2026-09-16: a summary OUR budget declined is a throttle, not a
+        venue error — keep the prior summary, flag the round, and do not discard
+        the other three reads by failing the whole sync."""
+        class ThrottledSummaryClient(_Client):
+            async def calculate_account_summary(self, ts=None):
+                raise RuntimeError("venue throttled: account summary budget denied")
+
+        p1, p2, p3, p4 = self._patches(ThrottledSummaryClient())
+        with p1, p2, p3, p4:
+            result = await nado_sync.sync_user(42, network="testnet", force=True)
+        assert result["venue_throttled"] is True
+        assert result.get("stale") is False
+        assert result.get("error") is None
+        assert result["open_orders"], "the other reads of the round are kept"
+
+    async def test_a_venue_error_on_the_summary_still_fails_the_round(self):
+        class BrokenSummaryClient(_Client):
+            async def calculate_account_summary(self, ts=None):
+                raise RuntimeError("SDK calculate_account_summary failed: 502")
+
+        p1, p2, p3, p4 = self._patches(BrokenSummaryClient())
+        with p1, p2, p3, p4:
+            result = await nado_sync.sync_user(42, network="testnet", force=True)
+        assert result.get("stale") is True
+        assert "502" in str(result.get("error"))
+
     async def test_a_fresh_balance_is_stamped_now_and_not_flagged(self):
         p1, p2, p3, p4 = self._patches(_Client())
         with p1, p2, p3, p4:
