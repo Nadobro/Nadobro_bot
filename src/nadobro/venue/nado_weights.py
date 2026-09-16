@@ -135,6 +135,11 @@ def query_weight(query_type: str, params: Optional[Mapping[str, Any]] = None) ->
         return _ceil_int(2 + (float(limit or 0) * subs / 20.0))
     if qt in ("subaccount_snapshots",):
         return _ceil_int(2 + (float(limit or 0) * subs / 10.0))
+    if qt in ("positions",):
+        # Archive position windows: 2 + limit / 20 (default limit 100 -> 7).
+        return _ceil_int(2 + (float(limit or 100) / 20.0))
+    if qt in ("portfolio", "portfolio_history", "portfolio_calendar"):
+        return 5
     if qt in ("signatures",):
         return _ceil_int(2 + (_count(p.get("digests")) / 10.0))
     if qt in ("tx_hashes",):

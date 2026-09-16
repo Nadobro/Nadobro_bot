@@ -98,46 +98,54 @@ def test_portfolio_deck_and_subviews_render_without_local_sync_text():
     assert view_kb.inline_keyboard
 
 
-def test_history_renders_round_trips_newest_first():
-    """History displays closed round-trips from the authoritative positions table
-    (not the drifting fill FIFO). Each row shows entry -> exit -> realized, and the
-    Share PnL button carries the position id as ``trip_key`` so the callback can
-    mint the per-trade card with the correct leverage.
-    """
+def test_history_renders_venue_windows_newest_first():
+    """History lists the VENUE'S position windows (every source), newest last
+    change first. Each row shows the venue entry -> exit -> realized PnL, and the
+    Share PnL button carries the window id (``vp:``) so the card is minted from
+    the venue figures. Open windows show as OPEN without a share button."""
     from datetime import datetime, timezone
 
-    trips = [
+    rows = [
         {
-            "id": 200, "product_id": 1, "pair": "NEW", "side": "long", "size": 1.0,
-            "avg_entry_price": 100.0, "close_price": 110.0, "close_realized_pnl": 10.0,
-            "leverage": 50.0, "isolated": False,
-            "opened_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
-            "closed_at": datetime(2026, 1, 2, 1, tzinfo=timezone.utc),
-            "metadata": {"close_fees": 0.2, "close_funding": 0.0},
+            "id": 200, "product_id": 1, "product_name": "NEW-PERP", "is_long": True, "isolated": False,
+            "total_close_amount": "1", "max_amount": "1", "amount": "0",
+            "avg_entry_price": "100", "avg_exit_price": "110", "realized_pnl": "10",
+            "open_fee": "0.1", "close_fee": "0.1", "is_open": False,
+            "open_ts": datetime(2026, 1, 2, tzinfo=timezone.utc),
+            "update_ts": datetime(2026, 1, 2, 1, tzinfo=timezone.utc),
+            "strategy_session_id": 314, "session_strategy": "mid", "source": "strategy",
         },
         {
-            "id": 100, "product_id": 2, "pair": "OLD", "side": "short", "size": 0.5,
-            "avg_entry_price": 90.0, "close_price": 80.0, "close_realized_pnl": 5.0,
-            "leverage": 10.0, "isolated": False,
-            "opened_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
-            "closed_at": datetime(2026, 1, 1, 1, tzinfo=timezone.utc),
-            "metadata": {"close_fees": 0.1, "close_funding": 0.0},
+            "id": 100, "product_id": 2, "product_name": "OLD-PERP", "is_long": False, "isolated": True,
+            "total_close_amount": "0.5", "max_amount": "0.5", "amount": "0",
+            "avg_entry_price": "90", "avg_exit_price": "80", "realized_pnl": "5",
+            "open_fee": "0.05", "close_fee": "0.05", "is_open": False,
+            "open_ts": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "update_ts": datetime(2026, 1, 1, 1, tzinfo=timezone.utc),
+            "strategy_session_id": None, "session_strategy": None, "source": "manual",
+        },
+        {
+            "id": 300, "product_id": 3, "product_name": "LIVE-PERP", "is_long": True, "isolated": False,
+            "total_close_amount": "0", "max_amount": "2", "amount": "2",
+            "avg_entry_price": "50", "avg_exit_price": "0", "realized_pnl": "0",
+            "open_fee": "0.2", "close_fee": "0", "is_open": True,
+            "open_ts": datetime(2026, 1, 3, tzinfo=timezone.utc),
+            "update_ts": datetime(2026, 1, 3, 1, tzinfo=timezone.utc),
+            "strategy_session_id": 315, "session_strategy": "grid", "source": "strategy",
         },
     ]
-    with patch(
-        "src.nadobro.models.database.get_manual_closed_round_trips",
-        return_value=trips,
-    ):
+    with patch("src.nadobro.models.database.get_venue_positions", return_value=rows):
         text, kb = render_history_view(_snapshot())
 
-    assert text.index("NEW") < text.index("OLD")
-    # entry -> exit is rendered from the position (100 -> 110 for the NEW long)
-    assert "100" in text and "110" in text
-    callback_data = [
-        btn.callback_data for row in kb.inline_keyboard for btn in row
-    ]
-    # trip_key is the position id -> the Share card fetches it (correct leverage)
-    assert any("portfolio:share_pnl:rt:200" in cb for cb in callback_data)
+    assert text.index("NEW-PERP") < text.index("OLD-PERP")
+    assert "$100.00 → $110.00" in text and "mid #314" in text
+    assert "manual" in text and "iso" in text
+    assert "OPEN" in text
+    callback_data = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    assert "portfolio:share_pnl:vp:200" in callback_data
+    assert "portfolio:share_pnl:vp:100" in callback_data
+    assert not any(cb == "portfolio:share_pnl:vp:300" for cb in callback_data)   # open: no exit yet
+    assert "Funding" not in text
 
 
 def test_order_cancel_indices_follow_sorted_order():
@@ -245,14 +253,28 @@ def test_deck_upnl_dot_matches_sign():
     assert "<b>Unrealized PnL</b>  🟢 +$19.19" in text
 
 
-def test_deck_funding_direction_label():
+def test_deck_has_no_funding_line():
+    """Funding is not shown on the portfolio card (2026-09-16)."""
     snapshot = _snapshot()
     snapshot["stats"]["funding_windows"] = {"24h": "0.12"}
     text, _ = render_portfolio_deck(snapshot)
-    assert "Funding   -$0.12 (paid)" in text
-    snapshot["stats"]["funding_windows"] = {"24h": "-0.12"}
+    assert "Funding" not in text
+
+
+def test_deck_realized_line_is_venue_sourced_or_marked_syncing():
+    """The Realized line shows the venue figure only once the venue position
+    windows are synced; before that it says so instead of showing the old
+    fill-replay guess."""
+    snapshot = _snapshot()
+    snapshot["stats"]["pnl_windows"] = {"24h": "-161.36"}
+    snapshot["stats"].pop("realized_source", None)
     text, _ = render_portfolio_deck(snapshot)
-    assert "Funding   +$0.12 (received)" in text
+    assert "Realized  — (syncing from Nado)" in text
+    assert "-161.36" not in text
+    snapshot["stats"]["realized_source"] = "venue"
+    snapshot["stats"]["pnl_windows"] = {"24h": "10.50"}
+    text, _ = render_portfolio_deck(snapshot)
+    assert "Realized  +$10.50" in text
 
 
 def test_deck_refreshing_banner():

@@ -26,13 +26,16 @@ def render_performance_view(
     page: int = 0,
     page_size: int = PAGE_SIZE,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Strategy-only performance, paginated 5 sessions per page.
+    """Per-session performance, paginated 5 sessions per page.
 
-    Each card on the page shows the per-session stats from the workflow
-    plan: Strategy Mode, Pair, Volume Completed, Fees paid, Realized PnL
-    and Cost/$1M. Every card has its own Generate PnL button that calls
-    ``portfolio:share_pnl:{session_id}`` so the rendered image reflects
-    THAT specific session, not cumulative stats.
+    Each card shows the session's Strategy Mode, Pair, Volume, Fees, realized
+    PnL and Cost/$1M. Realized PnL is the VENUE'S figure summed over the
+    position windows the session opened (``venue_realized_pnl``, see
+    ``database.attribute_venue_positions``); the bot's own fill-derived number
+    is the fallback until the first attribution. Funding is not shown. Every
+    card has a Generate PnL button (``portfolio:share_pnl:{session_id}``) and a
+    Trades button (``portfolio:session_trades:{session_id}:0``) that lists that
+    session's trades with their venue PnL.
     """
     page = max(0, int(page))
     offset = page * page_size
@@ -83,30 +86,108 @@ def _render_session_card(
     pair = str(session.get("product_name") or "—")
     volume = _dec(session.get("total_volume_usd") or 0)
     fees = abs(_dec(session.get("total_fees_paid") or 0))
-    funding = _dec(session.get("total_funding_paid") or 0)
-    pnl = _dec(session.get("realized_pnl") or 0)
+    pnl, pnl_source = session_realized_pnl(session)
+    trades = session.get("venue_trade_count")
     state = str(session.get("status") or "stopped").lower()
     badge = "🟢 running" if state == "running" else "⏹ ended"
-    net = pnl - fees - funding
+    net = pnl - fees
     # Cost/$1M — net-of-fees result per $1M of volume: (realized PnL − fees) /
     # volume × 1,000,000. Signed by outcome (profit after fees → +, loss → −).
     cost_per_million = (
         ((pnl - fees) / volume * Decimal("1000000")) if volume > 0 else Decimal("0")
     )
+    trades_part = f" · Trades {int(trades)}" if trades is not None else ""
+    src_part = "" if pnl_source == "venue" else " (bot est.)"
     lines.extend([
         f"{display_idx}. {b(strategy.upper())} · {b(pair)}  {badge}",
         f"    {_fmt_dt(session.get('started_at'))} · ran {_duration(session)}",
-        f"    Net {pnl_dot(net)} {signed_money(net)}  (gross {signed_money(pnl)} − fees {money(fees)}"
-        f" {'−' if funding >= 0 else '+'} funding {money(abs(funding))})",
-        f"    Vol {money(volume)} · Cost/$1M {signed_money(cost_per_million)}",
+        f"    Net {pnl_dot(net)} {signed_money(net)}  (gross {signed_money(pnl)}{src_part} − fees {money(fees)})",
+        f"    Vol {money(volume)}{trades_part} · Cost/$1M {signed_money(cost_per_million)}",
         "",
     ])
     return [[
         InlineKeyboardButton(
             f"📤 Generate PnL Card · #{display_idx}",
             callback_data=f"portfolio:share_pnl:{sid}",
-        )
+        ),
+        InlineKeyboardButton(
+            f"🧾 Trades · #{display_idx}",
+            callback_data=f"portfolio:session_trades:{sid}:0",
+        ),
     ]]
+
+
+def session_realized_pnl(session: dict[str, Any]) -> tuple[Decimal, str]:
+    """``(realized_pnl, source)`` for a session card: the venue-attributed
+    figure when the attribution has run (``venue_realized_pnl``), else the
+    bot's fill-derived ``realized_pnl`` marked as an estimate."""
+    venue = session.get("venue_realized_pnl")
+    if venue is not None:
+        return _dec(venue), "venue"
+    return _dec(session.get("realized_pnl") or 0), "bot"
+
+
+def render_session_trades_view(
+    user_id: int,
+    network: str,
+    session_id: int,
+    page: int = 0,
+    page_size: int = PAGE_SIZE,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """One session's trades — the venue position windows it opened — with
+    the venue's entry/exit, fees and realized PnL per trade."""
+    from src.nadobro.handlers.history_view import window_lines, window_share_callback
+    from src.nadobro.models.database import get_venue_positions
+
+    page = max(0, int(page))
+    session = query_all(
+        "SELECT * FROM strategy_sessions WHERE id = %s AND user_id = %s AND network = %s",
+        (int(session_id), int(user_id), network),
+    )
+    session = session[0] if session else None
+    rows = get_venue_positions(user_id, network, limit=500, session_id=int(session_id)) if session else []
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = min(page, total_pages - 1)
+    visible = rows[page * page_size:(page + 1) * page_size]
+
+    if session:
+        strategy = str(session.get("strategy") or "—").upper()
+        pair = str(session.get("product_name") or "—")
+        pnl, src = session_realized_pnl(session)
+        fees = abs(_dec(session.get("total_fees_paid") or 0))
+        header = [
+            f"🧾 <b>Session trades</b> · {esc(strategy)} · {esc(pair)} · #{int(session_id)}",
+            f"{_fmt_dt(session.get('started_at'))} · ran {_duration(session)} · "
+            f"{len(rows)} trade{'' if len(rows) == 1 else 's'}",
+            f"Realized {pnl_dot(pnl)} {signed_money(pnl)}{'' if src == 'venue' else ' (bot est.)'} · "
+            f"Fees -{money(fees)} · Net {signed_money(pnl - fees)}",
+            divider(),
+        ]
+    else:
+        header = ["🧾 <b>Session trades</b>", "Session not found.", divider()]
+    lines = list(header)
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for idx, row in enumerate(visible, start=page * page_size + 1):
+        body = window_lines(row, network)
+        lines.append(f"{idx}. {body[0]}")
+        lines.extend(body[1:])
+        lines.append("")
+        share = window_share_callback(row)
+        if share:
+            kb_rows.append([InlineKeyboardButton(f"📤 Share PnL · #{idx}", callback_data=share)])
+    if session and not rows:
+        lines.append("No venue trades attributed to this session yet.")
+        lines.append("Windows appear once the portfolio sync has seen the session's fills.")
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(ui.NAV_NEWER, callback_data=f"portfolio:session_trades:{int(session_id)}:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(ui.NAV_OLDER, callback_data=f"portfolio:session_trades:{int(session_id)}:{page + 1}"))
+    if nav:
+        kb_rows.append(nav)
+    kb_rows.append([InlineKeyboardButton("📊 Performance", callback_data="portfolio:performance")])
+    kb_rows.append([InlineKeyboardButton(ui.nav_back_to("Portfolio"), callback_data="portfolio:view")])
+    return "\n".join(lines)[:3500], InlineKeyboardMarkup(kb_rows)
 
 
 def ensure_session_card_template(path: Path = CARD_TEMPLATE) -> Path:
@@ -132,7 +213,6 @@ def generate_session_card(session: dict[str, Any], network: str, output_path: Pa
     label = str(session.get("strategy_label") or session.get("strategy") or "Strategy")
     pnl = _dec(session.get("realized_pnl") or 0)
     fees = abs(_dec(session.get("fees") or session.get("total_fees_paid") or 0))
-    funding = _dec(session.get("funding") or session.get("total_funding_paid") or 0)
     volume = _dec(session.get("volume") or session.get("total_volume_usd") or 0)
     cost_per_million = (((pnl - fees) / volume * Decimal("1000000"))
                         if volume else Decimal("0"))
@@ -147,7 +227,7 @@ def generate_session_card(session: dict[str, Any], network: str, output_path: Pa
     draw.text((720, 330), f"COST/$1M {signed(cost_per_million)}", fill="#f8fafc", font=_font(36))
     draw.text(
         (72, 650),
-        f"Fees -{money(fees)} · Funding {signed(funding)} · Win {win_rate:.1f}% ({wins}/{losses}) · {network.upper()}",
+        f"Fees -{money(fees)} · Win {win_rate:.1f}% ({wins}/{losses}) · {network.upper()}",
         fill="#f8fafc",
         font=_font(28),
     )
@@ -202,12 +282,12 @@ def render_hours_view(user_id: int, network: str) -> tuple[str, InlineKeyboardMa
 
     The grid post-mortem lesson: don't memorize schedules — measure when
     your strategy's preferred condition appears in your own data. Net PnL
-    (gross − fees − funding) per bucket, with session counts so thin
-    samples are visible instead of misleading.
+    (gross − fees) per bucket, with session counts so thin samples are
+    visible instead of misleading.
     """
     sessions = query_all(
         """
-        SELECT started_at, realized_pnl, total_fees_paid, total_funding_paid
+        SELECT started_at, realized_pnl, venue_realized_pnl, total_fees_paid
         FROM strategy_sessions
         WHERE user_id = %s AND network = %s AND started_at IS NOT NULL
           AND status != 'running'
@@ -226,15 +306,14 @@ def render_hours_view(user_id: int, network: str) -> tuple[str, InlineKeyboardMa
         block = next(i for i, (lo, hi) in enumerate(_HOUR_BLOCKS) if lo <= started.hour < hi)
         key = (started.weekday(), block)
         b = buckets.setdefault(key, {"net": Decimal(0), "n": 0})
-        net = (_dec(row.get("realized_pnl") or 0)
-               - abs(_dec(row.get("total_fees_paid") or 0))
-               - _dec(row.get("total_funding_paid") or 0))
+        gross, _src = session_realized_pnl(row)
+        net = gross - abs(_dec(row.get("total_fees_paid") or 0))
         b["net"] = _dec(b["net"]) + net
         b["n"] = int(b["n"]) + 1
 
     lines = [
         f"📅 <b>Your Hours</b> · {esc(network.upper())}",
-        "Net session PnL by day x 4h UTC block. Your data, not a schedule",
+        "Net session PnL (gross − fees) by day x 4h UTC block. Your data, not a schedule",
         divider(),
     ]
     if not buckets:

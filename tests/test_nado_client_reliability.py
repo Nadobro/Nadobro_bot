@@ -575,35 +575,32 @@ class NadoClientPortfolioWrapperTests(unittest.IsolatedAsyncioTestCase):
             market=SimpleNamespace(),
         )
 
-    async def test_get_matches_uses_indexer_params_and_returns_dicts(self):
-        captured = {}
+    async def test_get_matches_posts_the_archive_query_and_returns_enriched_dicts(self):
+        """get_matches reads the RAW archive envelope (not the SDK model, which
+        drops product_id / timestamp / appendix) and returns plain dicts carrying
+        the product, venue time and builder id joined from ``txs``/``order``."""
+        import src.nadobro.venue.nado_client as nc
 
-        class _Params:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        class _Indexer:
-            def get_matches(self, params):
-                captured["params"] = params
-                return SimpleNamespace(matches=[SimpleNamespace(digest="0xabc", submission_idx="10")])
-
-        self.client.client.context.indexer_client = _Indexer()
-        with patch.dict(
-            sys.modules,
-            {
-                "nado_protocol.indexer_client.types.query": SimpleNamespace(
-                    IndexerMatchesParams=_Params
-                )
-            },
-        ):
+        envelope = {
+            "matches": [{"digest": "0xabc", "submission_idx": "10", "order": {"appendix": "2561"}}],
+            "txs": [{"submission_idx": "10", "timestamp": "77", "tx": {"match_orders": {"product_id": 1}}}],
+        }
+        resp = SimpleNamespace(json=lambda: envelope, status_code=200, headers={}, text="", url="u")
+        with patch.object(self.client, "_gateway_allowed", return_value=True), \
+             patch.object(nc._rest_session, "post", return_value=resp) as post:
             rows = await self.client.get_matches(product_ids=[1], idx="7", limit=50, max_time=123)
 
-        self.assertEqual(rows, [{"digest": "0xabc", "submission_idx": "10"}])
-        self.assertEqual(captured["subaccounts"], [self.client.subaccount_hex])
-        self.assertEqual(captured["product_ids"], [1])
-        self.assertEqual(captured["idx"], 7)
-        self.assertEqual(captured["limit"], 50)
-        self.assertEqual(captured["max_time"], 123)
+        self.assertEqual(
+            rows,
+            [{"digest": "0xabc", "submission_idx": "10", "order": {"appendix": "2561"},
+              "product_id": 1, "timestamp": 77, "builder_id": 0}],
+        )
+        self.assertEqual(
+            post.call_args.kwargs["json"],
+            {"matches": {"subaccounts": [self.client.subaccount_hex], "limit": 50,
+                         "product_ids": [1], "idx": "7", "max_time": 123}},
+        )
+        self.assertEqual(post.call_args.args[0], self.client._archive_url())
 
     async def test_get_interest_and_funding_payments_flattens_payment_types(self):
         captured = {}

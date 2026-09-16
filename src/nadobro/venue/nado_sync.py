@@ -586,6 +586,14 @@ async def sync_user(
             balance_cached = isinstance(balance, dict) and bool(balance.get("_cached"))
             venue_throttled = bool(balance_cached or open_orders_unknown or summary_throttled)
 
+            # Venue position windows (archive ``positions``): the venue's own
+            # per-position ledger behind Realized PnL, History and per-session
+            # Performance. Newest 25 every round (weight 4 on the archive lane),
+            # 200 on the heavy pass; DENIED (None) keeps the rows we have.
+            venue_windows = await run_blocking_sdk(
+                _fetch_venue_positions, client, network, bool(need_heavy),
+            )
+
             if need_heavy:
                 matches, funding = await asyncio.gather(
                     client.get_matches(limit=200),
@@ -612,6 +620,17 @@ async def sync_user(
                 except Exception:  # a backfill hiccup must never break the sync
                     logger.debug("match ledger backfill skipped user=%s network=%s",
                                  user_id, network, exc_info=True)
+                # One-time walk over the fill history to stamp the venue fields
+                # (product / builder id / fill time) the SDK model dropped, and
+                # a backward page-in of older venue position windows.
+                try:
+                    await _stamp_older_fills(client, int(user_id), network)
+                except Exception:  # policy: degrade-ok(best-effort; resumes next heavy pass)
+                    logger.debug("venue fill stamp pass skipped user=%s", user_id, exc_info=True)
+                try:
+                    await _backfill_venue_positions(client, int(user_id), network)
+                except Exception:  # policy: degrade-ok(best-effort; resumes next heavy pass)
+                    logger.debug("venue positions backfill skipped user=%s", user_id, exc_info=True)
             else:
                 matches = list(prior.get("matches") or [])
                 funding = list(prior.get("funding_payments") or [])
@@ -637,6 +656,8 @@ async def sync_user(
                 "open_orders": all_orders,
                 "open_orders_unknown": open_orders_unknown,
                 "open_orders_scope": open_orders_scope,
+                "venue_positions": venue_windows,
+                "heavy_pass": bool(need_heavy),
                 "matches": matches or [],
                 "funding_payments": funding or [],
                 "stats": stats,
@@ -662,6 +683,144 @@ async def sync_user(
             _snapshot_cache[key] = deepcopy(stale)
             await run_blocking_db(_write_sync_log_error, int(user_id), network, int((time.perf_counter() - started) * 1000), str(exc))
             return stale
+
+
+_VENUE_POSITIONS_LIGHT_LIMIT = 25
+_VENUE_POSITIONS_HEAVY_LIMIT = 200
+_VENUE_POSITIONS_BACKFILL_PAGE = 500
+_VENUE_POSITIONS_BACKFILL_PAGES = 2
+_FILL_STAMP_PAGE = 500
+_FILL_STAMP_PAGES = 2
+
+
+def _fetch_venue_positions(client: Any, network: str, heavy: bool) -> list[dict[str, Any]] | None:
+    """Newest venue position windows for the client's parent subaccount (isolated
+    children are folded in by the venue). ``None`` when the archive could not be
+    read (DENIED-vs-EMPTY) so the writer keeps the rows it has."""
+    sub = getattr(client, "subaccount_hex", None)
+    if not sub:
+        return None
+    from src.nadobro.venue.nado_archive import ArchiveReadUnavailable, query_positions
+
+    try:
+        rows = query_positions(
+            network, sub,
+            limit=_VENUE_POSITIONS_HEAVY_LIMIT if heavy else _VENUE_POSITIONS_LIGHT_LIMIT,
+        )
+    except ArchiveReadUnavailable:
+        return None
+    except Exception:  # policy: degrade-ok(read failure = unknown this round)
+        logger.debug("venue positions read failed", exc_info=True)
+        return None
+    for r in rows:
+        try:
+            from src.nadobro.config import get_product_name
+            r["product_name"] = get_product_name(int(r.get("product_id") or 0), network=network)
+        except Exception:  # policy: degrade-ok(name is display-only)
+            r["product_name"] = None
+    return rows
+
+
+async def _backfill_venue_positions(client: Any, user_id: int, network: str) -> None:
+    """Page older venue position windows in once (newest -> oldest), a few pages
+    per heavy pass, with a persisted cursor. Idempotent upserts."""
+    from src.nadobro.models.database import (
+        get_bot_state,
+        get_venue_positions_oldest_open_id,
+        set_bot_state,
+        upsert_venue_positions,
+    )
+    from src.nadobro.venue.nado_archive import ArchiveReadUnavailable, query_positions
+
+    sub = getattr(client, "subaccount_hex", None)
+    if not sub:
+        return
+    key = f"venue_positions_backfill:{network}:{int(user_id)}"
+    state = await run_blocking_db(get_bot_state, key) or {}
+    if state.get("done"):
+        return
+    cursor = _safe_idx(state.get("oldest_idx"))
+    if cursor is None:
+        oldest = await run_blocking_db(get_venue_positions_oldest_open_id, int(user_id), network)
+        if oldest is None:
+            return                              # nothing synced yet; the round fetch seeds it
+        cursor = int(oldest)
+    done = False
+    for _ in range(_VENUE_POSITIONS_BACKFILL_PAGES):
+        next_idx = cursor - 1
+        if next_idx < 0:
+            done = True
+            break
+        try:
+            page = await run_blocking_sdk(
+                query_positions, network, sub, limit=_VENUE_POSITIONS_BACKFILL_PAGE, idx=next_idx,
+            )
+        except ArchiveReadUnavailable:
+            break                               # denied: retry next pass, never 'done'
+        except Exception:  # policy: degrade-ok(one page failure; retry next pass)
+            break
+        if not page:
+            done = True
+            break
+        for r in page:
+            try:
+                from src.nadobro.config import get_product_name
+                r["product_name"] = get_product_name(int(r.get("product_id") or 0), network=network)
+            except Exception:  # policy: degrade-ok(name is display-only)
+                r["product_name"] = None
+        await run_blocking_db(upsert_venue_positions, int(user_id), network, page)
+        ids = [int(r.get("open_id") or 0) for r in page if r.get("open_id")]
+        new_cursor = min(ids) if ids else cursor
+        if new_cursor >= cursor:
+            done = True
+            break
+        cursor = new_cursor
+        if len(page) < _VENUE_POSITIONS_BACKFILL_PAGE:
+            done = True
+            break
+    await run_blocking_db(set_bot_state, key, {"oldest_idx": cursor, "done": done})
+
+
+async def _stamp_older_fills(client: Any, user_id: int, network: str) -> None:
+    """One-time walk over the venue match history (newest -> oldest) so every
+    fill row carries the venue product / builder id / fill time — the columns
+    the SDK match model dropped. Runs through ``_write_matches`` (existing rows
+    are stamped, missing ones inserted). A few pages per heavy pass."""
+    from src.nadobro.models.database import get_bot_state, set_bot_state
+
+    key = f"venue_fill_stamp:{network}:{int(user_id)}"
+    state = await run_blocking_db(get_bot_state, key) or {}
+    if state.get("done"):
+        return
+    cursor = _safe_idx(state.get("oldest_idx"))
+    done = False
+    for _ in range(_FILL_STAMP_PAGES):
+        kwargs = {"limit": _FILL_STAMP_PAGE}
+        if cursor is not None:
+            if cursor - 1 < 0:
+                done = True
+                break
+            kwargs["idx"] = str(cursor - 1)
+        page = await client.get_matches(**kwargs)
+        if page is None:
+            break                               # denied: retry next pass
+        if not page:
+            done = True
+            break
+        await run_blocking_db(_write_matches, int(user_id), network, page)
+        ids = [i for i in (_safe_idx(m.get("submission_idx")) for m in page) if i is not None]
+        if not ids:
+            done = True
+            break
+        new_cursor = min(ids)
+        if cursor is not None and new_cursor >= cursor:
+            done = True
+            break
+        cursor = new_cursor
+        if len(page) < _FILL_STAMP_PAGE:
+            done = True
+            break
+    await run_blocking_db(set_bot_state, key, {"oldest_idx": cursor, "done": done})
 
 
 def _running_strategy_product_id(user_id: int, network: str) -> int | None:
@@ -758,36 +917,56 @@ def _write_snapshot(snapshot: dict[str, Any], duration_ms: int) -> None:
     except Exception:  # policy: degrade-ok(settlement is best-effort; a miss retries next sync)
         logger.warning("settle_closed_manual_positions failed user=%s", user_id, exc_info=True)
 
-    # Realized PnL is DERIVED position-aware from the FULL trades history (this
-    # venue reports none per-fill, so the snapshot's per-fill sum was always 0).
-    # Recompute it here — off the event loop, AFTER _write_matches has persisted
-    # the latest fills — and overwrite the always-zero pnl fields on the in-memory
-    # ``stats`` so the portfolio deck's Realized line reflects real round trips.
-    # Volume/fees windows stay as computed from the venue x18 columns.
+    # Venue position windows (archive ``positions``): persist, attribute to the
+    # session that OPENED each window, and take realized PnL from them. The old
+    # fill replay (average-cost pairing over a holey ledger) fabricated numbers:
+    # on 2026-09-16 it showed -$161.36 for a day the venue booked +$10.50.
+    venue_windows = snapshot.pop("venue_positions", None)
     try:
-        from src.nadobro.models.database import (
-            get_account_realized_pnl_windows,
-            get_analytics_fills,
-        )
-        from src.nadobro.quant.user_analytics import aggregate_user_analytics
+        from src.nadobro.models.database import attribute_venue_positions, upsert_venue_positions
 
-        realized = get_account_realized_pnl_windows(user_id, network)
+        if venue_windows:
+            upsert_venue_positions(user_id, network, venue_windows)
+        attribute_venue_positions(user_id, network)
+    except Exception:  # policy: degrade-ok(ledger write is best-effort; next round retries)
+        logger.warning("venue positions write failed user=%s network=%s", user_id, network, exc_info=True)
+    if snapshot.get("heavy_pass"):
+        try:
+            from src.nadobro.models.database import backfill_via_nadobro
+            backfill_via_nadobro(network, limit=2000)
+        except Exception:  # policy: degrade-ok(stamping is best-effort)
+            pass
+
+    try:
+        from src.nadobro.models.database import get_analytics_fills, get_venue_pnl_windows
+        from src.nadobro.quant.user_analytics import aggregate_user_analytics, our_builder_id
+
         stats = snapshot.get("stats")
-        if isinstance(stats, dict) and realized:
-            stats["pnl_windows"] = realized["pnl_windows"]
-            stats["total_pnl"] = realized["total_pnl"]
-            stats["wins"] = realized["wins"]
-            stats["losses"] = realized["losses"]
-            stats["win_rate"] = realized["win_rate"]
+        venue_pnl = get_venue_pnl_windows(user_id, network)
+        if isinstance(stats, dict):
+            if venue_pnl:
+                stats["pnl_windows"] = venue_pnl["pnl_windows"]
+                stats["total_pnl"] = venue_pnl["pnl_windows"]["all"]
+                stats["wins"] = venue_pnl["wins"]
+                stats["losses"] = venue_pnl["losses"]
+                decisive = venue_pnl["wins"] + venue_pnl["losses"]
+                stats["win_rate"] = (Decimal(venue_pnl["wins"]) / Decimal(decisive) * Decimal(100)) if decisive else Decimal(0)
+                stats["realized_source"] = "venue"
+            else:
+                # No venue windows yet (first sync after deploy, or the read was
+                # denied every round): say so rather than show a replayed guess.
+                stats["realized_source"] = "pending"
 
-        # Volume / fees / funding must come from the SAME complete ledger as
-        # realized PnL. They used to be aggregated from the transient
-        # get_matches(limit=200) list, which produced "Volume $0.00" next to
-        # "Realized +$16.73" and capped the All-time window at 200 fills.
+        # Volume / fees must come from the SAME complete ledger. They used to be
+        # aggregated from the transient get_matches(limit=200) list, which
+        # produced "Volume $0.00" next to "Realized +$16.73" and capped the
+        # All-time window at 200 fills.
         if isinstance(stats, dict):
             ledger = get_analytics_fills(user_id, network)
             if ledger:
-                analytics = aggregate_user_analytics(ledger, funding)
+                analytics = aggregate_user_analytics(
+                    ledger, funding, venue_pnl=venue_pnl or None, builder_id=our_builder_id(network),
+                )
                 stats["analytics"] = analytics
                 stats["volume_windows"] = {
                     w: v["total_usd"] for w, v in analytics["nado_volume"].items()
@@ -1009,8 +1188,17 @@ def _write_matches(user_id: int, network: str, matches: list[dict[str, Any]]) ->
             continue
         order = match.get("order") or {}
         product_id = match.get("product_id") or order.get("product_id") or 0
-        row = query_one(f"SELECT id FROM {table} WHERE submission_idx = %s LIMIT 1", (submission_idx,))
+        row = query_one(
+            f"SELECT id, product_id, builder_id FROM {table} WHERE submission_idx = %s LIMIT 1",
+            (submission_idx,),
+        )
         if row:
+            # Already in the ledger. Fill in what the SDK match model used to
+            # drop — product (was 0 for every Nado-UI fill), builder id, venue
+            # builder fee, venue fill time — so the stamp pass over old history
+            # repairs the volume/attribution figures without re-inserting.
+            if int(row.get("product_id") or 0) == 0 or row.get("builder_id") is None:
+                _stamp_venue_fields_on_row(network, int(row["id"]), match, product_id)
             continue
         base_x18 = _x18_field(match, "base_filled", "base_filled_x18")
         quote_x18 = _x18_field(match, "quote_filled", "quote_filled_x18")
@@ -1331,6 +1519,7 @@ def _write_matches(user_id: int, network: str, matches: list[dict[str, Any]]) ->
                     (submission_idx, f"{fee_h:f}", fee_x18, base_x18, quote_x18,
                      insert_pid, insert_pname, session_id, _placeholder["id"]),
                 )
+                _stamp_venue_fields_on_row(network, int(_placeholder["id"]), match, insert_pid)
                 if session_id:
                     touched_sessions.add(int(session_id))
                 continue
@@ -1342,9 +1531,9 @@ def _write_matches(user_id: int, network: str, matches: list[dict[str, Any]]) ->
               fill_size, price, fill_price, fill_fee, status,
               submission_idx, isolated, realized_pnl_x18, fee_x18, base_filled_x18, quote_filled_x18,
               order_digest, strategy_session_id, source, via_nadobro,
-              filled_at, created_at, leverage
+              filled_at, created_at, builder_id, builder_fee_x18, leverage
             )
-            VALUES (%s, %s, %s, 'match', %s, %s, %s, %s, %s, %s, 'filled', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s)
+            VALUES (%s, %s, %s, 'match', %s, %s, %s, %s, %s, %s, 'filled', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s, %s, %s)
             """,
             (
                 user_id,
@@ -1374,9 +1563,14 @@ def _write_matches(user_id: int, network: str, matches: list[dict[str, Any]]) ->
                 # 'manual', conflating bot trades with Nado-UI trades.
                 bool(intent_found),
                 _timestamp_or_now(match.get("timestamp")),
-                # Appended last so the existing positional params keep their
-                # indices (nado_sync tests assert by position). Real venue
-                # leverage from the positions table, or NULL when unknown.
+                # Venue routing signal (2026-09-16): the builder id from the
+                # order appendix and the venue builder fee. NULL when the match
+                # came without an order/appendix (legacy SDK shape).
+                _builder_id_of(match),
+                _x18_or_none(match, "builder_fee", "builder_fee_x18"),
+                # Kept LAST so the existing positional params keep their indices
+                # (nado_sync tests assert by position, leverage at [-1]). Real
+                # venue leverage from the positions table, or NULL when unknown.
                 fill_leverage,
             ),
         )
@@ -1407,6 +1601,47 @@ def _write_matches(user_id: int, network: str, matches: list[dict[str, Any]]) ->
         except Exception:  # noqa: BLE001 - re-rollup is best-effort, never break sync
             logger.debug("post-sync session re-rollup failed sid=%s", _sid, exc_info=True)
     return inserted
+
+
+def _builder_id_of(match: dict[str, Any]) -> int | None:
+    raw = match.get("builder_id")
+    if raw is None:
+        order = match.get("order") or {}
+        if isinstance(order, dict) and order.get("appendix") is not None:
+            from src.nadobro.venue.nado_archive import builder_id_from_appendix
+            return builder_id_from_appendix(order.get("appendix"))
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _x18_or_none(match: dict[str, Any], human_key: str, x18_key: str) -> str | None:
+    if match.get(human_key) is None and match.get(x18_key) is None:
+        return None
+    try:
+        return _x18_field(match, human_key, x18_key)
+    except Exception:  # policy: degrade-ok(a malformed fee leaves the column NULL)
+        return None
+
+
+def _stamp_venue_fields_on_row(network: str, row_id: int, match: dict[str, Any], product_id: Any) -> None:
+    """Best-effort write of the venue-authoritative fields onto an existing fill."""
+    try:
+        from src.nadobro.models.database import stamp_fill_venue_fields
+
+        pid = int(product_id or 0) or None
+        ts = match.get("timestamp")
+        stamp_fill_venue_fields(
+            network, int(row_id),
+            product_id=pid,
+            builder_id=_builder_id_of(match),
+            builder_fee_x18=_x18_or_none(match, "builder_fee", "builder_fee_x18"),
+            filled_at=_timestamp_or_now(ts) if ts is not None else None,
+        )
+    except Exception:  # policy: degrade-ok(stamping is best-effort; the next sync retries)
+        logger.debug("venue field stamp failed row=%s", row_id, exc_info=True)
 
 
 def _maybe_increment_session_win_loss(session_id: int | None, pnl_x18: str) -> None:

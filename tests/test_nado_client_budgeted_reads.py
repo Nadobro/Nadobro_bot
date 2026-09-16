@@ -31,14 +31,15 @@ def test_a_json_rate_limit_body_on_the_rest_path_is_recorded():
     c = _client()
     resp = SimpleNamespace(json=lambda: {"status": "failure", "error_code": 1000, "error": "Too Many Requests"},
                            status_code=200, headers={}, text="", url="u")
-    recorded: list = []
     with mock.patch.object(NadoClient, "_gateway_allowed", return_value=True), \
          mock.patch.object(NadoClient, "_gateway_release", return_value=None), \
-         mock.patch.object(NadoClient, "_record_gateway_error", side_effect=lambda e: recorded.append(str(e))), \
+         mock.patch("src.nadobro.venue.gateway_budget.record_gateway_failure") as rec, \
          mock.patch.object(nc._rest_session, "get", return_value=resp):
         data = c._query_rest("status")
     assert data["status"] == "failure"
-    assert recorded and "error_code=1000" in recorded[0]
+    assert rec.called
+    assert str(rec.call_args.args[0]).startswith(c._rest_url())     # recorded on the GATEWAY host
+    assert "error_code=1000" in str(rec.call_args.args[1])
 
 
 def test_payload_recogniser():

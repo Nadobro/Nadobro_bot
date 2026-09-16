@@ -1738,6 +1738,307 @@ def get_account_realized_pnl_windows(user_id: int, network: str, now=None) -> di
     return realized_pnl_windows_from_rows(rows, now=now)
 
 
+# ---------------------------------------------------------------------------
+# Venue position windows (archive ``positions``): realized PnL, history and
+# per-session results straight from the venue's own ledger (2026-09-16).
+# ---------------------------------------------------------------------------
+
+def upsert_venue_positions(user_id: int, network: str, rows: list[dict]) -> int:
+    """Insert or refresh venue position windows (keyed by product/isolated/open_id).
+    Windows are venue facts: an existing row is updated in place (an OPEN window
+    keeps changing until it closes), attribution columns are preserved."""
+    n = 0
+    for r in rows or []:
+        try:
+            pid = int(r.get("product_id") or 0)
+            open_id = int(r.get("open_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0 or open_id <= 0:
+            continue
+
+        def _ts(v):
+            try:
+                v = int(v or 0)
+            except (TypeError, ValueError):
+                return None
+            return datetime.fromtimestamp(v, tz=timezone.utc) if v > 0 else None
+
+        try:
+            execute(
+                """
+                INSERT INTO venue_positions (
+                  user_id, network, subaccount, product_id, product_name, isolated, is_long,
+                  open_id, close_id, submission_idx, amount, max_amount, total_open_amount,
+                  total_close_amount, avg_entry_price, avg_exit_price, liquidated_amount,
+                  open_fee, close_fee, realized_pnl, net_funding, net_interest,
+                  open_ts, update_ts, open_reason, close_reason, open_digest, close_digest,
+                  is_open, synced_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (user_id, network, product_id, isolated, open_id) DO UPDATE SET
+                  close_id = EXCLUDED.close_id, submission_idx = EXCLUDED.submission_idx,
+                  amount = EXCLUDED.amount, max_amount = EXCLUDED.max_amount,
+                  total_open_amount = EXCLUDED.total_open_amount,
+                  total_close_amount = EXCLUDED.total_close_amount,
+                  avg_entry_price = EXCLUDED.avg_entry_price, avg_exit_price = EXCLUDED.avg_exit_price,
+                  liquidated_amount = EXCLUDED.liquidated_amount,
+                  open_fee = EXCLUDED.open_fee, close_fee = EXCLUDED.close_fee,
+                  realized_pnl = EXCLUDED.realized_pnl, net_funding = EXCLUDED.net_funding,
+                  net_interest = EXCLUDED.net_interest, update_ts = EXCLUDED.update_ts,
+                  close_reason = EXCLUDED.close_reason, close_digest = EXCLUDED.close_digest,
+                  is_open = EXCLUDED.is_open, product_name = COALESCE(EXCLUDED.product_name, venue_positions.product_name),
+                  synced_at = now()
+                """,
+                (
+                    int(user_id), network, r.get("subaccount"), pid, r.get("product_name"),
+                    bool(r.get("isolated")), r.get("is_long"),
+                    open_id, r.get("close_id"), r.get("submission_idx"),
+                    str(r.get("amount") or 0), str(r.get("max_amount") or 0),
+                    str(r.get("total_open_amount") or 0), str(r.get("total_close_amount") or 0),
+                    str(r.get("avg_entry_price") or 0), str(r.get("avg_exit_price") or 0),
+                    str(r.get("liquidated_amount") or 0),
+                    str(r.get("open_fee") or 0), str(r.get("close_fee") or 0),
+                    str(r.get("realized_pnl") or 0), str(r.get("net_funding") or 0),
+                    str(r.get("net_interest") or 0),
+                    _ts(r.get("open_ts")), _ts(r.get("update_ts")),
+                    r.get("open_reason"), r.get("close_reason"),
+                    r.get("open_digest"), r.get("close_digest"),
+                    bool(r.get("is_open")),
+                ),
+            )
+            n += 1
+        except Exception:  # policy: degrade-ok(one bad window must not stop the ledger write; logged by execute)
+            continue
+    return n
+
+
+def attribute_venue_positions(user_id: int, network: str) -> None:
+    """Attribute unattributed windows to the strategy session that OPENED them
+    (the opening order's digest is a fill of that session), then to the single
+    session active on that product when the window opened, else 'manual'
+    (only once the window is closed and old enough for late fills to have
+    synced). Then refresh each touched session's venue totals."""
+    table = _trades_table(network)
+    execute(
+        f"""
+        UPDATE venue_positions v
+           SET strategy_session_id = t.strategy_session_id,
+               source = COALESCE(t.source, 'strategy'),
+               attributed_by = 'open_digest'
+          FROM (
+            SELECT DISTINCT ON (lower(order_digest)) lower(order_digest) AS d, strategy_session_id, source
+              FROM {table}
+             WHERE user_id = %s AND order_digest IS NOT NULL AND strategy_session_id IS NOT NULL
+             ORDER BY lower(order_digest), id
+          ) t
+         WHERE v.user_id = %s AND v.network = %s AND v.strategy_session_id IS NULL
+           AND v.open_digest IS NOT NULL AND t.d = v.open_digest
+        """,
+        (int(user_id), int(user_id), network),
+    )
+    execute(
+        f"""
+        UPDATE venue_positions v
+           SET source = COALESCE(t.source, 'manual'), attributed_by = 'open_digest'
+          FROM (
+            SELECT DISTINCT ON (lower(order_digest)) lower(order_digest) AS d, source
+              FROM {table}
+             WHERE user_id = %s AND order_digest IS NOT NULL AND strategy_session_id IS NULL
+             ORDER BY lower(order_digest), id
+          ) t
+         WHERE v.user_id = %s AND v.network = %s AND v.strategy_session_id IS NULL AND v.source IS NULL
+           AND v.open_digest IS NOT NULL AND t.d = v.open_digest
+        """,
+        (int(user_id), int(user_id), network),
+    )
+    execute(
+        """
+        UPDATE venue_positions v
+           SET strategy_session_id = m.sid, source = 'strategy', attributed_by = 'session_window'
+          FROM (
+            SELECT v2.id AS vid,
+                   (SELECT s.id FROM strategy_sessions s
+                     WHERE s.user_id = v2.user_id AND s.network = v2.network
+                       AND s.product_id = v2.product_id
+                       AND s.started_at <= v2.open_ts
+                       AND COALESCE(s.stopped_at, now()) >= v2.open_ts
+                     ORDER BY s.started_at DESC LIMIT 1) AS sid,
+                   (SELECT count(*) FROM strategy_sessions s
+                     WHERE s.user_id = v2.user_id AND s.network = v2.network
+                       AND s.product_id = v2.product_id
+                       AND s.started_at <= v2.open_ts
+                       AND COALESCE(s.stopped_at, now()) >= v2.open_ts) AS n
+              FROM venue_positions v2
+             WHERE v2.user_id = %s AND v2.network = %s AND v2.strategy_session_id IS NULL
+               AND v2.source IS NULL AND v2.open_ts IS NOT NULL
+          ) m
+         WHERE v.id = m.vid AND m.n = 1 AND m.sid IS NOT NULL
+        """,
+        (int(user_id), network),
+    )
+    execute(
+        """
+        UPDATE venue_positions
+           SET source = 'manual', attributed_by = 'default'
+         WHERE user_id = %s AND network = %s AND strategy_session_id IS NULL AND source IS NULL
+           AND is_open = false AND update_ts < now() - interval '10 minutes'
+        """,
+        (int(user_id), network),
+    )
+    execute(
+        """
+        UPDATE strategy_sessions s
+           SET venue_realized_pnl = agg.pnl, venue_trade_count = agg.n
+          FROM (
+            SELECT strategy_session_id AS sid, SUM(realized_pnl) AS pnl, COUNT(*) AS n
+              FROM venue_positions
+             WHERE user_id = %s AND network = %s AND strategy_session_id IS NOT NULL
+             GROUP BY strategy_session_id
+          ) agg
+         WHERE s.id = agg.sid AND s.user_id = %s
+        """,
+        (int(user_id), network, int(user_id)),
+    )
+
+
+def get_venue_positions(
+    user_id: int, network: str, *, limit: int = 200, offset: int = 0,
+    session_id: int | None = None, include_open: bool = True,
+) -> list[dict]:
+    """Venue position windows newest first (by last change), joined with the
+    owning session's strategy label. ``[]`` on any error."""
+    where = "v.user_id = %s AND v.network = %s"
+    params: list = [int(user_id), network]
+    if session_id is not None:
+        where += " AND v.strategy_session_id = %s"
+        params.append(int(session_id))
+    if not include_open:
+        where += " AND v.is_open = false"
+    params.extend([int(limit), int(offset)])
+    try:
+        return query_all(
+            f"""
+            SELECT v.*, s.strategy AS session_strategy, s.product_name AS session_product
+              FROM venue_positions v
+              LEFT JOIN strategy_sessions s ON s.id = v.strategy_session_id
+             WHERE {where}
+             ORDER BY v.update_ts DESC NULLS LAST, v.open_id DESC
+             LIMIT %s OFFSET %s
+            """,
+            tuple(params),
+        )
+    except Exception:
+        return []
+
+
+def get_venue_position(user_id: int, network: str, row_id: int) -> Optional[dict]:
+    try:
+        return query_one(
+            """
+            SELECT v.*, s.strategy AS session_strategy
+              FROM venue_positions v
+              LEFT JOIN strategy_sessions s ON s.id = v.strategy_session_id
+             WHERE v.id = %s AND v.user_id = %s AND v.network = %s
+            """,
+            (int(row_id), int(user_id), network),
+        )
+    except Exception:
+        return None
+
+
+def count_venue_positions(user_id: int, network: str, *, session_id: int | None = None) -> int:
+    where = "user_id = %s AND network = %s"
+    params: list = [int(user_id), network]
+    if session_id is not None:
+        where += " AND strategy_session_id = %s"
+        params.append(int(session_id))
+    try:
+        row = query_one(f"SELECT count(*) AS n FROM venue_positions WHERE {where}", tuple(params))
+        return int((row or {}).get("n") or 0)
+    except Exception:
+        return 0
+
+
+def get_venue_positions_oldest_open_id(user_id: int, network: str) -> Optional[int]:
+    try:
+        row = query_one(
+            "SELECT MIN(open_id) AS oldest FROM venue_positions WHERE user_id = %s AND network = %s",
+            (int(user_id), network),
+        )
+        val = (row or {}).get("oldest")
+        return int(val) if val is not None else None
+    except Exception:
+        return None
+
+
+def get_venue_pnl_windows(user_id: int, network: str) -> dict:
+    """Realized PnL per window from the venue position ledger, bucketed by the
+    window's last change (its close for a closed window). Wins/losses count
+    CLOSED windows. ``{}`` when the user has no windows yet (so the caller can
+    show 'syncing' instead of a fabricated number) or on error."""
+    try:
+        row = query_one(
+            """
+            SELECT COUNT(*) AS n,
+                   COALESCE(SUM(realized_pnl) FILTER (WHERE update_ts > now() - interval '24 hours'), 0) AS p24,
+                   COALESCE(SUM(realized_pnl) FILTER (WHERE update_ts > now() - interval '7 days'), 0) AS p7,
+                   COALESCE(SUM(realized_pnl) FILTER (WHERE update_ts > now() - interval '30 days'), 0) AS p30,
+                   COALESCE(SUM(realized_pnl), 0) AS pall,
+                   COUNT(*) FILTER (WHERE is_open = false AND realized_pnl > 0) AS wins,
+                   COUNT(*) FILTER (WHERE is_open = false AND realized_pnl < 0) AS losses,
+                   COUNT(*) FILTER (WHERE is_open = false AND realized_pnl > 0 AND update_ts > now() - interval '24 hours') AS wins_24h,
+                   COUNT(*) FILTER (WHERE is_open = false AND realized_pnl < 0 AND update_ts > now() - interval '24 hours') AS losses_24h,
+                   COUNT(*) FILTER (WHERE is_open = false AND realized_pnl > 0 AND update_ts > now() - interval '7 days') AS wins_7d,
+                   COUNT(*) FILTER (WHERE is_open = false AND realized_pnl < 0 AND update_ts > now() - interval '7 days') AS losses_7d,
+                   COUNT(*) FILTER (WHERE is_open = false AND realized_pnl > 0 AND update_ts > now() - interval '30 days') AS wins_30d,
+                   COUNT(*) FILTER (WHERE is_open = false AND realized_pnl < 0 AND update_ts > now() - interval '30 days') AS losses_30d
+              FROM venue_positions
+             WHERE user_id = %s AND network = %s
+            """,
+            (int(user_id), network),
+        )
+    except Exception:
+        return {}
+    if not row or int(row.get("n") or 0) == 0:
+        return {}
+    dec = lambda v: Decimal(str(v or 0))  # noqa: E731
+    return {
+        "count": int(row.get("n") or 0),
+        "pnl_windows": {"24h": dec(row.get("p24")), "7d": dec(row.get("p7")), "30d": dec(row.get("p30")), "all": dec(row.get("pall"))},
+        "wins": int(row.get("wins") or 0),
+        "losses": int(row.get("losses") or 0),
+        "wins_windows": {"24h": int(row.get("wins_24h") or 0), "7d": int(row.get("wins_7d") or 0), "30d": int(row.get("wins_30d") or 0), "all": int(row.get("wins") or 0)},
+        "losses_windows": {"24h": int(row.get("losses_24h") or 0), "7d": int(row.get("losses_7d") or 0), "30d": int(row.get("losses_30d") or 0), "all": int(row.get("losses") or 0)},
+    }
+
+
+def stamp_fill_venue_fields(
+    network: str, row_id: int, *, product_id: int | None, builder_id: int | None,
+    builder_fee_x18: str | int | None, filled_at=None,
+) -> None:
+    """Write the venue-authoritative fields the SDK match model used to drop
+    onto an existing fill row: the product (was 0 for every Nado-UI fill),
+    the builder id from the order appendix, the venue builder fee, and the
+    venue fill time. Only fills in missing values — never overwrites real ones."""
+    table = _trades_table(network)
+    try:
+        execute(
+            f"""
+            UPDATE {table}
+               SET product_id = CASE WHEN COALESCE(product_id, 0) = 0 AND %s IS NOT NULL THEN %s ELSE product_id END,
+                   builder_id = COALESCE(builder_id, %s),
+                   builder_fee_x18 = COALESCE(builder_fee_x18, %s),
+                   filled_at = CASE WHEN %s IS NOT NULL AND (filled_at IS NULL OR filled_at = created_at) THEN %s ELSE filled_at END
+             WHERE id = %s
+            """,
+            (product_id, product_id, builder_id, builder_fee_x18, filled_at, filled_at, int(row_id)),
+        )
+    except Exception:  # policy: degrade-ok(stamping is best-effort; the next sync retries)
+        pass
+
+
 def get_analytics_fills(user_id: int, network: str) -> list[dict]:
     """Every venue-confirmed fill for a user — the COMPLETE ledger behind the
     portfolio analytics (volume / fees / realized PnL).
@@ -1750,6 +2051,11 @@ def get_analytics_fills(user_id: int, network: str) -> list[dict]:
     Deduped per ``submission_idx`` (unique per match — verified on mainnet), so
     the bot's synthetic close rows and duplicate recorder rows never
     double-count. ``[]`` on any error so the deck never raises.
+
+    Product-less fills (``product_id = 0``) are INCLUDED: they are real venue
+    fills (every Nado-UI trade synced through the SDK match model landed
+    without a product, 1,700+ rows on one account) and excluding them
+    under-counted Nado volume and fees on every window (2026-09-16).
     """
     table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
     try:
@@ -1760,11 +2066,11 @@ def get_analytics_fills(user_id: int, network: str) -> list[dict]:
                    fill_size, size, fill_price, price,
                    base_filled_x18, quote_filled_x18, fee_x18,
                    fill_fee, fees, builder_fee, via_nadobro,
+                   builder_id, builder_fee_x18, strategy_session_id, source,
                    COALESCE(filled_at, created_at) AS filled_at
             FROM {table}
             WHERE user_id = %s
               AND submission_idx IS NOT NULL
-              AND COALESCE(product_id, 0) <> 0
               AND status IN ('filled', 'closed', 'partially_filled')
             ORDER BY submission_idx, COALESCE(filled_at, created_at), id
             """,
