@@ -34,7 +34,7 @@ class _Client:
             "isolated_positions": [],
         }
 
-    def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False):
+    def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False, product_ids=None):
         self.include_isolated_flags.append(include_isolated)
         return [{"product_id": 1, "product_name": "BTC", "digest": "0xabc", "amount": "1", "price": "100"}]
 
@@ -987,7 +987,7 @@ class DeniedOpenOrdersSweepTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_denied_open_orders_read_keeps_the_last_known_list_and_flags_unknown(self):
         class DeniedOrdersClient(_Client):
-            def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False):
+            def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False, product_ids=None):
                 return None            # unreadable this round — NOT an empty book
 
         prior_orders = [{"product_id": 1, "product_name": "BTC", "digest": "0xlive", "amount": "1", "price": "100"}]
@@ -1035,7 +1035,7 @@ class UnknownOrdersAreThrottledFreshnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_unknown_open_orders_round_is_flagged_throttled_and_keeps_last_sync(self):
         class DeniedOrdersClient(_Client):
-            def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False):
+            def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False, product_ids=None):
                 return None
 
         prior_sync = datetime(2026, 1, 1, tzinfo=timezone.utc)
