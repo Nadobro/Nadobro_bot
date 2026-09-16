@@ -59,6 +59,11 @@ except RuntimeError as e:
     logger.error(str(e))
     sys.exit(1)
 
+# Build stamp (Dockerfile ARG GIT_SHA -> NADOBRO_GIT_SHA): the one line that says
+# which commit is actually running. "unknown" means the image was built without
+# `--build-arg GIT_SHA=$(git rev-parse HEAD)` — see deploy.md.
+logger.info("Build: NADOBRO_GIT_SHA=%s", os.environ.get("NADOBRO_GIT_SHA", "unknown"))
+
 
 def check_config():
     transport_mode, webhook_url, webhook_path = _resolve_transport_settings()

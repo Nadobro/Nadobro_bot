@@ -65,7 +65,7 @@ fly secrets set TELEGRAM_TRANSPORT="polling"
 ## Step 4: Deploy
 
 ```bash
-fly deploy
+fly deploy --build-arg GIT_SHA=$(git rev-parse HEAD)
 ```
 
 This builds the Docker image and deploys it to the Amsterdam region.
@@ -83,7 +83,7 @@ You should see the bot starting in either polling or webhook mode, depending on 
 After making code changes in Replit:
 
 1. Download your updated files (or push to GitHub)
-2. Run `fly deploy` from the project directory
+2. Run `fly deploy --build-arg GIT_SHA=$(git rev-parse HEAD)` from the project directory (from a COMMITTED tree — the boot log prints `Build: NADOBRO_GIT_SHA=<sha>` so the running build can be matched to a commit)
 
 If using GitHub, you can set up auto-deploy:
 ```bash
