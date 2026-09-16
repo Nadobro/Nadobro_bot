@@ -295,3 +295,153 @@ def resolve_step_quote(
         capped=capped,
         floored=floored,
     )
+
+
+# ---------------------------------------------------------------------------
+# TRIGGER REVERSE GRID — the ONE plan the engine mapping AND the pre-start card
+# both derive from. The trigger ladder arms ``levels`` venue price-trigger rungs
+# on EACH side of the anchor (2 x levels pending triggers while flat), fills every
+# rung as a TAKER (a fired trigger crosses the book), and manages one venue
+# reduce-only stop that trails. Everything money-relevant about it is decided by
+# the four numbers below, so they are derived in one place:
+#
+#   step        rung spacing: the user's spread floored at REVGRID_STEP_FLOOR (the
+#               Aug-2026 real-tape sweep: ~15-25bp is the viable zone; 10bp bled chop)
+#   levels      rungs PER SIDE, capped at REVGRID_MAX_LEVELS: Nado allows at most 25
+#               PENDING trigger orders per product per subaccount (docs, trigger
+#               service rate limits). A flat ladder is 2 x levels, so 12 is the most
+#               that fits (24) with room for the reduce-only stop while in a position
+#               (levels-1 same-side rungs + 1 stop); 20 levels asked for 40 rungs and
+#               the venue rejected the 26th+ (prod session 292: exactly 25 placed).
+#   stop        protective distance from the average entry: 2 x step by default
+#               (floored at the taker round trip), or the user's own rgrid_stop_pct
+#   trail       favourable excursion that arms the trailing stop, and the giveback it
+#               trails by: 2 x step by default (the stop sits at ~breakeven the moment
+#               it arms and ratchets into profit), or the user's own rgrid_trail_pct
+#
+# The per-rung notional is ``resolve_step_quote`` against ``levels``, with the
+# stop-budget PRICE bound sized on the trigger geometry (``step_band_frac(step)``),
+# so a full pyramid reaching its own stop stays inside the session stop budget.
+# The card used to size this off the RAW spread and the legacy reset threshold
+# while the engine floored the step and ignored the reset — the card quoted
+# $186.57/rung where the engine placed $119.62 (prod 2026-08-30 config). One
+# function, one number, both callers.
+# ---------------------------------------------------------------------------
+
+# Validation-derived rung spacing floor (15bp); a user's wider spread is honoured.
+REVGRID_STEP_FLOOR = Decimal("0.0015")
+# How far THROUGH its level a fired entry rung may fill (its IOC price bound), and
+# how far through the stop level the reduce-only stop close is priced. ONE source
+# for the controller (its defaults) and the stop-budget sizing below: the bound
+# the budget covers must be the bound the orders actually carry.
+REVGRID_ENTRY_SLIP = Decimal("0.0015")   # 15bp
+REVGRID_STOP_SLIP = Decimal("0.005")     # 50bp (the rail's venue stop uses the same)
+# Venue limit: 25 pending trigger orders per product per subaccount.
+REVGRID_VENUE_MAX_PENDING_TRIGGERS = 25
+# Rungs per side that fit the venue limit while flat (2 x 12 = 24 <= 25).
+REVGRID_MAX_LEVELS = 12
+
+
+@dataclass(frozen=True)
+class TriggerLadderPlan:
+    """The resolved trigger-ladder geometry + per-rung size."""
+    step_pct: Decimal            # rung spacing, as a fraction of price
+    levels: int                  # rungs per side actually armed (capped)
+    levels_requested: int        # what the user asked for
+    stop_pct: Decimal            # protective stop distance from avg entry
+    trail_arm_pct: Decimal       # favourable excursion that arms the trail
+    trail_giveback_pct: Decimal  # distance the trailing stop sits behind the extreme
+    sizing: StepPlan             # per-rung notional and why
+    step_floored: bool           # the user's spread was below REVGRID_STEP_FLOOR
+    stop_is_auto: bool           # stop derived from the step (no user override)
+    trail_is_auto: bool          # trail derived from the step (no user override)
+
+    @property
+    def rung_quote(self) -> Decimal:
+        return self.sizing.step
+
+    @property
+    def levels_capped(self) -> bool:
+        return self.levels < self.levels_requested
+
+    @property
+    def pending_triggers_flat(self) -> int:
+        return 2 * self.levels
+
+
+def revgrid_stop_pct(step_pct: object, user_stop_pct: object = None) -> tuple[Decimal, bool]:
+    """Protective stop distance: the user's ``rgrid_stop_pct`` (percent of price,
+    > 0) or 2 x step. Floored at the taker round trip either way so ordinary
+    noise + fees cannot trip it. Returns ``(fraction, is_auto)``."""
+    step = _as_frac(step_pct)
+    user = _as_frac(user_stop_pct) / Decimal(100) if user_stop_pct not in (None, "") else Decimal(0)
+    if user > 0:
+        return max(user, TAKER_ROUND_TRIP_RATE), False
+    return max(step * Decimal(2), TAKER_ROUND_TRIP_RATE), True
+
+
+def revgrid_trail_pct(step_pct: object, user_trail_pct: object = None) -> tuple[Decimal, bool]:
+    """Trailing-stop arm distance (== giveback): the user's ``rgrid_trail_pct``
+    (percent of price, > 0) or ``arm_pct(step)`` = 2 x step floored at the taker
+    round trip. Returns ``(fraction, is_auto)``."""
+    step = _as_frac(step_pct)
+    user = _as_frac(user_trail_pct) / Decimal(100) if user_trail_pct not in (None, "") else Decimal(0)
+    if user > 0:
+        return max(user, TAKER_ROUND_TRIP_RATE), False
+    return arm_pct(step), True
+
+
+def trigger_ladder_plan(
+    *,
+    deployed_quote: object,
+    levels: int,
+    spread_frac: object,
+    stop_budget_usd: object,
+    min_step_usd: object,
+    chunk_quote: object = None,
+    user_stop_pct: object = None,
+    user_trail_pct: object = None,
+    max_levels: int = REVGRID_MAX_LEVELS,
+) -> TriggerLadderPlan:
+    """Resolve the trigger Reverse Grid's whole plan from the user's settings.
+
+    ``spread_frac`` is the user's spread as a fraction (10bp -> 0.001);
+    ``stop_budget_usd`` = the rail margin x the user's SL%; ``levels`` is the user's
+    setting (capped here); ``user_stop_pct`` / ``user_trail_pct`` are percents of
+    price (0 / None = derive from the step).
+    """
+    requested = max(1, int(levels or 1))
+    lv = max(1, min(requested, max(1, int(max_levels or REVGRID_MAX_LEVELS))))
+    raw_spread = _as_frac(spread_frac)
+    step = max(raw_spread, REVGRID_STEP_FLOOR)
+    stop, stop_auto = revgrid_stop_pct(step, user_stop_pct)
+    trail, trail_auto = revgrid_trail_pct(step, user_trail_pct)
+    # The adverse move the stop budget must cover is the distance from the entry
+    # to the ladder's OWN stop plus the prints on the way in and out: the entry
+    # may fill up to REVGRID_ENTRY_SLIP through its level and the stop close is
+    # priced REVGRID_STOP_SLIP through the stop level (worst-case bounds — a limit
+    # fills at the best available prices). The step-derived maker geometry is kept
+    # as a floor so the sizing never loosens below what the real-tape validation
+    # ran at. A user-WIDENED stop moves the exit further away and shrinks the rung
+    # (SL/TP trace 2026-09-16); a tighter one never grows it.
+    band = max(step_band_frac(step, Decimal(0)), stop + REVGRID_STOP_SLIP + REVGRID_ENTRY_SLIP)
+    sizing = resolve_step_quote(
+        deployed_quote=deployed_quote,
+        levels=lv,
+        chunk_quote=chunk_quote,
+        stop_budget_usd=stop_budget_usd,
+        min_step_usd=min_step_usd,
+        band_frac=band,
+    )
+    return TriggerLadderPlan(
+        step_pct=step,
+        levels=lv,
+        levels_requested=requested,
+        stop_pct=stop,
+        trail_arm_pct=trail,
+        trail_giveback_pct=trail,
+        sizing=sizing,
+        step_floored=raw_spread < REVGRID_STEP_FLOOR,
+        stop_is_auto=stop_auto,
+        trail_is_auto=trail_auto,
+    )

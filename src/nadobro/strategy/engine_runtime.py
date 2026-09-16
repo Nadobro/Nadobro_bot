@@ -39,6 +39,7 @@ from src.nadobro.engine.risk import RiskEngine
 # quote-gate pause reasons rendered on /status and in gate notifications.
 from src.nadobro.engine.routines.regime_gate import GATE_REASON_HUMAN as GATE_REASON_HUMAN  # noqa: F401
 from src.nadobro.engine.routines.regime_gate import REVGRID_GATE_REASONS as REVGRID_GATE_REASONS  # noqa: F401
+from src.nadobro.engine.routines.regime_gate import VENUE_GATE_REASONS as VENUE_GATE_REASONS  # noqa: F401
 from src.nadobro.engine.types import (
     RiskLimits,
     RiskState,
@@ -192,6 +193,55 @@ def _cancel_resting_for_stop(user_id: int, network: str, strategy: str) -> dict:
         only_pid = None
     from src.nadobro.trading.trade_service import cancel_resting_orders_for_user
     return cancel_resting_orders_for_user(int(user_id), network, only_pid=only_pid)
+
+
+async def _sweep_triggers_for_stop(user_id: int, network: str, strategy: str) -> dict:
+    """Cancel the bot's own venue trigger orders for a strategy stopped WITHOUT a
+    local controller (product + session resolved from the running session row;
+    falls back to the user's saved product when the session is already
+    finalized). Returns the sweep result; never raises."""
+    from src.nadobro.core.async_utils import run_blocking_db, run_blocking_sdk
+    from src.nadobro.strategy.venue_triggers import cancel_bot_trigger_orders
+
+    def _scope() -> tuple[Optional[int], Optional[int]]:
+        pid: Optional[int] = None
+        sid: Optional[int] = None
+        try:
+            from src.nadobro.models.database import get_strategy_session_by_id
+            from src.nadobro.trading.engine_persistence import resolve_running_session_id
+            _sid = resolve_running_session_id(strategy, user_id, network)
+            row = get_strategy_session_by_id(int(_sid)) if _sid else None
+            if row and row.get("product_id") is not None:
+                pid = int(row["product_id"])
+                sid = int(_sid)
+        except Exception:  # policy: degrade-ok(fall through to the saved product)
+            pid, sid = None, None
+        if pid is None:
+            try:
+                from src.nadobro.config import get_product_id
+                from src.nadobro.strategy.bot_runtime import _load_state
+                st = _load_state(user_id, network) or {}
+                product = str(st.get("product") or "").strip()
+                if product and product.upper() != "MULTI":
+                    pid = get_product_id(product, network=network)
+            except Exception:  # policy: degrade-ok(no scope -> no sweep)
+                pid = None
+        return pid, sid
+
+    pid, sid = await run_blocking_db(_scope)
+    if not pid:
+        return {"success": True, "cancelled": 0, "skipped": "no product to scope the sweep to"}
+    from src.nadobro.trading.trade_service import get_user_nado_client
+    client = await run_blocking_sdk(get_user_nado_client, user_id, network=network)
+    if client is None:
+        return {"success": True, "cancelled": 0, "skipped": "no client"}
+    res = await cancel_bot_trigger_orders(client, network, int(pid), session_id=sid)
+    if not res.get("success"):
+        logger.warning(
+            "stop: venue trigger sweep not confirmed user=%s strategy=%s pid=%s: %s",
+            user_id, strategy, pid, res.get("error"),
+        )
+    return res
 
 
 class EngineRuntime:
@@ -403,6 +453,16 @@ class EngineRuntime:
             except Exception:  # noqa: BLE001
                 logger.warning("cross-process venue cancel failed user=%s strategy=%s",
                                user_id, strategy, exc_info=True)
+            # VENUE TRIGGERS (2026-09-16): with no local controller nothing ran
+            # ``on_stop``, so a Reverse Grid's armed entry rungs / trailing stop
+            # (venue trigger orders, invisible to the resting cancel above) would
+            # stay armed. Sweep the bot's own triggers on the session's product.
+            if strategy in ("rgrid", "dgrid"):
+                try:
+                    await _sweep_triggers_for_stop(user_id, network, strategy)
+                except Exception:  # noqa: BLE001
+                    logger.warning("cross-process venue trigger sweep failed user=%s strategy=%s",
+                                   user_id, strategy, exc_info=True)
         self._controllers.pop(key, None)
         self._orchestrators.pop(key, None)
         self._persisted_sig.pop(key, None)
@@ -1197,12 +1257,51 @@ def _effective_leverage(settings: Dict[str, Any], fallback: float = 1.0) -> floa
     return max(1.0, raw)
 
 
-# The trigger Reverse Grid's rung SPACING floor. The controller floors the step at
-# the taker round trip (~8.6bp) so a rung is never a structural loss; this is the
-# tighter, validation-derived floor for the DEFAULT config — the Aug-2026 real-tape
-# sweep showed ~15-25bp is the viable zone (10bp bled chop, wider gave back trend).
-# A user's own wider spread is honoured above it; it can only ever WIDEN the step.
-_REVGRID_STEP_FLOOR = Decimal("0.0015")
+# The trigger Reverse Grid's rung SPACING floor (15bp) and the per-side rung cap
+# (12: Nado allows 25 PENDING trigger orders per product per subaccount, and a flat
+# ladder arms 2 x levels). Both live in quant/rgrid_sizing so the pre-start card and
+# this mapping derive the SAME plan (``trigger_ladder_plan``); these aliases keep
+# the old import paths working.
+from src.nadobro.quant.rgrid_sizing import (  # noqa: E402
+    REVGRID_MAX_LEVELS as _REVGRID_MAX_LEVELS,
+    REVGRID_STEP_FLOOR as _REVGRID_STEP_FLOOR,
+    REVGRID_VENUE_MAX_PENDING_TRIGGERS as _REVGRID_VENUE_MAX_PENDING_TRIGGERS,
+)
+
+
+def revgrid_plan_from_settings(
+    settings: Dict[str, Any],
+    *,
+    levels: int,
+    deployed: float,
+    spread_frac: Decimal,
+    sl_pct: float,
+    leverage: int,
+    chunk_dec: Optional[Decimal] = None,
+):
+    """The trigger Reverse Grid's whole plan (step / rungs / stop / trail / per-rung
+    size) from the user's settings — ONE derivation shared by ``_map_revgrid_config``
+    (what the engine places) and the strategy card (what the user is shown), so the
+    two can never disagree. Pure: no DB, no venue."""
+    from src.nadobro.quant.mm_quote_math import DEFAULT_MIN_ORDER_NOTIONAL_USD
+    from src.nadobro.quant.rgrid_sizing import trigger_ladder_plan
+    from src.nadobro.strategy.strategy_registry import session_margin_usd
+
+    # Stop budget = the margin the session rail measures against × the user's SL%,
+    # exactly as the legacy rgrid mapping sizes it.
+    rg_margin = session_margin_usd(settings) or float(deployed) / max(1.0, float(leverage or 1))
+    stop_budget = rg_margin * max(0.0, float(sl_pct)) / 100.0
+    return trigger_ladder_plan(
+        deployed_quote=deployed,
+        levels=levels,
+        spread_frac=spread_frac,
+        stop_budget_usd=stop_budget,
+        min_step_usd=DEFAULT_MIN_ORDER_NOTIONAL_USD,
+        chunk_quote=chunk_dec,
+        # User-facing exit knobs (percent of price; 0/unset = derive from the step).
+        user_stop_pct=_f(settings, "rgrid_stop_pct", 0.0),
+        user_trail_pct=_f(settings, "rgrid_trail_pct", 0.0),
+    )
 
 
 def _map_revgrid_config(
@@ -1219,55 +1318,54 @@ def _map_revgrid_config(
 ) -> Dict[str, object]:
     """Config for the trigger-based ``ReverseGridController`` (flag-gated `rgrid`).
 
-    Reuses the SAME step sizing as the legacy rgrid mapping (``resolve_step_quote``:
-    ``deployed / levels`` shrunk by a POV chunk and by the stop budget, floored at
-    the venue minimum), so the per-rung notional and the stop-budget discipline are
-    unchanged. The controller derives its stop / trail geometry from ``step_pct``,
-    so only the essentials are set here; the chop stand-down gate is ON by default.
+    Geometry + sizing come from ``revgrid_plan_from_settings`` (the same plan the
+    strategy card renders): the step is the user's spread floored at 15bp, rungs
+    per side are capped at 12 (the venue's 25-pending-trigger limit), the per-rung
+    notional is ``deployed / levels`` shrunk by a POV chunk and by the stop budget
+    (``resolve_step_quote`` against the trigger exit geometry), and the stop /
+    trail distances are 2 x step unless the user set ``rgrid_stop_pct`` /
+    ``rgrid_trail_pct``. The chop stand-down gate is ON by default.
     ``candle_provider`` is injected later by ``run_engine_cycle`` (rgrid is already
     in its injection set)."""
-    from src.nadobro.quant.mm_quote_math import DEFAULT_MIN_ORDER_NOTIONAL_USD
-    from src.nadobro.quant.rgrid_sizing import resolve_step_quote, step_band_frac
-    from src.nadobro.strategy.strategy_registry import session_margin_usd
-
-    # Rung spacing: the user's spread, floored to the validated viable-zone minimum
-    # (never below — a too-tight reverse grid bleeds chop). The controller applies
-    # its own round-trip floor on top, so this can only widen the step.
-    step_pct = max(spread_frac, _REVGRID_STEP_FLOOR)
-    # Stop budget = the margin the session rail measures against × the user's SL%,
-    # exactly as the legacy rgrid mapping sizes it.
-    rg_margin = session_margin_usd(settings) or float(deployed) / max(1.0, float(leverage or 1))
-    stop_budget = rg_margin * max(0.0, float(sl_pct)) / 100.0
-    plan = resolve_step_quote(
-        deployed_quote=deployed,
-        levels=levels,
-        chunk_quote=chunk_dec,
-        stop_budget_usd=stop_budget,
-        min_step_usd=DEFAULT_MIN_ORDER_NOTIONAL_USD,
-        band_frac=step_band_frac(step_pct, Decimal(0)),
+    plan = revgrid_plan_from_settings(
+        settings, levels=levels, deployed=deployed, spread_frac=spread_frac,
+        sl_pct=sl_pct, leverage=leverage, chunk_dec=chunk_dec,
     )
+    if plan.levels_capped:
+        logger.info(
+            "revgrid %s: %s levels requested, armed %s per side — Nado allows %s pending "
+            "trigger orders per product (a flat ladder is 2 x levels)",
+            product, plan.levels_requested, plan.levels,
+            _REVGRID_VENUE_MAX_PENDING_TRIGGERS,
+        )
     cfg: Dict[str, object] = {
         "trading_pair": product,
         # Kept so /status and the overlay/live-reconfig routers keep recognising the
         # exposure-anchored family; the trigger controller ignores anchor_mode.
         "anchor_mode": "rgrid",
-        "levels": int(levels),
-        "step_pct": step_pct,
-        "order_amount_quote": plan.step,
+        "levels": int(plan.levels),
+        "step_pct": plan.step_pct,
+        "order_amount_quote": plan.rung_quote,
         # The risk bound the (skipped) overlay may never exceed — kept for parity /
         # future use; the trigger geometry is deterministic and unshaded.
-        "step_capped_quote": plan.step,
+        "step_capped_quote": plan.rung_quote,
         "leverage": int(leverage or 1),
+        # Exit geometry: the controller reads these directly (it would derive the
+        # same defaults itself; passing them keeps card == engine by construction).
+        "stop_pct": plan.stop_pct,
+        "trail_arm_pct": plan.trail_arm_pct,
+        "trail_giveback_pct": plan.trail_giveback_pct,
         # Chop stand-down gate ON by default (a reverse grid must not trade chop).
         "revgrid_chop_stand_down": _as_bool(settings.get("rgrid_chop_stand_down", True), True),
     }
     # Honour explicit per-run geometry overrides if the operator set them (testnet
-    # tuning); otherwise the controller derives stop/trail from step_pct.
+    # tuning); they win over the user-facing knobs above.
     for key in ("stop_pct", "trail_arm_pct", "trail_giveback_pct", "reanchor_bands"):
         raw = settings.get(f"revgrid_{key}")
         if raw is not None:
             cfg[key] = _dec(raw)
     return cfg
+
 
 
 def map_strategy_config(
@@ -2219,8 +2317,24 @@ def map_strategy_config(
         # (recycle_levels is set for the whole GridExecutor family above.)
         cfg["dgrid_short_window"] = int(max(2, _f(settings, "dgrid_short_window_points", 4)))
         cfg["dgrid_long_window"] = int(max(4, _f(settings, "dgrid_long_window_points", 12)))
-        cfg["dgrid_trend_on_vr"] = _f(settings, "dgrid_trend_on_variance_ratio", 1.25)
-        cfg["dgrid_range_on_vr"] = _f(settings, "dgrid_range_on_variance_ratio", 1.15)
+        _trend_on_vr = _f(settings, "dgrid_trend_on_variance_ratio", 1.25)
+        _range_on_vr = _f(settings, "dgrid_range_on_variance_ratio", 1.15)
+        # HYSTERESIS SANITY: the classifier enters RGRID at VR >= trend_on and
+        # returns to GRID at VR <= range_on, so range_on must sit BELOW trend_on.
+        # The two are separate buttons, so a user can invert them (range 1.15 with
+        # trend 1.0); the classifier then reads every VR in [trend_on, range_on] as
+        # a trend (the trend branch is tested first) and the band is meaningless.
+        # Clamp the release below the trigger rather than silently running an
+        # inverted band; the card shows the effective pair.
+        if _range_on_vr > _trend_on_vr:
+            logger.info(
+                "dgrid: range_on VR %.2f exceeds trend_on VR %.2f — clamped to %.2f so "
+                "the hysteresis band is well-formed (user=%s)",
+                _range_on_vr, _trend_on_vr, _trend_on_vr, settings.get("user_id", "?"),
+            )
+            _range_on_vr = _trend_on_vr
+        cfg["dgrid_trend_on_vr"] = _trend_on_vr
+        cfg["dgrid_range_on_vr"] = _range_on_vr
         # Sustained-drift trend filter: flip the grid direction on a slow one-way
         # grind the variance ratio misses (a steady decline keeps VR<1 yet bleeds
         # a long grid). Percent over the long window; 0 disables.
@@ -3384,6 +3498,22 @@ async def _run_engine_cycle_locked(
             )
             configs["restore_cycles_completed"] = int(_f(state, "vol_cycles_completed", 0.0))
             configs["restore_session_volume_usd"] = _f(state, "volume_done_usd", 0.0)
+        # VENUE BASELINE RESTORE (2026-09-16): the trigger Reverse Grid and D-Grid
+        # capture the run's venue baseline (always 0 — a foreign position blocks
+        # arming) on their first read and persist it as telemetry every cycle. A
+        # REBUILD of the controller mid-session (worker handoff / FAILED-controller
+        # recovery) must restore it, or the run's OWN open position would be read
+        # as a foreign one — held forever, with the delegate's stop already
+        # cancelled by the teardown. Same runs>0 guard as DN: a fresh start (runs
+        # == 0, fresh state dict) never inherits one.
+        if strategy in ("rgrid", "dgrid") and int(_f(state, "runs", 0)) > 0:
+            _seed_key = "dgrid_venue_baseline" if strategy == "dgrid" else "grid_venue_baseline"
+            _seed = state.get(_seed_key)
+            if _seed is not None:
+                try:
+                    configs["venue_baseline"] = _dec(str(_seed))
+                except Exception:  # noqa: BLE001 - an unusable seed is no seed
+                    logger.debug("venue baseline restore skipped (unusable %r)", _seed)
         # Fill-anchored (grid/rgrid) exposure VWAP must be peculiar to THIS
         # session + user. Seed it from the run's OWN recorded fills
         # (get_session_recent_fills is scoped by strategy_session_id + user_id) so

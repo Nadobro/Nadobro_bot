@@ -153,6 +153,22 @@ async def reconcile_venue_stops(
             continue
         if _row_is_reduce_only_stop(r):
             orphans.append(dig)
+    # Never cancel a reduce-only stop the ENGINE placed and still manages — the
+    # Reverse Grid's trailing stop is a reduce-only mid-price trigger too, linked
+    # to its session in ``order_intents`` at placement. The rail's stop (placed
+    # here) carries no such link, so it is still swept. (2026-09-16)
+    if orphans:
+        try:
+            from src.nadobro.core.async_utils import run_blocking_db
+            from src.nadobro.models.database import get_bot_linked_digests
+
+            net = str(getattr(client, "network", "") or "")
+            linked = await run_blocking_db(get_bot_linked_digests, net, orphans) if net else set()
+            if linked:
+                orphans = [d for d in orphans if d.lower() not in linked]
+        except Exception:  # noqa: BLE001 - registry unreadable: sweep nothing rather than the engine's stop
+            logger.debug("venue stop reconcile: intent lookup failed pid=%s", product_id, exc_info=True)
+            return 0
     if orphans:
         await _cancel_digests(client, int(product_id), orphans)
     return len(orphans)

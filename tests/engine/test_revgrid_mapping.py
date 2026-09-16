@@ -268,3 +268,91 @@ def test_apply_live_update_routes_revgrid_to_reload_config():
     ))
     assert c.levels == 6                    # reloaded
     assert c._anchor == Decimal("100")      # runtime state preserved
+
+
+# ── 2026-09-16: venue cap, user exits, D-Grid hysteresis sanity ─────────
+
+def test_mapper_caps_the_rungs_per_side_at_the_venue_limit(monkeypatch):
+    """Nado allows 25 pending triggers per product; a flat ladder is 2 x levels,
+    so 20 levels (prod session 292: 40 rungs asked, 25 placed) map to 12."""
+    from src.nadobro.quant.rgrid_sizing import REVGRID_MAX_LEVELS
+
+    monkeypatch.setenv("NADO_REVGRID_TRIGGER_ENABLED", "1")
+    cfg = er.map_strategy_config("rgrid", {"levels": 20, "rgrid_spread_bp": 5,
+                                           "notional_usd": 200, "mm_leverage_override": 40,
+                                           "rgrid_stop_loss_pct": 10},
+                                 Decimal("110000"), product=PAIR, leverage=49)
+    assert cfg["levels"] == REVGRID_MAX_LEVELS == 12
+    # and the per-rung size is sized against 12 rungs, not 20: budget $20 over a
+    # 12-rung pyramid reaching its own stop (30bp) with the worst-case entry (15bp)
+    # and stop (50bp) prints plus the taker round trip -> ~$161 per rung
+    assert Decimal("155") < Decimal(str(cfg["order_amount_quote"])) < Decimal("167")
+    # the D-Grid trend sub-config gets the same cap
+    dg = er.map_strategy_config("dgrid", {"levels": 20}, Decimal("110000"), product=PAIR, leverage=5)
+    assert dg["trend_rgrid"]["levels"] == 12
+
+
+def test_user_stop_and_trail_reach_the_controller_and_auto_derives_from_the_step(monkeypatch):
+    monkeypatch.setenv("NADO_REVGRID_TRIGGER_ENABLED", "1")
+    auto = er.map_strategy_config("rgrid", {"levels": 4, "rgrid_spread_bp": 20},
+                                  Decimal("79000"), product=PAIR, leverage=5)
+    # auto: stop = trail = 2 x step (20bp step -> 40bp)
+    assert auto["step_pct"] == Decimal("0.002")
+    assert auto["stop_pct"] == Decimal("0.004") and auto["trail_arm_pct"] == Decimal("0.004")
+    assert auto["trail_giveback_pct"] == auto["trail_arm_pct"]
+    c = _build("rgrid", auto)
+    assert c.stop_pct == Decimal("0.004") and c.trail_arm_pct == Decimal("0.004")
+    # user overrides (percent of price)
+    user = er.map_strategy_config("rgrid", {"levels": 4, "rgrid_spread_bp": 20,
+                                            "rgrid_stop_pct": 0.5, "rgrid_trail_pct": 1.0},
+                                  Decimal("79000"), product=PAIR, leverage=5)
+    assert user["stop_pct"] == Decimal("0.005") and user["trail_arm_pct"] == Decimal("0.01")
+    c2 = _build("rgrid", user)
+    assert c2.stop_pct == Decimal("0.005") and c2.trail_arm_pct == Decimal("0.01")
+    assert c2.trail_giveback_pct == Decimal("0.01")
+    # 0 = auto (the button writes 0)
+    zero = er.map_strategy_config("rgrid", {"levels": 4, "rgrid_spread_bp": 20,
+                                            "rgrid_stop_pct": 0, "rgrid_trail_pct": 0},
+                                  Decimal("79000"), product=PAIR, leverage=5)
+    assert zero["stop_pct"] == Decimal("0.004")
+
+
+def test_dgrid_range_on_is_clamped_below_trend_on():
+    """An inverted hysteresis band (range release ABOVE the trend trigger, which
+    two independent buttons allow) is clamped so the classifier keeps a
+    well-formed band; a normal band is untouched."""
+    inv = er.map_strategy_config("dgrid", {"levels": 4, "dgrid_trend_on_variance_ratio": 1.0,
+                                           "dgrid_range_on_variance_ratio": 1.15},
+                                 Decimal("79000"), product=PAIR, leverage=5)
+    assert inv["dgrid_range_on_vr"] == 1.0 and inv["dgrid_trend_on_vr"] == 1.0
+    ok = er.map_strategy_config("dgrid", {"levels": 4, "dgrid_trend_on_variance_ratio": 1.25,
+                                          "dgrid_range_on_variance_ratio": 1.15},
+                                Decimal("79000"), product=PAIR, leverage=5)
+    assert ok["dgrid_range_on_vr"] == 1.15 and ok["dgrid_trend_on_vr"] == 1.25
+
+
+def test_new_rgrid_and_dgrid_buttons_are_wired_end_to_end():
+    """Exits (stop / trail) and D-Grid regime knobs (drift / confirm): button ->
+    set allowlist -> limits -> custom input -> mapper key the controller reads."""
+    from src.nadobro.handlers import strategy_handler as sh
+
+    src = open(sh.__file__).read()
+    allowed = src.split("allowed_numeric_fields = {", 1)[1].split("}", 1)[0]
+    inputs = src.split("allowed_inputs = (", 1)[1].split(")", 1)[0]
+    for field in ("rgrid_stop_pct", "rgrid_trail_pct", "dgrid_trend_drift_pct", "dgrid_flip_confirm_ticks"):
+        assert f'"{field}"' in allowed, field
+        assert f'"{field}"' in inputs, field
+        assert f'"{field}": (' in src, f"{field} has no limits entry"
+    for cb in ("strategy:set:rgrid:rgrid_stop_pct:0", "strategy:set:rgrid:rgrid_trail_pct:0",
+               "strategy:input:rgrid:rgrid_stop_pct", "strategy:input:rgrid:rgrid_trail_pct",
+               "strategy:set:dgrid:dgrid_trend_drift_pct:0.3", "strategy:set:dgrid:dgrid_flip_confirm_ticks:2",
+               "strategy:input:dgrid:dgrid_trend_drift_pct", "strategy:input:dgrid:dgrid_flip_confirm_ticks"):
+        assert f'callback_data="{cb}"' in src, cb
+    # the dead maker-only controls are gone from the Reverse Grid card
+    assert 'strategy:set:rgrid:rgrid_discretion' not in src
+    assert 'strategy:set:rgrid:rgrid_reset_threshold_pct' not in src
+    # the engine reads the D-Grid knobs
+    cfg = er.map_strategy_config("dgrid", {"levels": 4, "dgrid_trend_drift_pct": 0.5,
+                                           "dgrid_flip_confirm_ticks": 3},
+                                 Decimal("79000"), product=PAIR, leverage=5)
+    assert cfg["dgrid_trend_drift_pct"] == 0.5 and cfg["dgrid_flip_confirm_ticks"] == 3

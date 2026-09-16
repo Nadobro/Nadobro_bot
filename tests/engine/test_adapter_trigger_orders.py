@@ -299,3 +299,72 @@ def test_mock_fill_stream_yields_triggered_fills():
         assert len(streamed) == 1 and streamed[0].side is TradeType.BUY
 
     asyncio.run(body())
+
+
+# ── 2026-09-16: pending-trigger listing + IOC pass-through ───────────────
+
+def test_placement_passes_ioc_to_the_client_by_default():
+    adapter, client = _adapter()
+    asyncio.run(adapter.place_trigger_order(PAIR, TradeType.BUY, Decimal("0.01"), Decimal("79000")))
+    assert client.place_calls[0]["order_type"] == "ioc"
+    asyncio.run(adapter.place_trigger_order(PAIR, TradeType.BUY, Decimal("0.01"), Decimal("79100"), order_type="default"))
+    assert client.place_calls[1]["order_type"] == "default"
+
+
+def test_list_trigger_orders_returns_only_pending_digests_lowercased():
+    from src.nadobro.engine.adapter.nado import _pending_trigger_digest
+
+    rows = [
+        {"order": {"digest": "0xAAA", "product_id": 2}, "status": "waiting_price"},
+        {"order": {"digest": "0xbbb"}, "status": "waiting_dependency"},
+        {"order": {"digest": "0xccc"}, "status": "triggered"},
+        {"order": {"digest": "0xddd"}, "status": "cancelled"},
+        {"digest": "0xeee", "status": "pending"},            # older flat shape
+        {"order": {"order": {"digest": "0xfff"}}, "status": "waiting_price"},   # nested shape
+        {"order": {"digest": "0x111"}},                       # unknown status -> pending (conservative)
+        "garbage",
+    ]
+    assert [_pending_trigger_digest(r) for r in rows] == [
+        "0xaaa", "0xbbb", None, None, "0xeee", "0xfff", "0x111", None]
+
+    class _ListingClient(_FakeTriggerClient):
+        def __init__(self, rows, raises=False):
+            super().__init__()
+            self._rows, self._raises = rows, raises
+            self.list_calls = []
+
+        async def get_trigger_orders(self, *, product_ids=None, limit=100, strict=False, **kw):
+            self.list_calls.append({"product_ids": product_ids, "strict": strict})
+            if self._raises:
+                raise RuntimeError("503")
+            return list(self._rows)
+
+    client = _ListingClient([r for r in rows if isinstance(r, dict)])
+    adapter = NadoAdapter(client, META)
+    assert asyncio.run(adapter.list_trigger_orders(PAIR)) == ["0xaaa", "0xbbb", "0xeee", "0xfff", "0x111"]
+    assert client.list_calls == [{"product_ids": [2], "strict": True}]
+    # a row we cannot read at all makes the whole list untrustworthy (UNKNOWN)
+    assert asyncio.run(NadoAdapter(_ListingClient(rows), META).list_trigger_orders(PAIR)) is None
+    # an unreadable trigger service is UNKNOWN, never "nothing pending"
+    assert asyncio.run(NadoAdapter(_ListingClient([], raises=True), META).list_trigger_orders(PAIR)) is None
+
+
+def test_unparseable_pending_rows_make_the_list_unreadable_not_empty():
+    """Rows we cannot read a digest from (a row-shape change) must never be read
+    as 'nothing pending' — that would re-arm a duplicate ladder on top of a live one."""
+    class _ListingClient(_FakeTriggerClient):
+        def __init__(self, rows):
+            super().__init__()
+            self._rows = rows
+
+        async def get_trigger_orders(self, *, product_ids=None, limit=100, strict=False, **kw):
+            return list(self._rows)
+
+    bad = [{"order": {"no_digest_here": 1}, "status": "waiting_price"}]
+    assert asyncio.run(NadoAdapter(_ListingClient(bad), META).list_trigger_orders(PAIR)) is None
+    # a non-pending row without a digest is simply not pending (explained)
+    fine = [{"order": {"digest": "0xabc"}, "status": "waiting_price"}, {"status": "cancelled"}]
+    assert asyncio.run(NadoAdapter(_ListingClient(fine), META).list_trigger_orders(PAIR)) == ["0xabc"]
+    # digests are normalised for comparison (case + 0x prefix)
+    mixed = [{"order": {"digest": "ABC"}, "status": "waiting_price"}]
+    assert asyncio.run(NadoAdapter(_ListingClient(mixed), META).list_trigger_orders(PAIR)) == ["0xabc"]

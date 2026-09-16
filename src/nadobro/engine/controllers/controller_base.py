@@ -41,6 +41,11 @@ class ControllerState(Enum):
 LADDER_RECENTER_FLOOR_BP = 12.0
 LADDER_RECENTER_MIN_INTERVAL_S = 5.0
 
+# Pause reasons that are a VENUE hold set by a controller, never a gate verdict
+# (see evaluate_quote_gate). Mirrors routines/regime_gate.VENUE_GATE_REASONS;
+# duplicated as a literal so this module keeps no import edge to the routine.
+_VENUE_GATE_REASONS = frozenset({"venue_unreadable", "venue_residual", "venue_foreign_position"})
+
 
 def ladder_recenter_threshold_bp(
     step_bp: float,
@@ -221,6 +226,17 @@ class Controller(abc.ABC):
             self._gate_event: Optional[Dict[str, str]] = None
             self._gate_resume_streak: int = 0
             self._gate_prev_enabled: bool = False
+        # VENUE HOLDS ARE NOT GATE VERDICTS (audit 2026-09-16): a controller may
+        # park itself on a venue reason (position unreadable / residual / foreign
+        # position — see regime_gate.VENUE_GATE_REASONS) without a gate event. If
+        # the gate then read that PAUSE as its own, every QUOTE verdict would walk
+        # the resume streak and emit a "resumed quoting" event — a notification
+        # storm during a hold that never paused quoting for a regime reason.
+        # Treat the prior verdict as QUOTE; the controller re-asserts the hold
+        # after this call while it still applies.
+        if self.gate_verdict == "PAUSE" and self.gate_reason in _VENUE_GATE_REASONS:
+            self.gate_verdict, self.gate_reason = "QUOTE", ""
+            self._gate_resume_streak = 0
         if not bool(self.cfg("regime_gate_enabled", False)):
             # MID-GATE-STALE-PAUSE (audit 2026-07-31): a gate disabled MID-RUN
             # (the signal overlay arms it while suppressing, then disarms —

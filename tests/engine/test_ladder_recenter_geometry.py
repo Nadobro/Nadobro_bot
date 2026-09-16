@@ -118,7 +118,7 @@ def test_rgrid_ladder_follows_a_150_dollar_btc_move():
     20bp band. The ladder must now re-quote toward the new mid.
     """
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal("63373.5"))
+        adapter = MockNadoAdapter(mid=Decimal("63373.5"), venue_held={"BTC-PERP": Decimal(0)})
         orch = ExecutorOrchestrator()
         c = DynamicGridController(
             user_id=1, orchestrator=orch, adapter=adapter,
@@ -160,7 +160,7 @@ def test_recenter_is_not_starved_by_an_unconfirmed_phase_flip():
     (_phase_confirm_streak == 1, i.e. a flip IS pending) and has no escape hatch.
     """
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal("63373.5"))
+        adapter = MockNadoAdapter(mid=Decimal("63373.5"), venue_held={"BTC-PERP": Decimal(0)})
         orch = ExecutorOrchestrator()
         # A decisive DOWNTREND makes the classifier want RGRID while the live
         # phase is GRID; with flip_confirm_ticks=2 tick 1 leaves the flip PENDING.
@@ -255,7 +255,7 @@ def _flat_range(n=60, base=100.0, amp=0.12, period=7.0):
 def test_recenter_does_not_reset_the_trailing_arm_anchor():
     """A +0.6% run must arm a 0.5% trail even though it re-centered on the way."""
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal("100"))
+        adapter = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal(0)})
         orch = ExecutorOrchestrator()
         c = DynamicGridController(
             user_id=1, orchestrator=orch, adapter=adapter,
@@ -285,7 +285,7 @@ def test_recenter_does_not_reset_the_trailing_arm_anchor():
 def test_trail_anchor_survives_many_recenters():
     """The geometry anchor tracks price; the run anchor stays at the entry."""
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal("100"))
+        adapter = MockNadoAdapter(mid=Decimal("100"), venue_held={"P": Decimal(0)})
         orch = ExecutorOrchestrator()
         c = DynamicGridController(
             user_id=1, orchestrator=orch, adapter=adapter,

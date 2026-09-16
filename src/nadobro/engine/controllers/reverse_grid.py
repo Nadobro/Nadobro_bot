@@ -12,11 +12,27 @@ gateway-budget amplifier the maker design suffered).
 
 Execution model — the controller manages its trigger ladder DIRECTLY through the
 adapter's trigger surface (``place_trigger_order`` / ``cancel_trigger_order`` /
-``place_stop_order``), NOT through the OrderExecutor: an executor cancels via the
-resting-order path, which is the wrong venue service for a trigger and would leak
-it. Fills are detected by POLLING the net position (``adapter.held_base``) and
-attributing the change to the ladder's own rung geometry — this needs no
-assumption about whether a fired trigger's fill echoes the trigger's digest.
+``place_stop_order`` / ``list_trigger_orders``), NOT through the OrderExecutor: an
+executor cancels via the resting-order path, which is the wrong venue service for
+a trigger and would leak it. Fills are detected by POLLING the net position
+(``adapter.held_base``) and attributing the change to the ladder's own rung
+geometry — this needs no assumption about whether a fired trigger's fill echoes
+the trigger's digest.
+
+Venue facts this controller is built around (Nado trigger service, 2026-09):
+
+* at most **25 PENDING trigger orders per product per subaccount** — a flat ladder
+  is ``2 x levels`` triggers, so ``levels`` is capped at ``REVGRID_MAX_LEVELS`` (12);
+  asking for 20 levels used to request 40 rungs and the venue rejected the 26th on
+  (prod session 292: exactly 25 placed, the rest silently failed every re-arm);
+* a fired trigger becomes an ORDER with the execution type encoded at placement.
+  Entry rungs are placed **IOC**: a momentum entry that lags a fast move by more
+  than its price bound must never REST as an untracked maker limit (which the
+  controller could neither see nor cancel and which fills later as a phantom
+  entry). An unfilled IOC rung is simply gone — so the ladder is RECONCILED
+  against ``list_trigger_orders`` (a rung the venue no longer holds is re-armed);
+* the venue may also drop pending triggers on its own (expiry, a linked-signer
+  change, an account-health event) — the same reconciliation covers those.
 
 Lifecycle, per tick:
 
@@ -68,7 +84,23 @@ from src.nadobro.engine.adapter.base import AdapterError
 from src.nadobro.engine.controllers.controller_base import Controller
 from src.nadobro.engine.routines import variance_regime
 from src.nadobro.engine.types import OrderType, TradeType, _as_bool, _dec
-from src.nadobro.quant.rgrid_sizing import TAKER_ROUND_TRIP_RATE, arm_pct
+from src.nadobro.quant.rgrid_sizing import (
+    REVGRID_ENTRY_SLIP,
+    REVGRID_MAX_LEVELS,
+    REVGRID_STOP_SLIP,
+    REVGRID_VENUE_MAX_PENDING_TRIGGERS,
+    TAKER_ROUND_TRIP_RATE,
+    arm_pct,
+)
+
+
+def _norm_digest(digest: object) -> str:
+    """Canonical digest for comparisons (lower-case, 0x-prefixed) — the placement
+    response and the venue's pending list must compare equal for the same order."""
+    text = str(digest or "").strip().lower()
+    if text and not text.startswith("0x"):
+        text = "0x" + text
+    return text
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +113,9 @@ class _Rung:
     level: Decimal
     size_base: Decimal
     fired: bool = False
+    # Base attributed to this rung when it fired. A fired IOC is CONSUMED whether it
+    # filled in full or in part, so ``filled_base`` may be below ``size_base``.
+    filled_base: Decimal = Decimal(0)
 
 
 def _sign(value: Decimal) -> int:
@@ -113,12 +148,22 @@ class ReverseGridController(Controller):
         # over the next few ticks instead of resting a permanently-partial ladder.
         self._ladder_incomplete: bool = False
         self._pos_base: Decimal = Decimal(0)      # last observed signed net (run-only)
-        # Venue position that already existed on the product when the run began,
-        # captured on the first successful net read and subtracted from held_base so
-        # the controller manages ONLY the exposure IT opens (a pre-existing manual
-        # position, or a leftover from a prior run that was NOT auto-resumed, is
-        # baselined out — mirrors live_session's baseline). None = not yet captured.
+        # The run's venue BASELINE: the position on the product when the run began,
+        # subtracted from held_base so the controller reads ONLY its own exposure.
+        # None = not yet captured. It is captured on the first successful read and
+        # is only ever ZERO: a position this run did not open blocks arming (see
+        # _read_net — Nado's reduce-only exits act on the whole account position,
+        # so a run cannot safely manage its exposure on top of one). A REBUILD of
+        # the controller mid-session (worker handoff / FAILED-controller recovery)
+        # restores the persisted baseline via ``venue_baseline`` in the config so
+        # the run's own open position is still read as the run's, never as foreign.
         self._baseline_net: Optional[Decimal] = None
+        _seed = self.cfg("venue_baseline")
+        if _seed is not None:
+            try:
+                self._baseline_net = _dec(_seed)
+            except Exception:  # noqa: BLE001 - an unusable seed is no seed
+                self._baseline_net = None
         self._avg_entry: Optional[Decimal] = None
         self._peak: Optional[Decimal] = None      # favourable extreme mid since open
         # PRESENCE-FIRST: the ladder's FIRST arming (this run) is never gated — the
@@ -131,6 +176,13 @@ class ReverseGridController(Controller):
         self._stop_digest: Optional[str] = None
         self._stop_level: Optional[Decimal] = None
         self._stop_size: Optional[Decimal] = None
+        # Superseded stops whose cancel failed: retried on later ticks and at close
+        # so a replaced stop is never silently orphaned (reduce-only, so harmless
+        # to the position, but it holds a slot under the venue's 25-pending cap).
+        self._stale_stops: List[str] = []
+        # Cost-basis accumulators for the open position (see _recompute_avg_entry).
+        self._attr_num = Decimal(0)
+        self._attr_base = Decimal(0)
         self._last_mid: Optional[Decimal] = None
         # Order telemetry for /status. The base order_counts() sums executors, which
         # this controller has none of — it manages venue triggers directly — so it
@@ -146,6 +198,12 @@ class ReverseGridController(Controller):
         # reports). engine_diag reads gate_verdict/gate_reason each cycle.
         self.gate_verdict: str = "QUOTE"
         self.gate_reason: str = ""
+        # Tick counter (reconciliation cadence) and how many consecutive ticks the
+        # venue position has been unreadable (rate-limits the hold log).
+        self._tick_n = 0
+        self._unreadable_ticks = 0
+        self._foreign_ticks = 0
+        self._last_reconcile_tick = -1
 
     # -- config ---------------------------------------------------------------
     def _load_config(self) -> None:
@@ -153,7 +211,17 @@ class ReverseGridController(Controller):
         Called at construction and by :meth:`reload_config` on a live settings edit.
         Sets ONLY config attrs — never the runtime position/regime state."""
         self.trading_pair = str(self.cfg("trading_pair") or "")
-        self.levels = max(1, int(self.cfg("levels", 4) or 4))
+        # Rungs PER SIDE. Capped at REVGRID_MAX_LEVELS: the venue holds at most 25
+        # pending triggers per product per subaccount and a flat ladder is 2 x
+        # levels (the mapper caps too — this guards a directly-built controller).
+        _levels_raw = max(1, int(self.cfg("levels", 4) or 4))
+        self.levels = min(_levels_raw, REVGRID_MAX_LEVELS)
+        if _levels_raw > self.levels:
+            logger.info(
+                "revgrid %s: levels %s capped to %s per side (venue limit: %s pending "
+                "triggers per product; a flat ladder is 2 x levels)",
+                self.trading_pair, _levels_raw, self.levels, REVGRID_VENUE_MAX_PENDING_TRIGGERS,
+            )
         # A rung must clear the taker round trip or it is a structural loss; floor
         # the step there regardless of the configured value (conservative — the
         # real maker/marketable cost is lower, so this only ever leaves headroom).
@@ -177,10 +245,25 @@ class ReverseGridController(Controller):
         # While flat, re-anchor the ladder once the mid drifts this many steps from
         # the anchor, so a fresh break is always a real move from the CURRENT price.
         self.reanchor_bands = max(Decimal(1), _dec(self.cfg("reanchor_bands", 2) or 2))
-        # How far THROUGH its level a fired entry crosses (a few bp — enough to fill,
-        # not to overpay); the stop close is priced further through so it always fills.
-        self.entry_slippage_pct = float(self.cfg("entry_slippage_pct", 0.05) or 0.05)
-        self.stop_slippage_pct = float(self.cfg("stop_slippage_pct", 0.5) or 0.5)
+        # How far THROUGH its level a fired entry may fill (its IOC price bound). A
+        # LIMIT fills at the best available prices — the bound only caps the worst
+        # print — so it is set wide enough to cross a normal book plus a modest gap
+        # (15bp; the grid executor bounds its crossing exits at 30bp) without
+        # letting a gapped book fill a rung arbitrarily far from its level. Below
+        # the bound the fire lags a fast move, the IOC cancels, and the rung is
+        # re-armed by the reconciliation. The stop close is priced further through
+        # so it always fills.
+        # Defaults are the SHARED constants the stop-budget sizing covers
+        # (quant/rgrid_sizing): the bound the budget assumes must be the bound the
+        # orders carry.
+        _entry_slip = float(REVGRID_ENTRY_SLIP * Decimal(100))
+        _stop_slip = float(REVGRID_STOP_SLIP * Decimal(100))
+        self.entry_slippage_pct = float(self.cfg("entry_slippage_pct", _entry_slip) or _entry_slip)
+        self.stop_slippage_pct = float(self.cfg("stop_slippage_pct", _stop_slip) or _stop_slip)
+        # Reconcile the ladder against the venue's pending-trigger list this often
+        # (ticks) — and immediately whenever a rung SHOULD have fired (the mid is
+        # past its level) but the position did not move.
+        self.reconcile_every_ticks = max(1, int(self.cfg("revgrid_reconcile_every_ticks", 6) or 6))
         # Bound stop re-arm churn: only re-place the trailing stop when its level
         # moves at least this fraction of a step (or the position size changes).
         self.stop_min_reprice_frac = max(Decimal(0), _dec(self.cfg("stop_min_reprice_frac", "0.25") or "0.25"))
@@ -223,23 +306,45 @@ class ReverseGridController(Controller):
         self._rungs = []
         self._ladder_incomplete = False
         self._pos_base = Decimal(0)
-        self._baseline_net = None
+        # Keep a restored baseline (rebuild); a fresh run captures it on the first read.
+        if self.cfg("venue_baseline") is None:
+            self._baseline_net = None
         # A fresh run always does the presence-first initial entry (see _maintain_flat).
         self._has_opened = False
         self._reset_position_state()
 
     async def on_tick(self) -> None:
+        self._tick_n += 1
         mid = await self._mid()
         if mid is None or mid <= 0:
+            self._note_venue_hold("mid")
             return
+        # Pending-trigger snapshot FIRST, position second: a rung that fires between
+        # the two reads then shows as "still pending + net grew" (the normal fill
+        # path), never as "gone + net unchanged" (a hole). See _reconcile.
+        pending = await self._pending_snapshot(mid)
         net = await self._read_net()
         if net is None:
+            if self.gate_reason == "venue_foreign_position":
+                return                    # holding on a foreign position (surfaced by _read_net)
             # Unreadable venue — hold. Never act (open, close, reset) on a bad read.
+            # Say so: a silent hold reads as "LIVE, 0 orders" on the card.
+            self._note_venue_hold("position")
             return
+        if self._unreadable_ticks:
+            logger.info(
+                "revgrid %s: venue readable again after %s held tick(s) (user=%s)",
+                self.trading_pair, self._unreadable_ticks, self.user_id,
+            )
+            self._unreadable_ticks = 0
         self._last_mid = mid
         # Refresh the regime read every tick so the flat gate and the debounce stay
         # current (cheap; exits never consult it).
         await self._classify_regime()
+        # Ladder vs venue: drop rungs/stops the venue no longer holds so the
+        # bookkeeping below never trusts a trigger that is gone (see _reconcile).
+        if pending is not None:
+            await self._reconcile(pending, mid, net)
 
         if net == 0:
             if self._pos_base != 0:
@@ -265,9 +370,21 @@ class ReverseGridController(Controller):
         await self._maintain_position(net, mid)
 
     async def on_stop(self, reason: str = "stopped") -> None:
-        """Cancel every venue trigger this controller owns — the ladder and the
-        stop — so a stopped session leaves nothing watching the mid."""
-        await self._reset_after_close()
+        """Tear the ENTRY ladder down (a rung firing after the stop would open an
+        unmanaged position) but LEAVE the protective reduce-only stop armed: a
+        stop runs before the session's flatten, and if that flatten fails the
+        open position keeps its venue stop instead of sitting naked (audit
+        2026-09-16). Once the session-end path has flattened, its trigger sweep
+        (``strategy/venue_triggers``) cancels the now-stale stop by digest."""
+        await self._cancel_all_rungs()
+        await self._retry_stale_stops()
+        if self._stop_digest is not None:
+            logger.info(
+                "revgrid %s: stopped (%s) — protective stop %s left armed for the "
+                "position; the session-end sweep clears it once flat (user=%s)",
+                self.trading_pair, reason, self._stop_digest, self.user_id,
+            )
+        self._anchor = None
 
     async def flatten_now(self, mid: Decimal, *, reason: str = "handoff") -> bool:
         """Close the whole position, cancel every trigger, and report whether the
@@ -342,14 +459,161 @@ class ReverseGridController(Controller):
         held = _dec(held)
         if self._baseline_net is None:
             # First good read of the run — the ladder is not armed yet, so whatever
-            # is held now is pre-existing and is baselined out.
-            self._baseline_net = held
-            logger.info(
-                "revgrid baseline captured: %s pre-existing on %s (run reads net "
-                "relative to this) (user=%s)",
-                held, self.trading_pair, self.user_id,
-            )
+            # is held now was NOT opened by this run. The run cannot trade on top of
+            # it (reduce-only exits act on the whole account position), so it holds,
+            # visibly, until the position is gone; then the baseline is ZERO.
+            if held != 0:
+                self._note_foreign_position(held)
+                return None
+            self._baseline_net = Decimal(0)
+            if self._foreign_ticks:
+                logger.info("revgrid %s: foreign position cleared after %s tick(s) — arming (user=%s)",
+                            self.trading_pair, self._foreign_ticks, self.user_id)
+                self._foreign_ticks = 0
         return held - self._baseline_net
+
+    def _note_foreign_position(self, held: Decimal) -> None:
+        """Hold (visibly) while the product carries a position this run did not
+        open: card line "Quoting: PAUSED (an open position on this market was not
+        opened by this run)"; rate-limited warning."""
+        self._foreign_ticks += 1
+        self.gate_verdict, self.gate_reason = "PAUSE", "venue_foreign_position"
+        if self._foreign_ticks == 1 or self._foreign_ticks % 12 == 0:
+            logger.warning(
+                "revgrid %s: %s base already held on the venue was not opened by this run "
+                "— holding (close it, or stop and use another market) (%s tick(s), user=%s)",
+                self.trading_pair, held, self._foreign_ticks, self.user_id,
+            )
+
+    def _note_venue_hold(self, what: str) -> None:
+        """The venue could not be read this tick; hold and make it VISIBLE. The
+        gate telemetry turns the /status line into "Quoting: PAUSED (venue position
+        read unavailable — holding)"; the log is rate-limited to the first hold and
+        every 12th thereafter so a throttle storm does not flood it."""
+        self._unreadable_ticks += 1
+        self.gate_verdict, self.gate_reason = "PAUSE", "venue_unreadable"
+        if self._unreadable_ticks == 1 or self._unreadable_ticks % 12 == 0:
+            logger.warning(
+                "revgrid %s: venue %s read unavailable — holding (no arm / no exit "
+                "decisions) for %s consecutive tick(s); armed triggers and the venue "
+                "stop keep working (user=%s)",
+                self.trading_pair, what, self._unreadable_ticks, self.user_id,
+            )
+
+    # -- ladder vs venue reconciliation ---------------------------------------
+    def _fire_expected(self, mid: Decimal) -> bool:
+        """Is the mid past the level of a rung we still believe is armed? Then the
+        venue should have fired it — if the position did not move, the rung was an
+        IOC that cancelled unfilled (or the venue dropped it) and it is gone."""
+        for r in self._rungs:
+            if r.fired:
+                continue
+            if r.side is TradeType.BUY and mid >= r.level:
+                return True
+            if r.side is TradeType.SELL and mid <= r.level:
+                return True
+        return False
+
+    async def _pending_snapshot(self, mid: Decimal) -> Optional[List[str]]:
+        """The venue's pending trigger digests for this product when a reconcile
+        is due — every ``reconcile_every_ticks`` ticks, and at once when a rung
+        SHOULD have fired (the mid is past its level; ``_fire_expected``). ``None``
+        when not due, when the adapter cannot list, or when the list is unreadable
+        (unknown is never "gone"). Read BEFORE the position (see on_tick)."""
+        since = self._tick_n - self._last_reconcile_tick
+        due = since >= self.reconcile_every_ticks
+        # A rung the mid is past should have fired: check sooner — but no more
+        # than every other tick, so a venue that fires late (or a mid that differs
+        # from ours) cannot force a 5-weight list read every tick.
+        forced = self._pos_base == 0 and since >= 2 and self._fire_expected(mid)
+        if not (due or forced):
+            return None
+        if not self._rungs and self._stop_digest is None:
+            self._last_reconcile_tick = self._tick_n
+            return None
+        lister = getattr(self.adapter, "list_trigger_orders", None)
+        if not callable(lister):
+            return None
+        try:
+            pending = await lister(self.trading_pair)
+        except Exception:  # noqa: BLE001 - unreadable list = unknown, never "gone"
+            logger.debug("revgrid trigger list failed pair=%s", self.trading_pair, exc_info=True)
+            return None
+        if pending is None:
+            return None
+        self._last_reconcile_tick = self._tick_n
+        return [str(d).lower() for d in pending]
+
+    async def _reconcile(self, pending: List[str], mid: Decimal, net: Decimal) -> None:
+        """Compare the ladder + stop we THINK are armed with what the venue still
+        holds pending (``pending``, read before the position), and drop what is gone.
+
+        * a missing ENTRY rung while FLAT: the ladder has a hole exactly where price
+          went — tear the ladder down and re-anchor at the current mid (the flat
+          path re-arms a complete ladder this tick);
+        * a missing entry rung while IN A POSITION whose level the mid has NOT
+          crossed: the venue dropped it — forget it (the pyramid simply has one
+          fewer add). A missing rung the mid HAS crossed is a fill that is landing
+          (the position read follows the list read) — leave it for the net read;
+        * a missing STOP while in a position: the stop is gone (fired — the close
+          will show up on the next net read — or dropped by the venue) — forget its
+          digest so ``_ensure_stop`` re-arms protection at once (reduce-only, so a
+          re-arm over a close-in-flight is harmless).
+        """
+        held = {_norm_digest(d) for d in pending}
+        missing = [r for r in self._rungs if not r.fired and _norm_digest(r.digest) not in held]
+        stop_missing = (
+            self._stop_digest is not None and _norm_digest(self._stop_digest) not in held
+        )
+        if not missing and not stop_missing:
+            return
+        # DEFENCE IN DEPTH: a rung the venue reports gone is still CANCELLED by
+        # digest (idempotent — an unknown digest costs one execute weight and a
+        # venue "not found"). Should the list ever be wrong (a digest shape the
+        # venue changed under us), a still-live rung is cancelled rather than
+        # duplicated by the fresh ladder below.
+        if missing and net == 0 and self._pos_base == 0:
+            logger.info(
+                "revgrid %s: %s armed rung(s) no longer pending on the venue while flat "
+                "(fired unfilled / rejected / dropped) — re-anchoring the ladder at %s "
+                "(user=%s)",
+                self.trading_pair, len(missing), mid, self.user_id,
+            )
+            await self._cancel_all_rungs()      # cancels every unfired rung, missing ones included
+            self._anchor = None
+        elif missing:
+            def _crossed(r: _Rung) -> bool:
+                return (mid >= r.level) if r.side is TradeType.BUY else (mid <= r.level)
+            dropped = [r for r in missing if not _crossed(r)]
+            if dropped:
+                logger.info(
+                    "revgrid %s: %s armed add rung(s) no longer pending on the venue — "
+                    "dropped (position keeps its stop; the pyramid has fewer adds) (user=%s)",
+                    self.trading_pair, len(dropped), self.user_id,
+                )
+                for r in dropped:
+                    try:
+                        await self.adapter.cancel_trigger_order(r.digest)
+                    except AdapterError:
+                        logger.debug("revgrid dropped-rung cancel failed digest=%s", r.digest, exc_info=True)
+                self._rungs = [r for r in self._rungs if r not in dropped]
+        if stop_missing:
+            logger.warning(
+                "revgrid %s: protective stop %s is no longer pending on the venue — "
+                "re-arming protection now (user=%s)",
+                self.trading_pair, self._stop_digest, self.user_id,
+            )
+            old = self._stop_digest
+            self._stop_digest = None
+            self._stop_level = None
+            self._stop_size = None
+            if old is not None:
+                # Idempotent: if the list was wrong and the stop is live, this
+                # cancels it before the re-arm so two stops never stack.
+                try:
+                    await self.adapter.cancel_trigger_order(old)
+                except AdapterError:
+                    logger.debug("revgrid missing-stop cancel failed digest=%s", old, exc_info=True)
 
     # -- chop stand-down gate ------------------------------------------------
     async def _candles(self) -> List[dict]:
@@ -450,6 +714,7 @@ class ReverseGridController(Controller):
             return
         resting = {(r.side, r.level) for r in self._rungs if not r.fired}
         placed = 0
+        failed = False
         for k in range(1, self.levels + 1):
             offset = self.step_pct * Decimal(k)
             for side, level in (
@@ -480,17 +745,22 @@ class ReverseGridController(Controller):
                     order = await self.adapter.place_trigger_order(
                         self.trading_pair, side, size, level,
                         slippage_pct=self.entry_slippage_pct,
+                        # IOC: fill on fire or vanish — never rest as an untracked limit.
+                        order_type="ioc",
                     )
                 except AdapterError:
                     logger.warning(
                         "revgrid rung place failed side=%s level=%s (user=%s pair=%s)",
                         side.name, level, self.user_id, self.trading_pair, exc_info=True,
                     )
+                    failed = True
                     continue
                 self._rungs.append(_Rung(order.id, side, level, size))
                 placed += 1
         self._n_placed += placed
-        self._ladder_incomplete = False
+        # A transient placement failure leaves a hole: keep re-arming (only the
+        # missing rungs) on the next ticks instead of resting an asymmetric ladder.
+        self._ladder_incomplete = bool(failed)
         logger.info(
             "revgrid armed %s trigger rungs around anchor %s (levels=%s step=%s "
             "user=%s pair=%s)",
@@ -519,8 +789,9 @@ class ReverseGridController(Controller):
 
     async def _cancel_all_rungs(self) -> None:
         for r in self._rungs:
-            if not r.fired:
-                self._n_cancelled += 1
+            if r.fired:
+                continue              # consumed on the venue — nothing to cancel
+            self._n_cancelled += 1
             try:
                 await self.adapter.cancel_trigger_order(r.digest)
             except AdapterError:
@@ -551,6 +822,8 @@ class ReverseGridController(Controller):
         self._has_opened = True
         # The losing side is cancelled — the break went the other way.
         await self._cancel_side_rungs(TradeType.SELL if long else TradeType.BUY)
+        self._attr_num, self._attr_base = Decimal(0), Decimal(0)
+        self._avg_entry = None
         self._recompute_avg_entry(net)
         self._peak = mid
         self._trail_armed = False
@@ -566,33 +839,49 @@ class ReverseGridController(Controller):
     def _recompute_avg_entry(self, net: Decimal) -> None:
         """Average entry of the open position, attributed to the ladder's own rungs.
 
-        The observed net grew on one side, so the fill was some of that side's
-        rungs. They fire NEAREST the anchor first (k=1 before k=2), so attribute the
-        filled base to un-fired same-side rungs in that order and take the
-        size-weighted average of their LEVELS — a trigger fills at ~its level. This
-        needs no fill feed and no digest match; the ladder geometry is the basis.
+        Only the GROWTH since the last read is attributed (a shrink keeps the cost
+        basis — closing part of a position does not change what the rest cost).
+        Rungs fire NEAREST the anchor first (k=1 before k=2), so the growth is
+        laid onto un-fired same-side rungs in that order, at most one rung's size
+        each, and each rung it touches is marked FIRED with its actual attributed
+        base: a fired IOC is consumed whether it filled in full or in part, so a
+        40% partial must not be credited at full size (it understated the entry
+        and loosened the stop; audit 2026-09-16). Growth beyond what the ladder
+        explains (a manual add) is booked at the last mid. The basis is the
+        running base-weighted average of everything attributed — a trigger fills
+        at ~its level, so the level stands in for the print. This needs no fill
+        feed and no digest match; the ladder geometry is the basis.
         """
         side = TradeType.BUY if net > 0 else TradeType.SELL
-        target = abs(net)
+        prev = abs(self._pos_base) if _sign(self._pos_base) == _sign(net) else Decimal(0)
+        remaining = abs(net) - prev
+        if remaining <= 0:
+            if self._avg_entry is None:
+                self._avg_entry = self._anchor or self._last_mid
+            return
         same = sorted(
-            [r for r in self._rungs if r.side is side],
+            [r for r in self._rungs if r.side is side and not r.fired],
             key=lambda r: abs(r.level - (self._anchor or r.level)),
         )
-        acc = Decimal(0)
-        num = Decimal(0)
         for r in same:
-            if acc >= target:
+            if remaining <= 0:
                 break
-            take = min(r.size_base, target - acc)
+            take = min(r.size_base, remaining)
             if take <= 0:
                 continue
-            if not r.fired:
-                self._n_filled += 1     # a rung just fired (entry / add)
             r.fired = True
-            num += r.level * take
-            acc += take
-        if acc > 0:
-            self._avg_entry = num / acc
+            r.filled_base = take
+            self._n_filled += 1         # a rung just fired (entry / add)
+            self._attr_num += r.level * take
+            self._attr_base += take
+            remaining -= take
+        if remaining > 0:
+            px = self._last_mid or self._anchor
+            if px:
+                self._attr_num += px * remaining
+                self._attr_base += remaining
+        if self._attr_base > 0:
+            self._avg_entry = self._attr_num / self._attr_base
         elif self._avg_entry is None:
             # No ladder to attribute against (a user restart mid-position): fall back
             # to the anchor / last mid so a protective stop can still be sized.
@@ -620,6 +909,7 @@ class ReverseGridController(Controller):
         if self._stop_level is not None:
             desired = max(desired, self._stop_level) if long else min(desired, self._stop_level)
         await self._ensure_stop(net, desired)
+        await self._retry_stale_stops()
 
     async def _ensure_stop(self, net: Decimal, level: Decimal) -> None:
         """Arm / re-arm the single venue reduce-only stop. Place-then-cancel so the
@@ -659,6 +949,19 @@ class ReverseGridController(Controller):
                 await self.adapter.cancel_trigger_order(old)
             except AdapterError:
                 logger.debug("revgrid stale stop cancel failed digest=%s", old, exc_info=True)
+                self._stale_stops.append(old)     # retried on later ticks / at close
+
+    async def _retry_stale_stops(self) -> None:
+        """Retry the cancel of superseded stops whose cancel failed earlier."""
+        if not self._stale_stops:
+            return
+        still: List[str] = []
+        for digest in self._stale_stops:
+            try:
+                await self.adapter.cancel_trigger_order(digest)
+            except AdapterError:
+                still.append(digest)
+        self._stale_stops = still
 
     # -- close / reset -------------------------------------------------------
     async def _reset_after_close(self) -> None:
@@ -671,12 +974,15 @@ class ReverseGridController(Controller):
                 await self.adapter.cancel_trigger_order(self._stop_digest)
             except AdapterError:
                 logger.debug("revgrid stop cancel-on-close failed", exc_info=True)
+                self._stale_stops.append(self._stop_digest)
+        await self._retry_stale_stops()
         await self._cancel_all_rungs()
         self._anchor = None       # re-anchor to the current mid on the next flat tick
         self._reset_position_state()
 
     def _reset_position_state(self) -> None:
         self._avg_entry = None
+        self._attr_num, self._attr_base = Decimal(0), Decimal(0)
         self._peak = None
         self._trail_armed = False
         self._stop_digest = None
@@ -721,6 +1027,25 @@ class ReverseGridController(Controller):
             # profit, it ratchets the exit with the move.
             "grid_reset_active": bool(self._trail_armed),
             "grid_reset_side": "long" if long else ("short" if short else "none"),
+            # --- reverse-grid ladder telemetry (rendered by the /status card) ---
+            "grid_rungs_armed": sum(1 for r in self._rungs if not r.fired),
+            "grid_rungs_per_side": int(self.levels),
+            "grid_step_bp": float(self.step_pct * Decimal(10000)),
+            "grid_stop_level": float(self._stop_level) if self._stop_level else 0.0,
+            "grid_trail_armed": bool(self._trail_armed),
+            # Persisted by the runtime and restored on a rebuild (see __init__).
+            "grid_venue_baseline": (
+                float(self._baseline_net) if self._baseline_net is not None else None
+            ),
+            # Persisted every cycle so the stop / restart sweeps can vouch for this
+            # run's triggers even if the placement→session DB link was missed, and
+            # keep the protective stop when the position is left open (boot).
+            "grid_stop_digest": self._stop_digest,
+            "grid_trigger_digests": (
+                [r.digest for r in self._rungs if not r.fired]
+                + ([self._stop_digest] if self._stop_digest else [])
+                + list(self._stale_stops)
+            ),
             # --- reverse-grid extras (ignored by the card; used by tests/logs) ---
             "avg_entry": self._avg_entry,
             "stop_level": self._stop_level,

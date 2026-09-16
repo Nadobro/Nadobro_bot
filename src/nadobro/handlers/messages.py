@@ -1621,6 +1621,10 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         "grid_reset_threshold_pct", "grid_reset_timeout_seconds",
         "rgrid_spread_bp", "rgrid_stop_loss_pct", "rgrid_take_profit_pct",
         "rgrid_reset_threshold_pct", "rgrid_reset_timeout_seconds", "rgrid_discretion",
+        # Trigger Reverse Grid exits (percent of price; 0 = auto = 2 x step) and the
+        # D-Grid regime knobs the engine reads live (drift %, flip confirm ticks).
+        "rgrid_stop_pct", "rgrid_trail_pct",
+        "dgrid_trend_drift_pct", "dgrid_flip_confirm_ticks",
         # Mid Mode accepts directional_bias as a continuous float in [-1, +1].
         "directional_bias",
         # MM/grid leverage (position size = margin × leverage).
@@ -1708,6 +1712,12 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         "dgrid_max_spread_bp": (1.0, 200.0),
         "dgrid_short_window_points": (2, 50),
         "dgrid_long_window_points": (4, 200),
+        # Trigger Reverse Grid exits: 0 = auto (2 x step); else % of price.
+        "rgrid_stop_pct": (0, 10.0),
+        "rgrid_trail_pct": (0, 10.0),
+        # D-Grid regime: drift % over the long window (0 = off), flip debounce ticks.
+        "dgrid_trend_drift_pct": (0, 5.0),
+        "dgrid_flip_confirm_ticks": (1, 20),
         # Volume Bot (spot) custom inputs — mirror strategy_handler set limits.
         # Band $100-$500 per docs/volume_bot_taker_v4.md (was 10..1_000_000,
         # which disagreed with the handler's own floor of 100).
@@ -1721,6 +1731,11 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         "mm_duration_minutes": (1, 14400),
         "twap_pause_move_bp": (0, 5000),
     }
+    # The trigger Reverse Grid arms ``levels`` rungs on EACH side and Nado holds at
+    # most 25 pending triggers per product, so R-Grid levels stop at 12 (the
+    # button path enforces the same bound; the engine caps regardless).
+    if field == "levels" and strategy == "rgrid":
+        limits["levels"] = (1, 12)
     if field not in limits:
         logger.error("Missing strategy limit for field=%s (strategy=%s)", field, strategy)
         await _reply_loc(
@@ -1766,7 +1781,7 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         int_fields = {
             "interval_seconds", "levels", "quote_ttl_seconds", "rgrid_reset_timeout_seconds",
             "grid_reset_timeout_seconds", "dgrid_short_window_points", "dgrid_long_window_points",
-            "dn_hold_seconds", "dn_cycles", "mm_leverage_override",
+            "dn_hold_seconds", "dn_cycles", "mm_leverage_override", "dgrid_flip_confirm_ticks",
         }
         if field in int_fields:
             cfg[field] = int(value)

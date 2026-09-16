@@ -17,6 +17,11 @@ _STRATEGY_SETTINGS_RUNTIME_BLOCKLIST = frozenset({
     # fill-anchored grid soft-reset telemetry (green/red trigger levels).
     "grid_reset_up_price", "grid_reset_down_price", "grid_soft_reset_engaged",
     "grid_net_base", "grid_reset_threshold_bp", "grid_mode",
+    # trigger Reverse Grid ladder telemetry (rungs / step / stop / trail) and the
+    # D-Grid run baseline — controller-derived, never user settings.
+    "grid_rungs_armed", "grid_rungs_per_side", "grid_step_bp", "grid_stop_level",
+    "grid_trail_armed", "dgrid_venue_baseline", "grid_venue_baseline",
+    "grid_stop_digest", "grid_trigger_digests",
     # MM participation/duration (TWAP): preset + user duration are start-snapshot
     # (they freeze the chunk/run-duration computed at start, like vol_direction);
     # the computed run duration, chunk + one-shot notify flag are runtime-owned.
@@ -904,6 +909,37 @@ async def _boot_stand_down_one(telegram_id: int, network: str, state: dict, stra
         cancel_resting_orders_for_user, telegram_id, network, only_pid=only_pid
     )
     order_ok = bool(cancel.get("success"))
+    # 1b) VENUE TRIGGERS (2026-09-16): a Reverse Grid (rgrid, or D-Grid's trend
+    #     phase) arms its entry rungs and trailing stop as venue TRIGGER orders,
+    #     which the resting-order cancel above never sees. An armed entry rung is
+    #     NOT reduce-only — after a restart it would fire on a price cross and open
+    #     an unmanaged position. Sweep the bot's own ENTRY triggers on the product
+    #     (digests the intent registry or the run's persisted telemetry vouches
+    #     for — a user's manual TP/SL triggers are untouched). The run's protective
+    #     reduce-only stop and the rail's reduce-only stop are deliberately LEFT
+    #     ARMED: the position is being left open for the user, and a reduce-only
+    #     stop is the only protection it has once the session rail is off. (Stale
+    #     ones are reconciled by the next run.) Best-effort; an unconfirmed sweep
+    #     is reported like an unconfirmed cancel.
+    kept_stop = False
+    if strategy in ("grid", "rgrid", "dgrid", "mid") and only_pid is not None:
+        try:
+            from src.nadobro.strategy.venue_triggers import cancel_session_trigger_orders_for_state
+            from src.nadobro.trading.trade_service import get_user_nado_client
+            _client = await run_blocking_sdk(get_user_nado_client, telegram_id, network=network)
+            if _client is not None:
+                _sweep = await cancel_session_trigger_orders_for_state(
+                    _client, network, state, keep_protective=True,
+                )
+                kept_stop = bool(_sweep.get("kept_protective"))
+                if not _sweep.get("success"):
+                    order_ok = False
+                    logger.warning(
+                        "boot stand-down: venue trigger sweep not confirmed user=%s pid=%s: %s",
+                        telegram_id, only_pid, _sweep.get("error"),
+                    )
+        except Exception:  # noqa: BLE001 - never block the stand-down on the sweep
+            logger.warning("boot stand-down: venue trigger sweep failed user=%s", telegram_id, exc_info=True)
     # 2) Terminate stale executor rows + clear engine progress so the next run
     #    builds cleanly (mirrors the cross-process stop path).
     try:
@@ -932,8 +968,9 @@ async def _boot_stand_down_one(telegram_id: int, network: str, state: dict, stra
         await _notify(
             telegram_id,
             "🔄 {strategy} on {product} ({network}) was stopped by a restart — resting orders "
-            "cancelled; any open position is untouched. Tap Start to resume.",
+            "cancelled; any open position is untouched{stop_note}. Tap Start to resume.",
             strategy=_strategy_display_name(strategy), product=product or "your market", network=network,
+            stop_note=(" (its protective venue stop is left in place)" if kept_stop else ""),
         )
     else:
         await _notify(
@@ -1641,6 +1678,22 @@ def start_user_bot(
         cycle_notional_cfg = float(state.get("cycle_notional_usd") or margin_usd or 0.0)
         cycle_notional = max(cycle_notional_cfg, margin_usd)
         spread_bp = float(state.get(spread_key) or state.get("spread_bp") or 0.0)
+        if strategy == "rgrid":
+            # The Reverse Grid is a venue price-TRIGGER ladder (buys above / sells
+            # below the mid, each rung fills as a taker when its level is crossed,
+            # one trailing reduce-only stop) — not maker quotes, and the ladder is
+            # placed once, so the per-cycle re-quote budget note does not apply.
+            try:
+                from src.nadobro.quant.rgrid_sizing import REVGRID_MAX_LEVELS, REVGRID_STEP_FLOOR
+                _lv = min(max(1, int(float(state.get("levels") or 4))), REVGRID_MAX_LEVELS)
+                _step_bp = max(spread_bp, float(REVGRID_STEP_FLOOR) * 10000.0)
+            except Exception:  # policy: degrade-ok(message detail only)
+                _lv, _step_bp = int(float(state.get("levels") or 4)), spread_bp
+            return True, (
+                f"{_strategy_display_name(strategy)} bot started on {product.upper()}-PERP ({network}) "
+                f"| Trigger ladder: {_lv} rungs/side x {_step_bp:.0f}bp (buys above / sells below mid) "
+                f"| Margin ${margin_usd:,.0f} | Notional ${cycle_notional:,.0f} | Trailing venue stop"
+            )
         msg = (
             f"{_strategy_display_name(strategy)} bot started on {product.upper()}-PERP ({network}) "
             f"| Maker-only quotes | Margin ${margin_usd:,.0f} | Notional ${cycle_notional:,.0f} / cycle | Spread {spread_bp:.0f}bp"
@@ -1740,7 +1793,78 @@ def _cancel_leftover_resting_orders(telegram_id: int, network: str, state: dict,
         return None
     from src.nadobro.trading.trade_service import cancel_resting_orders_for_user
 
-    return cancel_resting_orders_for_user(telegram_id, network, only_pid=int(only_pid))
+    res = cancel_resting_orders_for_user(telegram_id, network, only_pid=int(only_pid))
+    # Leftover VENUE TRIGGERS (Reverse Grid entry rungs) are swept too — same
+    # precision (bot-owned digests only), same fail-loud contract. The position
+    # may still be open here (a failed flatten is what this path retries), so the
+    # protective reduce-only stops are KEPT.
+    sweep = _sweep_bot_trigger_orders_sync(telegram_id, network, state, int(only_pid), keep_protective=True)
+    if sweep is not None:
+        if not sweep.get("success"):
+            res["success"] = False
+            res["error"] = (res.get("error") or "") + f" venue triggers not confirmed cancelled: {sweep.get('error')}"
+        res["cancelled_triggers"] = int(sweep.get("cancelled") or 0)
+    return res
+
+
+async def _sweep_session_triggers_async(client, network: str, state: dict) -> None:
+    """Cancel the run's own venue triggers after a session-end FLATTEN (rail
+    SL/TP, duration cap, stale session): the position is gone, so the run's
+    protective stop and any leftover entry rung are stale. Best-effort."""
+    try:
+        from src.nadobro.strategy.venue_triggers import cancel_session_trigger_orders_for_state
+        res = await cancel_session_trigger_orders_for_state(client, network, state, keep_protective=False)
+        if not res.get("success"):
+            logger.warning(
+                "session end: venue trigger sweep not confirmed user=? strategy=%s: %s",
+                state.get("strategy"), res.get("error"),
+            )
+    except Exception:  # noqa: BLE001 - best-effort
+        logger.debug("session end: venue trigger sweep failed", exc_info=True)
+
+
+def _sweep_bot_trigger_orders_sync(
+    telegram_id: int, network: str, state: dict, product_id: int, *, keep_protective: bool = False,
+) -> dict | None:
+    """Run the venue trigger sweep from a SYNC stop path. Returns the sweep result,
+    or ``None`` when the client is unavailable / the strategy owns no triggers.
+    ``keep_protective``: the position is being left open — keep the run's and the
+    rail's reduce-only stops; otherwise (flat) cancel them too."""
+    strategy = _normalize_strategy_id(str(state.get("strategy") or ""))
+    if strategy not in ("grid", "rgrid", "dgrid", "mid") or int(product_id or 0) <= 0:
+        return None
+    try:
+        from src.nadobro.strategy.venue_triggers import cancel_session_trigger_orders_for_state
+        from src.nadobro.trading.trade_service import get_user_nado_client
+
+        client = get_user_nado_client(telegram_id, network=network)
+    except Exception:  # noqa: BLE001
+        return None
+    if client is None:
+        return None
+    box: dict = {}
+
+    async def _go():
+        box["res"] = await cancel_session_trigger_orders_for_state(
+            client, network, state, keep_protective=keep_protective,
+        )
+        if keep_protective:
+            return
+        # The rail's OWN reduce-only venue stop (strategy/venue_stop.py) is not
+        # intent-linked, so the sweep above never selects it — cancel it through its
+        # tracker here so a manual Stop leaves no reduce-only trigger behind that
+        # could clip the user's next position on this product (SL/TP trace
+        # 2026-09-16; it used to linger until the NEXT run's first reconcile).
+        try:
+            from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
+            await cancel_session_venue_stop(client, state, product_id=int(product_id))
+        except Exception:  # noqa: BLE001 - reduce-only; best-effort
+            logger.debug("stop: venue stop cancel failed", exc_info=True)
+
+    ok, err = _run_engine_stop_sync(_go, user_id=telegram_id, network=network, strategy=strategy)
+    if not ok:
+        return {"success": False, "cancelled": 0, "error": err or "sweep failed"}
+    return box.get("res") or {"success": False, "cancelled": 0, "error": "sweep did not run"}
 
 
 def stop_user_bot(telegram_id: int, cancel_orders: bool = True) -> tuple[bool, str]:
@@ -1802,6 +1926,29 @@ def stop_user_bot(telegram_id: int, cancel_orders: bool = True) -> tuple[bool, s
             close_res = cleanup_strategy_positions(telegram_id, network, state)
         except Exception as e:  # an unreadable position book (DENIED-vs-EMPTY) is a failed cleanup, retriable
             close_res = {"success": False, "error": str(e)}
+        # VENUE TRIGGERS (2026-09-16): the controller's on_stop cancelled its entry
+        # rungs but LEFT its protective stop armed. Now that the flatten has run,
+        # sweep the run's triggers: once FLAT every stop is stale (the run's and the
+        # rail's) and is cancelled too; if the flatten FAILED the position is still
+        # open, so the protective stops are kept and only leftover entry rungs go.
+        # Precise (bot-owned digests only) and best-effort.
+        if _normalize_strategy_id(str(state.get("strategy") or "")) in ("grid", "rgrid", "dgrid", "mid"):
+            try:
+                _product = str(state.get("product") or "").strip()
+                _pid = get_product_id(_product, network=network) if (_product and _product.upper() != "MULTI") else None
+                _sweep = (
+                    _sweep_bot_trigger_orders_sync(
+                        telegram_id, network, state, int(_pid),
+                        keep_protective=not bool(close_res.get("success")),
+                    ) if _pid else None
+                )
+                if _sweep is not None and not _sweep.get("success"):
+                    logger.warning(
+                        "stop: venue trigger sweep not confirmed user=%s strategy=%s: %s",
+                        telegram_id, state.get("strategy"), _sweep.get("error"),
+                    )
+            except Exception:  # noqa: BLE001 - never block the stop on the sweep
+                logger.debug("stop: venue trigger sweep failed", exc_info=True)
         if not close_res.get("success"):
             return False, f"Strategy loop stopped, but cleanup failed: {close_res.get('error', 'unknown')}"
     if not engine_ok:
@@ -2164,6 +2311,14 @@ def get_user_bot_status(telegram_id: int) -> dict:
         "rgrid_reset_threshold_pct": state.get("rgrid_reset_threshold_pct") or state.get("grid_reset_threshold_pct"),
         "rgrid_reset_timeout_seconds": state.get("rgrid_reset_timeout_seconds") or state.get("grid_reset_timeout_seconds"),
         "rgrid_discretion": state.get("rgrid_discretion") or state.get("grid_discretion"),
+        # Trigger Reverse Grid ladder telemetry (rgrid standalone; dgrid's trend
+        # phase emits the same grid_* keys while its delegate runs).
+        "rgrid_rungs_armed": int(state.get("grid_rungs_armed") or 0),
+        "rgrid_rungs_per_side": int(state.get("grid_rungs_per_side") or 0),
+        "rgrid_step_bp": float(state.get("grid_step_bp") or 0.0),
+        "rgrid_stop_level": float(state.get("grid_stop_level") or 0.0),
+        "rgrid_trail_armed": bool(state.get("grid_trail_armed")),
+        "dgrid_venue_baseline": float(state.get("dgrid_venue_baseline") or 0.0),
         "dgrid_phase": state.get("dgrid_phase") or "",
         "dgrid_variance_ratio": float(state.get("dgrid_variance_ratio") or 0.0),
         "dgrid_realized_move_bp": float(state.get("dgrid_realized_move_bp") or 0.0),
@@ -3026,6 +3181,7 @@ async def _evaluate_mm_duration_rail(
     try:
         from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
         await cancel_session_venue_stop(client, state)
+        await _sweep_session_triggers_async(client, network, state)
     except Exception:  # noqa: BLE001 - cleanup is best-effort; never mask the duration result
         logger.debug("venue stop cancel on duration cap failed", exc_info=True)
     return True, None
@@ -3202,6 +3358,7 @@ async def _evaluate_session_pnl_rail(
         try:
             from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
             await cancel_session_venue_stop(client, state)
+            await _sweep_session_triggers_async(client, network, state)
         except Exception:  # noqa: BLE001 - best-effort cleanup
             logger.debug("venue stop cancel on stale session failed", exc_info=True)
         _SLTP_MARK_CACHE.pop(int(sess.get("id") or 0), None)   # session over — drop its mark
@@ -3422,6 +3579,7 @@ async def _evaluate_session_pnl_rail(
     try:
         from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
         await cancel_session_venue_stop(client, state)
+        await _sweep_session_triggers_async(client, network, state)
     except Exception:  # noqa: BLE001 - cleanup is best-effort; never mask the stop result
         logger.debug("venue stop cancel on session stop failed", exc_info=True)
     return True, None
@@ -3891,7 +4049,11 @@ async def _run_cycle(
                        "grid_drift_from_anchor_pct", "grid_reset_active",
                        "grid_mode", "grid_reset_threshold_bp", "grid_soft_reset_engaged",
                        "grid_reset_up_price", "grid_reset_down_price", "grid_net_base",
-                       "grid_buy_exposure_price", "grid_sell_exposure_price"):
+                       "grid_buy_exposure_price", "grid_sell_exposure_price",
+                       # trigger Reverse Grid ladder + D-Grid baseline (2026-09-16)
+                       "grid_rungs_armed", "grid_rungs_per_side", "grid_step_bp",
+                       "grid_stop_level", "grid_trail_armed", "dgrid_venue_baseline",
+                       "grid_venue_baseline", "grid_stop_digest", "grid_trigger_digests"):
                 if _k in _telemetry:
                     state[_k] = _telemetry[_k]
             await _save_state_async(telegram_id, network, state)

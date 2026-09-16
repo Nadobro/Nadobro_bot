@@ -218,6 +218,28 @@ class DynamicGridController(Controller):
         # run is pinpointable (candle feed vs gate pause vs spawn refusal).
         self._last_candle_count: int = 0
         self._last_mid: Optional[Decimal] = None
+        # SESSION BASELINE (2026-09-16): the venue position on the product when
+        # THIS run first read it, captured BEFORE the first spawn. It is only ever
+        # ZERO: a position this run did not open (a manual long, a leftover a
+        # previous stop could not close) BLOCKS arming, visibly, until it is gone.
+        # The previous code force-closed such a position at spawn as a "residual"
+        # (it market-sold a user's own position the moment they tapped Start);
+        # trading on TOP of it is not safe either — Nado's reduce-only exits act on
+        # the whole account position, so a close against an opposite-signed
+        # position could never fill and a same-signed one could be trimmed by the
+        # run's exits. A REBUILD mid-session (worker handoff / FAILED-controller
+        # recovery) restores the persisted baseline via ``venue_baseline`` so the
+        # run's own open position is read as the run's (and cleared as a residual
+        # before the next phase arms), never as a foreign position.
+        # None = not captured yet: no phase may arm until the venue is readable.
+        self._venue_baseline: Optional[Decimal] = None
+        _seed = self.cfg("venue_baseline")
+        if _seed is not None:
+            try:
+                self._venue_baseline = _dec(_seed)
+            except Exception:  # noqa: BLE001 - an unusable seed is no seed
+                self._venue_baseline = None
+        self._venue_hold_ticks: int = 0
 
     async def on_start(self) -> None:
         return None
@@ -521,6 +543,14 @@ class DynamicGridController(Controller):
         # never sit it out. Keep the gate call only for ATR/telemetry; both
         # pause flags off => dgrid always quotes.
         await self.evaluate_quote_gate(pair, pause_on_trend=False, pause_on_breakout=False)
+        # A venue hold (unreadable position / residual close / foreign position)
+        # is not a regime verdict; it is re-asserted below when still true, so
+        # clear it here.
+        if self.gate_reason in ("venue_unreadable", "venue_residual", "venue_foreign_position"):
+            self.gate_verdict, self.gate_reason = "QUOTE", ""
+        # No phase arms before the run's venue baseline is known (see __init__).
+        if self._venue_baseline is None and not await self._capture_venue_baseline():
+            return
 
         desired = await self._classify()
         # PHASE-0: when the trend delegate is disabled, D-Grid never enters the
@@ -988,9 +1018,49 @@ class DynamicGridController(Controller):
         if self._trend is not None:
             await self._trend.on_tick()
 
+    def _note_venue_hold(self, reason: str, detail: str) -> None:
+        """Make a venue-side deferral VISIBLE: gate telemetry (the /status card
+        renders "Quoting: PAUSED (venue position read unavailable — holding)") and a
+        rate-limited warning (first hold, then every 12th tick)."""
+        self._venue_hold_ticks += 1
+        self.gate_verdict, self.gate_reason = "PAUSE", reason
+        if self._venue_hold_ticks == 1 or self._venue_hold_ticks % 12 == 0:
+            logger.warning(
+                "dgrid %s: %s — deferring (%s consecutive tick(s); controller=%s)",
+                self.trading_pair, detail, self._venue_hold_ticks, self.id,
+            )
+
+    async def _capture_venue_baseline(self) -> bool:
+        """Read the venue position ONCE at the start of the run and remember it as
+        the baseline (see __init__). ``False`` (and a visible hold) while the venue
+        cannot be read — a baseline must never be taken off a bad read."""
+        try:
+            held = await self.adapter.held_base(self.trading_pair)
+        except Exception:  # noqa: BLE001 - unreadable => hold
+            logger.debug("dgrid %s: baseline read failed", self.id, exc_info=True)
+            held = None
+        if held is None:
+            self._note_venue_hold("venue_unreadable", "venue position read unavailable before the first spawn")
+            return False
+        held = _dec(held)
+        if held != 0:
+            self._note_venue_hold(
+                "venue_foreign_position",
+                f"{held} base already held on {self.trading_pair} was not opened by this run "
+                "— holding (close it, or stop and use another market)",
+            )
+            return False
+        self._venue_baseline = Decimal(0)
+        if self._venue_hold_ticks:
+            logger.info("dgrid %s: venue hold cleared after %s tick(s) — arming (controller=%s)",
+                        self.trading_pair, self._venue_hold_ticks, self.id)
+            self._venue_hold_ticks = 0
+        return True
+
     async def _ensure_venue_flat_for_trend(self, mid: Decimal, *, before: str = "trend spawn",
                                            lenient_unreadable: bool = False) -> bool:
-        """Confirm the VENUE is flat before the trigger trend delegate arms.
+        """Confirm the VENUE is flat — relative to the run's baseline — before the
+        next phase arms.
 
         DGRID-GRIDRGRID-RESIDUAL (audit 2026-08-28): the GRID phase books via the
         shared inventory (the ``_spawn_phase`` gate reads it), but the trigger
@@ -1005,30 +1075,35 @@ class DynamicGridController(Controller):
         notional dust floor); defer (False) on an unreadable venue or a close that
         did not confirm — never arm the delegate onto a venue position it did not open.
         """
+        baseline = self._venue_baseline if self._venue_baseline is not None else Decimal(0)
         try:
             held = await self.adapter.held_base(self.trading_pair)
         except Exception:  # noqa: BLE001 - can't confirm flat -> defer, retry next tick
-            logger.warning("dgrid %s: venue read failed before %s — deferring",
-                           self.id, before, exc_info=True)
-            return lenient_unreadable
+            logger.debug("dgrid %s: venue read failed before %s", self.id, before, exc_info=True)
+            held = None
         if held is None:
             # Unreadable. The trigger delegate BASELINES OUT whatever it finds, so
             # it must never arm on a bad read; the GRID ladder books via inventory
             # and only a POSITIVE residual matters to it, so it may proceed.
+            if not lenient_unreadable:
+                self._note_venue_hold("venue_unreadable", f"venue position read unavailable before {before}")
             return lenient_unreadable
-        held = _dec(held)
+        # The RUN's exposure: whatever is held beyond the position that already
+        # existed when the run began (that one is the user's, never touched).
+        residual = _dec(held) - baseline
         dust = (Decimal(1) / mid) if mid > 0 else Decimal(0)   # ~$1 notional
-        if abs(held) <= dust:
-            return True                        # venue already flat
-        close_side = TradeType.SELL if held > 0 else TradeType.BUY
-        logger.warning(
-            "dgrid %s: venue residual %s base before %s (inventory read flat) "
-            "— closing reduce-only so the next phase starts from true flat (controller=%s)",
-            self.id, held, before, self.id,
+        if abs(residual) <= dust:
+            self._venue_hold_ticks = 0
+            return True                        # venue already flat (for this run)
+        close_side = TradeType.SELL if residual > 0 else TradeType.BUY
+        self._note_venue_hold(
+            "venue_residual",
+            f"venue residual {residual} base (beyond the run baseline {baseline}) before "
+            f"{before} — closing reduce-only so the next phase starts from flat",
         )
         try:
             await self.adapter.place_order(
-                self.trading_pair, close_side, OrderType.MARKET, abs(held),
+                self.trading_pair, close_side, OrderType.MARKET, abs(residual),
                 reduce_only=True,
             )
         except Exception:  # noqa: BLE001 - close failed; defer and retry next tick
@@ -1039,7 +1114,13 @@ class DynamicGridController(Controller):
             held2 = await self.adapter.held_base(self.trading_pair)
         except Exception:  # noqa: BLE001
             return False
-        return held2 is not None and abs(_dec(held2)) <= dust
+        if held2 is None:
+            return False
+        flat = abs(_dec(held2) - baseline) <= dust
+        if flat:
+            self.gate_verdict, self.gate_reason = "QUOTE", ""
+            self._venue_hold_ticks = 0
+        return flat
 
     async def _spawn_trend(self, mid: Optional[Decimal]) -> bool:
         if mid is None or mid <= 0:
@@ -1161,6 +1242,26 @@ class DynamicGridController(Controller):
         self._dgrid_event = None
         return event
 
+    def grid_metrics(self) -> Dict[str, object]:
+        """The trend delegate's trigger-ladder telemetry (rungs armed / step /
+        stop / trail) while the RGRID phase runs, so the /status card shows the
+        ladder exactly as it does for a standalone Reverse Grid; zeroed ladder keys
+        otherwise (the card hides the line when no rungs are configured). Only the
+        ladder keys are emitted outside the trend phase so the GRID phase's own
+        anchor / drift telemetry (``dgrid_metrics``) is never overridden."""
+        trend = self._trend
+        fn = getattr(trend, "grid_metrics", None) if isinstance(trend, ReverseGridController) else None
+        if callable(fn):
+            try:
+                return dict(fn() or {})
+            except Exception:  # policy: degrade-ok(telemetry only)
+                pass
+        return {
+            "grid_rungs_armed": 0, "grid_rungs_per_side": 0, "grid_step_bp": 0.0,
+            "grid_stop_level": 0.0, "grid_trail_armed": False,
+            "grid_stop_digest": None, "grid_trigger_digests": [],
+        }
+
     def dgrid_metrics(self) -> Dict[str, object]:
         """Live phase + variance + anchor/side telemetry for the /status card."""
         side = (
@@ -1176,4 +1277,9 @@ class DynamicGridController(Controller):
             "grid_reset_side": side,
             "grid_drift_from_anchor_pct": float(self.realized_move_bp) / 100.0,
             "grid_reset_active": bool(self.reset_threshold_bp > 0),
+            # The run's venue baseline (0 once captured; None until then). Persisted
+            # by the runtime and restored on a rebuild (see __init__).
+            "dgrid_venue_baseline": (
+                float(self._venue_baseline) if self._venue_baseline is not None else None
+            ),
         }

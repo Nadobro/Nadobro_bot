@@ -85,6 +85,7 @@ class MockNadoAdapter(NadoAdapterBase):
         self._triggers: Dict[str, dict] = {}
         self.placed_triggers: List[NadoOrder] = []
         self.cancelled_triggers: List[str] = []
+        self.trigger_order_types: Dict[str, str] = {}
 
     # -- test controls ----------------------------------------------------
     def set_mid(self, value: object) -> None:
@@ -218,6 +219,7 @@ class MockNadoAdapter(NadoAdapterBase):
         *,
         slippage_pct: float = 0.5,
         dependency: Optional[str] = None,
+        order_type: str = "ioc",
     ) -> NadoOrder:
         self._maybe_fail("place_trigger_order")
         if _dec(amount_base) <= 0:
@@ -239,9 +241,30 @@ class MockNadoAdapter(NadoAdapterBase):
             # A dependent rung stays UNARMED until its parent fires (pyramiding);
             # an independent rung is armed the moment it is placed.
             "armed": dependency is None,
+            "order_type": str(order_type or "ioc"),
         }
         self.placed_triggers.append(order)
+        self.trigger_order_types[tid] = str(order_type or "ioc")
         return copy.copy(order)
+
+    async def list_trigger_orders(self, trading_pair: str):
+        """Digests of the triggers the venue still holds PENDING for ``trading_pair``
+        (entry rungs and stops). ``fail_on=["list_trigger_orders"]`` models an
+        unreadable trigger service (returns None, the base contract's UNKNOWN)."""
+        try:
+            self._maybe_fail("list_trigger_orders")
+        except AdapterError:
+            return None
+        return [
+            tid for tid, trg in self._triggers.items()
+            if trg["order"].trading_pair == trading_pair and not trg["order"].state.is_terminal
+        ]
+
+    def drop_trigger(self, order_id: str) -> None:
+        """Test control: make the venue FORGET a pending trigger without firing or
+        cancelling it through the adapter (an IOC that fired and cancelled unfilled,
+        a rejection at the venue's pending cap, an expiry, a signer change)."""
+        self._triggers.pop(order_id, None)
 
     async def place_stop_order(
         self,

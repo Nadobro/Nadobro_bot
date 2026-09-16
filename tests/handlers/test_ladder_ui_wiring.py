@@ -238,9 +238,12 @@ def test_button_and_typed_input_paths_agree_on_the_bands():
 
 
 def test_every_threshold_button_lands_inside_its_band():
+    # Reverse Grid no longer offers reset-threshold buttons (2026-09-16): the
+    # live trigger engine never read rgrid_reset_threshold_pct (a key of the
+    # retired maker controller), so the buttons were dead and were removed. The
+    # typed-input bands above are kept for backward compatibility only.
     for sid, field, (lo, hi) in (
         ("grid", "grid_reset_threshold_pct", _GRID_RANGE),
-        ("rgrid", "rgrid_reset_threshold_pct", _RGRID_RANGE),
     ):
         emitted = _emitted(f"strategy:set:{sid}:{field}:")
         assert emitted, f"{sid} lost its {field} buttons"

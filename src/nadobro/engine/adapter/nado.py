@@ -25,7 +25,7 @@ import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, AsyncIterator, Callable, Dict, Iterable, Optional, Sequence
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Sequence
 
 from src.nadobro.utils.env import env_float
 from src.nadobro.engine.adapter.base import (
@@ -263,6 +263,48 @@ def _client_call_succeeded(resp: Any) -> tuple[bool, str]:
         if "success" in resp and not resp.get("success"):
             return False, str(resp.get("error") or "venue returned success=False")
     return True, ""
+
+
+_PENDING_TRIGGER_STATUSES = frozenset({
+    "waiting_price", "waiting_dependency", "triggering", "twap_executing", "pending",
+})
+
+
+def _norm_digest(digest: object) -> str:
+    """Canonical digest form for comparisons: lower-case hex with a ``0x`` prefix.
+    The placement response and the trigger-service rows are compared by digest;
+    a case or prefix difference between the two would make every armed rung look
+    "gone" — the same failure as a denied read, so normalise both sides."""
+    text = str(digest or "").strip().lower()
+    if text and not text.startswith("0x"):
+        text = "0x" + text
+    return text
+
+
+def _pending_trigger_digest(row: object) -> Optional[str]:
+    """The digest of a ``get_trigger_orders`` row that is still PENDING, else
+    ``None``. Rows are the plain-dict form of the trigger service's response
+    (``{"order": {"digest": ..., ...}, "status": "waiting_price", ...}``); the
+    digest may also sit at the top level in older shapes. A row whose status is
+    unknown is treated as pending (conservative: an unknown rung is never
+    declared gone)."""
+    if not isinstance(row, dict):
+        return None
+    status = str(row.get("status") or "").strip().lower()
+    if status and status not in _PENDING_TRIGGER_STATUSES:
+        return None
+    inner = row.get("order")
+    digest = None
+    if isinstance(inner, dict):
+        digest = inner.get("digest") or inner.get("order_digest")
+        if not digest:
+            deeper = inner.get("order")
+            if isinstance(deeper, dict):
+                digest = deeper.get("digest")
+    if not digest:
+        digest = row.get("digest") or row.get("order_digest")
+    text = str(digest or "").strip()
+    return text.lower() if text else None
 
 
 def _trigger_digest(resp: object) -> str:
@@ -772,6 +814,7 @@ class NadoAdapter(NadoAdapterBase):
         *,
         slippage_pct: float = 0.5,
         dependency: Optional[str] = None,
+        order_type: str = "ioc",
     ) -> NadoOrder:
         """Place a venue PRICE-TRIGGER entry rung (see the base-class contract).
 
@@ -825,6 +868,7 @@ class NadoAdapter(NadoAdapterBase):
                 slippage_pct=float(slippage_pct),
                 isolated=bool(meta.isolated_only),
                 dependency=dependency,
+                order_type=str(order_type or "ioc"),
             )
         except Exception as exc:  # noqa: BLE001 - normalize venue errors
             raise AdapterError(f"place_trigger_order failed: {exc}") from exc
@@ -861,6 +905,42 @@ class NadoAdapter(NadoAdapterBase):
             order_type=OrderType.LIMIT, amount_base=abs(_dec(amount_base)),
             price=_dec(trigger_price), state=OrderState.OPEN,
         )
+
+    async def list_trigger_orders(self, trading_pair: str) -> Optional[List[str]]:
+        """Digests of this account's PENDING trigger orders on ``trading_pair``
+        (see the base-class contract). One product-scoped trigger-service query;
+        ``None`` on any read failure / budget denial (UNKNOWN, never "none pending")."""
+        meta = self._meta(trading_pair)
+        try:
+            rows = await self._client.get_trigger_orders(
+                product_ids=[int(meta.product_id)], limit=200, strict=True,
+            )
+        except Exception:  # noqa: BLE001 - unreadable trigger service => UNKNOWN
+            logger.debug("list_trigger_orders failed pair=%s", trading_pair, exc_info=True)
+            return None
+        if rows is None:
+            return None
+        out: List[str] = []
+        unexplained = 0
+        for row in rows:
+            digest = _pending_trigger_digest(row)
+            if digest:
+                out.append(_norm_digest(digest))
+                continue
+            status = str(row.get("status") or "").strip().lower() if isinstance(row, dict) else ""
+            if not status or status in _PENDING_TRIGGER_STATUSES:
+                # A row we can neither read a digest from nor explain as
+                # non-pending: the venue row shape is not what we expect.
+                unexplained += 1
+        if unexplained:
+            # Unknown, never "nothing pending" — a misread list would make every
+            # armed rung look gone (the same failure as a denied read).
+            logger.warning(
+                "list_trigger_orders pair=%s: %s of %s rows unparseable — treating the "
+                "list as unreadable", trading_pair, unexplained, len(rows),
+            )
+            return None
+        return out
 
     async def cancel_trigger_order(self, order_id: str) -> bool:
         """Cancel a resting price-trigger by digest via the venue TRIGGER service
