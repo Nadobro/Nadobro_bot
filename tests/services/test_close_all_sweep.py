@@ -237,3 +237,87 @@ def test_cancel_only_entry_point_reports_an_unknown_book():
          patch.object(trade_service, "_order_sender_params", return_value=[None]):
         out = trade_service.cancel_resting_orders_for_user(1234, "mainnet", only_pid=BTC_PID)
     assert out["success"] is False and "unavailable" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# PARTIAL-CANCEL & VERIFY-UNREADABLE (audit 2026-09-04).
+# The book reads fine but a per-digest cancel is rejected/rate-limited and stays
+# resting, OR the post-close verify read is denied. Either way the stop must NOT
+# report the book clear — the session-312 residual class.
+# ---------------------------------------------------------------------------
+
+def test_partial_cancel_failure_fails_loud_cancel_only():
+    """AUDIT-SWEEP-2026-09-04-PARTIAL-CANCEL-FALSE-SUCCESS: two digests read from a
+    readable book; the first cancels, the second is denied mid-sweep and stays
+    resting. cancel_resting_orders_for_user must report success=False. The old gate
+    (``not _book_unknown and not (cancelled == 0 and errors)``) passed because
+    cancelled>=1 and the cancel-failed string is not an UNKNOWN_BOOK marker."""
+    class _PartialCancel(_FakeClient):
+        def cancel_order(self, product_id, digest, sender=None):
+            self.calls.append("cancel_order")
+            self.cancelled.append((product_id, digest, sender))
+            if len(self.cancelled) >= 2:      # first ok, second denied
+                return {"success": False, "error": "Rate limited — please retry in a moment.", "rate_limited": True}
+            return {"success": True}
+
+    client = _PartialCancel(resting=[
+        {"product_id": BTC_PID, "digest": "0xA"}, {"product_id": BTC_PID, "digest": "0xB"},
+    ])
+    p1, p2 = _known_pids([BTC_PID])
+    with p1, p2, patch.object(trade_service, "get_user", return_value=_FakeUser()), \
+         patch.object(trade_service, "get_user_nado_client", return_value=client), \
+         patch.object(trade_service, "get_product_name", return_value="BTC-PERP"), \
+         patch.object(trade_service, "_order_sender_params", return_value=[None]):
+        out = trade_service.cancel_resting_orders_for_user(1234, "mainnet", only_pid=BTC_PID)
+    assert out["success"] is False, "a partial cancel must fail loud, not report the book clear"
+    assert out.get("order_errors"), "the rejected cancel must be surfaced"
+
+
+def test_partial_cancel_failure_fails_loud_close_all_no_positions():
+    """AUDIT-SWEEP-2026-09-04-PARTIAL-CANCEL-FALSE-SUCCESS: same defect on the
+    close_all_positions no-positions branch — a partial cancel used to fall through
+    to ``if cancelled_orders > 0: return success=True`` with order_errors attached."""
+    class _PartialCancelNoPos(_FakeClient):
+        def get_all_positions(self):               # no open position -> no-positions branch
+            self.calls.append("get_all_positions")
+            return []
+        def cancel_order(self, product_id, digest, sender=None):
+            self.calls.append("cancel_order")
+            self.cancelled.append((product_id, digest, sender))
+            if len(self.cancelled) >= 2:
+                return {"success": False, "error": "venue rejected", "rate_limited": False}
+            return {"success": True}
+
+    # _flat stays False so the batched read returns the resting book (readable);
+    # only the position is absent.
+    client = _PartialCancelNoPos(resting=[
+        {"product_id": BTC_PID, "digest": "0xA"}, {"product_id": BTC_PID, "digest": "0xB"},
+    ])
+    p1, p2 = _known_pids([BTC_PID])
+    with p1, p2:
+        result = _close_all(client)
+    assert result.get("success") is False, "a partial cancel must fail the close-all"
+    assert result.get("order_errors")
+
+
+def test_positions_found_unreadable_verify_fails_loud():
+    """AUDIT-SWEEP-2026-09-04-CLOSE-ALL-UNKNOWN-BOOK-POS-BRANCH: with a position to
+    flatten, the initial book reads empty-and-readable and the close lands, but the
+    post-close VERIFY read is DENIED on every sender. Before the fix the verify call
+    passed no known_pids/network, so its fallback returned empty and the denied read
+    collapsed to '0 remaining' -> success=True. It must now fail loud."""
+    class _DeniedVerifyClient(_FakeClient):
+        def get_all_open_orders(self, *a, **k):
+            self.calls.append("get_all_open_orders")
+            return None if self._flat else []          # readable-empty pre-close, denied post-close
+        def get_open_orders(self, product_id, sender=None, refresh=False):
+            self.calls.append("get_open_orders")
+            return None                                # fallback also denied -> unknown book
+
+    client = _DeniedVerifyClient()
+    p1, p2 = _known_pids([BTC_PID])
+    with p1, p2:
+        result = _close_all(client)
+    assert client.calls.count("place_market_order") == 1, "the position was flattened"
+    assert result.get("success") is False, "an unreadable post-close verify must fail loud"
+    assert "clear after close" in str(result.get("error", ""))

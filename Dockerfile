@@ -33,6 +33,11 @@ ENV PYTHONPATH=/app/site-packages:/app \
     PATH=/app/site-packages/bin:$PATH \
     TELEGRAM_WEBHOOK_PORT=8082
 WORKDIR /app
+# Build stamp: `fly deploy --build-arg GIT_SHA=$(git rev-parse HEAD)`. Logged at
+# boot so the running build is identifiable (2026-09-16: v273 turned out to be
+# a dirty-worktree snapshot that matched no commit — half a fix was live).
+ARG GIT_SHA=unknown
+ENV NADOBRO_GIT_SHA=${GIT_SHA}
 COPY --from=builder /build/site-packages /app/site-packages
 COPY --chown=${APP_USER}:${APP_USER} main.py ./
 COPY --chown=${APP_USER}:${APP_USER} assets/ ./assets/

@@ -45,7 +45,8 @@ def _stack(*, sdk: bool = True, allowed=True, isolated=()):
                      mock.patch.object(NadoClient, "_gateway_allowed", return_value=allowed))
     st.enter_context(mock.patch.object(NadoClient, "_gateway_release", return_value=None))
     st.enter_context(mock.patch.object(NadoClient, "_open_order_product_ids", return_value=[1, 2]))
-    st.enter_context(mock.patch.object(NadoClient, "_isolated_subaccount_hexes", return_value=list(isolated)))
+    st.enter_context(mock.patch.object(
+        NadoClient, "_isolated_subaccounts", return_value=[(iso, None) for iso in isolated]))
     return st
 
 
@@ -91,3 +92,22 @@ def test_strict_callers_still_get_the_exception():
     c = _client()
     with _stack(sdk=False), pytest.raises(RuntimeError):
         c.get_all_open_orders(True, strict=True)
+
+
+def test_a_failed_child_discovery_with_nothing_cached_is_unknown_not_parent_only():
+    """Children we cannot enumerate are children we cannot read: the list must
+    be UNKNOWN (None), never silently parent-only (which would let the stale
+    sweep mark every child order cancelled_or_filled)."""
+    pytest.importorskip("nado_protocol")
+    c = _client()
+    c.client = _engine([])
+    with ExitStack() as st:
+        st.enter_context(mock.patch.object(NadoClient, "_ensure_sdk_client", return_value=True))
+        st.enter_context(mock.patch.object(NadoClient, "_gateway_allowed", return_value=True))
+        st.enter_context(mock.patch.object(NadoClient, "_gateway_release", return_value=None))
+        st.enter_context(mock.patch.object(NadoClient, "_open_order_product_ids", return_value=[1, 2]))
+        st.enter_context(mock.patch.object(
+            NadoClient, "_isolated_subaccounts", side_effect=RuntimeError("archive 429")))
+        assert c.get_all_open_orders(True, include_isolated=True) is None
+        with pytest.raises(RuntimeError):
+            c.get_all_open_orders(True, include_isolated=True, strict=True)

@@ -59,6 +59,11 @@ except RuntimeError as e:
     logger.error(str(e))
     sys.exit(1)
 
+# Build stamp (Dockerfile ARG GIT_SHA -> NADOBRO_GIT_SHA): the one line that says
+# which commit is actually running. "unknown" means the image was built without
+# `--build-arg GIT_SHA=$(git rev-parse HEAD)` — see deploy.md.
+logger.info("Build: NADOBRO_GIT_SHA=%s", env_str("NADOBRO_GIT_SHA", "unknown"))
+
 
 def check_config():
     transport_mode, webhook_url, webhook_path = _resolve_transport_settings()
@@ -552,12 +557,25 @@ async def run_bot():
     # the SLTP safety poll would keep the rail alive on that orphaned position.
     # Cancel the resting orders, finalize, clear the flag; resume is user-tapped.
     try:
+        from src.nadobro.runtime.scheduler import note_boot_standdown_started
         from src.nadobro.strategy.bot_runtime import boot_stand_down_strategies
+        # Re-anchor the safety poll's grace ceiling to the stand-down window so a
+        # slow boot preamble cannot burn it before the stand-down runs.
+        note_boot_standdown_started()
         stood = await boot_stand_down_strategies()
         if stood:
             logger.info("Strategy boot stand-down: stopped %d running session(s); resume is user-initiated", stood)
     except Exception:
         logger.warning("Strategy boot stand-down failed", exc_info=True)
+
+    # Boot stand-down is finished (or was gated off / failed above): re-arm the
+    # fast SL/TP safety poll, which was parked so it could not flatten an orphaned
+    # 'running' session during the boot window (AUDIT-BOOT-2026-09-04-POLL-FLATTEN-RACE).
+    try:
+        from src.nadobro.runtime.scheduler import mark_boot_standdown_complete
+        mark_boot_standdown_complete()
+    except Exception:
+        logger.warning("Could not signal boot stand-down complete to the SLTP safety poll", exc_info=True)
 
     from telegram import BotCommand
     await bot_app.bot.set_my_commands([

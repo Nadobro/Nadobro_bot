@@ -428,6 +428,14 @@ def _bytes32_hex_to_u8_array(hex_value: str) -> list[int] | None:
         return None
 
 
+class ArchiveReadUnavailable(RuntimeError):
+    """The archive could not be READ this round — our own budget denied it, the
+    Cloudflare circuit is open, or the request failed — as opposed to a
+    successful read that returned nothing. DENIED-vs-EMPTY for the indexer:
+    a caller that treats this as ``[]`` turns "children unknown" into
+    "no children", and a stale sweep then wipes every child's live rows."""
+
+
 def query_isolated_subaccounts_for_parent(
     network: str,
     parent_subaccount_hex: str,
@@ -436,6 +444,10 @@ def query_isolated_subaccounts_for_parent(
     """
     Isolated margin positions live on child subaccounts. List those linked to the
     default (parent) subaccount.
+
+    Raises :class:`ArchiveReadUnavailable` when the read could not be made
+    (``_post`` answers ``None`` for a budget denial, an open circuit or a failed
+    request); returns ``[]`` only for a successful read with no children.
 
     https://docs.nado.xyz/developer-resources/api/archive-indexer/isolated-subaccounts
     """
@@ -454,6 +466,10 @@ def query_isolated_subaccounts_for_parent(
         }
     }
     result = _post(url, payload)
+    if result is None:
+        raise ArchiveReadUnavailable(
+            "isolated_subaccounts read unavailable (archive budget denied, circuit open or request failed)"
+        )
     return _isolated_subaccounts_list_from_response(result) or []
 
 

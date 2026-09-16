@@ -462,7 +462,9 @@ class ReverseGridController(Controller):
                     continue          # already on the book — don't double-place
                 # Per-cycle opening cap: stop laying rungs once the budget is spent.
                 # The remaining rungs are placed on the next tick (see _maintain_flat).
-                if self.adapter.opening_budget_exhausted():
+                # EXECUTE-BUDGET-BACKOFF: also stop once a placement was throttled by the
+                # execute budget this cycle (bucket drained — the rest would 429 anyway).
+                if self.adapter.opening_budget_exhausted() or self.adapter.execute_budget_exhausted():
                     self._n_placed += placed
                     self._ladder_incomplete = True
                     logger.info(

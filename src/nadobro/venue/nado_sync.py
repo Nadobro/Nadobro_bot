@@ -525,12 +525,47 @@ async def sync_user(
             # authoritative sync must include isolated subaccounts too.
             include_isolated = True
 
+            # OPEN-ORDERS SCOPE (2026-09-16 storm): the venue charges 2 x products
+            # for a multi-product read, so a whole-catalog sweep (~96 ids -> ~192
+            # weight) on every sender cannot fit the 400/10s per-IP budget for a
+            # user with isolated children (7 x 192 per poll). The regular poll
+            # reads only the products that can hold one of OUR rows — DB
+            # open-order rows, open positions, the last known snapshot — so the
+            # stale sweep stays correct (every swept row's product is in scope);
+            # the heavy pass (portfolio_heavy_sync_seconds) keeps the whole-
+            # catalog discovery of orders placed outside the bot. Isolated
+            # children always read exactly their own product.
+            open_orders_scope: list[int] | None = None
+            if not need_heavy:
+                open_orders_scope = await run_blocking_db(
+                    _open_orders_scope_for_user, int(user_id), network, prior
+                )
+
             summary, orders, trigger_orders, balance = await asyncio.gather(
                 client.calculate_account_summary(ts=int(time.time())),
-                run_blocking_sdk(client.get_all_open_orders, True, include_isolated=include_isolated),
+                run_blocking_sdk(
+                    client.get_all_open_orders, True,
+                    include_isolated=include_isolated, product_ids=open_orders_scope,
+                ),
                 client.get_trigger_orders(limit=200),
                 run_blocking_sdk(client.get_balance),
+                return_exceptions=True,
             )
+            # A summary OUR budget declined this round is a throttle, not a venue
+            # error: keep the prior summary/positions and flag the round
+            # "Cached · venue throttled" instead of failing the whole sync and
+            # discarding the other three reads (review 2026-09-16). Any other
+            # failure still takes the error path below.
+            summary_throttled = False
+            if isinstance(summary, BaseException):
+                if "venue throttled" in str(summary):
+                    summary_throttled = True
+                    summary = prior.get("summary") or {}
+                else:
+                    raise summary
+            for _res in (orders, trigger_orders, balance):
+                if isinstance(_res, BaseException):
+                    raise _res
             # DENIED-vs-EMPTY (2026-09-02): ``None`` means this round could not
             # read the book (budget-denied / venue error) — NOT an empty book.
             # Keep the last known list for display and flag the snapshot so the
@@ -549,7 +584,7 @@ async def sync_user(
             # failed) or an unknown open-orders book — must not be stamped
             # "synced now"; the deck says "Cached · venue throttled" instead.
             balance_cached = isinstance(balance, dict) and bool(balance.get("_cached"))
-            venue_throttled = bool(balance_cached or open_orders_unknown)
+            venue_throttled = bool(balance_cached or open_orders_unknown or summary_throttled)
 
             if need_heavy:
                 matches, funding = await asyncio.gather(
@@ -601,6 +636,7 @@ async def sync_user(
                 "positions": positions,
                 "open_orders": all_orders,
                 "open_orders_unknown": open_orders_unknown,
+                "open_orders_scope": open_orders_scope,
                 "matches": matches or [],
                 "funding_payments": funding or [],
                 "stats": stats,
@@ -628,6 +664,67 @@ async def sync_user(
             return stale
 
 
+def _running_strategy_product_id(user_id: int, network: str) -> int | None:
+    """The product of this user's running strategy (bot_state ``strategy_bot:``
+    row), read directly so the venue layer does not import strategy/. A fresh
+    grid's resting ladder has no DB order row until the sync writes one — the
+    scope must still include its product or the deck shows 0 orders until the
+    heavy pass."""
+    try:
+        row = query_one("SELECT value FROM bot_state WHERE key = %s", (f"strategy_bot:{int(user_id)}:{network}",))
+        if not row:
+            return None
+        import json
+
+        state = json.loads(row.get("value") or "{}")
+        if not state.get("running"):
+            return None
+        product = str(state.get("product") or "").strip()
+        if not product or product.upper() == "MULTI":
+            return None
+        from src.nadobro.config import get_product_id
+
+        pid = get_product_id(product, network=network)
+        return int(pid) if pid is not None else None
+    except Exception:  # policy: degrade-ok(scope hint only)
+        return None
+
+
+def _open_orders_scope_for_user(user_id: int, network: str, prior: dict[str, Any] | None) -> list[int]:
+    """Products that can hold one of this user's open-order rows: DB open-order
+    rows, DB open positions, products traded in the last 24h, the running
+    strategy's product, and the last known snapshot's orders/positions. The
+    regular poll reads (and sweeps) exactly these; anything placed outside the
+    bot on another product is discovered by the heavy whole-catalog pass."""
+    scope: set[int] = set()
+    try:
+        from src.nadobro.models.database import (
+            get_open_order_product_ids,
+            get_open_position_product_ids,
+            get_recent_trade_product_ids,
+        )
+
+        for fn in (get_open_order_product_ids, get_open_position_product_ids, get_recent_trade_product_ids):
+            try:
+                scope.update(int(p) for p in fn(int(user_id), network))
+            except Exception:  # policy: degrade-ok(scope hint; the heavy pass still sweeps the whole catalog)
+                continue
+    except Exception:  # policy: degrade-ok(DB helpers unavailable; the snapshot-derived scope below still applies)
+        pass
+    strategy_pid = _running_strategy_product_id(int(user_id), network)
+    if strategy_pid is not None:
+        scope.add(strategy_pid)
+    for key in ("open_orders", "positions"):
+        for row in (prior or {}).get(key) or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                scope.add(int(row.get("product_id")))
+            except (TypeError, ValueError):
+                continue
+    return sorted(scope)
+
+
 def _write_snapshot(snapshot: dict[str, Any], duration_ms: int) -> None:
     user_id = int(snapshot["user_id"])
     network = _normalize_network(snapshot["network"])
@@ -645,7 +742,7 @@ def _write_snapshot(snapshot: dict[str, Any], duration_ms: int) -> None:
             user_id, network,
         )
     else:
-        _write_open_orders(user_id, network, orders)
+        _write_open_orders(user_id, network, orders, product_scope=snapshot.get("open_orders_scope"))
     fills_inserted = _write_matches(user_id, network, matches)
     funding_inserted = _write_funding(user_id, network, funding)
 
@@ -816,7 +913,28 @@ def _write_positions(user_id: int, network: str, positions: list[dict[str, Any]]
         )
 
 
-def _write_open_orders(user_id: int, network: str, orders: list[dict[str, Any]]) -> None:
+def _write_open_orders(
+    user_id: int, network: str, orders: list[dict[str, Any]], *, product_scope: list[int] | None = None,
+) -> None:
+    """Upsert the venue's open orders and sweep DB rows the venue no longer
+    lists. ``product_scope`` (a SCOPED read, see ``_open_orders_scope_for_user``)
+    restricts the sweep to the products that were actually read — the scope
+    plus every product a returned order sits on (an isolated child's own
+    product). ``None`` is a whole-account read and sweeps every row."""
+    sweep_sql = ""
+    sweep_params: tuple = ()
+    if product_scope is not None:
+        swept: set[int] = {int(p) for p in product_scope}
+        for o in orders:
+            try:
+                swept.add(int(o.get("product_id")))
+            except (TypeError, ValueError):
+                continue
+        if not swept:
+            # Nothing was read: no row can be swept and there is nothing to upsert.
+            return
+        sweep_sql = " AND product_id = ANY(%s)"
+        sweep_params = (sorted(swept),)
     digests = [str(o.get("digest") or o.get("order_digest") or "") for o in orders if o.get("digest") or o.get("order_digest")]
     if digests:
         placeholders = ", ".join(["%s"] * len(digests))
@@ -825,18 +943,18 @@ def _write_open_orders(user_id: int, network: str, orders: list[dict[str, Any]])
             UPDATE open_orders
             SET status = 'cancelled_or_filled', synced_at = now()
             WHERE user_id = %s AND network = %s AND status IN ('open', 'pending', 'armed')
-              AND order_digest NOT IN ({placeholders})
+              AND order_digest NOT IN ({placeholders}){sweep_sql}
             """,
-            (user_id, network, *digests),
+            (user_id, network, *digests, *sweep_params),
         )
     elif not orders:
         execute(
-            """
+            f"""
             UPDATE open_orders
             SET status = 'cancelled_or_filled', synced_at = now()
-            WHERE user_id = %s AND network = %s AND status IN ('open', 'pending', 'armed')
+            WHERE user_id = %s AND network = %s AND status IN ('open', 'pending', 'armed'){sweep_sql}
             """,
-            (user_id, network),
+            (user_id, network, *sweep_params),
         )
     else:
         logger.warning(

@@ -49,7 +49,12 @@ class _FakeClient:
         self.placed.append({"product_id": product_id, "size": size, **kwargs})
         return {"success": True, "digest": "0xC1053"}
 
-    def get_open_orders(self, product_id, sender=None):
+    # Batched book read used by the post-close verify (_resting_orders_by_sender).
+    # [] = READ, empty. Subclasses return None to simulate a denied read.
+    def get_all_open_orders(self, *a, **k):
+        return []
+
+    def get_open_orders(self, product_id, sender=None, refresh=False):
         return []
 
     def get_market_price(self, product_id):
@@ -89,10 +94,10 @@ def test_link_digest_intent_empty_digest_noops():
     assert calls == []
 
 
-def _close_position_with_mocks(**close_kwargs):
+def _close_position_with_mocks(client=None, cancel_return=(0, []), **close_kwargs):
     """Drive close_position through one leg with a fake client; capture the
     intent link and the synthetic-row recording."""
-    client = _FakeClient()
+    client = client if client is not None else _FakeClient()
     linked = []
     recorded = []
 
@@ -113,7 +118,7 @@ def _close_position_with_mocks(**close_kwargs):
          patch.object(trade_service, "get_product_name", return_value="BTC-PERP"), \
          patch.object(trade_service, "get_user_nado_client", return_value=client), \
          patch.object(trade_service, "_order_sender_params", return_value=[None]), \
-         patch.object(trade_service, "_cancel_open_orders_for_product", return_value=(0, [])), \
+         patch.object(trade_service, "_cancel_open_orders_for_product", return_value=cancel_return), \
          patch.object(trade_service, "_iter_position_legs",
                       return_value=[{"subaccount": None, "signed_amount": 0.5}]), \
          patch.object(trade_service, "_net_abs_for_subaccount", return_value=(0.5, 1)), \
@@ -167,3 +172,49 @@ def test_close_position_links_session_close_digest():
     assert kwargs.get("strategy_session_id") == 55
     # Synthetic row must NOT inherit the non-manual source (double-count guard).
     assert "source" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# DENIED-vs-EMPTY in close_position (single-product manual close), 2026-09-04.
+# Same class as the close_all_positions / cancel_resting_orders_for_user fixes:
+# a budget-denied order read must FAIL LOUD, never collapse to "book clear".
+# get_all_positions uses a cache/empty fallback (never None), so only the order
+# side can fail loud here — but orphaned ORDERS were the session-312 mechanism.
+# ---------------------------------------------------------------------------
+
+def test_close_position_full_close_fails_loud_on_unreadable_verify():
+    """AUDIT-SWEEP-2026-09-04-CLOSE-ALL-UNKNOWN-BOOK-POS-BRANCH: after the close fills, an
+    UNREADABLE post-close order verify (batched + fallback both denied) must fail loud
+    instead of collapsing a denied read to '0 remaining' and reporting a clean close."""
+    class _DeniedVerifyClient(_FakeClient):
+        def get_all_open_orders(self, *a, **k):
+            return None                                    # batched verify read denied
+        def get_open_orders(self, product_id, sender=None, refresh=False):
+            return None                                    # per-product fallback denied too
+
+    result, _, _, client = _close_position_with_mocks(client=_DeniedVerifyClient())
+    assert client.placed, "the close order was still placed"
+    assert result.get("success") is False, "an unreadable post-close verify must fail loud"
+    assert "could not confirm the order book is clear" in str(result.get("error", "")).lower()
+
+
+def test_close_position_no_position_fails_loud_on_unreadable_cancel():
+    """AUDIT-SWEEP-2026-09-04-PARTIAL-CANCEL-FALSE-SUCCESS: with no position to close, an
+    unreadable order book during the pre-close cancel (or a rejected cancel) must fail
+    loud, not report a clean cancel-only close over orders that may still rest."""
+    class _FlatClient(_FakeClient):
+        def get_all_positions(self):
+            return []                                      # no position on this product
+
+    result, _, _, _ = _close_position_with_mocks(
+        client=_FlatClient(),
+        cancel_return=(0, ["open-orders read unavailable for BTC-PERP"]),
+    )
+    assert result.get("success") is False, "an unreadable book during cancel must fail loud"
+    assert "could not confirm the order book is clear" in str(result.get("error", "")).lower()
+
+
+def test_close_position_full_close_succeeds_on_readable_empty_verify():
+    """Happy path unchanged: a READABLE empty post-close book -> success (no false fail)."""
+    result, _, _, client = _close_position_with_mocks()   # default _FakeClient: [] book
+    assert client.placed and result.get("success") is True

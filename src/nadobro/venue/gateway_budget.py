@@ -32,6 +32,13 @@ Callers pass ``weight`` (documented per-call cost — see ``nado_weights``) and
    place *without* spot leverage costs 20, so 20×30 = 600/min caps it at the
    documented 30/min automatically.
 
+**Edge (kind="edge", limited per IP, its own bucket):**
+
+1. **Cloudflare circuit** only — the ``error_code=1000`` live breaker does not
+   apply (a throttled live lane is exactly when the edge lane must carry the
+   price snapshot).
+2. **Per-host edge bucket** — 12000/min, 2000/10s, weight 1 per request.
+
 When :func:`try_acquire` returns ``False``, callers must **skip** the call
 and serve cached data — never fan out to per-product fallbacks.
 """
@@ -75,6 +82,18 @@ _RL_COOLDOWN = env_float("NADO_GATEWAY_RL_COOLDOWN_SECONDS", 60.0)
 # round-trip) until the ban is likely lifted; queries are unaffected.
 _WRITE_BAN_COOLDOWN = env_float("NADO_WRITE_BAN_COOLDOWN_SECONDS", 45.0)
 
+# EDGE lane (``/edge/query``, kind="edge"): in-gateway cached market/reference
+# reads on a SEPARATE, larger per-IP bucket — 12000/min, 2000/10s, weight 1 per
+# request regardless of product count (docs: developer-resources/api/gateway/edge).
+# Bulk price polling belongs here: it must never compete with order/margin reads
+# for the 400/10s live budget (2026-09-16: the alert scan's 82-weight live
+# ``market_prices`` read every 5s alone burned ~41% of the live IP budget).
+_EDGE_RPS = env_float("NADO_EDGE_RPS", 150.0)        # doc 200/s; safety margin
+_EDGE_BURST = env_float("NADO_EDGE_BURST", 1500.0)   # doc 2000/10s; safety margin
+# An edge rejection ("rate limited" body) parks the edge lane briefly so callers
+# serve their last snapshot instead of re-polling into the rejection.
+_EDGE_RL_COOLDOWN = env_float("NADO_EDGE_RL_COOLDOWN_SECONDS", 5.0)
+
 
 @dataclass
 class _TokenBucket:
@@ -116,6 +135,8 @@ _lock = threading.RLock()
 _user_buckets: dict[int, _TokenBucket] = {}
 _user_inflight: dict[int, int] = {}
 _wallet_buckets: dict[str, _TokenBucket] = {}
+_edge_buckets: dict[str, _TokenBucket] = {}
+_edge_rl: dict[str, float] = {}  # host -> open_until (wall clock)
 _gateway_rl: dict[str, _BreakerLite] = {}
 _write_ban: dict[str, float] = {}  # host -> open_until (monotonic-free wall clock)
 
@@ -246,6 +267,50 @@ def _wallet_bucket(wallet: str) -> _TokenBucket:
         return bucket
 
 
+def record_edge_rate_limited(url: str) -> None:
+    """Park the edge lane for ``_EDGE_RL_COOLDOWN`` after the venue rejected an
+    edge query. Separate from the live breaker: an edge rejection says nothing
+    about the live query budget, and vice versa."""
+    host = _host(url)
+    if not host:
+        return
+    now = time.time()
+    with _lock:
+        prev = _edge_rl.get(host, 0.0)
+        _edge_rl[host] = now + _EDGE_RL_COOLDOWN
+    if now >= prev:
+        logger.warning("Nado edge lane rate-limited host=%s cooldown=%.0fs", host, _EDGE_RL_COOLDOWN)
+
+
+def is_edge_rate_limited(url: str) -> bool:
+    host = _host(url)
+    if not host:
+        return False
+    with _lock:
+        return time.time() < _edge_rl.get(host, 0.0)
+
+
+def _wallet_key(wallet: Optional[str]) -> str:
+    """The venue's execute budget is per WALLET ADDRESS (600/min), not per
+    subaccount. A 32-byte subaccount hex is ``address ++ name``: the parent and
+    every isolated child of one wallet share ONE venue budget, so they must
+    share one bucket here — keying by the full subaccount hex handed each child
+    its own 600/min and under-counted a multi-child wallet N-fold."""
+    key = (wallet or "").strip().lower()
+    if key.startswith("0x") and len(key) == 66:
+        return key[:42]
+    return key
+
+
+def _edge_bucket(host: str) -> _TokenBucket:
+    with _lock:
+        bucket = _edge_buckets.get(host)
+        if bucket is None:
+            bucket = _TokenBucket(rps=_EDGE_RPS, burst=_EDGE_BURST)
+            _edge_buckets[host] = bucket
+        return bucket
+
+
 def try_acquire(
     url: str,
     *,
@@ -263,28 +328,56 @@ def try_acquire(
       * ``"execute"`` — per-wallet bucket only (no in-flight slot, so **no**
         :func:`release` needed). Executes are limited per wallet, not per IP.
 
+      * ``"edge"`` — the edge-query bucket only (12000/min per IP, weight 1 per
+        request). Independent of the live query budget AND of the
+        ``error_code=1000`` breaker; only a Cloudflare challenge on the host
+        parks it. No :func:`release` needed.
+
     Returns False when budget is unavailable — callers must skip and serve
     cached data.
     """
-    if is_gateway_blocked(url):
-        return False
     wait = _USER_MAX_WAIT if max_wait is None else float(max_wait)
     w = max(1.0, float(weight))
 
+    if kind == "edge":
+        try:
+            from src.nadobro.core.http_session import is_circuit_open
+            if is_circuit_open(url):
+                return False
+        except Exception:
+            pass
+        if is_edge_rate_limited(url):
+            return False
+        if not _edge_bucket(_host(url)).try_acquire(max_wait=wait, cost=w):
+            logger.debug("gateway budget: edge bucket starved host=%s (w=%s)", _host(url), w)
+            return False
+        return True
+
     if kind == "execute":
-        # ip_query_only write circuit: while open, every execute is rejected by
-        # the venue anyway — short-circuit so we don't add load that prolongs
-        # the ban or churn executors into FAILED on a doomed round-trip.
+        # Executes are limited per WALLET by the venue, independently of the
+        # per-IP query budget: a query 429 storm (the error_code=1000 breaker)
+        # must NOT park place/cancel — that is exactly when a stop has to reach
+        # the venue. Only a Cloudflare challenge (host down) or the
+        # ip_query_only write ban (the venue itself refusing executes) does.
+        try:
+            from src.nadobro.core.http_session import is_circuit_open
+            if is_circuit_open(url):
+                return False
+        except Exception:
+            pass
         if is_write_blocked(url):
             logger.debug("gateway budget: execute parked — write circuit open host=%s", _host(url))
             return False
-        key = (wallet or "").strip().lower()
+        key = _wallet_key(wallet)
         if not key:
             return True  # no wallet to scope by; host circuit already checked
         if not _wallet_bucket(key).try_acquire(max_wait=wait, cost=w):
             logger.debug("gateway budget: wallet %s execute bucket starved (w=%s)", key[:10], w)
             return False
         return True
+
+    if is_gateway_blocked(url):
+        return False
 
     uid: Optional[int] = int(user_id) if user_id is not None else None
     if uid is not None:
@@ -325,6 +418,7 @@ def snapshot() -> dict:
     with _lock:
         inflight = dict(_user_inflight)
         rl_open = {h: s.open_until for h, s in _gateway_rl.items() if time.time() < s.open_until}
+        edge_rl_open = {h: t for h, t in _edge_rl.items() if time.time() < t}
     try:
         from src.nadobro.core.http_session import bucket_snapshot, breaker_snapshot
         host_buckets = bucket_snapshot()
@@ -335,8 +429,10 @@ def snapshot() -> dict:
     return {
         "user_buckets": len(_user_buckets),
         "wallet_buckets": len(_wallet_buckets),
+        "edge_buckets": len(_edge_buckets),
         "user_inflight": inflight,
         "gateway_rl_open": rl_open,
+        "edge_rl_open": edge_rl_open,
         "host_buckets": host_buckets,
         "breakers": breakers,
         "limits": {
@@ -345,5 +441,7 @@ def snapshot() -> dict:
             "user_max_inflight": _USER_MAX_INFLIGHT,
             "wallet_rps": _WALLET_RPS,
             "wallet_burst": _WALLET_BURST,
+            "edge_rps": _EDGE_RPS,
+            "edge_burst": _EDGE_BURST,
         },
     }

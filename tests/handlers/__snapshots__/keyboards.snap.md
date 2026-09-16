@@ -53,6 +53,7 @@ Each cell is `[label] → callback_data`.
 [CHIP] → alert:product:CHIP  |  [PENG] → alert:product:PENG  |  [BBX] → alert:product:BBX  |  [MSTR] → alert:product:MSTR
 [ZHIPU] → alert:product:ZHIPU  |  [CRCL] → alert:product:CRCL  |  [EIGEN] → alert:product:EIGEN  |  [NBIS] → alert:product:NBIS
 [HIMS] → alert:product:HIMS  |  [LLY] → alert:product:LLY  |  [ORCL] → alert:product:ORCL  |  [SKHY] → alert:product:SKHY
+[CASHCAT] → alert:product:CASHCAT  |  [PONS] → alert:product:PONS
 [◀ Back] → alert:menu  |  [🏠 Home] → nav:main
 ```
 
@@ -120,6 +121,7 @@ Each cell is `[label] → callback_data`.
 [CHIP] → pos:close:CHIP  |  [PENG] → pos:close:PENG  |  [BBX] → pos:close:BBX  |  [MSTR] → pos:close:MSTR
 [ZHIPU] → pos:close:ZHIPU  |  [CRCL] → pos:close:CRCL  |  [EIGEN] → pos:close:EIGEN  |  [NBIS] → pos:close:NBIS
 [HIMS] → pos:close:HIMS  |  [LLY] → pos:close:LLY  |  [ORCL] → pos:close:ORCL  |  [SKHY] → pos:close:SKHY
+[CASHCAT] → pos:close:CASHCAT  |  [PONS] → pos:close:PONS
 [◀ Back] → nav:main
 ```
 
@@ -511,6 +513,7 @@ Each cell is `[label] → callback_data`.
 [CHIP]  |  [PENG]  |  [BBX]  |  [MSTR]
 [ZHIPU]  |  [CRCL]  |  [EIGEN]  |  [NBIS]
 [HIMS]  |  [LLY]  |  [ORCL]  |  [SKHY]
+[CASHCAT]  |  [PONS]
 [◀ Back]  |  [◀ Home]
 ```
 

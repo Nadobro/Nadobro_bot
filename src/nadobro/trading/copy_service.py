@@ -782,7 +782,11 @@ def get_trader_preview(trader_id: int, network: str = "mainnet", requester_user_
     # NO_ORDERS_AUDIT-FIX-R6b: cached.
     from src.nadobro.venue.nado_client import get_or_create_readonly_client
     client = get_or_create_readonly_client(wallet, network)
-    positions = client.get_all_positions() or []
+    try:
+        positions = client.get_all_positions() or []
+    except Exception as exc:  # DENIED-vs-EMPTY: an unreadable book is UNKNOWN, never a flat preview
+        logger.warning("copy preview: leader positions unavailable trader=%s: %s", trader_id, exc)
+        return {"found": False, "error": "leader positions unavailable right now — please retry"}
     balance = client.get_balance() or {}
     balances = balance.get("balances", {}) or {}
     usdt_balance = float(balances.get(0, balances.get("0", 0.0)) or 0.0)

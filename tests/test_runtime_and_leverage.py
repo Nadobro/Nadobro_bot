@@ -289,6 +289,140 @@ class RuntimeAndLeverageTests(unittest.TestCase):
         self.assertTrue(ok, msg)
         runtime.stop.assert_awaited_once_with(456, "testnet", "mid")
 
+    # --- STOP-NOT-RETRIABLE (prod 2026-09-04): a prior stop cleared `running`
+    # while its venue cancel failed (rate-limited), leaving orders resting. A
+    # repeat Stop / /stop_all must re-attempt a cancel-only sweep and report the
+    # truth, never a silent "No running strategy bot found" no-op over live orders.
+    def test_stop_user_bot_retries_leftover_cancel_when_not_running(self):
+        fake_user = SimpleNamespace(network_mode=SimpleNamespace(value="mainnet"))
+        state = {"running": False, "strategy": "grid", "product": "BTC"}
+        calls = {}
+
+        def _cancel(tid, net, only_pid=None):
+            calls["only_pid"] = only_pid
+            return {"success": True, "cancelled_orders": 2}
+
+        with patch.object(bot_runtime, "get_user", return_value=fake_user), patch.object(
+            bot_runtime, "_load_state", return_value=state
+        ), patch.object(bot_runtime, "get_product_id", return_value=2), patch(
+            "src.nadobro.trading.trade_service.cancel_resting_orders_for_user", _cancel
+        ):
+            ok, msg = bot_runtime.stop_user_bot(123, cancel_orders=True)
+        self.assertTrue(ok, msg)
+        self.assertIn("cancelled 2 leftover", msg)
+        self.assertEqual(calls.get("only_pid"), 2)  # scoped to the perp product, not user-wide
+
+    def test_stop_user_bot_reports_when_leftover_cancel_is_throttled(self):
+        fake_user = SimpleNamespace(network_mode=SimpleNamespace(value="mainnet"))
+        state = {"running": False, "strategy": "mid", "product": "BTC"}
+
+        def _cancel(tid, net, only_pid=None):
+            return {"success": False, "error": "open-orders read unavailable"}
+
+        with patch.object(bot_runtime, "get_user", return_value=fake_user), patch.object(
+            bot_runtime, "_load_state", return_value=state
+        ), patch.object(bot_runtime, "get_product_id", return_value=2), patch(
+            "src.nadobro.trading.trade_service.cancel_resting_orders_for_user", _cancel
+        ):
+            ok, msg = bot_runtime.stop_user_bot(123, cancel_orders=True)
+        self.assertFalse(ok)
+        self.assertIn("rate-limited", msg.lower())
+        self.assertNotIn("No running strategy bot found", msg)
+
+    def test_stop_user_bot_not_running_non_engine_reports_none(self):
+        fake_user = SimpleNamespace(network_mode=SimpleNamespace(value="mainnet"))
+        state = {"running": False, "strategy": "copy", "product": "BTC"}
+        with patch.object(bot_runtime, "get_user", return_value=fake_user), patch.object(
+            bot_runtime, "_load_state", return_value=state
+        ):
+            ok, msg = bot_runtime.stop_user_bot(123, cancel_orders=True)
+        self.assertFalse(ok)
+        self.assertIn("No running strategy bot found", msg)
+
+    def test_stop_all_user_bots_retries_leftover_cancel_when_nothing_running(self):
+        row_state = {"running": False, "strategy": "mid", "product": "BTC"}
+
+        def _cancel(tid, net, only_pid=None):
+            return {"success": True, "cancelled_orders": 3}
+
+        with patch.object(
+            bot_runtime, "query_all",
+            return_value=[{"key": "strategy_bot:456:mainnet", "value": json.dumps(row_state)}],
+        ), patch.object(bot_runtime, "get_product_id", return_value=2), patch(
+            "src.nadobro.trading.trade_service.cancel_resting_orders_for_user", _cancel
+        ):
+            ok, msg = bot_runtime.stop_all_user_bots(456, cancel_orders=True)
+        self.assertTrue(ok, msg)
+        self.assertIn("cancelled 3 leftover", msg)
+
+    def test_stop_all_user_bots_reports_throttled_leftover_cancel(self):
+        row_state = {"running": False, "strategy": "grid", "product": "BTC"}
+
+        def _cancel(tid, net, only_pid=None):
+            return {"success": False, "error": "open-orders read unavailable"}
+
+        with patch.object(
+            bot_runtime, "query_all",
+            return_value=[{"key": "strategy_bot:456:mainnet", "value": json.dumps(row_state)}],
+        ), patch.object(bot_runtime, "get_product_id", return_value=2), patch(
+            "src.nadobro.trading.trade_service.cancel_resting_orders_for_user", _cancel
+        ):
+            ok, msg = bot_runtime.stop_all_user_bots(456, cancel_orders=True)
+        self.assertFalse(ok)
+        self.assertIn("rate-limited", msg.lower())
+        self.assertNotIn("No running strategy bot found", msg)
+
+    def test_stop_all_user_bots_reports_none_when_no_engine_leftover(self):
+        row_state = {"running": False, "strategy": "copy", "product": "BTC"}
+        with patch.object(
+            bot_runtime, "query_all",
+            return_value=[{"key": "strategy_bot:456:mainnet", "value": json.dumps(row_state)}],
+        ):
+            ok, msg = bot_runtime.stop_all_user_bots(456, cancel_orders=True)
+        self.assertFalse(ok)
+        self.assertIn("No running strategy bot found", msg)
+
+    def test_stop_user_bot_vol_leftover_is_not_unscoped_cancelled(self):
+        """vol/dn must NOT trigger an unscoped network-wide cancel — the helper skips
+        them (get_product_id is perp-only), so a repeat Stop leaves them for Close-All
+        rather than wiping the user's unrelated orders."""
+        fake_user = SimpleNamespace(network_mode=SimpleNamespace(value="mainnet"))
+        state = {"running": False, "strategy": "vol", "product": "BTC"}
+        called = {"n": 0}
+
+        def _cancel(tid, net, only_pid=None):
+            called["n"] += 1
+            return {"success": True, "cancelled_orders": 9}
+
+        with patch.object(bot_runtime, "get_user", return_value=fake_user), patch.object(
+            bot_runtime, "_load_state", return_value=state
+        ), patch("src.nadobro.trading.trade_service.cancel_resting_orders_for_user", _cancel):
+            ok, msg = bot_runtime.stop_user_bot(123, cancel_orders=True)
+        self.assertFalse(ok)
+        self.assertIn("No running strategy bot found", msg)
+        self.assertEqual(called["n"], 0)  # no unscoped cancel was issued
+
+    def test_stop_user_bot_grid_unresolvable_product_is_skipped(self):
+        """A grid-family strategy whose product does not resolve must SKIP the residual
+        (not degrade to an unscoped cancel)."""
+        fake_user = SimpleNamespace(network_mode=SimpleNamespace(value="mainnet"))
+        state = {"running": False, "strategy": "grid", "product": "BTC"}
+        called = {"n": 0}
+
+        def _cancel(tid, net, only_pid=None):
+            called["n"] += 1
+            return {"success": True, "cancelled_orders": 9}
+
+        with patch.object(bot_runtime, "get_user", return_value=fake_user), patch.object(
+            bot_runtime, "_load_state", return_value=state
+        ), patch.object(bot_runtime, "get_product_id", return_value=None), patch(
+            "src.nadobro.trading.trade_service.cancel_resting_orders_for_user", _cancel
+        ):
+            ok, msg = bot_runtime.stop_user_bot(123, cancel_orders=True)
+        self.assertFalse(ok)
+        self.assertIn("No running strategy bot found", msg)
+        self.assertEqual(called["n"], 0)
+
     def test_run_cycle_retires_legacy_volume_perp_before_spot_dispatch(self):
         telegram_id = 42
         network = "mainnet"

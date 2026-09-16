@@ -15,7 +15,7 @@ from decimal import Decimal
 from typing import Awaitable, Callable, Dict, Optional, Protocol, TypeVar
 
 from src.nadobro.engine.adapter.base import (
-    AdapterError, Fill, NadoAdapterBase, NadoOrder,
+    AdapterError, AdapterThrottled, Fill, NadoAdapterBase, NadoOrder,
 )
 from src.nadobro.engine.inventory import InventoryRepository
 from src.nadobro.engine.types import CloseType, ExecutorState, OrderType, TradeType
@@ -144,6 +144,13 @@ class Executor(abc.ABC):
         for attempt in range(self.MAX_ATTEMPTS):
             try:
                 return await op()
+            except AdapterThrottled:
+                # EXECUTE-BUDGET-BACKOFF: a client-side execute-budget throttle. The
+                # bucket refills over seconds, so retrying now (within ~0.03s) is
+                # pointless, and it must NOT fail the executor — the placement is
+                # deferred to a later cycle. Re-raise WITHOUT retrying or terminating;
+                # the orchestrator treats it as a deferral, not a FAILED.
+                raise
             except AdapterError as exc:
                 last_exc = exc
                 self.retries += 1

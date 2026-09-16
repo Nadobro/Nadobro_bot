@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
+from src.nadobro.engine.adapter.base import AdapterThrottled
 from src.nadobro.engine.controllers.controller_base import Controller
 from src.nadobro.engine.executors.order_executor import OrderExecutor, OrderExecutorConfig
 from src.nadobro.engine.risk import ExecutorRequest
@@ -1173,7 +1174,14 @@ class MarketMakingController(Controller):
         # cycle, and a resting quote is simply left in place (its price stays valid
         # one more cycle); no order is resized. Bounds the deep-ladder requote burst
         # that starved the loop.
-        if is_opening and self.adapter.opening_budget_exhausted():
+        # EXECUTE-BUDGET-BACKOFF (prod 2026-09-04): defer further OPENING quotes once
+        # the per-wallet execute budget has throttled a placement this cycle — the
+        # bucket is drained, so every further placement would 429 anyway. Without this
+        # the deep ladder spammed ~40 doomed placements, draining the budget until
+        # reads also 429'd and the gateway circuit opened (which then broke Stop).
+        if is_opening and (
+            self.adapter.opening_budget_exhausted() or self.adapter.execute_budget_exhausted()
+        ):
             return
 
         if cur_id is not None and cur_price is not None:
@@ -1279,6 +1287,16 @@ class MarketMakingController(Controller):
                 old_digest, self.trading_pair, side, OrderType.LIMIT_MAKER,
                 amount_base, target, self.leverage_hint,
             )
+        except AdapterThrottled:
+            # EXECUTE-BUDGET-BACKOFF (strategy-auditor 2026-09-05): the fused requote was
+            # throttled by the execute budget. It is ATOMIC — the OLD order is untouched —
+            # so HOLD the resting quote this cycle (return True = fused path took ownership)
+            # instead of falling through to cancel-old-then-respawn, which would cancel a
+            # live quote and leave a GAP (and, pre-fix, leak an executor). The requote is
+            # re-attempted next cycle once the bucket refills; further openings this cycle
+            # are already deferred by execute_budget_exhausted().
+            logger.debug("cancel_and_place throttled %s; holding the resting quote", self.trading_pair)
+            return True
         except Exception:  # noqa: BLE001 - atomic failure: OLD order untouched
             logger.debug(
                 "cancel_and_place failed %s; falling back to stop+spawn",

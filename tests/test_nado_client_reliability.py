@@ -285,8 +285,10 @@ class NadoClientReliabilityTests(unittest.TestCase):
 
         client.get_market_price = _tripwire
 
-        # Cache present -> serve it, no fanout.
+        # Cache present -> serve it, no fanout (edge lane unavailable too).
         with patch.object(client, "_query_rest", return_value=None), patch.object(
+            client, "_query_edge", return_value=None
+        ), patch.object(
             gateway_budget, "is_gateway_blocked", return_value=True
         ):
             with nc._caches_lock:
@@ -299,6 +301,8 @@ class NadoClientReliabilityTests(unittest.TestCase):
 
         # Cache empty -> return {}, still no fanout.
         with patch.object(client, "_query_rest", return_value=None), patch.object(
+            client, "_query_edge", return_value=None
+        ), patch.object(
             gateway_budget, "is_gateway_blocked", return_value=True
         ):
             with nc._caches_lock:
@@ -351,6 +355,7 @@ class NadoClientReliabilityTests(unittest.TestCase):
              patch.object(pc, "get_spot_catalog", return_value=spot_catalog), \
              patch.object(client, "_gateway_allowed", return_value=True), \
              patch.object(client, "_gateway_release"), \
+             patch.object(client, "_isolated_subaccounts", return_value=[]), \
              patch.dict(sys.modules, {
                  "nado_protocol": nado_mod,
                  "nado_protocol.utils": utils_mod,

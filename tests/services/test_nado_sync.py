@@ -34,7 +34,7 @@ class _Client:
             "isolated_positions": [],
         }
 
-    def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False):
+    def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False, product_ids=None):
         self.include_isolated_flags.append(include_isolated)
         return [{"product_id": 1, "product_name": "BTC", "digest": "0xabc", "amount": "1", "price": "100"}]
 
@@ -960,6 +960,33 @@ class ThrottledBalanceFreshnessTests(unittest.IsolatedAsyncioTestCase):
         assert result["last_sync"] == prior_sync, "not stamped 'synced now' on a throttled round"
         assert result["stale"] is False                     # positions ARE fresh (summary read ok)
 
+    async def test_a_budget_throttled_summary_degrades_instead_of_failing_the_round(self):
+        """Review 2026-09-16: a summary OUR budget declined is a throttle, not a
+        venue error — keep the prior summary, flag the round, and do not discard
+        the other three reads by failing the whole sync."""
+        class ThrottledSummaryClient(_Client):
+            async def calculate_account_summary(self, ts=None):
+                raise RuntimeError("venue throttled: account summary budget denied")
+
+        p1, p2, p3, p4 = self._patches(ThrottledSummaryClient())
+        with p1, p2, p3, p4:
+            result = await nado_sync.sync_user(42, network="testnet", force=True)
+        assert result["venue_throttled"] is True
+        assert result.get("stale") is False
+        assert result.get("error") is None
+        assert result["open_orders"], "the other reads of the round are kept"
+
+    async def test_a_venue_error_on_the_summary_still_fails_the_round(self):
+        class BrokenSummaryClient(_Client):
+            async def calculate_account_summary(self, ts=None):
+                raise RuntimeError("SDK calculate_account_summary failed: 502")
+
+        p1, p2, p3, p4 = self._patches(BrokenSummaryClient())
+        with p1, p2, p3, p4:
+            result = await nado_sync.sync_user(42, network="testnet", force=True)
+        assert result.get("stale") is True
+        assert "502" in str(result.get("error"))
+
     async def test_a_fresh_balance_is_stamped_now_and_not_flagged(self):
         p1, p2, p3, p4 = self._patches(_Client())
         with p1, p2, p3, p4:
@@ -987,7 +1014,7 @@ class DeniedOpenOrdersSweepTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_denied_open_orders_read_keeps_the_last_known_list_and_flags_unknown(self):
         class DeniedOrdersClient(_Client):
-            def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False):
+            def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False, product_ids=None):
                 return None            # unreadable this round — NOT an empty book
 
         prior_orders = [{"product_id": 1, "product_name": "BTC", "digest": "0xlive", "amount": "1", "price": "100"}]
@@ -1035,7 +1062,7 @@ class UnknownOrdersAreThrottledFreshnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_unknown_open_orders_round_is_flagged_throttled_and_keeps_last_sync(self):
         class DeniedOrdersClient(_Client):
-            def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False):
+            def get_all_open_orders(self, refresh=True, *, include_isolated=True, strict=False, product_ids=None):
                 return None
 
         prior_sync = datetime(2026, 1, 1, tzinfo=timezone.utc)

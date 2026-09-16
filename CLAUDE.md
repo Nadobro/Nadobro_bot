@@ -74,6 +74,14 @@ Layering (enforced by `tests/lint/test_architecture_layers.py` — domain packag
   paths (home card) must serve cached data and refresh in the background, never block on the venue.
 - i18n: user-facing strings go through `i18n.py` (`localize_text`/`localize_markup`); translated
   reply-keyboard labels round-trip back to English for routing via `resolve_reply_button_text`.
+- Nado rate limits are per-IP WEIGHT (400/10s, 2400/min for live queries) and the venue charges
+  exactly what the docs say — measured 2026-09-16: a multi-product `orders` read costs
+  2 × product_ids (~192 for the whole catalog), `market_prices` costs N. Never flat-charge a
+  batched read; keep N small instead (scoped parent read, one product per isolated child). Every
+  SDK call goes through `_gateway_allowed` + `_record_gateway_error` (a venue 429 is an HTTP 200
+  JSON body, `error_code=1000`). Bulk price polling uses the edge lane (`/edge/query`
+  `cached_prices`, weight 1, separate 12000/min bucket) — never a per-product fan-out. When the
+  book cannot be read, cancel-only cleanup uses `cancel_product_orders` (read-free execute).
 
 ## Hard rules
 

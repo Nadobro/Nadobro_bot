@@ -883,9 +883,26 @@ async def _boot_stand_down_one(telegram_id: int, network: str, state: dict, stra
     from src.nadobro.strategy.engine_runtime import deterministic_controller_id
     from src.nadobro.trading.trade_service import cancel_resting_orders_for_user
 
-    # 1) Cancel resting venue orders (fail-loud). Leave the open position — the
-    #    user decides its fate; a redeploy must never flatten it.
-    cancel = await run_blocking_sdk(cancel_resting_orders_for_user, telegram_id, network)
+    # 1) Cancel THIS strategy's resting venue orders (fail-loud). Leave the open
+    #    position — the user decides its fate; a redeploy must never flatten it.
+    #    AUDIT-BOOT-2026-09-04-UNSCOPED-CANCEL: scope to the strategy's product so a
+    #    user's unrelated manual limit orders on other markets are not wiped on every
+    #    restart. ONLY the single-perp maker strategies (grid/rgrid/dgrid/mid) have all
+    #    their resting orders on one perp product that get_product_id (perp catalog)
+    #    resolves. vol is SPOT and dn is two-leg (spot+perp) — a perp-pid scope would
+    #    MISS their orders, so those stay UNSCOPED (cancel-only, every product) rather
+    #    than orphan a resting order. Unresolved product also falls back to unscoped.
+    only_pid = None
+    if strategy in ("grid", "rgrid", "dgrid", "mid"):
+        try:
+            _product = str(state.get("product") or "").strip()
+            if _product and _product.upper() != "MULTI":
+                only_pid = get_product_id(_product, network=network)
+        except Exception:  # policy: degrade-ok(unresolved product -> unscoped cancel; still cancel-only)
+            only_pid = None
+    cancel = await run_blocking_sdk(
+        cancel_resting_orders_for_user, telegram_id, network, only_pid=only_pid
+    )
     order_ok = bool(cancel.get("success"))
     # 2) Terminate stale executor rows + clear engine progress so the next run
     #    builds cleanly (mirrors the cross-process stop path).
@@ -1695,11 +1712,67 @@ def run_cycle_job_sync(payload: dict) -> dict:
         set_process_worker_mode(False)
 
 
+def _cancel_leftover_resting_orders(telegram_id: int, network: str, state: dict, strategy: str) -> dict | None:
+    """Cancel-only (never flatten) sweep of a stopped strategy's leftover resting
+    orders, for a RETRIABLE stop (audit 2026-09-04 STOP-NOT-RETRIABLE).
+
+    A prior Stop / /stop_all can clear ``running`` while its venue cancel FAILS
+    (rate-limited), leaving orders resting on Nado. Because both stop paths gate on
+    ``running``, the next Stop then reported "No running strategy bot found" and did
+    nothing — a silent no-op over live resting orders. This lets a repeat stop
+    re-attempt the cancel.
+
+    ONLY runs when the sweep can be SCOPED PRECISELY to the strategy's own product —
+    the single-perp maker strategies (grid/rgrid/dgrid/mid) whose one product
+    ``get_product_id`` resolves. Returns ``None`` (caller skips) otherwise: vol (spot)
+    and dn (two-leg) resolve wrong/None via the perp-only ``get_product_id``, and an
+    unresolvable product would degrade to an UNSCOPED network-wide cancel that could
+    wipe a user's unrelated/manual orders. Better to skip the residual (the user uses
+    Close-All) than cancel more than this strategy owns. Positions are never touched."""
+    if strategy not in ("grid", "rgrid", "dgrid", "mid"):
+        return None
+    try:
+        product = str(state.get("product") or "").strip()
+        only_pid = get_product_id(product, network=network) if (product and product.upper() != "MULTI") else None
+    except Exception:  # policy: degrade-ok(unresolved product -> skip residual rather than an unscoped cancel)
+        only_pid = None
+    if only_pid is None:
+        return None
+    from src.nadobro.trading.trade_service import cancel_resting_orders_for_user
+
+    return cancel_resting_orders_for_user(telegram_id, network, only_pid=int(only_pid))
+
+
 def stop_user_bot(telegram_id: int, cancel_orders: bool = True) -> tuple[bool, str]:
     user = get_user(telegram_id)
     network = user.network_mode.value if user else "mainnet"
     state = _load_state(telegram_id, network)
     if not state.get("running"):
+        # STOP-NOT-RETRIABLE (prod 2026-09-04): a prior stop may have cleared
+        # ``running`` while its venue cancel failed (rate-limited), leaving orders
+        # resting. Re-attempt a precisely-scoped cancel-only sweep so a repeat Stop
+        # clears them instead of a silent "No running strategy bot found" no-op over
+        # live orders. The helper returns None when it cannot scope safely (non
+        # single-perp strategy, or unresolvable product) — then fall through unchanged.
+        strategy = _normalize_strategy_id(str(state.get("strategy") or ""))
+        if cancel_orders:
+            try:
+                res = _cancel_leftover_resting_orders(telegram_id, network, state, strategy)
+            except Exception as exc:  # policy: degrade-ok(surfaced to the user as a stop-retry-failed message)
+                return False, f"Stop retry failed: {exc}"
+            if res is not None:
+                if not res.get("success"):
+                    return False, (
+                        "Nothing was actively running, but leftover resting orders could not be "
+                        "confirmed cancelled — the venue may be rate-limited. Try again in a moment, "
+                        f"or check Orders/Positions. ({res.get('error', 'unknown')})"
+                    )
+                n = int(res.get("cancelled_orders") or 0)
+                if n > 0:
+                    return True, (
+                        f"No active loop was running — cancelled {n} leftover resting order(s) from a "
+                        "previous stop. Any open position is untouched; use Close-All to flatten it."
+                    )
         return False, "No running strategy bot found."
 
     _finalize_session(state, stop_reason="user_stop")
@@ -1725,7 +1798,10 @@ def stop_user_bot(telegram_id: int, cancel_orders: bool = True) -> tuple[bool, s
     engine_ok, engine_error = _stop_engine_runtime_for_state(telegram_id, network, state)
 
     if cancel_orders:
-        close_res = cleanup_strategy_positions(telegram_id, network, state)
+        try:
+            close_res = cleanup_strategy_positions(telegram_id, network, state)
+        except Exception as e:  # an unreadable position book (DENIED-vs-EMPTY) is a failed cleanup, retriable
+            close_res = {"success": False, "error": str(e)}
         if not close_res.get("success"):
             return False, f"Strategy loop stopped, but cleanup failed: {close_res.get('error', 'unknown')}"
     if not engine_ok:
@@ -1776,6 +1852,8 @@ def _session_fee_truth_summary(state: dict) -> str:
 
 def stop_all_user_bots(telegram_id: int, cancel_orders: bool = True) -> tuple[bool, str]:
     stopped = 0
+    residual_cancelled = 0
+    residual_errors: list[str] = []
     close_errors: list[str] = []
     stop_errors: list[str] = []
     rows = query_all(
@@ -1792,6 +1870,23 @@ def stop_all_user_bots(telegram_id: int, cancel_orders: bool = True) -> tuple[bo
             state = json.loads(row.get("value") or "{}")
             _migrate_state_strategy(state)
             if not state.get("running"):
+                # STOP-NOT-RETRIABLE (prod 2026-09-04): a prior stop may have cleared
+                # `running` while its venue cancel failed (rate-limited), leaving orders
+                # resting. Re-attempt a cancel-only sweep so /stop_all is retriable and
+                # reports the truth instead of "No running strategy bot found". Positions
+                # are left for the user to close explicitly.
+                strategy = _normalize_strategy_id(str(state.get("strategy") or ""))
+                if cancel_orders:
+                    try:
+                        res = _cancel_leftover_resting_orders(telegram_id, network, state, strategy)
+                        if res is None:
+                            pass  # not safely scopeable (vol/dn/unresolvable) — skip, don't cancel network-wide
+                        elif res.get("success"):
+                            residual_cancelled += int(res.get("cancelled_orders") or 0)
+                        else:
+                            residual_errors.append(f"{network}/{strategy}: {res.get('error', 'cancel failed')}")
+                    except Exception as exc:  # policy: degrade-ok(recorded per-row; one row's cleanup must not block the rest)
+                        residual_errors.append(f"{network}/{strategy}: {exc}")
                 continue
             _finalize_session(state, stop_reason="user_stop_all")
             state["running"] = False
@@ -1804,7 +1899,10 @@ def stop_all_user_bots(telegram_id: int, cancel_orders: bool = True) -> tuple[bo
             if not engine_ok:
                 close_errors.append(f"{network}: engine cleanup failed: {engine_error or 'unknown'}")
             if cancel_orders:
-                close_res = cleanup_strategy_positions(telegram_id, network, state)
+                try:
+                    close_res = cleanup_strategy_positions(telegram_id, network, state)
+                except Exception as e:  # an unreadable position book (DENIED-vs-EMPTY) is a failed cleanup, retriable
+                    close_res = {"success": False, "error": str(e)}
                 if not close_res.get("success"):
                     close_errors.append(f"{network}: {close_res.get('error', 'close_all_positions failed')}")
             stopped += 1
@@ -1814,9 +1912,9 @@ def stop_all_user_bots(telegram_id: int, cancel_orders: bool = True) -> tuple[bo
             stop_errors.append(f"{key or 'unknown'}: {exc}")
             continue
     if stopped > 0:
-        all_errors = [*close_errors, *stop_errors]
+        all_errors = [*close_errors, *stop_errors, *residual_errors]
         cleanup_note = ""
-        if cancel_orders and not close_errors and not stop_errors:
+        if cancel_orders and not all_errors:
             cleanup_note = (
                 " Open resting orders were cancelled and positions closed on Nado per stopped strategy "
                 "(same behavior as single-bot stop)."
@@ -1829,6 +1927,21 @@ def stop_all_user_bots(telegram_id: int, cancel_orders: bool = True) -> tuple[bo
         return True, f"Stopped {stopped} running strategy loop(s).{cleanup_note}"
     if stop_errors:
         return False, f"No strategy bot was fully stopped. Errors: {'; '.join(stop_errors)}"
+    if residual_cancelled > 0 or residual_errors:
+        parts: list[str] = []
+        if residual_cancelled > 0:
+            parts.append(
+                f"No active loop was running — cancelled {residual_cancelled} leftover resting "
+                "order(s) from a previous stop. Any open position is untouched; use Close-All to flatten it."
+            )
+        else:
+            parts.append("No active loop was running.")
+        if residual_errors:
+            parts.append(
+                "Some leftover orders could not be confirmed cancelled — the venue may be rate-limited. "
+                "Try again in a moment, or check Orders/Positions: " + "; ".join(residual_errors[:4])
+            )
+        return (len(residual_errors) == 0), " ".join(parts)
     return False, "No running strategy bot found."
 
 
