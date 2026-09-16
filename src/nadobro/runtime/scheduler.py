@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import time
 from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from src.nadobro.utils.env import env_float, env_int
@@ -392,6 +393,51 @@ async def tick_night_howl():
         logger.error("Night HOWL ticker failed: %s", e)
 
 
+# AUDIT-BOOT-2026-09-04-POLL-FLATTEN-RACE: the fast SL/TP safety poll below
+# enumerates every running strategy session and can enqueue a rails-only cycle
+# that FLATTENS a position on a session SL/TP/liq breach. start_scheduler() arms
+# it early in boot, ~100 lines before boot_stand_down_strategies() clears the
+# orphaned 'running' rows — so during the boot window it could flatten an
+# orphaned session (a redeploy must NEVER flatten; the session-312 phantom TP
+# fired through exactly this path). Park the poll until boot stand-down signals
+# complete, with a hard grace ceiling so a gated-off / crashed stand-down re-arms
+# the SL backstop rather than silently losing it for the process's lifetime.
+_boot_standdown_done = False
+_scheduler_started_at = 0.0
+
+
+def note_boot_standdown_started() -> None:
+    """Re-anchor the poll's grace timer to the moment the strategy stand-down BEGINS,
+    so the fail-safe ceiling measures the stand-down window itself — not the earlier
+    boot preamble (bot_app start, mirror stand-down, copy polling — all network I/O
+    that can stall). Without this a slow preamble could burn the grace before the
+    stand-down even runs, re-arming the flatten poll over orphaned sessions."""
+    global _scheduler_started_at
+    _scheduler_started_at = time.time()
+
+
+def mark_boot_standdown_complete() -> None:
+    """Signal that boot finished standing engine strategies down, so the fast
+    SL/TP safety poll may resume. ``main.py`` calls this after
+    ``boot_stand_down_strategies()`` unconditionally — even when the stand-down is
+    gated off, boot has reached the point where the poll may run."""
+    global _boot_standdown_done
+    _boot_standdown_done = True
+
+
+def _sltp_safety_poll_armed() -> bool:
+    """The poll is parked during the boot window (see AUDIT-BOOT-2026-09-04-…)."""
+    if _boot_standdown_done:
+        return True
+    # Fail safe: if the signal never arrives (a crash before it, or an alternate
+    # entrypoint), re-arm the SL/TP backstop after a hard ceiling rather than
+    # disabling it for the whole process. Anchored at stand-down start
+    # (note_boot_standdown_started) so the ceiling covers only the stand-down loop,
+    # generously above any realistic per-boot duration.
+    grace = max(30, env_int("NADO_BOOT_STANDDOWN_GRACE_SECONDS", 300))
+    return _scheduler_started_at > 0 and (time.time() - _scheduler_started_at) > grace
+
+
 async def tick_sltp_safety():
     """Decoupled fast SL/TP safety poll (SLTP-FAST-POLL, 2026-08-25 incident).
 
@@ -409,6 +455,10 @@ async def tick_sltp_safety():
     single-product rail and ``bro`` is not a perp session — both are skipped."""
     from src.nadobro.utils.env import env_bool
     if not env_bool("NADO_SLTP_FAST_POLL_ENABLED", True):
+        return
+    if not _sltp_safety_poll_armed():
+        # Boot stand-down has not cleared orphaned 'running' sessions yet — do not
+        # enqueue (and thus never flatten) during the boot window.
         return
     import json
     import time as _time
@@ -1012,6 +1062,8 @@ async def tick_vault_deposit_watch_job():
 
 
 def start_scheduler():
+    global _scheduler_started_at
+    _scheduler_started_at = time.time()
     relay_poll_seconds = relay_poll_interval_seconds()
     from src.nadobro.core.feature_flags import (
         lowiqpts_relay_poll_enabled,

@@ -883,9 +883,26 @@ async def _boot_stand_down_one(telegram_id: int, network: str, state: dict, stra
     from src.nadobro.strategy.engine_runtime import deterministic_controller_id
     from src.nadobro.trading.trade_service import cancel_resting_orders_for_user
 
-    # 1) Cancel resting venue orders (fail-loud). Leave the open position — the
-    #    user decides its fate; a redeploy must never flatten it.
-    cancel = await run_blocking_sdk(cancel_resting_orders_for_user, telegram_id, network)
+    # 1) Cancel THIS strategy's resting venue orders (fail-loud). Leave the open
+    #    position — the user decides its fate; a redeploy must never flatten it.
+    #    AUDIT-BOOT-2026-09-04-UNSCOPED-CANCEL: scope to the strategy's product so a
+    #    user's unrelated manual limit orders on other markets are not wiped on every
+    #    restart. ONLY the single-perp maker strategies (grid/rgrid/dgrid/mid) have all
+    #    their resting orders on one perp product that get_product_id (perp catalog)
+    #    resolves. vol is SPOT and dn is two-leg (spot+perp) — a perp-pid scope would
+    #    MISS their orders, so those stay UNSCOPED (cancel-only, every product) rather
+    #    than orphan a resting order. Unresolved product also falls back to unscoped.
+    only_pid = None
+    if strategy in ("grid", "rgrid", "dgrid", "mid"):
+        try:
+            _product = str(state.get("product") or "").strip()
+            if _product and _product.upper() != "MULTI":
+                only_pid = get_product_id(_product, network=network)
+        except Exception:  # policy: degrade-ok(unresolved product -> unscoped cancel; still cancel-only)
+            only_pid = None
+    cancel = await run_blocking_sdk(
+        cancel_resting_orders_for_user, telegram_id, network, only_pid=only_pid
+    )
     order_ok = bool(cancel.get("success"))
     # 2) Terminate stale executor rows + clear engine progress so the next run
     #    builds cleanly (mirrors the cross-process stop path).
