@@ -13,11 +13,15 @@ over one consistent set of rows:
 
 * **Nado volume**    — every fill on the account, including trades the user made
   on the Nado UI. This is "total volume as displayed on Nado".
-* **Nadobro volume** — only fills routed through the bot (``via_nadobro``).
+* **Nadobro volume** — fills whose ORDER carried our builder id (decoded from
+  the venue's order appendix, ``builder_id``); for rows synced before that
+  column existed, ``via_nadobro`` / a strategy session / a bot source.
 * **Perp vs spot**   — split per window, classified per fill.
-* **Realized PnL**   — GROSS (fees and funding are reported as their own lines),
-  position-aware, delegated to ``realized_pnl_windows_from_rows`` so PnL and
-  volume finally describe the SAME rows.
+* **Realized PnL**   — from the VENUE'S position windows (``venue_pnl``, see
+  ``database.get_venue_pnl_windows``), GROSS of fees. The venue reports no
+  per-fill PnL and the old fill replay fabricated numbers over a holey
+  ledger (2026-09-16: -$161 shown for a +$10.50 day), so without venue
+  windows the figure is reported as UNKNOWN (``None``), never guessed.
 
 Pure: no DB, no network. ``now`` is injectable so windows are testable.
 """
@@ -32,7 +36,6 @@ from src.nadobro.quant.portfolio_calculator import (
     _decimal_from_possible_x18,
     _row_time,
     funding_payment_amount,
-    realized_pnl_windows_from_rows,
 )
 
 WINDOW_SECONDS: dict[str, int] = {
@@ -102,6 +105,44 @@ def _fill_fee(row: Mapping[str, Any]) -> Decimal:
     return ZERO
 
 
+_BOT_SOURCES = frozenset({"strategy", "copy", "dn", "vol", "vol_stop", "desk", "bro", "agent"})
+
+
+def our_builder_id(network: str | None = None) -> int | None:
+    """Nadobro's builder id for ``network`` (mainnet only; testnet bypasses
+    builder routing). ``None`` when not configured."""
+    try:
+        from src.nadobro.config import get_nado_builder_routing_config
+
+        builder_id, _rate = get_nado_builder_routing_config(network)
+        return int(builder_id) or None
+    except Exception:
+        return None
+
+
+def is_nadobro_fill(row: Mapping[str, Any], builder_id: int | None = None) -> bool:
+    """Was this fill routed through Nadobro (our builder code)?
+
+    The venue-authoritative signal is the builder id decoded from the order
+    appendix (``builder_id``): when both it and our configured id are known, it
+    decides alone. Rows synced before that column existed fall back to the
+    bot's own attribution — ``via_nadobro`` (order registered by the bot), a
+    strategy session id, or a bot source. A plain ``manual`` row with none of
+    those is a Nado-UI trade.
+    """
+    raw = row.get("builder_id")
+    if raw is not None and builder_id:
+        try:
+            return int(raw) == int(builder_id)
+        except (TypeError, ValueError):
+            pass
+    if row.get("via_nadobro"):
+        return True
+    if row.get("strategy_session_id") is not None:
+        return True
+    return str(row.get("source") or "").strip().lower() in _BOT_SOURCES
+
+
 def _empty_bucket() -> dict[str, Decimal | int]:
     return {"perp_usd": ZERO, "spot_usd": ZERO, "total_usd": ZERO, "fills": 0}
 
@@ -111,6 +152,8 @@ def aggregate_user_analytics(
     funding_payments: Iterable[Mapping[str, Any]] | None = None,
     *,
     now: datetime | None = None,
+    venue_pnl: Mapping[str, Any] | None = None,
+    builder_id: int | None = None,
 ) -> dict[str, Any]:
     """Aggregate a user's COMPLETE fill ledger into the analytics payload.
 
@@ -125,9 +168,13 @@ def aggregate_user_analytics(
           "nadobro_volume": {window: {...}},   # subset routed through the bot
           "fees":           {window: Decimal},
           "funding":        {window: Decimal},  # paid-positive (a cost)
-          "realized_pnl":   {window: Decimal},  # GROSS of fees/funding
+          "realized_pnl":   {window: Decimal | None},  # venue windows; None = unknown
+          "realized_source": "venue" | "pending",
           "wins"/"losses":  {window: int},
         }
+
+    ``venue_pnl`` is ``database.get_venue_pnl_windows`` output; ``builder_id``
+    is our configured builder id (``our_builder_id``).
     """
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -143,7 +190,7 @@ def aggregate_user_analytics(
         notional = _fill_notional(row)
         fee = _fill_fee(row)
         perp = is_perp_fill(row)
-        via_bot = bool(row.get("via_nadobro"))
+        via_bot = is_nadobro_fill(row, builder_id)
         ts = _row_time(row)
         age = None
         if ts is not None:
@@ -175,16 +222,25 @@ def aggregate_user_analytics(
                 continue
             funding[window] += amount
 
-    # Realized PnL over the SAME rows (position-aware; the venue reports none).
-    pnl = realized_pnl_windows_from_rows(rows, now=now)
-    pnl_windows = pnl.get("pnl_windows") or {}
+    # Realized PnL from the venue's position windows — never a replay guess.
+    if venue_pnl and venue_pnl.get("pnl_windows"):
+        pw = venue_pnl["pnl_windows"]
+        realized = {w: Decimal(str(pw.get(w, 0) or 0)) for w in WINDOWS}
+        wins = dict(venue_pnl.get("wins_windows") or {})
+        losses = dict(venue_pnl.get("losses_windows") or {})
+        source = "venue"
+    else:
+        realized = {w: None for w in WINDOWS}
+        wins, losses = {}, {}
+        source = "pending"
 
     return {
         "nado_volume": nado,
         "nadobro_volume": nadobro,
         "fees": fees,
         "funding": funding,
-        "realized_pnl": {w: pnl_windows.get(w, ZERO) for w in WINDOWS},
-        "wins": dict(pnl.get("wins_windows") or {}),
-        "losses": dict(pnl.get("losses_windows") or {}),
+        "realized_pnl": realized,
+        "realized_source": source,
+        "wins": wins,
+        "losses": losses,
     }

@@ -196,7 +196,13 @@ def build_type_b_card_data(
     session = _fetch_session(telegram_id, network, session_id)
 
     volume = _to_decimal(session.get("total_volume_usd"))
-    pnl = _to_decimal(session.get("realized_pnl"))
+    # The venue-attributed figure (position windows the session opened) when
+    # the attribution has run; the bot's fill-derived number until then.
+    pnl = (
+        _to_decimal(session.get("venue_realized_pnl"))
+        if session.get("venue_realized_pnl") is not None
+        else _to_decimal(session.get("realized_pnl"))
+    )
     fees = _to_decimal(session.get("total_fees_paid"))
     strategy = session.get("strategy")
     icon_key, display = _type_b_product(session.get("product_name"))
@@ -274,6 +280,41 @@ def build_round_trip_card_data(
         "entry_price": float(_to_decimal(rt.get("avg_entry_price"))),
         "exit_price": float(_to_decimal(rt.get("close_price"))),
         "size": float(_to_decimal(rt.get("size"))),
+        "referral_code": _fetch_active_referral_code(telegram_id, network) or "",
+    }
+
+
+def build_venue_position_card_data(
+    telegram_id: int,
+    network: str,
+    venue_position_id: int,
+) -> dict:
+    """Type A card data for a CLOSED venue position window (the History tab's
+    trade unit). Entry / exit / size / PnL are the venue's own figures for the
+    window; leverage is the isolated cap when the venue reports one, else
+    unknown (rendered as '—')."""
+    from src.nadobro.models.database import get_venue_position
+
+    row = get_venue_position(int(telegram_id), network, int(venue_position_id))
+    if not row or bool(row.get("is_open")):
+        return {"unsupported": "not_found"}
+    product_name = row.get("product_name")
+    base, display, is_perp = _type_a_product(product_name)
+    if not is_perp:
+        return {"unsupported": "spot"}
+    is_long = row.get("is_long")
+    size = float(_to_decimal(row.get("total_close_amount"))) or float(_to_decimal(row.get("max_amount")))
+    strategy = str(row.get("session_strategy") or "").strip().upper()
+    return {
+        "badge": f"{strategy} SESSION" if strategy else "DESK TRADE",
+        "product": display,
+        "base_symbol": base,
+        "side": "LONG" if is_long else "SHORT",
+        "leverage": 0.0,
+        "pnl": float(_to_decimal(row.get("realized_pnl"))),
+        "entry_price": float(_to_decimal(row.get("avg_entry_price"))),
+        "exit_price": float(_to_decimal(row.get("avg_exit_price"))),
+        "size": size,
         "referral_code": _fetch_active_referral_code(telegram_id, network) or "",
     }
 

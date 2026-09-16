@@ -834,6 +834,13 @@ def init_db():
             # this: unlinked venue fills default to source='manual', which
             # conflates bot manual trades with external ones.
             ("via_nadobro", "BOOLEAN"),
+            # Venue-authoritative routing signal (2026-09-16): the builder id
+            # decoded from the order appendix of the archive match, and the
+            # venue's builder fee for the fill. "Nadobro volume" = fills whose
+            # order carried OUR builder id; via_nadobro/session are the
+            # fallback for rows synced before these columns existed.
+            ("builder_id", "INT"),
+            ("builder_fee_x18", "NUMERIC(78,0)"),
         ]
         with conn.cursor() as cur:
             for net in ("testnet", "mainnet"):
@@ -1005,6 +1012,13 @@ def init_db():
                     ADD COLUMN IF NOT EXISTS win_count INT NOT NULL DEFAULT 0;
                 ALTER TABLE strategy_sessions
                     ADD COLUMN IF NOT EXISTS loss_count INT NOT NULL DEFAULT 0;
+                -- Venue-attributed session results (2026-09-16): realized PnL and
+                -- trade count summed over the venue position windows this session
+                -- OPENED (see venue_positions). NULL until the first attribution.
+                ALTER TABLE strategy_sessions
+                    ADD COLUMN IF NOT EXISTS venue_realized_pnl DOUBLE PRECISION;
+                ALTER TABLE strategy_sessions
+                    ADD COLUMN IF NOT EXISTS venue_trade_count INT;
                 CREATE INDEX IF NOT EXISTS idx_strategy_sessions_user
                     ON strategy_sessions (user_id, network, strategy);
                 CREATE INDEX IF NOT EXISTS idx_strategy_sessions_status
@@ -1291,6 +1305,54 @@ def init_db():
                     WHERE closed_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_positions_user_status ON positions (user_id, status);
                 CREATE INDEX IF NOT EXISTS idx_positions_pair_status ON positions (pair, status);
+
+                -- Venue position windows (archive ``positions`` query): the
+                -- venue's OWN per-position ledger — one row per open->close
+                -- window with volume-weighted entry/exit, fees, realized PnL and
+                -- funding. Feeds the portfolio Realized line, the History tab and
+                -- per-session Performance; attributed to the session that OPENED
+                -- the window (open_digest -> trades.strategy_session_id).
+                CREATE TABLE IF NOT EXISTS venue_positions (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    network TEXT NOT NULL CHECK (network IN ('testnet', 'mainnet')),
+                    subaccount TEXT,
+                    product_id INT NOT NULL,
+                    product_name TEXT,
+                    isolated BOOLEAN NOT NULL DEFAULT false,
+                    is_long BOOLEAN,
+                    open_id NUMERIC(78,0) NOT NULL,
+                    close_id NUMERIC(78,0),
+                    submission_idx NUMERIC(78,0),
+                    amount NUMERIC(38,18) NOT NULL DEFAULT 0,
+                    max_amount NUMERIC(38,18) NOT NULL DEFAULT 0,
+                    total_open_amount NUMERIC(38,18) NOT NULL DEFAULT 0,
+                    total_close_amount NUMERIC(38,18) NOT NULL DEFAULT 0,
+                    avg_entry_price NUMERIC(38,18),
+                    avg_exit_price NUMERIC(38,18),
+                    liquidated_amount NUMERIC(38,18) NOT NULL DEFAULT 0,
+                    open_fee NUMERIC(38,18) NOT NULL DEFAULT 0,
+                    close_fee NUMERIC(38,18) NOT NULL DEFAULT 0,
+                    realized_pnl NUMERIC(38,18) NOT NULL DEFAULT 0,
+                    net_funding NUMERIC(38,18) NOT NULL DEFAULT 0,
+                    net_interest NUMERIC(38,18) NOT NULL DEFAULT 0,
+                    open_ts TIMESTAMPTZ,
+                    update_ts TIMESTAMPTZ,
+                    open_reason TEXT,
+                    close_reason TEXT,
+                    open_digest TEXT,
+                    close_digest TEXT,
+                    is_open BOOLEAN NOT NULL DEFAULT false,
+                    strategy_session_id INT,
+                    source TEXT,
+                    attributed_by TEXT,
+                    synced_at TIMESTAMPTZ DEFAULT now(),
+                    UNIQUE (user_id, network, product_id, isolated, open_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_venue_positions_user_time
+                    ON venue_positions (user_id, network, update_ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_venue_positions_session
+                    ON venue_positions (strategy_session_id);
 
                 CREATE TABLE IF NOT EXISTS open_orders (
                     id BIGSERIAL PRIMARY KEY,

@@ -473,6 +473,171 @@ def query_isolated_subaccounts_for_parent(
     return _isolated_subaccounts_list_from_response(result) or []
 
 
+# ---------------------------------------------------------------------------
+# Position windows (archive ``positions`` query, 2026-09-10 API) — the venue's
+# OWN per-position ledger: one record per open->close window with the
+# volume-weighted entry/exit, fees, realized PnL and funding. This is the
+# authoritative source for realized PnL and trade history; the bot's fill
+# replay (holey ledger, average-cost pairing) fabricated numbers.
+# ---------------------------------------------------------------------------
+
+def _positions_list_from_response(result) -> list:
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return result
+    if not isinstance(result, dict):
+        return []
+    rows = result.get("positions")
+    if isinstance(rows, list):
+        return rows
+    data = result.get("data")
+    if isinstance(data, dict):
+        inner = data.get("positions")
+        if isinstance(inner, list):
+            return inner
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _parse_position(row: dict) -> dict:
+    """Normalize one archive position window to human units.
+
+    ``is_open`` is derived from ``close_id`` (``-1`` while open) with the
+    ``amount`` as a fallback; ``update_ts`` is the close time for a closed
+    window and the last change for an open one.
+    """
+    def _int(v, default=0):
+        try:
+            return int(str(v))
+        except (TypeError, ValueError):
+            return default
+
+    close_id = _int(row.get("close_id"), -1)
+    amount = _from_x18(row.get("amount", 0))
+    is_open = close_id < 0 if row.get("close_id") is not None else abs(amount) > 0
+    direction = row.get("direction")
+    if isinstance(direction, str):
+        direction = direction.strip().lower() in ("true", "1", "long")
+    return {
+        "subaccount": str(row.get("subaccount") or ""),
+        "product_id": _int(row.get("product_id"), 0),
+        "isolated": bool(row.get("isolated", False)),
+        "is_long": bool(direction) if direction is not None else None,
+        "open_id": _int(row.get("open_id"), 0),
+        "close_id": close_id if close_id >= 0 else None,
+        "submission_idx": _int(row.get("submission_idx"), 0),
+        "amount": abs(amount),
+        "max_amount": abs(_from_x18(row.get("max_amount", 0))),
+        "total_open_amount": abs(_from_x18(row.get("total_open_amount", 0))),
+        "total_close_amount": abs(_from_x18(row.get("total_close_amount", 0))),
+        "avg_entry_price": _from_x18(row.get("average_entry_price", 0)),
+        "avg_exit_price": _from_x18(row.get("average_exit_price", 0)),
+        "liquidated_amount": abs(_from_x18(row.get("liquidated_amount", 0))),
+        "open_fee": abs(_from_x18(row.get("open_fee", 0))),
+        "close_fee": abs(_from_x18(row.get("close_fee", 0))),
+        "realized_pnl": _from_x18(row.get("realized_pnl", 0)),
+        "net_funding": _from_x18(row.get("net_funding_payment", 0)),
+        "net_interest": _from_x18(row.get("net_interest_payment", 0)),
+        "open_ts": _int(row.get("open_timestamp"), 0),
+        "update_ts": _int(row.get("update_timestamp"), 0),
+        "open_reason": str(row.get("open_reason") or ""),
+        "close_reason": str(row.get("close_reason") or ""),
+        "open_digest": str(row.get("open_digest") or "").strip().lower() or None,
+        "close_digest": str(row.get("close_digest") or "").strip().lower() or None,
+        "is_open": bool(is_open),
+    }
+
+
+def query_positions(
+    network: str,
+    subaccount_hex: str,
+    *,
+    limit: int = 100,
+    idx: int | str | None = None,
+    open: bool | None = None,
+    product_id: int | None = None,
+) -> list[dict]:
+    """Position windows for a cross-margin subaccount (isolated children are
+    folded in with ``isolated=true``), newest ``open_id`` first.
+
+    Weight ``2 + limit/20`` on the archive lane. DENIED-vs-EMPTY: raises
+    :class:`ArchiveReadUnavailable` when the read could not be made; ``[]``
+    only for a successful read with no windows.
+    """
+    sub = (subaccount_hex or "").strip()
+    if not sub:
+        return []
+    params: dict = {"subaccount": sub, "limit": max(1, min(int(limit), 500))}
+    if idx is not None:
+        params["idx"] = str(idx)
+    if open is not None:
+        params["open"] = bool(open)
+    if product_id is not None:
+        params["product_id"] = int(product_id)
+    result = _post(archive_url_for_network(network), {"positions": params})
+    if result is None:
+        raise ArchiveReadUnavailable(
+            "positions read unavailable (archive budget denied, circuit open or request failed)"
+        )
+    return [_parse_position(r) for r in _positions_list_from_response(result) if isinstance(r, dict)]
+
+
+def builder_id_from_appendix(appendix) -> int | None:
+    """Builder id encoded in an order appendix (bits 48..63 — the layout
+    ``NadoClient._build_appendix`` writes). ``None`` when unparsable."""
+    try:
+        return (int(str(appendix)) >> 48) & 0xFFFF
+    except (TypeError, ValueError):
+        return None
+
+
+def enrich_matches_from_archive(result: dict) -> list[dict]:
+    """The raw archive ``matches`` envelope, with each match carrying what the
+    SDK model drops: ``product_id`` + ``timestamp`` (joined from the ``txs``
+    array by ``submission_idx``) and ``builder_id`` (decoded from the order
+    appendix). The 1,700+ Nado-UI fills that landed with ``product_id = 0`` —
+    and were then excluded from every portfolio figure — came from that gap."""
+    if not isinstance(result, dict):
+        return []
+    by_idx: dict[str, tuple[int | None, int | None]] = {}
+    for tx in result.get("txs") or []:
+        if not isinstance(tx, dict):
+            continue
+        key = str(tx.get("submission_idx"))
+        pid = None
+        try:
+            inner = tx.get("tx") or {}
+            for tx_type in ("match_orders", "match_orders_amm", "liquidate_subaccount"):
+                body = inner.get(tx_type) if isinstance(inner, dict) else None
+                if isinstance(body, dict) and body.get("product_id") is not None:
+                    pid = int(body.get("product_id"))
+                    break
+        except (TypeError, ValueError):
+            pid = None
+        try:
+            ts = int(str(tx.get("timestamp"))) if tx.get("timestamp") is not None else None
+        except (TypeError, ValueError):
+            ts = None
+        by_idx[key] = (pid, ts)
+    out: list[dict] = []
+    for m in _matches_list_from_archive_response(result):
+        if not isinstance(m, dict):
+            continue
+        row = dict(m)
+        pid, ts = by_idx.get(str(m.get("submission_idx")), (None, None))
+        if pid is not None and not row.get("product_id"):
+            row["product_id"] = pid
+        if ts is not None and row.get("timestamp") is None:
+            row["timestamp"] = ts
+        order = row.get("order") or {}
+        if isinstance(order, dict) and order.get("appendix") is not None:
+            row["builder_id"] = builder_id_from_appendix(order.get("appendix"))
+        out.append(row)
+    return out
+
+
 def _pick(d: dict, *keys, default=0):
     for k in keys:
         if k in d and d[k] is not None:

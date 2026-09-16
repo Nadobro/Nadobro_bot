@@ -706,8 +706,12 @@ class NadoClient:
             from src.nadobro.venue.gateway_budget import record_edge_rate_limited
             record_edge_rate_limited(url)
             return
-        self._record_gateway_error(
-            RuntimeError(f'error_code=1000 {data.get("error")} type={query_type or "?"}')
+        # Host-keyed: an archive rejection opens the ARCHIVE breaker, a gateway
+        # rejection the gateway one (the two are independent per-IP budgets).
+        from src.nadobro.venue.gateway_budget import record_gateway_failure
+        record_gateway_failure(
+            url or self._rest_url(),
+            RuntimeError(f'error_code=1000 {data.get("error")} type={query_type or "?"}'),
         )
 
     def _edge_url(self) -> str:
@@ -1653,53 +1657,69 @@ class NadoClient:
         idx: str | None = None,
         max_time: int | None = None,
     ) -> Optional[list[dict]]:
-        """
-        Fetch indexer match/fill events for this subaccount.
+        """Indexer matches (fills) for this subaccount, straight from the archive
+        ``matches`` envelope. Every match carries ``product_id`` + ``timestamp``
+        (joined from the envelope's ``txs`` by ``submission_idx``) and
+        ``builder_id`` (decoded from the order appendix) — the fields the SDK's
+        IndexerMatch model drops. Without them every Nado-UI fill landed as
+        ``product_id = 0`` and was excluded from every portfolio figure, and
+        venue-only fills were stamped with the SYNC time instead of the fill
+        time (2026-09-16).
 
         CONTRACT (DENIED-vs-EMPTY, 2026-09-02): ``[]`` means a SUCCESSFUL read
-        with no matches. ``None`` means the read could NOT be performed (no SDK
-        client, archive budget denied, or the SDK raised) = fills UNKNOWN. It
-        used to return ``[]`` for all three, so a gone order whose fills could
-        not be read was booked CANCELLED(filled=0): inventory blind, level
-        re-entered (audit AUDIT-DENY-2026-09-02-F3).
-
-        SDK 0.3.3 aliases ``idx`` as ``submission_idx`` on IndexerBaseParams.
+        with no matches. ``None`` means the read could NOT be performed (no
+        subaccount, archive budget denied, or the request failed) = fills
+        UNKNOWN. It used to return ``[]`` for all three, so a gone order whose
+        fills could not be read was booked CANCELLED(filled=0): inventory
+        blind, level re-entered (audit AUDIT-DENY-2026-09-02-F3).
         """
-        if not self._ensure_sdk_client():
+        if not self.subaccount_hex:
             return None
         from src.nadobro.venue.nado_weights import query_weight
+        archive_url = self._archive_url()
         # _gateway_allowed -> try_acquire can time.sleep() on a starved token
         # bucket. This runs in the coroutine body (not inside _call), so doing it
         # inline would block the event loop. Run it in the SDK pool.
         if not await run_blocking_sdk(
             self._gateway_allowed,
             weight=query_weight("matches", {"limit": limit, "subaccounts": [self.subaccount_hex]}),
-            url=self._archive_url(),
+            url=archive_url,
             user_scoped=False,
         ):
             return None
+        params: dict = {"subaccounts": [self.subaccount_hex], "limit": int(limit)}
+        if product_ids:
+            params["product_ids"] = [int(p) for p in product_ids]
+        if idx is not None:
+            params["idx"] = str(idx)
+        if max_time is not None:
+            params["max_time"] = int(max_time)
+
+        def _call():
+            resp = _rest_session.post(
+                archive_url, json={"matches": params},
+                headers={"Accept-Encoding": "gzip"}, timeout=_REQUEST_TIMEOUT_SECONDS,
+            )
+            if getattr(resp, "status_code", 200) == 429:
+                from src.nadobro.venue.gateway_budget import record_gateway_failure
+                record_gateway_failure(archive_url, "429 Too Many Requests (archive matches)")
+                return None
+            data = self._parse_json_response(resp)
+            if data is not None:
+                self._note_rate_limited_payload(data, archive_url, "matches")
+            return data
+
         try:
-            from nado_protocol.indexer_client.types.query import IndexerMatchesParams
-
-            def _call():
-                params = IndexerMatchesParams(
-                    subaccounts=[self.subaccount_hex],
-                    product_ids=product_ids,
-                    isolated=None,
-                    idx=int(idx) if idx is not None else None,
-                    max_time=max_time,
-                    limit=int(limit),
-                )
-                return self.client.context.indexer_client.get_matches(params)
-
             data = await run_blocking_sdk(_call)
-            rows = getattr(data, "matches", None)
-            if rows is None and isinstance(data, dict):
-                rows = data.get("matches")
-            return self._to_plain(rows or [])
         except Exception as e:
-            logger.error("SDK get_matches failed: %s", _format_sdk_error(e))
+            from src.nadobro.venue.gateway_budget import record_gateway_failure
+            record_gateway_failure(archive_url, e)
+            logger.error("archive get_matches failed: %s", _format_sdk_error(e))
             return None
+        if not isinstance(data, dict) or _payload_is_rate_limited(data) or "matches" not in data:
+            return None
+        from src.nadobro.venue.nado_archive import enrich_matches_from_archive
+        return enrich_matches_from_archive(data)
 
     async def get_interest_and_funding_payments(
         self,

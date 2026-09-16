@@ -1,6 +1,19 @@
+"""History tab — every trade on the account, from the venue's own ledger.
+
+A "trade" is a venue POSITION WINDOW (archive ``positions``): one open->close
+cycle on a product with the venue's volume-weighted entry/exit, fees and
+realized PnL — for EVERY source (strategy sessions, copy, desk, and trades made
+on the Nado app). Windows are synced into ``venue_positions`` by the portfolio
+sync and attributed to the strategy session that OPENED them.
+
+Why not the bot's own reconstruction: the old tab paired fills FIFO / listed
+the bot's ``positions`` rows, which drifted (a Sep-2026 row showed a BTC entry
+at $105k that never traded) and hid strategy trades. The venue record is the
+truth; this tab only renders it.
+"""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -9,8 +22,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from src.nadobro.utils.visual import b, divider, esc, money, pnl_dot, signed_money
 from src.nadobro.handlers import ui
 
-
 PAGE_SIZE = 5
+_FETCH_LIMIT = 200
 
 
 def render_history_view(
@@ -18,115 +31,39 @@ def render_history_view(
     page: int = 0,
     page_size: int = PAGE_SIZE,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Render the History tab — round-trips for non-strategy trades only.
-
-    - Strategy fills are excluded (they live in the Performance tab).
-    - Manual round-trips come from the venue-synced ``positions`` table
-      (:func:`database.get_manual_closed_round_trips`) — the authoritative record
-      with correct leverage. The old FIFO reconstruction over the (holey) fill
-      stream drifted and fabricated phantom trades / 1x leverage (2026-08-29 fix).
-    - Each round-trip gets its own ``Share PnL`` button (``trip_key`` = position id).
-    """
-    from src.nadobro.models.database import get_manual_closed_round_trips
+    """Render the History tab: all venue position windows, newest first."""
+    from src.nadobro.models.database import get_venue_positions
 
     network = str(snapshot.get("network") or "mainnet")
     user_id = int(snapshot.get("user_id") or 0)
     try:
-        round_trips = get_manual_closed_round_trips(user_id, network, limit=200) if user_id else []
+        rows = get_venue_positions(user_id, network, limit=_FETCH_LIMIT) if user_id else []
     except Exception:
-        round_trips = []
-    # Closed copy positions are single trades too — surface them in History
-    # (DISPLAY ONLY). They are never fed into compute_round_trips (source='copy'
-    # + a session id exclude them), so there is no double-count with the manual
-    # stream and no aggregate total to distort — copy stays tracked solely in
-    # copy accounting.
-    try:
-        from src.nadobro.models.database import get_closed_copy_positions
+        rows = []
 
-        closed_copies = get_closed_copy_positions(user_id, network, limit=200) if user_id else []
-    except Exception:
-        closed_copies = []
-
-    # Unified chronological entries: (sort_ts, lines[], share_callback_data).
-    entries: list[tuple[str, list[str], str]] = []
-    for trip in round_trips:
-        pair = _resolve_pair_name(
-            trip.get("product_id"), str(trip.get("pair") or ""), network,
-        )
-        is_long = str(trip.get("side") or "").lower() in ("long", "buy")
-        side = "📈 long" if is_long else "📉 short"
-        size = abs(_dec(trip.get("size")))
-        open_px = _dec(trip.get("avg_entry_price"))
-        close_px = _dec(trip.get("close_price"))
-        pnl = _dec(trip.get("close_realized_pnl"))
-        meta = _meta(trip.get("metadata"))
-        fees = _dec(meta.get("close_fees"))
-        funding = _dec(meta.get("close_funding"))
-        volume = size * (open_px + close_px)     # round-trip notional (both legs)
-        hold = _hold_duration(trip.get("opened_at"), trip.get("closed_at"))
-        margin = "iso" if bool(trip.get("isolated")) else "cross"
-        closed_at = _fmt_ts(trip.get("closed_at"))
-        entries.append((
-            str(trip.get("closed_at") or ""),
-            [
-                f"{b(pair)}  {side} · {margin}" + (f" · {closed_at}" if closed_at else ""),
-                f"    {_fmt_size(size)} @ {money(open_px)} → {money(close_px)} · held {hold}",
-                f"    Realized {pnl_dot(pnl)} {signed_money(pnl)} · Fees -{money(abs(fees))} · "
-                f"Funding {signed_money(-funding)} · Vol {money(volume)}",
-            ],
-            f"portfolio:share_pnl:rt:{trip.get('id')}",
-        ))
-    for pos in closed_copies:
-        pair = _resolve_pair_name(
-            pos.get("product_id"),
-            str(pos.get("product_name") or ""),
-            network,
-        )
-        is_long = str(pos.get("side") or "").lower() in ("long", "buy")
-        side = "📈 long" if is_long else "📉 short"
-        # Whole-trade base closed across all slices (partial + final); falls back
-        # to the remaining `size` for legacy rows without closed_size. Keeps the
-        # exit reconstruction in sync with the accumulated pnl. See
-        # build_copy_trade_card_data.
-        closed_size = _dec(pos.get("closed_size"))
-        size = closed_size if closed_size > 0 else _dec(pos.get("size"))
-        entry = _dec(pos.get("entry_price"))
-        pnl = _dec(pos.get("pnl"))
-        direction = Decimal(1) if is_long else Decimal(-1)
-        exit_px = entry + (pnl / (size * direction)) if size > 0 else entry
-        closed_at = _fmt_ts(pos.get("closed_at"))
-        entries.append((
-            str(pos.get("closed_at") or ""),
-            [
-                f"{b(pair)}  {side} · copy" + (f" · {closed_at}" if closed_at else ""),
-                f"    {_fmt_size(abs(size))} @ {money(entry)} → {money(exit_px)}",
-                f"    Realized {pnl_dot(pnl)} {signed_money(pnl)}",
-            ],
-            f"portfolio:share_pnl:copy:{pos.get('id')}",
-        ))
-
-    entries.sort(key=lambda e: e[0], reverse=True)
-    total_pages = max(1, (len(entries) + page_size - 1) // page_size)
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
     page = max(0, min(page, total_pages - 1))
-    visible = entries[page * page_size:(page + 1) * page_size]
+    visible = rows[page * page_size:(page + 1) * page_size]
 
     lines = [
         f"📜 <b>Trade History</b> · {esc(network.upper())} · page {page + 1}/{total_pages}",
-        "Single trades (desk + copy). Strategy sessions live under Performance",
+        "Every trade on your account, from Nado's own records",
         divider(),
     ]
-    rows: list[list[InlineKeyboardButton]] = []
-    for idx, (_ts, body_lines, share_cb) in enumerate(visible, start=page * page_size + 1):
-        lines.append(f"{idx}. {body_lines[0]}")
-        lines.extend(body_lines[1:])
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for idx, row in enumerate(visible, start=page * page_size + 1):
+        body = window_lines(row, network)
+        lines.append(f"{idx}. {body[0]}")
+        lines.extend(body[1:])
         lines.append("")
-        rows.append([InlineKeyboardButton(f"📤 Share PnL · #{idx}", callback_data=share_cb)])
+        share = window_share_callback(row)
+        if share:
+            kb_rows.append([InlineKeyboardButton(f"📤 Share PnL · #{idx}", callback_data=share)])
     if not visible:
         # F-06: the first screen a new user lands on must not be a dead end.
-        # Give it a human line, the reason, and one clear way to start.
-        lines.append("No closed trades yet.")
-        lines.append("Your fills land here once you've opened and closed a position.")
-        rows.append([InlineKeyboardButton("🤖 Make your first trade", callback_data="card:trade:start")])
+        lines.append("No trades yet.")
+        lines.append("Your trades land here once you've opened and closed a position.")
+        kb_rows.append([InlineKeyboardButton("🤖 Make your first trade", callback_data="card:trade:start")])
 
     nav: list[InlineKeyboardButton] = []
     if page > 0:
@@ -134,10 +71,61 @@ def render_history_view(
     if page + 1 < total_pages:
         nav.append(InlineKeyboardButton(ui.NAV_OLDER, callback_data=f"portfolio:history:{page + 1}"))
     if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("📈 Performance", callback_data="portfolio:performance")])
-    rows.append([InlineKeyboardButton(ui.nav_back_to("Portfolio"), callback_data="portfolio:view")])
-    return "\n".join(lines)[:3500], InlineKeyboardMarkup(rows)
+        kb_rows.append(nav)
+    kb_rows.append([InlineKeyboardButton("📈 Performance", callback_data="portfolio:performance")])
+    kb_rows.append([InlineKeyboardButton(ui.nav_back_to("Portfolio"), callback_data="portfolio:view")])
+    return "\n".join(lines)[:3500], InlineKeyboardMarkup(kb_rows)
+
+
+def window_lines(row: dict[str, Any], network: str) -> list[str]:
+    """Three display lines for one venue position window (shared with the
+    per-session trades view)."""
+    pair = _resolve_pair_name(row.get("product_id"), str(row.get("product_name") or ""), network)
+    is_long = row.get("is_long")
+    side = "📈 long" if is_long else ("📉 short" if is_long is not None else "trade")
+    margin = "iso" if bool(row.get("isolated")) else "cross"
+    is_open = bool(row.get("is_open"))
+    entry = _dec(row.get("avg_entry_price"))
+    exit_px = _dec(row.get("avg_exit_price"))
+    size = _dec(row.get("total_close_amount")) if not is_open else _dec(row.get("amount"))
+    if size <= 0:
+        size = _dec(row.get("max_amount"))
+    pnl = _dec(row.get("realized_pnl"))
+    fees = _dec(row.get("open_fee")) + _dec(row.get("close_fee"))
+    when = _fmt_ts(row.get("update_ts")) if not is_open else "open"
+    tag = _source_tag(row)
+    head = f"{b(pair)}  {side} · {margin} · {tag}" + (f" · {when}" if when else "")
+    if is_open:
+        detail = f"    {_fmt_size(size)} @ {money(entry)} · OPEN · held {_hold_duration(row.get('open_ts'), None)}"
+    else:
+        detail = (
+            f"    {_fmt_size(size)} @ {money(entry)} → {money(exit_px)} · "
+            f"held {_hold_duration(row.get('open_ts'), row.get('update_ts'))}"
+        )
+    result = f"    Realized {pnl_dot(pnl)} {signed_money(pnl)} · Fees -{money(abs(fees))}"
+    if _dec(row.get("liquidated_amount")) > 0:
+        result += " · ⚠ liquidated"
+    return [head, detail, result]
+
+
+def window_share_callback(row: dict[str, Any]) -> str | None:
+    """Share-card callback for a CLOSED window (an open one has no exit yet)."""
+    if bool(row.get("is_open")) or row.get("id") is None:
+        return None
+    return f"portfolio:share_pnl:vp:{int(row['id'])}"
+
+
+def _source_tag(row: dict[str, Any]) -> str:
+    strategy = str(row.get("session_strategy") or "").strip().lower()
+    sid = row.get("strategy_session_id")
+    if strategy and sid:
+        return f"{esc(strategy)} #{int(sid)}"
+    if sid:
+        return f"session #{int(sid)}"
+    source = str(row.get("source") or "").strip().lower()
+    if source in ("", "manual", "default"):
+        return "manual"
+    return esc(source)
 
 
 def _resolve_pair_name(product_id: Any, stored: str, network: str) -> str:
@@ -159,19 +147,7 @@ def _resolve_pair_name(product_id: Any, stored: str, network: str) -> str:
                 return name
         except Exception:
             pass
-    return stored or (f"ID:{pid}" if pid else "?")
-
-
-def _fmt_size(size: Decimal) -> str:
-    """Trim float→Decimal noise (0.01535000000000003 → 0.01535): sizes come
-    from float DB columns, so digits past 8 decimals are representation
-    artifacts, not venue precision."""
-    try:
-        q = size.quantize(Decimal("0.00000001"))
-        text = f"{q.normalize():f}"
-        return text if text not in ("-0", "") else "0"
-    except Exception:
-        return str(size)
+    return stored or "—"
 
 
 def _dec(value: Any) -> Decimal:
@@ -185,35 +161,37 @@ def _dec(value: Any) -> Decimal:
         return Decimal("0")
 
 
-def _meta(value: Any) -> dict:
-    """positions.metadata comes back as a dict (jsonb adapter) or a JSON string."""
-    if isinstance(value, dict):
-        return value
+def _fmt_size(value: Decimal) -> str:
+    text = f"{value:.8f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _as_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)) and value > 0:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
     if isinstance(value, str) and value:
-        import json
         try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-    return {}
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
 
 
 def _fmt_ts(value: Any) -> str:
-    """Compact close timestamp (UTC) so trades are identifiable at a glance."""
-    if not isinstance(value, datetime):
-        return ""
-    return f"{value:%b} {value.day}, {value:%H:%M}"
+    dt = _as_dt(value)
+    return dt.strftime("%b %d %H:%M") if dt else ""
 
 
-def _hold_duration(open_ts: Any, close_ts: Any) -> str:
-    if not (isinstance(open_ts, datetime) and isinstance(close_ts, datetime)):
+def _hold_duration(opened: Any, closed: Any) -> str:
+    start = _as_dt(opened)
+    end = _as_dt(closed) or datetime.now(timezone.utc)
+    if not start:
         return "—"
-    seconds = int((close_ts - open_ts).total_seconds())
-    if seconds < 60:
-        return f"{max(0, seconds)}s"
+    seconds = max(0, int((end - start).total_seconds()))
     if seconds < 3600:
         return f"{seconds // 60}m"
     if seconds < 86400:
-        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
-    return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
+        return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"

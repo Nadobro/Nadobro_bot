@@ -88,18 +88,60 @@ def test_nadobro_volume_is_a_subset_of_nado_volume():
     assert out["nado_volume"]["24h"]["fills"] == 2
 
 
-def test_volume_and_realized_pnl_describe_the_same_rows():
-    """The reported bug: volume $0.00 alongside a non-zero realized PnL. Both
-    now derive from the one ledger, so a round trip produces BOTH."""
+def test_realized_pnl_comes_from_the_venue_windows_or_is_unknown():
+    """Realized PnL is the VENUE'S figure (position windows). Without it the
+    analytics must say UNKNOWN (None) — never a fill-replay guess: on
+    2026-09-16 the replay showed -$161.36 for a day the venue booked +$10.50."""
     fills = [
-        _fill(hours_ago=3, product="BTC-PERP", quote="60000", base="1", side="long"),
-        _fill(hours_ago=1, product="BTC-PERP", quote="60100", base="1", side="short"),
+        _fill(hours_ago=1, product="BTC-PERP", quote="-60000", side="long"),
+        _fill(hours_ago=0.5, product="BTC-PERP", quote="60100", side="short"),
     ]
     out = aggregate_user_analytics(fills, [], now=NOW)
+    assert out["realized_source"] == "pending"
+    assert all(out["realized_pnl"][w] is None for w in ("24h", "7d", "30d", "all"))
     assert out["nado_volume"]["24h"]["total_usd"] == Decimal("120100")
-    assert out["realized_pnl"]["24h"] == Decimal("100")      # 60100 - 60000
-    # Never one without the other.
-    assert (out["nado_volume"]["24h"]["total_usd"] > 0) == (out["realized_pnl"]["24h"] != 0)
+
+    venue = {
+        "pnl_windows": {"24h": Decimal("10.4981"), "7d": Decimal("10.4981"), "30d": Decimal("-91.37"), "all": Decimal("18.54")},
+        "wins_windows": {"24h": 4, "7d": 4, "30d": 120, "all": 300},
+        "losses_windows": {"24h": 0, "7d": 0, "30d": 125, "all": 192},
+    }
+    out = aggregate_user_analytics(fills, [], now=NOW, venue_pnl=venue)
+    assert out["realized_source"] == "venue"
+    assert out["realized_pnl"]["24h"] == Decimal("10.4981")
+    assert out["realized_pnl"]["30d"] == Decimal("-91.37")
+    assert out["wins"]["24h"] == 4 and out["losses"]["30d"] == 125
+
+
+def test_nadobro_volume_uses_the_venue_builder_id_when_known():
+    """'Routed through builder 2900' is decided by the order appendix the venue
+    returns with each match; rows synced before that column existed fall back
+    to the bot's own attribution (via_nadobro / session / bot source)."""
+    from src.nadobro.quant.user_analytics import is_nadobro_fill
+
+    ours = 2900
+    assert is_nadobro_fill({"builder_id": 2900, "via_nadobro": False, "source": "manual"}, ours) is True
+    assert is_nadobro_fill({"builder_id": 0, "via_nadobro": True, "source": "manual"}, ours) is False   # a Nado-UI fill
+    assert is_nadobro_fill({"builder_id": 1234, "strategy_session_id": 9}, ours) is False              # another builder
+    # Legacy rows (no builder id yet): bot attribution decides.
+    assert is_nadobro_fill({"builder_id": None, "via_nadobro": True}, ours) is True
+    assert is_nadobro_fill({"builder_id": None, "strategy_session_id": 314, "source": "strategy"}, ours) is True
+    assert is_nadobro_fill({"builder_id": None, "source": "copy"}, ours) is True
+    assert is_nadobro_fill({"builder_id": None, "source": "manual", "via_nadobro": None}, ours) is False
+    # Testnet (builder routing bypassed, builder_id config None): bot attribution decides.
+    assert is_nadobro_fill({"builder_id": 0, "via_nadobro": True}, None) is True
+
+    bot = _fill(hours_ago=1, product="BTC-PERP", quote="-60000")
+    bot["builder_id"] = 2900
+    ui = _fill(hours_ago=2, product="BTC-PERP", quote="-60000")
+    ui["builder_id"] = 0
+    ui["via_nadobro"] = False
+    legacy = _fill(hours_ago=3, product="BTC-PERP", quote="-60000")
+    legacy["builder_id"] = None
+    legacy["strategy_session_id"] = 7
+    out = aggregate_user_analytics([bot, ui, legacy], [], now=NOW, builder_id=2900)
+    assert out["nado_volume"]["24h"]["fills"] == 3
+    assert out["nadobro_volume"]["24h"]["fills"] == 2
 
 
 def test_fees_are_not_double_counted_across_overlapping_columns():
@@ -123,7 +165,8 @@ def test_funding_is_reported_paid_positive_as_a_cost():
 
 
 def test_empty_ledger_is_all_zero_not_an_error():
-    out = aggregate_user_analytics([], [], now=NOW)
+    zero = {w: Decimal("0") for w in ("24h", "7d", "30d", "all")}
+    out = aggregate_user_analytics([], [], now=NOW, venue_pnl={"pnl_windows": zero, "wins_windows": {}, "losses_windows": {}})
     for w in ("24h", "7d", "30d", "all"):
         assert out["nado_volume"][w]["total_usd"] == Decimal("0")
         assert out["nadobro_volume"][w]["total_usd"] == Decimal("0")

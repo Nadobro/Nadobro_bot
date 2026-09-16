@@ -447,6 +447,23 @@ async def _handle_portfolio(query, data, telegram_id):
         await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
+    if action == "session_trades":
+        from src.nadobro.handlers.performance_view import render_session_trades_view
+
+        if not user:
+            await _edit_loc(query, "⚠ Performance unavailable. Execution mode not set.")
+            return
+        try:
+            sid = int(parts[2])
+            page = max(0, int(parts[3])) if len(parts) > 3 else 0
+        except (TypeError, ValueError, IndexError):
+            await query.answer("That session is no longer available.", show_alert=True)
+            return
+        # Pure DB — off the event loop like the other performance reads.
+        text, kb = await run_blocking(render_session_trades_view, telegram_id, user.network_mode.value, sid, page)
+        await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+
     if action == "hours":
         from src.nadobro.handlers.performance_view import render_hours_view
 
@@ -485,7 +502,8 @@ async def _handle_portfolio(query, data, telegram_id):
 
     if action == "share_pnl":
         # Per-trade cards (Type A, miner/trophy design):
-        #   ``portfolio:share_pnl:rt:{trip_key}``   — desk/agent/manual round-trip
+        #   ``portfolio:share_pnl:vp:{venue_position_id}`` — a closed venue window (History)
+        #   ``portfolio:share_pnl:rt:{trip_key}``   — desk/agent/manual round-trip (legacy)
         #   ``portfolio:share_pnl:copy:{position_id}`` — a closed copy position
         # Strategy-session cards (Type B):
         #   ``portfolio:share_pnl:{sid}``           — a strategy session
@@ -497,14 +515,21 @@ async def _handle_portfolio(query, data, telegram_id):
             build_type_b_card_data,
             build_round_trip_card_data,
             build_copy_trade_card_data,
+            build_venue_position_card_data,
         )
 
         network = user.network_mode.value if user else "mainnet"
         session_id: int | None = None
         round_trip_key: str | None = None
         copy_position_id: int | None = None
+        venue_position_id: int | None = None
         if len(parts) > 2:
-            if parts[2] == "rt" and len(parts) > 3:
+            if parts[2] == "vp" and len(parts) > 3:
+                try:
+                    venue_position_id = int(parts[3])
+                except (TypeError, ValueError):
+                    venue_position_id = None
+            elif parts[2] == "rt" and len(parts) > 3:
                 round_trip_key = parts[3]
             elif parts[2] == "copy" and len(parts) > 3:
                 try:
@@ -517,7 +542,11 @@ async def _handle_portfolio(query, data, telegram_id):
                 except (TypeError, ValueError):
                     session_id = None
         try:
-            if round_trip_key is not None:
+            if venue_position_id is not None:
+                data = await run_blocking(
+                    build_venue_position_card_data, telegram_id, network, venue_position_id
+                )
+            elif round_trip_key is not None:
                 data = await run_blocking(
                     build_round_trip_card_data, telegram_id, network, round_trip_key
                 )

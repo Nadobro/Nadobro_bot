@@ -162,66 +162,59 @@ def test_round_trip_builder_gates_spot_and_missing():
 
 # ── History integration (display-only, no double-count) ─────────
 
-def test_history_merges_copy_positions_without_touching_round_trips():
+def test_history_shows_copy_and_desk_trades_from_the_venue_ledger():
+    """Copy trades and desk trades are both venue position windows now; each
+    is labelled by its source and gets a venue-window share card."""
     from src.nadobro.handlers import history_view
 
     from datetime import datetime, timezone
-    manual_rt = [{
-        "id": 77, "product_id": 1, "pair": "ETH-PERP", "side": "long", "size": 1.0,
-        "leverage": 10, "avg_entry_price": 2400.0, "close_price": 2450.0,
-        "close_realized_pnl": 50.0, "isolated": False,
-        "opened_at": datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
-        "closed_at": datetime(2026, 7, 19, 11, tzinfo=timezone.utc),
-        "metadata": {"close_fees": 1.0, "close_funding": 0.0},
-    }]
-    closed_copy = [{
-        "id": 55, "product_id": 2, "product_name": "BTC-PERP", "side": "short",
-        "entry_price": 100.0, "size": 2.0, "leverage": 5, "pnl": 20.0,
-        "closed_at": "2026-07-19T12:00:00Z",
-    }]
-    with patch("src.nadobro.models.database.get_manual_closed_round_trips", return_value=manual_rt), \
-         patch("src.nadobro.models.database.get_closed_copy_positions", return_value=closed_copy):
+    rows = [
+        {
+            "id": 55, "product_id": 2, "product_name": "BTC-PERP", "is_long": False, "isolated": True,
+            "total_close_amount": "2", "max_amount": "2", "amount": "0",
+            "avg_entry_price": "100", "avg_exit_price": "90", "realized_pnl": "20",
+            "open_fee": "0.5", "close_fee": "0.5", "is_open": False,
+            "open_ts": datetime(2026, 7, 19, 11, 30, tzinfo=timezone.utc),
+            "update_ts": datetime(2026, 7, 19, 12, tzinfo=timezone.utc),
+            "strategy_session_id": 311, "session_strategy": "copy", "source": "copy",
+        },
+        {
+            "id": 77, "product_id": 1, "product_name": "ETH-PERP", "is_long": True, "isolated": False,
+            "total_close_amount": "1", "max_amount": "1", "amount": "0",
+            "avg_entry_price": "2400", "avg_exit_price": "2450", "realized_pnl": "50",
+            "open_fee": "0.5", "close_fee": "0.5", "is_open": False,
+            "open_ts": datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
+            "update_ts": datetime(2026, 7, 19, 11, tzinfo=timezone.utc),
+            "strategy_session_id": None, "session_strategy": None, "source": "manual",
+        },
+    ]
+    with patch("src.nadobro.models.database.get_venue_positions", return_value=rows):
         text, kb = history_view.render_history_view({"network": "mainnet", "user_id": 42})
 
     cbs = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    # Both a copy card and a desk round-trip card are offered, from their OWN sources.
-    assert "portfolio:share_pnl:copy:55" in cbs
-    assert "portfolio:share_pnl:rt:77" in cbs
-    # Copy renders after the manual trip (later close_ts sorts first) — display only.
-    assert "copy" in text and "ETH-PERP" in text
-
-
-def test_history_shows_copies_even_with_no_manual_trades():
-    from src.nadobro.handlers import history_view
-
-    closed_copy = [{
-        "id": 60, "product_id": 2, "product_name": "SOL-PERP", "side": "long",
-        "entry_price": 100.0, "size": 3.0, "leverage": 3, "pnl": -9.0,
-        "closed_at": "2026-07-19T12:00:00Z",
-    }]
-    with patch("src.nadobro.trading.trade_service.compute_round_trips", return_value=[]), \
-         patch("src.nadobro.models.database.get_closed_copy_positions", return_value=closed_copy):
-        text, kb = history_view.render_history_view({"network": "mainnet", "user_id": 42})
-    cbs = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    assert "portfolio:share_pnl:copy:60" in cbs
+    assert "portfolio:share_pnl:vp:55" in cbs
+    assert "portfolio:share_pnl:vp:77" in cbs
+    assert "copy #311" in text and "ETH-PERP" in text and "manual" in text
+    # The venue's own exit is rendered — no reconstruction from an accumulated pnl.
+    assert "$100.00 → $90.00" in text
     assert "No trades yet" not in text
 
 
-def test_history_shows_whole_trade_size_and_exit_for_partial_closed_copy():
-    from src.nadobro.handlers import history_view
+def test_venue_position_card_data_uses_the_venue_figures():
+    from src.nadobro.portfolio.pnl_card_builder import build_venue_position_card_data
 
-    # Leader trimmed before closing: row size = last slice (0.25), closed_size =
-    # whole trade (1.0), pnl = accumulated (25). History must show the whole
-    # trade — size 1 and exit $125.00 (100 + 25/1.0) — not the broken last-slice
-    # reconstruction (0.25 → exit $200.00 = 100 + 25/0.25).
-    closed_copy = [{
-        "id": 70, "product_id": 2, "product_name": "ETH-PERP", "side": "long",
-        "entry_price": 100.0, "size": 0.25, "closed_size": 1.0, "leverage": 3,
-        "pnl": 25.0, "closed_at": "2026-07-19T12:00:00Z",
-    }]
-    with patch("src.nadobro.trading.trade_service.compute_round_trips", return_value=[]), \
-         patch("src.nadobro.models.database.get_closed_copy_positions", return_value=closed_copy):
-        text, _kb = history_view.render_history_view({"network": "mainnet", "user_id": 42})
-    assert "$125.00" in text        # size-weighted whole-trade exit
-    assert "$200.00" not in text    # the broken last-slice-only exit must be gone
-    assert "1 @ $100.00" in text    # whole-trade size, not 0.25
+    row = {
+        "id": 70, "product_id": 1, "product_name": "ETH-PERP", "is_long": True, "isolated": False,
+        "total_close_amount": "1.0", "max_amount": "1.0", "avg_entry_price": "100",
+        "avg_exit_price": "125", "realized_pnl": "25", "is_open": False, "session_strategy": "copy",
+    }
+    with patch("src.nadobro.models.database.get_venue_position", return_value=row), \
+         patch("src.nadobro.portfolio.pnl_card_builder._fetch_active_referral_code", return_value="REF"):
+        data = build_venue_position_card_data(42, "mainnet", 70)
+    assert data["badge"] == "COPY SESSION"
+    assert data["entry_price"] == 100.0 and data["exit_price"] == 125.0 and data["size"] == 1.0
+    assert data["pnl"] == 25.0 and data["side"] == "LONG"
+    with patch("src.nadobro.models.database.get_venue_position", return_value={**row, "is_open": True}):
+        assert build_venue_position_card_data(42, "mainnet", 70) == {"unsupported": "not_found"}
+    with patch("src.nadobro.models.database.get_venue_position", return_value=None):
+        assert build_venue_position_card_data(42, "mainnet", 70) == {"unsupported": "not_found"}

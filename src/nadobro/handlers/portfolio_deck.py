@@ -145,7 +145,10 @@ def render_portfolio_deck(
     vol_window = _window_value(stats, "volume_windows", window)
     pnl_window = _window_value(stats, "pnl_windows", window)
     fees_window = _window_value(stats, "fees_windows", window)
-    funding_window = _window_value(stats, "funding_windows", window)
+    # Realized PnL is the VENUE'S figure (its position windows); until the
+    # first sync has written them the line says so instead of showing the old
+    # fill-replay guess (2026-09-16: -$161 shown for a +$10.50 day).
+    realized_known = str(stats.get("realized_source") or "") == "venue"
 
     # Shared freshness contract (utils.visual.freshness_line). Behaviour is
     # byte-identical to the four states this deck pioneered; the degraded
@@ -157,14 +160,6 @@ def render_portfolio_deck(
         degraded=bool(snapshot.get("stale") and snapshot.get("error")),
         cached_reason="venue throttled" if snapshot.get("venue_throttled") else None,
     )
-
-    # Funding sign convention: positive = paid (a cost), negative = received.
-    if funding_window > 0:
-        funding_line = f"Funding   -{money(funding_window)} (paid)"
-    elif funding_window < 0:
-        funding_line = f"Funding   +{money(abs(funding_window))} (received)"
-    else:
-        funding_line = "Funding   $0.00"
 
     lines = [
         f"📊 <b>Portfolio</b> · {esc(network)} · {_window_label(window)}",
@@ -194,9 +189,8 @@ def render_portfolio_deck(
     else:
         lines.append(f"Volume    {money(vol_window)}")
     lines.extend([
-        f"Realized  {signed_money(pnl_window)}",
+        f"Realized  {signed_money(pnl_window)}" if realized_known else "Realized  — (syncing from Nado)",
         f"Fees      -{money(abs(fees_window))}",
-        funding_line,
         divider(),
         "<b>Top Positions</b>",
     ])
