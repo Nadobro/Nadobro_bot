@@ -39,7 +39,7 @@ _S165 = {
 def test_symptom1_the_ladder_follows_price_within_the_sessions_own_range():
     """The ladder must re-quote on a move SMALLER than session 165's whole range."""
     async def body():
-        adapter = MockNadoAdapter(mid=Decimal("63373.5"))
+        adapter = MockNadoAdapter(mid=Decimal("63373.5"), venue_held={"BTC-PERP": Decimal(0)})
         orch = ExecutorOrchestrator()
         c = DynamicGridController(
             user_id=1, orchestrator=orch, adapter=adapter,

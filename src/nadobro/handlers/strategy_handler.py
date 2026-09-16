@@ -124,8 +124,11 @@ def _turbo_preset_settings(
             "grid_reset_threshold_pct": 0.15,
         })
     elif sid == "rgrid":
+        # The trigger Reverse Grid floors its rung spacing at REVGRID_STEP_FLOOR
+        # (15bp — the real-tape viable zone); writing 3bp here showed a spread the
+        # engine silently replaced. Write the value that actually runs.
         base.update({
-            "spread_bp": 3.0, "rgrid_spread_bp": 3.0,
+            "spread_bp": 15.0, "rgrid_spread_bp": 15.0,
             "rgrid_stop_loss_pct": sl,
         })
     elif sid == "dgrid":
@@ -907,9 +910,17 @@ async def _handle_strategy(query, data, context, telegram_id):
             # revgrid_chop_stand_down and _apply_live_controller_update pushes it),
             # so a running session picks the change up without a restart.
             "rgrid_chop_stand_down",
+            # Trigger Reverse Grid exits: protective stop / trailing-stop distance as
+            # % of price (0 = auto = 2 x step). Read by engine_runtime._map_revgrid_config
+            # (rgrid standalone AND D-Grid's trend phase) and re-read live.
+            "rgrid_stop_pct", "rgrid_trail_pct",
             "dgrid_trend_on_variance_ratio", "dgrid_range_on_variance_ratio",
             "dgrid_spread_bp", "dgrid_min_spread_bp", "dgrid_max_spread_bp",
             "dgrid_short_window_points", "dgrid_long_window_points",
+            # D-Grid regime knobs the engine already reads (and refreshes live via
+            # _apply_dgrid_controller_config): sustained-drift trend filter (% over
+            # the long window, 0 = off) and the flip debounce (ticks).
+            "dgrid_trend_drift_pct", "dgrid_flip_confirm_ticks",
             # D-Grid auto-switch: 1 (the default, under the trigger flag) = also run
             # the RGRID trend-follow phase so the bot switches GRID<->RGRID with the
             # regime and stays in-market; 0 = mean-reversion GRID ladder only. Routes
@@ -1002,6 +1013,10 @@ async def _handle_strategy(query, data, context, telegram_id):
             "dgrid_short_window_points": (2, 50),
             "dgrid_long_window_points": (4, 200),
             "dgrid_trend_follow": (0, 1),
+            "rgrid_stop_pct": (0, 10.0),
+            "rgrid_trail_pct": (0, 10.0),
+            "dgrid_trend_drift_pct": (0, 5.0),
+            "dgrid_flip_confirm_ticks": (1, 20),
             "auto_close_on_maintenance": (0, 1),
             "is_long_bias": (0, 1),
             "fill_anchored": (0, 1),
@@ -1023,6 +1038,11 @@ async def _handle_strategy(query, data, context, telegram_id):
             logger.error("strategy set: field %r whitelisted but has no limits entry", field)
             return
         lo, hi = _bounds
+        if field == "levels" and strategy_id == "rgrid":
+            # The trigger Reverse Grid arms ``levels`` rungs on EACH side and Nado
+            # holds at most 25 pending triggers per product, so 12 is the ceiling
+            # (the engine caps regardless; the card must not promise more).
+            hi = min(hi, 12)
         if field == "mm_leverage_override":
             # Per-asset ceiling: the static (1, 50) bound accepted values above a
             # pair's max (e.g. 45x on a 40x SOL) that the start guard then rejected.
@@ -1044,7 +1064,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "auto_close_on_maintenance", "is_long_bias", "rgrid_reset_timeout_seconds",
             "dn_hold_seconds", "dn_cycles", "dn_cycle_gap_seconds", "mm_leverage_override",
             "fill_anchored", "mm_duration_minutes", "twap_pause_move_bp",
-            "rgrid_chop_stand_down", "dgrid_trend_follow",
+            "rgrid_chop_stand_down", "dgrid_trend_follow", "dgrid_flip_confirm_ticks",
         }
 
         def _mutate(s):
@@ -1132,9 +1152,11 @@ async def _handle_strategy(query, data, context, telegram_id):
             "quote_ttl_seconds", "min_spread_bp", "max_spread_bp", "vol_sensitivity",
             "rgrid_spread_bp", "rgrid_stop_loss_pct", "rgrid_take_profit_pct",
             "rgrid_reset_threshold_pct", "rgrid_reset_timeout_seconds", "rgrid_discretion",
+            "rgrid_stop_pct", "rgrid_trail_pct",
             "dgrid_trend_on_variance_ratio", "dgrid_range_on_variance_ratio",
             "dgrid_spread_bp", "dgrid_min_spread_bp", "dgrid_max_spread_bp",
             "dgrid_short_window_points", "dgrid_long_window_points",
+            "dgrid_trend_drift_pct", "dgrid_flip_confirm_ticks",
             "grid_reset_threshold_pct", "grid_reset_timeout_seconds",
             "directional_bias", "mm_leverage_override", "mm_duration_minutes",
             "twap_pause_move_bp",
@@ -1194,6 +1216,10 @@ async def _handle_strategy(query, data, context, telegram_id):
             "dgrid_max_spread_bp": "Enter DGRID maximum spread in bps \\(example: `50`\\)",
             "dgrid_short_window_points": "Enter DGRID short volatility window points \\(example: `4`\\)",
             "dgrid_long_window_points": "Enter DGRID long volatility window points \\(example: `12`\\)",
+            "rgrid_stop_pct": "Enter RGRID stop distance % of price \\(`0` \\= auto, 2 × step; example: `0\\.5`\\)",
+            "rgrid_trail_pct": "Enter RGRID trailing\\-stop distance % of price \\(`0` \\= auto, 2 × step; example: `0\\.5`\\)",
+            "dgrid_trend_drift_pct": "Enter DGRID trend drift % over the long window \\(`0` \\= off; example: `0\\.3`\\)",
+            "dgrid_flip_confirm_ticks": "Enter DGRID flip confirm ticks \\(example: `2`\\)",
             "session_margin_usd": "Enter session margin in USD \\(per\\-cycle notional, example: `500`\\)",
             "target_volume_usd": "Enter target cumulative volume in USD \\(example: `25000`\\)",
             "mm_leverage_override": "Enter leverage \\(1 – pair max; position size \\= margin × leverage, example: `5`\\)",
@@ -1612,10 +1638,11 @@ def _strategy_config_sections(strategy: str) -> list[tuple[str, str]]:
     if strategy == "grid":
         return [("setup", "⚙️ Core"), ("execution", "📐 Spread"), ("risk", "🛡 Risk")]
     if strategy == "rgrid":
-        # The "reset" section id is kept (callbacks and pending-input routing use
-        # it). The threshold ARMS the trailing soft reset: once price has drifted
-        # favourably by it, the exit leg follows the trend instead of banking.
-        return [("setup", "⚙️ Core"), ("risk", "🛡 Risk"), ("reset", "🎯 Soft Reset")]
+        # Exits = the trigger Reverse Grid's protective stop + trailing stop (the
+        # one venue reduce-only order that is both its stop-loss and take-profit).
+        # The old "Soft Reset" tab (reset threshold / discretion) drove the retired
+        # maker controller only — the live trigger engine never read those keys.
+        return [("setup", "⚙️ Core"), ("risk", "🛡 Risk"), ("exits", "🎯 Exits")]
     if strategy == "dgrid":
         return [("setup", "⚙️ Core"), ("regime", "⚡ Regime"), ("risk", "🛡 Risk")]
     if strategy == "mid":
@@ -1637,15 +1664,17 @@ def _strategy_section_for_field(strategy: str, field: str) -> str:
             return "risk"
         return "setup"
     if strategy == "rgrid":
-        if field in {"rgrid_reset_threshold_pct", "rgrid_reset_timeout_seconds", "rgrid_discretion"}:
-            return "reset"
+        if field in {"rgrid_stop_pct", "rgrid_trail_pct",
+                     "rgrid_reset_threshold_pct", "rgrid_reset_timeout_seconds", "rgrid_discretion"}:
+            return "exits"
         if field in {"rgrid_stop_loss_pct", "rgrid_take_profit_pct"}:
             return "risk"
         return "setup"
     if strategy == "dgrid":
         if field.startswith("dgrid_"):
             return "regime"
-        if field in {"rgrid_stop_loss_pct", "rgrid_take_profit_pct", "tp_pct", "sl_pct"}:
+        if field in {"rgrid_stop_loss_pct", "rgrid_take_profit_pct", "tp_pct", "sl_pct",
+                     "rgrid_stop_pct", "rgrid_trail_pct"}:
             return "risk"
         return "setup"
     if strategy == "mid":
@@ -1763,6 +1792,31 @@ def _start_leverage_for_card(
     return max(1.0, default_lev)
 
 
+def rgrid_trigger_plan(conf: dict, sl_pct_val: float, *, spread_key: str = "rgrid_spread_bp"):
+    """The trigger Reverse Grid's WHOLE plan (step / rungs per side / stop /
+    trail / per-rung size) for ``conf`` — from ``engine_runtime.
+    revgrid_plan_from_settings``, the very function ``_map_revgrid_config`` uses,
+    so the card and the engine derive one plan. ``spread_key`` lets D-Grid's card
+    describe its trend phase from ``dgrid_spread_bp`` the way the mapper does.
+    """
+    from decimal import Decimal
+
+    from src.nadobro.strategy.engine_runtime import revgrid_plan_from_settings
+
+    deploy_margin = _effective_margin_usd(conf)
+    lev = max(1.0, float(_mm_effective_leverage(conf)))
+    levels = max(1, int(float(conf.get("levels", 4) or 4)))
+    band_bp = float(conf.get(spread_key, conf.get("spread_bp", 10.0)) or 10.0)
+    return revgrid_plan_from_settings(
+        dict(conf),
+        levels=levels,
+        deployed=deploy_margin * lev,
+        spread_frac=Decimal(str(band_bp / 10000.0)) if band_bp > 0 else Decimal("0.001"),
+        sl_pct=max(0.0, float(sl_pct_val)),
+        leverage=int(lev),
+    )
+
+
 def rgrid_step_plan(conf: dict, sl_pct_val: float):
     """The per-break size R-Grid will actually trade, and why.
 
@@ -1770,12 +1824,23 @@ def rgrid_step_plan(conf: dict, sl_pct_val: float):
     (:mod:`src.nadobro.quant.rgrid_sizing`), so the card can never quote a size
     the strategy does not place. Lazy import: handlers/ has no module-level edge
     to quant/ (tests/lint/test_architecture_layers.py).
+
+    Routed like the engine: under the trigger flag the size is the trigger
+    ladder's (15bp step floor, 12-rung cap, exits derived from the step) — the
+    legacy maker geometry below quoted $186.57/rung where the engine placed
+    $119.62 on the 2026-08-30 prod config.
     """
     from decimal import Decimal
 
     from src.nadobro.quant.mm_quote_math import DEFAULT_MIN_ORDER_NOTIONAL_USD
     from src.nadobro.quant.rgrid_sizing import resolve_step_quote, step_band_frac
+    from src.nadobro.strategy.engine_runtime import revgrid_trigger_enabled
     from src.nadobro.strategy.strategy_registry import session_margin_usd
+
+    if revgrid_trigger_enabled():
+        plan = rgrid_trigger_plan(conf, sl_pct_val)
+        rail_margin = session_margin_usd(conf) or _effective_margin_usd(conf)
+        return rail_margin, plan.sizing
 
     # TWO different bases, on purpose — mixing them is what the 2026-08-06 audit
     # caught. Deployment is cycle-first (what the engine actually trades); the stop
@@ -2140,97 +2205,129 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
                 f"PnL take profit: *{escape_md(pnl_tp)}*\n"
                 f"{_budget_line}\n"
                 "Both are % of MARGIN, measured on live PnL \\(realized \\+ open\\) "
-                "NET of fees — not raw market drift\\. R\\-Grid rests post\\-only "
-                "limit orders, so it earns the spread rather than paying it; only the "
-                "trailing stop crosses\\. The size per break is capped so even a "
-                "worst\\-case crossing round trip fits inside that budget\\."
+                "NET of fees — the session rail behind every position\\. Every rung "
+                "fills as a TAKER when its trigger fires and the trailing stop crosses "
+                "to exit, so the size per rung is capped so a full pyramid reaching its "
+                "own stop, fees included, fits inside that budget\\. The per\\-position "
+                "stop and trail live on the Exits tab\\."
                 f"{_rgrid_step_cap_note(conf, _sl_val)}"
             )
-        if section == "reset":
-            _tp_pct_val = float(conf.get("rgrid_reset_threshold_pct", 0.2) or 0.2)
-            reset_threshold = f"{_tp_pct_val:.2f}%"
-            discretion = f"{float(conf.get('rgrid_discretion', 0.06)):.2f}"
-            # The controller REFUSES a target inside 2x the entry band (it would
-            # close the position before the break that opened it is established).
-            # 0.1% is a valid setting yet sits inside the band at the default
-            # 10bp spread — so without this the knob would silently do nothing.
-            _band_bp = max(
-                float(conf.get("rgrid_spread_bp", conf.get("spread_bp", 10.0)) or 10.0),
-                float(conf.get("min_spread_bp", 1.5) or 1.5),
-            )
-            _inactive = _tp_pct_val * 100.0 < 2.0 * _band_bp
-            _tp_note = (
-                f"\n⚠️ Inactive: needs \\> *{escape_md(f'{2.0 * _band_bp / 100.0:.2f}%')}* "
-                f"at a {escape_md(f'{_band_bp:.1f} bp')} band \\(2× the entry band\\)\\."
-                if _inactive else ""
-            )
-            # This threshold ARMS the soft reset — it is not a re-anchor (grid's
-            # meaning) and no longer an immediate take-profit. Re-anchoring the
-            # ENTRY on drift would suppress the very break the strategy exists to
-            # trade; banking at the threshold would stop it following the trend.
-            # rgrid_reset_timeout_seconds is NOT displayed — no controller reads it.
+        if section in ("exits", "reset"):
+            _sl_val = float(conf.get("rgrid_stop_loss_pct", sl_pct) or 0.0)
+            _plan = rgrid_trigger_plan(conf, _sl_val)
+            _step_bp = float(_plan.step_pct) * 10000.0
+            _stop_pct = float(_plan.stop_pct) * 100.0
+            _trail_pct = float(_plan.trail_arm_pct) * 100.0
+            _stop_lbl = f"{_stop_pct:.2f}%" + (" (auto: 2 × step)" if _plan.stop_is_auto else "")
+            _trail_lbl = f"{_trail_pct:.2f}%" + (" (auto: 2 × step)" if _plan.trail_is_auto else "")
             return (
-                "⚙️ *Reverse GRID · Soft Reset*\n\n"
-                f"Arms after: *{escape_md(reset_threshold)}* favourable move{_tp_note}\n"
-                f"Discretion: *{escape_md(discretion)}* \\(exposure VWAP window\\)\n\n"
-                "R\\-Grid adds INTO a trend\\. Once the move has gone this far your "
-                "way *and* you are in profit, the exit starts FOLLOWING the trend — "
-                "one spread behind the best price, instead of sitting at your entry, "
-                "so the run keeps going and the profit is locked\\. A pullback that "
-                "stops short of it is booked by the resting limit; once price comes "
-                "back THROUGH it the stop crosses and closes the whole position\\. "
-                "Range 0\\.1–10%\\. Set it clear of the entry band or the exit would "
-                "arm before the move that opened the position is established\\."
+                "⚙️ *Reverse GRID · Exits*\n\n"
+                f"Stop: *{escape_md(_stop_lbl)}* below/above the average entry\n"
+                f"Trail: arms at *{escape_md(_trail_lbl)}* in profit, then follows the best "
+                f"price by the same distance\n"
+                f"Step: *{escape_md(f'{_step_bp:.0f} bp')}*\n\n"
+                "ONE venue reduce\\-only stop is both the stop\\-loss and the take\\-profit\\. "
+                "It starts at the stop distance from your average entry; once the move "
+                "has gone the trail distance your way it moves to \\~breakeven and then "
+                "ratchets behind the best price — never loosening — so a winner keeps "
+                "running and a reversal closes the whole position in profit\\. Auto "
+                "keeps both at 2 × step \\(the real\\-tape\\-validated geometry\\); a "
+                "custom value is a % of price and is floored at the taker round trip\\. "
+                "The session PnL rail on the Risk tab is the backstop behind it\\."
             )
-        levels = str(int(conf.get("levels", 4)))
+        levels_req = int(conf.get("levels", 4) or 4)
+        _sl_val = float(conf.get("rgrid_stop_loss_pct", sl_pct) or 0.0)
+        _plan = rgrid_trigger_plan(conf, _sl_val)
         rgrid_spread = f"{float(conf.get('rgrid_spread_bp', spread_bp)):.1f} bp"
+        _step_bp = float(_plan.step_pct) * 10000.0
+        _step_note = (
+            f" \\(step floored to *{escape_md(f'{_step_bp:.0f} bp')}*\\)" if _plan.step_floored else ""
+        )
+        _levels_lbl = str(_plan.levels) + (
+            f" (of {levels_req} requested — 12 max per side)" if _plan.levels_capped else " per side"
+        )
         pov_label = str(conf.get("participation_preset") or "OFF").upper()
+        _chop = "On" if float(conf.get("rgrid_chop_stand_down", 1) or 0) >= 0.5 else "Off"
         return (
             "⚙️ *Reverse GRID · Core*\n\n"
             f"Margin: *{escape_md(f'${notional:,.0f}')}* \\| Interval: *{escape_md(f'{interval_seconds}s')}*\n"
-            f"Levels: *{escape_md(levels)}* \\| Spread: *{escape_md(rgrid_spread)}*\n"
-            f"POV: *{escape_md(pov_label)}*\n"
+            f"Rungs: *{escape_md(_levels_lbl)}* \\| Spread: *{escape_md(rgrid_spread)}*{_step_note}\n"
+            f"Per rung: *{escape_md(f'${float(_plan.rung_quote):,.0f}')}* \\| "
+            f"Chop guard: *{escape_md(_chop)}* \\| POV: *{escape_md(pov_label)}*\n"
             f"{_mm_sizing_line(conf)}\n\n"
-            "Both legs rest as *post\\-only limit orders* one spread either side of "
-            "the *average of your buy and sell exposure prices* — the buy ABOVE it, "
-            "the sell BELOW\\. Each becomes fillable once price has travelled past "
-            "it, so you buy into strength and sell into weakness without ever paying "
-            "the spread\\. Profits in trends, waits in chop — the mirror of GRID\\. "
-            "The trailing stop is the one order that crosses\\. "
-            "*Position size \\= margin × leverage*\\."
+            "A ladder of venue *price triggers*: BUY rungs one step apart ABOVE the "
+            "mid, SELL rungs BELOW it\\. Whichever side price breaks first fires and "
+            "fills as a taker, the other side is cancelled, and the same\\-side rungs "
+            "above/below keep adding as the move extends \\(a pyramid, capped at the rung "
+            "count\\)\\. One trailing venue stop exits the whole position\\. Profits in "
+            "trends, gives back a little in chop — the mirror of GRID\\. The first ladder "
+            "always arms; with the chop guard on, a re\\-arm after a stop\\-out waits "
+            "for a confirmed trend\\. *Position size \\= margin × leverage*\\."
         )
 
     if strategy == "dgrid":
+        _dg_sl = float(conf.get("rgrid_stop_loss_pct", sl_pct) or 0.0)
+        _dg_spread_key = "rgrid_spread_bp" if float(conf.get("rgrid_spread_bp", 0) or 0) > 0 else "dgrid_spread_bp"
+        _trend_plan = rgrid_trigger_plan(conf, _dg_sl, spread_key=_dg_spread_key)
+        _trend_step_bp = float(_trend_plan.step_pct) * 10000.0
+        _auto_switch = float(conf.get("dgrid_trend_follow", 1) or 0) >= 0.5
         if section == "regime":
             trend_on = float(conf.get("dgrid_trend_on_variance_ratio", 1.25))
             range_on = float(conf.get("dgrid_range_on_variance_ratio", 1.15))
             min_spread = float(conf.get("dgrid_min_spread_bp", 2.0))
             max_spread = float(conf.get("dgrid_max_spread_bp", 50.0))
+            drift = float(conf.get("dgrid_trend_drift_pct", 0.30) or 0.0)
+            confirm = int(float(conf.get("dgrid_flip_confirm_ticks", 2) or 2))
+            _inverted = (
+                f"\n⚠️ Range {escape_md(f'{range_on:.2f}')} is above Trend "
+                f"{escape_md(f'{trend_on:.2f}')} — the engine clamps Range down to Trend\\."
+                if range_on > trend_on else ""
+            )
+            _drift_lbl = f"{drift:.2f}%" if drift > 0 else "off"
             return (
                 "⚡ *Dynamic GRID · Regime*\n\n"
                 f"Switch to RGRID: *{escape_md(f'{trend_on:.2f}')}* variance ratio\n"
-                f"Switch to GRID: *{escape_md(f'{range_on:.2f}')}* variance ratio\n"
-                f"Spread band: *{escape_md(f'{min_spread:.1f} - {max_spread:.1f} bp')}*\n\n"
-                "DGRID uses hysteresis so it does not flip\\-flop in mixed regimes\\."
+                f"Switch to GRID: *{escape_md(f'{range_on:.2f}')}* variance ratio{_inverted}\n"
+                f"Trend drift: *{escape_md(_drift_lbl)}* over the long window \\| "
+                f"Confirm: *{escape_md(str(confirm))}* ticks\n"
+                f"Spread band: *{escape_md(f'{min_spread:.1f} - {max_spread:.1f} bp')}*\n"
+                f"Trend phase: *{escape_md(f'{_trend_plan.levels} rungs/side x {_trend_step_bp:.0f} bp')}* "
+                f"trigger ladder\n\n"
+                "The variance ratio compares long\\- vs short\\-horizon moves: above the "
+                "RGRID threshold \\(or a sustained drift past the trend drift %\\) the "
+                "trend\\-following trigger ladder runs; back below the GRID threshold "
+                "the ranging ladder returns\\. Hysteresis plus the confirm ticks stop "
+                "it flip\\-flopping in mixed regimes\\."
             )
         if section == "risk":
-            pnl_sl = f"{float(conf.get('rgrid_stop_loss_pct', sl_pct)):.2f}%"
+            pnl_sl = f"{_dg_sl:.2f}%"
             pnl_tp = f"{float(conf.get('rgrid_take_profit_pct', tp_pct)):.2f}%"
+            _stop_lbl = f"{float(_trend_plan.stop_pct) * 100.0:.2f}%" + (" (auto)" if _trend_plan.stop_is_auto else "")
+            _trail_lbl = f"{float(_trend_plan.trail_arm_pct) * 100.0:.2f}%" + (" (auto)" if _trend_plan.trail_is_auto else "")
             return (
                 "⚡ *Dynamic GRID · Risk*\n\n"
-                f"PnL stop: *{escape_md(pnl_sl)}* \\| PnL take profit: *{escape_md(pnl_tp)}*\n\n"
-                "GRID phase watches realized PnL; RGRID phase watches open exposure risk\\."
+                f"PnL stop: *{escape_md(pnl_sl)}* \\| PnL take profit: *{escape_md(pnl_tp)}*\n"
+                f"Trend stop: *{escape_md(_stop_lbl)}* \\| Trend trail: *{escape_md(_trail_lbl)}*\n\n"
+                "PnL stop/TP are % of MARGIN on live PnL \\(realized \\+ open\\) NET of "
+                "fees, and run in BOTH phases\\. On top: the GRID phase scales out in tiers "
+                "up to the take profit, and the RGRID phase runs the trigger ladder's "
+                "venue stop — protective at the trend stop distance, trailing once the move "
+                "is the trail distance in profit \\(auto \\= 2 × step\\)\\."
             )
         levels = str(int(conf.get("levels", 4)))
         pov_label = str(conf.get("participation_preset") or "OFF").upper()
+        _mode = "Auto-switch" if _auto_switch else "Grid only"
         return (
             "⚡ *Dynamic GRID · Core*\n\n"
             f"Margin: *{escape_md(f'${notional:,.0f}')}* \\| Interval: *{escape_md(f'{interval_seconds}s')}*\n"
             f"Levels: *{escape_md(levels)}* \\| Starting spread: *{escape_md(f'{spread_bp:.1f} bp')}*\n"
-            f"POV: *{escape_md(pov_label)}*\n"
+            f"Mode: *{escape_md(_mode)}* \\| POV: *{escape_md(pov_label)}*\n"
             f"{_mm_sizing_line(conf)}\n\n"
-            "DGRID auto\\-switches GRID↔RGRID, ladders into the move, trails take\\-profit, "
-            "and flips long↔short on a confirmed reversal\\. *Position size \\= margin × leverage*\\."
+            "In ranges DGRID rests a maker ladder below the mid and sells each fill "
+            "one step up; when the regime turns to a trend it flips to the Reverse "
+            "GRID trigger ladder \\(buys above / sells below the mid, pyramiding with "
+            "the move, one trailing venue stop\\) and back again when the trend "
+            "stalls\\. *Position size \\= margin × leverage*\\."
         )
 
     if strategy == "mid":
@@ -2621,6 +2718,21 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                     InlineKeyboardButton("Custom Trend", callback_data="strategy:input:dgrid:dgrid_trend_on_variance_ratio"),
                     InlineKeyboardButton("Custom Range", callback_data="strategy:input:dgrid:dgrid_range_on_variance_ratio"),
                 ],
+                # Sustained-drift trend filter (% over the long window) — the slow
+                # one-way grind the variance ratio misses; 0 turns it off.
+                [
+                    InlineKeyboardButton("Drift 0.3%", callback_data="strategy:set:dgrid:dgrid_trend_drift_pct:0.3"),
+                    InlineKeyboardButton("0.5%", callback_data="strategy:set:dgrid:dgrid_trend_drift_pct:0.5"),
+                    InlineKeyboardButton("Off", callback_data="strategy:set:dgrid:dgrid_trend_drift_pct:0"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:dgrid:dgrid_trend_drift_pct"),
+                ],
+                # Flip debounce: consecutive ticks that must agree before a phase flip.
+                [
+                    InlineKeyboardButton("Confirm 2 ticks", callback_data="strategy:set:dgrid:dgrid_flip_confirm_ticks:2"),
+                    InlineKeyboardButton("3", callback_data="strategy:set:dgrid:dgrid_flip_confirm_ticks:3"),
+                    InlineKeyboardButton("5", callback_data="strategy:set:dgrid:dgrid_flip_confirm_ticks:5"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:dgrid:dgrid_flip_confirm_ticks"),
+                ],
                 [
                     InlineKeyboardButton("✍️ Custom Spread", callback_data="strategy:input:dgrid:dgrid_spread_bp"),
                 ],
@@ -2646,6 +2758,25 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                 [
                     InlineKeyboardButton("Custom PnL SL", callback_data="strategy:input:dgrid:rgrid_stop_loss_pct"),
                     InlineKeyboardButton("Custom PnL TP", callback_data="strategy:input:dgrid:rgrid_take_profit_pct"),
+                ],
+                # Trend-phase exits (the trigger ladder's protective stop / trail, % of
+                # price; 0 = Auto = 2 x step) — the same keys R-Grid's Exits tab writes,
+                # read by the D-Grid trend sub-config (engine_runtime dgrid branch).
+                [
+                    InlineKeyboardButton("Trend stop: Auto", callback_data="strategy:set:dgrid:rgrid_stop_pct:0"),
+                    InlineKeyboardButton("0.3%", callback_data="strategy:set:dgrid:rgrid_stop_pct:0.3"),
+                    InlineKeyboardButton("0.5%", callback_data="strategy:set:dgrid:rgrid_stop_pct:0.5"),
+                    InlineKeyboardButton("1%", callback_data="strategy:set:dgrid:rgrid_stop_pct:1"),
+                ],
+                [
+                    InlineKeyboardButton("Trend trail: Auto", callback_data="strategy:set:dgrid:rgrid_trail_pct:0"),
+                    InlineKeyboardButton("0.3%", callback_data="strategy:set:dgrid:rgrid_trail_pct:0.3"),
+                    InlineKeyboardButton("0.5%", callback_data="strategy:set:dgrid:rgrid_trail_pct:0.5"),
+                    InlineKeyboardButton("1%", callback_data="strategy:set:dgrid:rgrid_trail_pct:1"),
+                ],
+                [
+                    InlineKeyboardButton("✍️ Custom Trend Stop", callback_data="strategy:input:dgrid:rgrid_stop_pct"),
+                    InlineKeyboardButton("✍️ Custom Trend Trail", callback_data="strategy:input:dgrid:rgrid_trail_pct"),
                 ],
             ]
     elif strategy == "rgrid":
@@ -2678,23 +2809,17 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                     InlineKeyboardButton("60s", callback_data="strategy:set:rgrid:interval_seconds:60"),
                     InlineKeyboardButton("120s", callback_data="strategy:set:rgrid:interval_seconds:120"),
                 ],
-                # No mode toggle: Reverse Grid has exactly one engine (both legs
-                # quote off the average of the buy/sell exposure prices and take
-                # the break). The old "Directional ladder" option routed R-Grid to
-                # the D-Grid phase switcher, which is why R-Grid sessions reported
-                # "switched RGRID → GRID" — pick D-Grid if you want a switcher.
-                [
-                    InlineKeyboardButton("Discretion 0.06", callback_data="strategy:set:rgrid:rgrid_discretion:0.06"),
-                    InlineKeyboardButton("0.12", callback_data="strategy:set:rgrid:rgrid_discretion:0.12"),
-                    InlineKeyboardButton("0.25", callback_data="strategy:set:rgrid:rgrid_discretion:0.25"),
-                ],
-                # Chop guard (default ON): Reverse Grid only arms once a trend is
-                # confirmed, so it sits flat in ranges/chop (the "R-Grid places no
-                # orders" reports). Turn it OFF to quote in every regime — faster to
-                # engage, but a reverse grid bleeds in chop, so this is opt-in.
+                # No mode toggle: Reverse Grid has exactly one engine (the venue
+                # price-trigger ladder). The old "Discretion" row drove the retired
+                # maker controller's exposure-VWAP window — the trigger engine never
+                # read it, so the buttons were dead and are gone.
+                #
+                # Chop guard (default ON): the FIRST ladder always arms (presence
+                # first); after a stop-out the RE-arm waits for a confirmed trend so a
+                # whipsaw does not re-enter the same chop. OFF re-arms in every regime.
                 [
                     InlineKeyboardButton("🛡️ Chop guard: On", callback_data="strategy:set:rgrid:rgrid_chop_stand_down:1"),
-                    InlineKeyboardButton("Off (quote always)", callback_data="strategy:set:rgrid:rgrid_chop_stand_down:0"),
+                    InlineKeyboardButton("Off (re-arm always)", callback_data="strategy:set:rgrid:rgrid_chop_stand_down:0"),
                 ],
                 [
                     InlineKeyboardButton("Custom Levels", callback_data="strategy:input:rgrid:levels"),
@@ -2730,28 +2855,26 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                 ],
             ]
         else:
+            # Exits: the trigger ladder's protective stop and trailing stop, as a
+            # % of PRICE. 0 = Auto (2 x step, the real-tape-validated geometry).
+            # Read by engine_runtime._map_revgrid_config for standalone R-Grid AND
+            # D-Grid's trend phase, and re-read live on edit.
             rows = [
                 [
-                    # Range spans the full 0.1–10% band. RGrid follows trends, so
-                    # its anchor legitimately sits far from mid — a grid-sized
-                    # band would re-anchor constantly and never let a trend run.
-                    # RGRID-STALE-LADDER note: on the CLASSIC ladder opt-out
-                    # (fill_anchored=0) GridTradingController still caps the
-                    # value to the ladder band and logs it, so a wide setting
-                    # cannot strand that path. The fill-anchored default (both
-                    # maker and taker-momentum) honours it verbatim.
-                    InlineKeyboardButton("Reset 0.1%", callback_data="strategy:set:rgrid:rgrid_reset_threshold_pct:0.1"),
-                    InlineKeyboardButton("1%", callback_data="strategy:set:rgrid:rgrid_reset_threshold_pct:1"),
-                    InlineKeyboardButton("5%", callback_data="strategy:set:rgrid:rgrid_reset_threshold_pct:5"),
-                    InlineKeyboardButton("10%", callback_data="strategy:set:rgrid:rgrid_reset_threshold_pct:10"),
+                    InlineKeyboardButton("Stop: Auto", callback_data="strategy:set:rgrid:rgrid_stop_pct:0"),
+                    InlineKeyboardButton("0.3%", callback_data="strategy:set:rgrid:rgrid_stop_pct:0.3"),
+                    InlineKeyboardButton("0.5%", callback_data="strategy:set:rgrid:rgrid_stop_pct:0.5"),
+                    InlineKeyboardButton("1%", callback_data="strategy:set:rgrid:rgrid_stop_pct:1"),
                 ],
                 [
-                    InlineKeyboardButton("Disc 0.06", callback_data="strategy:set:rgrid:rgrid_discretion:0.06"),
-                    InlineKeyboardButton("Disc 0.10", callback_data="strategy:set:rgrid:rgrid_discretion:0.10"),
+                    InlineKeyboardButton("Trail: Auto", callback_data="strategy:set:rgrid:rgrid_trail_pct:0"),
+                    InlineKeyboardButton("0.3%", callback_data="strategy:set:rgrid:rgrid_trail_pct:0.3"),
+                    InlineKeyboardButton("0.5%", callback_data="strategy:set:rgrid:rgrid_trail_pct:0.5"),
+                    InlineKeyboardButton("1%", callback_data="strategy:set:rgrid:rgrid_trail_pct:1"),
                 ],
                 [
-                    InlineKeyboardButton("Custom Reset", callback_data="strategy:input:rgrid:rgrid_reset_threshold_pct"),
-                    InlineKeyboardButton("Custom Disc", callback_data="strategy:input:rgrid:rgrid_discretion"),
+                    InlineKeyboardButton("✍️ Custom Stop", callback_data="strategy:input:rgrid:rgrid_stop_pct"),
+                    InlineKeyboardButton("✍️ Custom Trail", callback_data="strategy:input:rgrid:rgrid_trail_pct"),
                 ],
             ]
     elif strategy == "mid":
@@ -3311,6 +3434,13 @@ def _build_strategy_preview_text(
         range_on = float(conf.get("dgrid_range_on_variance_ratio", 1.15))
         min_spread = float(conf.get("dgrid_min_spread_bp", 2.0))
         max_spread = float(conf.get("dgrid_max_spread_bp", 50.0))
+        _dg_sl = float(conf.get("rgrid_stop_loss_pct", conf.get("sl_pct", 0.8)) or 0.0)
+        _dg_spread_key = "rgrid_spread_bp" if float(conf.get("rgrid_spread_bp", 0) or 0) > 0 else "dgrid_spread_bp"
+        _dg_plan = rgrid_trigger_plan(conf, _dg_sl, spread_key=_dg_spread_key)
+        _dg_trend_lbl = (
+            f"{_dg_plan.levels} rungs/side x {float(_dg_plan.step_pct) * 10000.0:.0f}bp"
+            if float(conf.get("dgrid_trend_follow", 1) or 0) >= 0.5 else "off (Grid only)"
+        )
         phase = str(bot_status.get("dgrid_phase") or "grid").upper()
         variance = float(bot_status.get("dgrid_variance_ratio") or 0.0)
         realized_move = float(bot_status.get("dgrid_realized_move_bp") or 0.0)
@@ -3347,14 +3477,17 @@ def _build_strategy_preview_text(
             f"• Levels: *{escape_md(str(levels))}*\n"
             f"• Phase: *{escape_md(phase)}* \\| Variance: *{escape_md(f'{variance:.2f}')}*\n"
             f"• Realized move: *{escape_md(f'{realized_move:.1f}bp')}* \\| Reset: *{escape_md(f'{reset_bp:.1f}bp')}*\n"
-            f"• Hysteresis: *{escape_md(f'{range_on:.2f} / {trend_on:.2f}')}* \\| Spread: *{escape_md(f'{min_spread:.0f}-{max_spread:.0f}bp')}*\n\n"
+            f"• Hysteresis: *{escape_md(f'{range_on:.2f} / {trend_on:.2f}')}* \\| Spread: *{escape_md(f'{min_spread:.0f}-{max_spread:.0f}bp')}*\n"
+            f"• Trend phase: *{escape_md(_dg_trend_lbl)}*\n\n"
             "📊 *Statistics*\n"
             f"• Total Volume: *{escape_md(_fmt_usd(session_volume))}*\n"
             f"• Total Trades: *{escape_md(str(trades_count))}*\n"
             f"• Fees Paid: *{escape_md(_fmt_usd(session_fees))}*\n"
             f"• PnL: *{escape_md(f'{session_pnl:+,.2f} USD')}*\n\n"
             "ℹ️ *How it works*\n"
-            "Automatically switches between GRID in range regimes and RGRID in trend regimes, while resizing spread from recent realized movement\\."
+            "Rests a maker ladder in ranging regimes and switches to the Reverse GRID "
+            "trigger ladder \\(pyramids with the move, one trailing venue stop\\) when "
+            "the variance ratio or a sustained drift says trend — and back when it stalls\\."
             + (f"\n\n{warning}" if warning else "")
         )
 
@@ -3413,9 +3546,15 @@ def _build_strategy_preview_text(
         levels = int(conf.get("levels", 4) or 4)
         grid_tp = float(conf.get("rgrid_take_profit_pct", conf.get("grid_take_profit_pct", tp_pct)))
         max_loss_pct = float(conf.get("rgrid_stop_loss_pct", conf.get("grid_stop_loss_pct", sl_pct)))
-        discretion = float(conf.get("rgrid_discretion", conf.get("grid_discretion", 0.06)))
-        reset_threshold = float(conf.get("rgrid_reset_threshold_pct", conf.get("grid_reset_threshold_pct", 0.2)))
-        reset_timeout = int(conf.get("rgrid_reset_timeout_seconds", conf.get("grid_reset_timeout_seconds", 120)))
+        # What the trigger engine will actually run (one plan with the mapper).
+        _rg_plan = rgrid_trigger_plan(conf, max_loss_pct)
+        _rg_step_bp = float(_rg_plan.step_pct) * 10000.0
+        _rg_stop_pct = float(_rg_plan.stop_pct) * 100.0
+        _rg_trail_pct = float(_rg_plan.trail_arm_pct) * 100.0
+        _rg_chop = "On" if float(conf.get("rgrid_chop_stand_down", 1) or 0) >= 0.5 else "Off"
+        _rg_rungs = f"{_rg_plan.levels}/side" + (
+            f" (requested {levels}; 12 max)" if _rg_plan.levels_capped else ""
+        )
         if _stats_owner and not _snapshot_applied:
             session_volume = float(bot_status.get("session_notional_done_usd") or session_volume)
             session_pnl = float(bot_status.get("rgrid_last_cycle_pnl_usd") or session_pnl)
@@ -3445,21 +3584,27 @@ def _build_strategy_preview_text(
             f"• Margin \\(collateral cap\\): *{escape_md(_fmt_usd(margin_usd))}*\n"
             f"• Est\\. max resting quotes: *{escape_md(str(mm_max_quotes_est))}* \\| "
             f"*~{escape_md(_fmt_usd(mm_margin_per_quote_est))}* margin/quote \\(est\\.\\)\n"
-            f"• Levels: *{escape_md(str(levels))}*\n"
-            f"• Spread: *{escape_md(f'{spread_bp:.0f}bp')}*\n"
+            f"• Rungs: *{escape_md(_rg_rungs)}* \\| Step: *{escape_md(f'{_rg_step_bp:.0f}bp')}*"
+            + (f" \\(spread {escape_md(f'{spread_bp:.0f}bp')} floored\\)" if _rg_plan.step_floored else "")
+            + "\n"
+            f"• Per rung: *{escape_md(_fmt_usd(float(_rg_plan.rung_quote)))}*\n"
             f"• Timing: *{escape_md(f'{interval_seconds}s')}*\n"
             f"• Leverage: *{escape_md(f'MAX ({leverage:.0f}x per-asset)')}*\n"
-            f"• Reset: *{escape_md(f'{reset_threshold:.2f}% / {reset_timeout}s')}*\n"
-            f"• Discretion: *{escape_md(f'{discretion:.2f}')}*\n"
+            f"• Stop / Trail: *{escape_md(f'{_rg_stop_pct:.2f}% / {_rg_trail_pct:.2f}%')}*"
+            + (" \\(auto\\)" if (_rg_plan.stop_is_auto and _rg_plan.trail_is_auto) else "")
+            + "\n"
+            f"• Chop guard: *{escape_md(_rg_chop)}*\n"
             f"• PnL SL/TP: *{escape_md(f'{max_loss_pct:.2f}% / {grid_tp:.2f}%')}*\n\n"
             "📊 *Statistics*\n"
             f"• Total Volume: *{escape_md(_fmt_usd(session_volume))}*\n"
             f"• Total Trades: *{escape_md(str(trades_count))}*\n"
             f"• Fees Paid: *{escape_md(_fmt_usd(session_fees))}*\n"
-            f"• PnL: *{escape_md(f'{session_pnl:+,.2f} USD')}*\n"
-            f"• Est\\. quote depth cap: *{escape_md(str(mm_max_quotes_est))}* resting \\(wallet \\& collateral limited\\)\n\n"
+            f"• PnL: *{escape_md(f'{session_pnl:+,.2f} USD')}*\n\n"
             "ℹ️ *How it works*\n"
-            "Anchors to exposure and places buy above / sell below to capture continuation\\."
+            "A ladder of venue price triggers — buys one step apart ABOVE the mid, sells "
+            "BELOW\\. The first break fires and fills as a taker, the other side is "
+            "cancelled, same\\-side rungs keep adding as the move extends, and one "
+            "trailing venue stop exits the whole position\\. Profits in trends\\."
             + (f"\n\n{warning}" if warning else "")
         )
 

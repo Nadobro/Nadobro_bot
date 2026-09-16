@@ -95,3 +95,81 @@ def test_uses_the_real_order_prep_method_not_a_typo():
     assert "self._prepare_place_order_params(" in src
     assert "reduce_only=False" in src        # entry, never a reduce-only stop
     assert "never_grow=False" in src         # a rung must be allowed to grow the book
+
+
+# ── 2026-09-16: entry rungs are IOC (fill on fire or vanish) ─────────────
+
+def test_entry_rungs_default_to_ioc_and_encode_the_sdk_order_type(monkeypatch):
+    from nado_protocol.utils.expiration import OrderType as SdkOrderType
+
+    cap: dict = {}
+    client = _client(monkeypatch, cap)
+    res = asyncio.run(client.place_entry_trigger_order(
+        product_id=2, size=1.0, trigger_price=79000.0, direction_is_buy=True,
+    ))
+    assert res.get("success") is True, res
+    assert cap.get("order_type") is SdkOrderType.IOC
+    assert res.get("order_type") == "ioc"
+
+
+def test_a_default_gtc_entry_is_still_selectable(monkeypatch):
+    from nado_protocol.utils.expiration import OrderType as SdkOrderType
+
+    cap: dict = {}
+    client = _client(monkeypatch, cap)
+    res = asyncio.run(client.place_entry_trigger_order(
+        product_id=2, size=1.0, trigger_price=79000.0, direction_is_buy=True, order_type="default",
+    ))
+    assert res.get("success") is True and cap.get("order_type") is SdkOrderType.DEFAULT
+
+
+def test_an_unknown_trigger_order_type_is_refused_before_any_venue_call(monkeypatch):
+    cap: dict = {}
+    client = _client(monkeypatch, cap)
+    res = asyncio.run(client.place_entry_trigger_order(
+        product_id=2, size=1.0, trigger_price=79000.0, direction_is_buy=True, order_type="fok",
+    ))
+    assert res.get("success") is False and not cap
+
+
+# ── 2026-09-16: the trigger list is DENIED-vs-EMPTY ──────────────────────
+
+def test_a_budget_denied_trigger_list_is_unknown_never_empty(monkeypatch):
+    cap: dict = {}
+    client = _client(monkeypatch, cap)
+    monkeypatch.setattr(client, "_gateway_allowed", lambda **kw: False)
+
+    async def _direct_sdk(fn, *a, **kw):
+        return fn(*a, **kw)
+
+    monkeypatch.setattr(nc_mod, "run_blocking_sdk", _direct_sdk)
+    assert asyncio.run(client.get_trigger_orders(product_ids=[2])) is None
+    try:
+        asyncio.run(client.get_trigger_orders(product_ids=[2], strict=True))
+    except RuntimeError as exc:
+        assert "denied" in str(exc)
+    else:
+        raise AssertionError("strict must raise on a budget denial")
+
+
+def test_a_response_without_an_orders_list_is_unknown_and_an_empty_one_is_empty(monkeypatch):
+    cap: dict = {}
+    client = _client(monkeypatch, cap)
+
+    async def _direct_sdk(fn, *a, **kw):
+        return fn(*a, **kw)
+
+    monkeypatch.setattr(nc_mod, "run_blocking_sdk", _direct_sdk)
+    monkeypatch.setattr(client, "_gateway_allowed", lambda **kw: True)
+
+    class _TC:
+        def __init__(self, data):
+            self._data = data
+
+        def list_trigger_orders(self, params):
+            return SimpleNamespace(data=self._data)
+
+    client.client.context.trigger_client = _TC({"orders": []})
+    assert asyncio.run(client.get_trigger_orders(product_ids=[2])) == []
+    client.client.context.trigger_client = _TC({"something_else": 1})
+    assert asyncio.run(client.get_trigger_orders(product_ids=[2])) is None

@@ -357,6 +357,7 @@ class SimNadoAdapter(NadoAdapterBase):
         *,
         slippage_pct: float = 0.5,
         dependency: Optional[str] = None,
+        order_type: str = "ioc",
     ) -> NadoOrder:
         if _dec(amount_base) <= 0:
             raise AdapterError("place_trigger_order requires a positive amount")
@@ -399,6 +400,14 @@ class SimNadoAdapter(NadoAdapterBase):
             "dependency": None, "armed": True,
         }
         return copy.copy(order)
+
+    async def list_trigger_orders(self, trading_pair: str):
+        """Pending trigger digests on ``trading_pair`` (the sim never loses one
+        silently, so this simply mirrors ``_triggers``)."""
+        return [
+            tid for tid, t in self._triggers.items()
+            if t["order"].trading_pair == trading_pair and not t["order"].state.is_terminal
+        ]
 
     async def cancel_trigger_order(self, order_id: str) -> bool:
         t = self._triggers.get(order_id)

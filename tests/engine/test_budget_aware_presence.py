@@ -209,7 +209,9 @@ _DG = {
 
 def test_a_dgrid_recenter_is_deferred_while_the_venue_throttles_reads():
     async def body():
-        adapter = _ThrottledPollsAdapter(mid=Decimal("63373.5"))
+        # A readable, flat venue: D-Grid takes its run baseline from the first
+        # position read and arms nothing before it (2026-09-16).
+        adapter = _ThrottledPollsAdapter(mid=Decimal("63373.5"), venue_held={"BTC-PERP": Decimal(0)})
         orch = ExecutorOrchestrator()
         c = DynamicGridController(
             user_id=1, orchestrator=orch, adapter=adapter, inventory=InventoryRepository(),

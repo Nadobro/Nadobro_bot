@@ -80,23 +80,42 @@ def test_unreadable_venue_arms_nothing():
     asyncio.run(body())
 
 
-def test_preexisting_position_is_baselined_out():
-    """P2: a position already on the product when the run starts (a manual trade, or
-    a leftover NOT auto-resumed) must be baselined out — the controller reads, sizes,
-    and flattens ONLY its own exposure, and treats itself as flat at start."""
+def test_preexisting_position_holds_until_it_is_gone_then_arms_from_zero():
+    """A position already on the product when the run starts (a manual trade, a
+    leftover a previous stop could not close) was NOT opened by this run. The run
+    cannot trade on top of it — Nado's reduce-only exits act on the whole account
+    position — so it HOLDS, visibly, and arms with a ZERO baseline once it is gone.
+    (2026-08-28's "baseline it out and trade anyway" could never fill its stop
+    against an opposite-signed position; audit 2026-09-16.)"""
     async def body():
         a = _adapter(venue_held={PAIR: Decimal("5")})   # 5 pre-existing
         c = _controller(a)
-        await c.on_tick()                                # first read captures baseline
-        assert c._baseline_net == Decimal("5")
-        assert c._pos_base == 0                          # the run reads as flat...
-        assert len(a.placed_triggers) == 4               # ...and arms its ladder
-        # the controller's OWN buy fill grows net from 0, not from 5
-        a.set_mid(Decimal("101.5"))
-        a.cross_triggers(Decimal("101.5"))               # venue_held 5 -> ~5.99
         await c.on_tick()
-        assert Decimal("0") < c._pos_base < Decimal("1")  # ~0.99 (run-only), not ~5.99
-        assert _approx(c._avg_entry, Decimal("101"))     # its own entry, uncontaminated
+        assert a.placed_triggers == [], "nothing arms on top of a foreign position"
+        assert c._baseline_net is None
+        assert c.gate_verdict == "PAUSE" and c.gate_reason == "venue_foreign_position"
+        a.venue_held[PAIR] = Decimal(0)                  # the user closed it
+        await c.on_tick()
+        assert c._baseline_net == Decimal(0)
+        assert len(a.placed_triggers) == 4               # the ladder arms
+        assert c.gate_verdict == "QUOTE" and c.gate_reason == ""
+
+    asyncio.run(body())
+
+
+def test_a_rebuild_restores_the_persisted_baseline_and_keeps_managing_its_own_position():
+    """Mid-session rebuild (worker handoff / recovery): the runtime passes the
+    persisted baseline (0) back in. The run's OWN open position must then read as
+    the run's — it is re-protected with a stop — never as a foreign position."""
+    async def body():
+        a = _adapter(venue_held={PAIR: Decimal("0.99")})   # the previous controller's long
+        c = _controller(a, venue_baseline=Decimal(0))
+        assert c._baseline_net == Decimal(0)
+        await c.on_start()                                 # on_start keeps a restored seed
+        assert c._baseline_net == Decimal(0)
+        await c.on_tick()
+        assert c._pos_base == Decimal("0.99") and c._stop_digest is not None, "re-protected"
+        assert c.gate_verdict == "QUOTE"
 
     asyncio.run(body())
 

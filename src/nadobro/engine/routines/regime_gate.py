@@ -63,12 +63,33 @@ GATE_REASON_HUMAN: Dict[str, str] = {
     # whipsaw) and arms once a trend confirms — the opposite resume condition to
     # the ranging grid, so REVGRID_GATE_REASONS below flips the card's wording.
     "revgrid_chop": "choppy — waiting for a trend",
+    # Venue-side holds (not a regime verdict): the controller could not READ its
+    # venue position, so it acts on nothing until the read recovers. Surfaced
+    # because a silent hold reads as "LIVE, 0 orders" — the exact R-Grid/D-Grid
+    # "does nothing" reports of 2026-08/09 during gateway throttling.
+    "venue_unreadable": "venue position read unavailable — holding",
+    # D-Grid found a venue position it did not open (a residual from its previous
+    # phase) and is closing it before arming the next phase.
+    "venue_residual": "clearing a venue residual before re-arming",
+    # An open position on this market that THIS run did not open. The run cannot
+    # trade on top of it: Nado's reduce-only exits act on the whole account
+    # position, so a stop against an opposite-signed position could never fill
+    # and a same-signed one could be trimmed by the run's exits. Hold until the
+    # user closes it (or stops and picks another market).
+    "venue_foreign_position": "an open position on this market was not opened by this run",
 }
 
 # Reasons whose resume condition is "a trend forms" (reverse grid), NOT "the
 # market ranges again" (grid/mid). The /status card and the pause notice read
 # this to word the resume line correctly per strategy.
 REVGRID_GATE_REASONS: frozenset = frozenset({"revgrid_chop"})
+
+# Reasons that are a VENUE hold, not a regime verdict: they resume when the venue
+# read recovers / the residual is cleared, so the card must not promise "when the
+# market ranges again" or "when a trend forms".
+VENUE_GATE_REASONS: frozenset = frozenset({
+    "venue_unreadable", "venue_residual", "venue_foreign_position",
+})
 
 
 # CANDLE-ORDER guardrail (2026-07-31): shared with variance_regime — see

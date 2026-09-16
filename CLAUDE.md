@@ -82,6 +82,18 @@ Layering (enforced by `tests/lint/test_architecture_layers.py` — domain packag
   JSON body, `error_code=1000`). Bulk price polling uses the edge lane (`/edge/query`
   `cached_prices`, weight 1, separate 12000/min bucket) — never a per-product fan-out. When the
   book cannot be read, cancel-only cleanup uses `cancel_product_orders` (read-free execute).
+- Reverse GRID (`rgrid`, and D-Grid's trend phase) is a venue PRICE-TRIGGER ladder
+  (`engine/controllers/reverse_grid.py`), not maker quotes. Nado holds at most 25 PENDING
+  trigger orders per product per subaccount, so rungs are capped at 12 per side
+  (`quant/rgrid_sizing.REVGRID_MAX_LEVELS`); entry rungs are IOC and the ladder is reconciled
+  against `list_trigger_orders`. Trigger orders are NOT in the resting book: every stop /
+  restart path must also run `strategy/venue_triggers.cancel_bot_trigger_orders` (bot-linked
+  digests only). Card and engine derive one plan (`engine_runtime.revgrid_plan_from_settings`);
+  never size the card separately. Both controllers HOLD (visibly, `venue_foreign_position`)
+  while the product carries a position the run did not open — reduce-only exits act on the
+  whole account position, so trading on top of one is unsafe and closing it is not ours to do
+  — and persist a zero baseline that a mid-session rebuild restores (`venue_baseline`).
+  See `docs/reverse_grid_strategy.md`.
 
 ## Hard rules
 

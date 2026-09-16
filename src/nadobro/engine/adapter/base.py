@@ -373,12 +373,23 @@ class NadoAdapterBase(abc.ABC):
         *,
         slippage_pct: float = 0.5,
         dependency: Optional[str] = None,
+        order_type: str = "ioc",
     ) -> NadoOrder:
         """Place a venue PRICE-TRIGGER **entry** order — the Reverse Grid rung
         primitive. The venue fires it when the mid crosses ``trigger_price``: a
         BUY rung fires on a RISE, a SELL rung on a FALL (momentum). It is NOT
         reduce-only — it OPENS/GROWS a position — and it is priced ``slippage_pct``
         THROUGH the level so it crosses and fills on trigger.
+
+        ``order_type`` is the execution type of the order the venue submits WHEN
+        the trigger fires. The default ``"ioc"`` (immediate-or-cancel) is
+        deliberate: a fired momentum entry must fill NOW or not at all. With a
+        plain ``"default"`` (GTC) order, a rung whose fire lagged a fast move by
+        more than its slippage bound RESTS on the book as an untracked maker limit
+        below/above the market — the controller can neither see it nor cancel it
+        (it addresses triggers through the trigger service), and it fills later on
+        a pullback as a phantom entry. IOC never rests; an unfilled rung is simply
+        gone and :meth:`list_trigger_orders` lets the controller notice and re-arm.
 
         ``dependency`` (a prior rung's digest) chains this rung to fire only after
         that one fills, which builds a pyramid. The returned :class:`NadoOrder`
@@ -390,6 +401,19 @@ class NadoAdapterBase(abc.ABC):
         on it without a capability check.
         """
         raise NotImplementedError
+
+    async def list_trigger_orders(self, trading_pair: str) -> Optional[List[str]]:
+        """Digests of the account's trigger orders STILL PENDING (waiting for
+        their price / dependency) on ``trading_pair``, per the venue's trigger
+        service. ``None`` when the venue could not be read — callers must treat
+        that as UNKNOWN (hold), never as "nothing pending".
+
+        The Reverse Grid reconciles its ladder against this: a rung it believes is
+        armed but the venue no longer holds (fired-but-unfilled IOC, rejected at
+        the venue's 25-pending-triggers-per-product cap, expired, or cancelled by
+        the venue on a linked-signer / health event) is re-armed instead of being
+        trusted forever. Concrete default ``None`` (unsupported == unreadable)."""
+        return None
 
     async def cancel_trigger_order(self, order_id: str) -> bool:
         """Cancel a resting price-trigger order via the venue's TRIGGER service.

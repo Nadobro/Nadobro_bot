@@ -1794,7 +1794,7 @@ def fmt_status_overview(status: dict, onboarding: dict):
         # Via the strategy layer: handlers must not import engine directly
         # (tests/lint/test_architecture_layers.py pins the edge set).
         from src.nadobro.strategy.engine_runtime import (
-            GATE_REASON_HUMAN, REVGRID_GATE_REASONS,
+            GATE_REASON_HUMAN, REVGRID_GATE_REASONS, VENUE_GATE_REASONS,
         )
         _gate_reason_key = str(status.get("mm_gate_reason") or "").strip()
         gate_why = GATE_REASON_HUMAN.get(_gate_reason_key, "unfavourable regime")
@@ -1809,7 +1809,14 @@ def fmt_status_overview(status: dict, onboarding: dict):
         # when the market ranges again; a reverse grid pyramids WITH a trend, so it
         # resumes when a trend forms. Word it per reason so the card never tells a
         # reverse-grid user to wait for the opposite of what actually arms it.
-        if _gate_reason_key in REVGRID_GATE_REASONS:
+        if _gate_reason_key == "venue_foreign_position":
+            # The run will not trade on top of a position it did not open.
+            _resume_line = _loc("Close that position (or Stop and pick another market) to arm.")
+        elif _gate_reason_key in VENUE_GATE_REASONS:
+            # A venue hold (position unreadable / residual being cleared) is not a
+            # regime verdict — it resumes when the venue read recovers.
+            _resume_line = _loc("Resumes automatically once the venue read recovers.")
+        elif _gate_reason_key in REVGRID_GATE_REASONS:
             _resume_line = _loc("New quotes resume automatically when a trend forms.")
         else:
             _resume_line = _loc("New quotes resume automatically when the market ranges again.")
@@ -2001,6 +2008,19 @@ def fmt_status_overview(status: dict, onboarding: dict):
             lines.append(f"{_loc('Auto reset')}: *{escape_md(f'{reset_bp:.1f}bp')}*")
         else:
             lines.extend(["", "*Reverse GRID*" if strategy == "RGRID" else "*GRID*"])
+        if strategy in ("RGRID", "DGRID") and int(status.get("rgrid_rungs_per_side") or 0) > 0:
+            # Trigger ladder telemetry (rgrid; dgrid while its trend phase runs).
+            _rungs = int(status.get("rgrid_rungs_armed") or 0)
+            _per_side = int(status.get("rgrid_rungs_per_side") or 0)
+            _step_bp = float(status.get("rgrid_step_bp") or 0.0)
+            _stop = float(status.get("rgrid_stop_level") or 0.0)
+            _trail = bool(status.get("rgrid_trail_armed"))
+            lines.append(
+                f"{_loc('Rungs armed')}: *{escape_md(f'{_rungs}')}* "
+                f"\\({escape_md(f'{_per_side}/side x {_step_bp:.0f}bp')}\\) \\| "
+                f"{_loc('Stop')}: *{escape_md(f'{_stop:,.2f}') if _stop > 0 else 'n/a'}* "
+                f"\\| {_loc('Trail')}: *{_loc_md('armed') if _trail else _loc_md('not yet')}*"
+            )
         lines.append(
             f"{_loc('Anchor')}: *{escape_md(f'{anchor:,.2f}') if anchor > 0 else 'n/a'}* \\| "
             f"{_loc('Drift')}: *{escape_md(f'{drift_pct:.3f}%')}*"
@@ -2190,10 +2210,21 @@ def fmt_ops_overview(status: dict, ops: dict) -> str:
 
 def fmt_strategy_update(strategy: str, network: str, conf: dict) -> str:
     notional = float(conf.get("notional_usd", 100.0))
-    spread_bp = float(conf.get("spread_bp", 5.0))
+    # Reverse / Dynamic Grid keep their spread and PnL SL/TP under their OWN keys
+    # (rgrid_spread_bp / dgrid_spread_bp, rgrid_stop_loss_pct / rgrid_take_profit_pct
+    # — the ones the engine reads). This confirmation used to echo the generic
+    # spread_bp / sl_pct / tp_pct instead, so tapping "PnL SL 0.5%" on R-Grid
+    # confirmed the OLD default 0.8% — a card that contradicted the button.
+    sid = str(strategy or "").lower()
+    spread_key = {"rgrid": "rgrid_spread_bp", "dgrid": "dgrid_spread_bp"}.get(sid, "spread_bp")
+    spread_bp = float(conf.get(spread_key, conf.get("spread_bp", 5.0)) or 0.0)
     interval_seconds = int(conf.get("interval_seconds", 60))
-    tp_pct = float(conf.get("tp_pct", 1.0))
-    sl_pct = float(conf.get("sl_pct", 0.5))
+    if sid in ("rgrid", "dgrid"):
+        tp_pct = float(conf.get("rgrid_take_profit_pct", conf.get("tp_pct", 1.0)) or 0.0)
+        sl_pct = float(conf.get("rgrid_stop_loss_pct", conf.get("sl_pct", 0.5)) or 0.0)
+    else:
+        tp_pct = float(conf.get("tp_pct", 1.0))
+        sl_pct = float(conf.get("sl_pct", 0.5))
     return (
         f"✅ *{escape_md(strategy.upper())} {_loc('updated')}* \\({escape_md(network.upper())}\\)\n\n"
         f"{_loc('Margin')}: {escape_md(f'${notional:,.2f}')}\n"

@@ -2884,3 +2884,41 @@ def get_session_net_base_by_product(session_id: int, network: str) -> dict[int, 
             continue
         out[pid] = Decimal(str(r["bought"] or 0)) - Decimal(str(r["sold"] or 0))
     return out
+
+
+def get_bot_linked_digests(
+    network: str, digests: list[str] | tuple[str, ...], *, session_id: int | None = None,
+) -> set[str]:
+    """Which of ``digests`` were placed BY THE BOT — i.e. carry an ``order_intents``
+    row (every engine placement links its digest at placement time, every bot
+    close tags its digest). Optionally narrowed to one strategy session.
+
+    Used by the venue-trigger sweep on stop / restart: a Reverse Grid's entry
+    rungs and its trailing stop are venue TRIGGER orders that the resting-order
+    cancel never touches, so a stood-down session would leave them armed (a
+    non-reduce-only rung firing later opens an unmanaged position). Cancelling
+    every trigger on the product would also wipe a user's own manual TP/SL
+    triggers, so the sweep cancels ONLY the digests this registry vouches for.
+    Case-insensitive on the digest hex. Read-only; ``set()`` on any error.
+    """
+    wanted = sorted({str(d).strip().lower() for d in (digests or []) if str(d).strip()})
+    if not wanted:
+        return set()
+    net = str(network or "").strip().lower()
+    sql = """
+        SELECT lower(order_digest) AS digest
+        FROM order_intents
+        WHERE order_digest IS NOT NULL
+          AND lower(order_digest) = ANY(%s)
+          AND (intent_id LIKE %s OR intent_id LIKE %s)
+    """
+    params: list = [wanted, f"engine:{net}:%", f"close:{net}:%"]
+    if session_id is not None:
+        sql += " AND (value->>'strategy_session_id') = %s"
+        params.append(str(int(session_id)))
+    try:
+        rows = query_all(sql, tuple(params))
+        return {str(r["digest"]) for r in rows if r.get("digest")}
+    except Exception:  # policy: degrade-ok(the sweep then cancels nothing — never more than the bot owns)
+        logger.warning("get_bot_linked_digests failed network=%s", network, exc_info=True)
+        return set()

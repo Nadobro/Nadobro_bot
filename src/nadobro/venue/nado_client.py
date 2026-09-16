@@ -1902,20 +1902,33 @@ class NadoClient:
         limit: int = 100,
         digests: list[str] | None = None,
         strict: bool = False,
-    ) -> list[dict]:
-        """List trigger / TP / SL / TWAP orders from the trigger service."""
+    ) -> Optional[list[dict]]:
+        """List PENDING trigger / TP / SL / TWAP orders from the trigger service.
+
+        DENIED-vs-EMPTY (audit 2026-09-16): a read this client could NOT make —
+        no SDK client, no trigger client, a gateway-budget denial, or a response
+        without an ``orders`` list — is UNKNOWN, never "nothing pending": it
+        raises under ``strict`` and returns ``None`` otherwise. ``[]`` means the
+        venue answered and holds nothing. It used to return ``[]`` on a budget
+        denial, which the Reverse Grid's ladder reconcile would have read as
+        "every rung is gone" (re-arming a duplicate ladder on top of the live one)
+        and the stop-path trigger sweep as "clear".
+        """
         if not self._ensure_sdk_client():
             if strict:
                 raise RuntimeError("SDK client unavailable for trigger-order sync")
-            return []
+            return None
         trigger_client = getattr(getattr(self.client, "context", None), "trigger_client", None)
         if not trigger_client:
             if strict:
                 raise RuntimeError("Trigger client unavailable for trigger-order sync")
-            return []
+            return None
         # Run the (potentially sleeping) token-bucket gate in the SDK pool.
         if not await run_blocking_sdk(self._gateway_allowed, weight=5, user_scoped=False):
-            return []  # trigger-service list query; conservative weight
+            # trigger-service list query; conservative weight. Budget-denied = UNKNOWN.
+            if strict:
+                raise RuntimeError("trigger-order list budget-denied")
+            return None
         try:
             from nado_protocol.trigger_client.types.query import (
                 ListTriggerOrdersParams,
@@ -1939,12 +1952,15 @@ class NadoClient:
             rows = getattr(data, "orders", None)
             if rows is None and isinstance(data, dict):
                 rows = data.get("orders")
-            return self._to_plain(rows or [])
+            if rows is None:
+                # A payload with no ``orders`` list is not an empty book.
+                raise RuntimeError("trigger-order list response carried no orders list")
+            return self._to_plain(list(rows))
         except Exception as e:
             logger.error("get_trigger_orders failed: %s", _format_sdk_error(e))
             if strict:
                 raise RuntimeError(f"get_trigger_orders failed: {_format_sdk_error(e)}") from e
-            return []
+            return None
 
     async def cancel_trigger_orders(self, *, product_id: int, digests: list[str]) -> dict:
         """Cancel trigger / TP / SL / TWAP orders for one product."""
@@ -2086,6 +2102,7 @@ class NadoClient:
         isolated: bool = False,
         client_id: Optional[int] = None,
         dependency: Optional[object] = None,
+        order_type: str = "ioc",
     ) -> dict:
         """Place a NON-reduce-only ENTRY price-trigger order — the Reverse Grid rung
         primitive. It OPENS/GROWS a position when the mid crosses ``trigger_price``,
@@ -2105,6 +2122,11 @@ class NadoClient:
         crosses and fills on trigger. ``never_grow`` is False by design — a rung is
         MEANT to grow the book. ``dependency`` (another rung's digest) chains this
         rung to fire only after that one fills, which builds a pyramid.
+
+        ``order_type`` is the execution type of the order the venue submits when the
+        trigger fires: ``"ioc"`` (the default — fill now or cancel; a momentum entry
+        that lagged a fast move must never REST as an untracked maker limit) or
+        ``"default"`` (GTC). The SDK encodes it into the order appendix.
 
         Reuses :meth:`_prepare_place_order_params` for the exact increment /
         min-notional / signed-amount alignment the engine order path uses, then hands
@@ -2130,11 +2152,14 @@ class NadoClient:
 
         # Reuse the single order-construction home for aligned x18 amount+price.
         # reduce_only=False and never_grow=False: this is an ENTRY that opens/grows.
+        _otype = str(order_type or "ioc").strip().lower()
+        if _otype not in ("ioc", "default"):
+            return {"success": False, "error": f"unsupported trigger order_type {order_type!r}"}
         params, _tag, _size, _price, err = self._prepare_place_order_params(
             product_id=int(product_id),
             size=float(size),
             price=float(order_price),
-            order_type="default",
+            order_type=_otype,
             is_buy=bool(direction_is_buy),
             isolated_only=bool(isolated),
             isolated_margin=None,
@@ -2159,6 +2184,8 @@ class NadoClient:
         ):
             return {"success": False, "error": "Rate limited — please retry in a moment.", "rate_limited": True}
         try:
+            from nado_protocol.utils.expiration import OrderType as _SdkOrderType
+
             kwargs = dict(
                 product_id=int(product_id),
                 price_x18=str(price_x18),
@@ -2167,6 +2194,9 @@ class NadoClient:
                 trigger_type=trigger_type,
                 reduce_only=False,
                 sender=self.subaccount_hex,
+                # The execution type the venue applies WHEN the trigger fires
+                # (encoded in the order appendix by the SDK).
+                order_type=(_SdkOrderType.IOC if _otype == "ioc" else _SdkOrderType.DEFAULT),
             )
             if dependency is not None:
                 kwargs["dependency"] = dependency
@@ -2176,6 +2206,7 @@ class NadoClient:
                 "trigger_type": trigger_type,
                 "trigger_price": float(trigger_price),
                 "amount_x18": str(amount_x18),
+                "order_type": _otype,
                 "response": self._to_plain(resp),
             }
         except Exception as e:  # noqa: BLE001 - venue-write guard: never raise

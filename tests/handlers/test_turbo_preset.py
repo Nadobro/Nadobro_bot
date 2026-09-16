@@ -75,11 +75,13 @@ def test_rgrid_dgrid_write_their_own_sl_keys_and_keep_tp():
     """rgrid/dgrid rails read rgrid_stop_loss_pct; their TP and level
     mechanics must NOT be disturbed (position exits flow through barriers)."""
     mmf = fallback_mmf(1.0 / 50.0)
-    for sid, spread_key in (("rgrid", "rgrid_spread_bp"), ("dgrid", "dgrid_spread_bp")):
+    # rgrid's Turbo spread is the trigger engine's 15bp step floor (writing 3bp
+    # showed a spread the engine silently replaced); dgrid's GRID ladder keeps 3bp.
+    for sid, spread_key, spread in (("rgrid", "rgrid_spread_bp", 15.0), ("dgrid", "dgrid_spread_bp", 3.0)):
         cfg = _turbo_preset_settings(sid, 50.0, mmf=mmf)
         assert cfg["rgrid_stop_loss_pct"] > 0
         assert cfg["rgrid_stop_loss_pct"] <= safe_max_sl_pct(50.0, mmf) + 1e-9
-        assert cfg[spread_key] == 3.0
+        assert cfg[spread_key] == spread
         assert "rgrid_take_profit_pct" not in cfg
         assert "tp_pct" not in cfg
         assert "levels" not in cfg
