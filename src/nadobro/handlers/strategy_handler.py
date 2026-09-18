@@ -1028,7 +1028,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             "dn_max_drift_pct": (0.5, 50),
             "dn_hedge_ratio": (0.1, 5.0),
             "mm_leverage_override": (1, 50),
-            "mm_duration_minutes": (1, 14400),   # 1 min .. 240h (POV upper bound)
+            "mm_duration_minutes": (1, 14400),   # 1 min .. 240h wall-clock run cap
             "twap_pause_move_bp": (0, 5000),     # 0 = off .. 50% per-cycle move
         }
         # A whitelisted field with no limits entry is a wiring bug — reject
@@ -1977,6 +1977,44 @@ def _effective_margin_usd(conf: dict) -> float:
     return 100.0
 
 
+def _fmt_run_duration(minutes: float) -> str:
+    """Human run-duration label: 45 -> '45m', 120 -> '2h', 6000 -> '100h',
+    90 -> '1h30m'."""
+    try:
+        total = int(round(float(minutes)))
+    except (TypeError, ValueError):
+        return "0m"
+    if total <= 0:
+        return "0m"
+    hours, mins = divmod(total, 60)
+    if hours and mins:
+        return f"{hours}h{mins}m"
+    if hours:
+        return f"{hours}h"
+    return f"{mins}m"
+
+
+def _run_duration_line(conf: dict, strategy: str) -> str:
+    """Core-card line confirming the user's run duration and how it is enforced,
+    so the setting is VISIBLE and honest: a HARD stop for Mid / D-Grid, a soft
+    TARGET (keeps running) for Grid / R-Grid. 0/unset = runs until stopped.
+
+    (The duration used to be silently clamped to the participation window — a
+    100h request became ~30 min — so showing the real, honored value matters.)"""
+    try:
+        mins = float(conf.get("mm_duration_minutes") or 0.0)
+    except (TypeError, ValueError):
+        mins = 0.0
+    if mins <= 0:
+        return "Run: *until stopped*"
+    # Source of truth for hard-cap vs soft-target lives in bot_runtime; lazy
+    # import keeps the handler free of a load-time domain dependency.
+    from src.nadobro.strategy.bot_runtime import _mm_duration_is_hard_cap
+
+    kind = "hard stop" if _mm_duration_is_hard_cap(strategy) else "target, keeps running"
+    return f"Run: *{escape_md(_fmt_run_duration(mins))}* \\({escape_md(kind)}\\)"
+
+
 def _ladder_line(conf: dict) -> str:
     """'Levels: N x $S each | Curve: FLAT' for the laddered quoters.
 
@@ -2179,7 +2217,8 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             f"Spread: *{escape_md(f'{spread_bp:.1f} bp')}* \\| Bias: *{escape_md(g_bias_str)}*\n"
             f"{_mode_line}"
             f"POV: *{escape_md(pov_label)}* \\(per\\-cycle pacing from Nado 24h volume\\)\n"
-            f"{_mm_sizing_line(conf)}\n\n"
+            f"{_mm_sizing_line(conf)}\n"
+            f"{_run_duration_line(conf, 'grid')}\n\n"
             f"{_mode_help}"
         )
 
@@ -2254,7 +2293,8 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             f"Rungs: *{escape_md(_levels_lbl)}* \\| Spread: *{escape_md(rgrid_spread)}*{_step_note}\n"
             f"Per rung: *{escape_md(f'${float(_plan.rung_quote):,.0f}')}* \\| "
             f"Chop guard: *{escape_md(_chop)}* \\| POV: *{escape_md(pov_label)}*\n"
-            f"{_mm_sizing_line(conf)}\n\n"
+            f"{_mm_sizing_line(conf)}\n"
+            f"{_run_duration_line(conf, 'rgrid')}\n\n"
             "A ladder of venue *price triggers*: BUY rungs one step apart ABOVE the "
             "mid, SELL rungs BELOW it\\. Whichever side price breaks first fires and "
             "fills as a taker, the other side is cancelled, and the same\\-side rungs "
@@ -2322,7 +2362,8 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             f"Margin: *{escape_md(f'${notional:,.0f}')}* \\| Interval: *{escape_md(f'{interval_seconds}s')}*\n"
             f"Levels: *{escape_md(levels)}* \\| Starting spread: *{escape_md(f'{spread_bp:.1f} bp')}*\n"
             f"Mode: *{escape_md(_mode)}* \\| POV: *{escape_md(pov_label)}*\n"
-            f"{_mm_sizing_line(conf)}\n\n"
+            f"{_mm_sizing_line(conf)}\n"
+            f"{_run_duration_line(conf, 'dgrid')}\n\n"
             "In ranges DGRID rests a maker ladder below the mid and sells each fill "
             "one step up; when the regime turns to a trend it flips to the Reverse "
             "GRID trigger ladder \\(buys above / sells below the mid, pyramiding with "
@@ -2366,7 +2407,8 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             f"Spread: *{escape_md(f'{spread_bp:+.1f} bp')}*\n"
             f"{_ladder_line(conf)}\n"
             f"Execution: *{escape_md(execution_mode)}*\n"
-            f"Bias: *{escape_md(bias_str)}*\n\n"
+            f"Bias: *{escape_md(bias_str)}*\n"
+            f"{_run_duration_line(conf, 'mid')}\n\n"
             "Mid Mode keeps two\\-sided post\\-only quotes around the market mid\\. "
             "Levels split the same margin into rungs stepping away from mid — more "
             "rungs scale in and out of a move without adding exposure\\. "

@@ -3034,29 +3034,30 @@ def _twap_should_pause(state: dict, strategy: str, mid: float) -> bool:
 
 
 def _resolve_mm_run_duration_minutes(state: dict, deployed_usd: float, vol_24h_usd: float) -> float:
-    """Enforced MM run length in minutes (0 = no cap → unchanged behavior).
+    """The run's WALL-CLOCK cap in minutes (0 = no cap → runs until stopped).
 
-    A user-set ``mm_duration_minutes`` wins, clamped to the participation bounds
-    ([Aggressive … 10×Passive]) when 24h volume is known; otherwise the
-    participation preset implies the duration (compute_pov_duration). Opt-in:
-    with neither a custom duration nor a preset (or no volume), returns 0."""
-    from src.nadobro.quant import pov_engine
+    ``mm_duration_minutes`` is the user's run duration and is honored VERBATIM —
+    "run for 100 hours" means 100 hours. It is NOT a participation/POV schedule.
 
+    BUGFIX 2026-09-18 (prod session 320): this used to route a custom duration
+    through ``pov_engine.bound_user_duration_minutes``, which clamps to
+    ``[Aggressive_completion … 10×Passive_completion]``. On a thin deployed
+    notional against a high-volume pair (e.g. $4,000 deployed on BTC-PERP at
+    ~$195M/24h) that ceiling collapses to ~30 min, so a user's 6000-min (100h)
+    request was silently cut to ~30 min — and only when the 24h-volume fetch
+    happened to succeed at start, so the cut was non-deterministic. A
+    participation preset paces SIZING (the per-cycle chunk via
+    ``_resolve_mm_cycle_notional_usd`` and the margin multiplier); it must never
+    impose a run cap. Never silently override an explicit user setting.
+
+    ``deployed_usd`` / ``vol_24h_usd`` are retained for signature stability (the
+    caller computes them for the chunk-sizing resolver) but no longer affect the
+    run duration."""
     try:
         custom = float(state.get("mm_duration_minutes") or 0.0)
     except (TypeError, ValueError):
         custom = 0.0
-    deployed = max(0.0, float(deployed_usd or 0.0))
-    vol = max(0.0, float(vol_24h_usd or 0.0))
-    preset = state.get("participation_preset")
-    if custom > 0:
-        if vol > 0 and deployed > 0:
-            clamped, _lo, _hi = pov_engine.bound_user_duration_minutes(custom, deployed, vol)
-            return float(clamped)
-        return custom
-    if preset and vol > 0 and deployed > 0:
-        return float(pov_engine.compute_pov_duration(deployed, str(preset), vol)["duration_minutes"])
-    return 0.0
+    return custom if custom > 0 else 0.0
 
 
 def _resolve_mm_cycle_notional_usd(

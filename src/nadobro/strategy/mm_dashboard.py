@@ -429,10 +429,14 @@ def render_pretrade_card_lines(breakdown: dict) -> list[str]:
         f"net ${fees['net_fee_usd']:+,.4f} (on ${fees['placed_notional_usd']:,.2f})"
     )
     if pov:
+        # NOTE: duration_minutes is a PACING estimate (how long to cycle the
+        # notional through the book once at this participation rate), NOT a run
+        # cap — the run length is the user's mm_duration_minutes, honored
+        # verbatim. Framed accordingly so it isn't read as a stop time.
         lines.append(
-            f"POV {pov['preset']}: {pov['multiplier'] * 100:.0f}%/min, "
-            f"~{pov['duration_minutes']:.1f} min duration, "
-            f"cycle ${pov['cycle_notional_usd']:,.2f} every {pov['interval_seconds']}s"
+            f"POV {pov['preset']}: {pov['multiplier'] * 100:.0f}%/min pace, "
+            f"cycle ${pov['cycle_notional_usd']:,.2f} every {pov['interval_seconds']}s "
+            f"(~{pov['duration_minutes']:.1f} min to cycle the notional once)"
             f"{pov.get('pacing_note', '')}"
         )
     # Live book spread vs the configured spread — so the user can set a spread that
@@ -834,7 +838,7 @@ def render_status_lines(snapshot: dict) -> list[str]:
         pov = snapshot["pov_engine"]
         lines.append(
             f"POV {pov['preset']}: cycle ${pov['cycle_notional_usd']:,.2f} every "
-            f"{pov['interval_seconds']}s, ~{pov['duration_minutes']:.1f} min total"
+            f"{pov['interval_seconds']}s (~{pov['duration_minutes']:.1f} min to cycle the notional once)"
         )
     elif snapshot.get("pov_warning"):
         lines.append(f"POV: {snapshot['pov_warning']}")

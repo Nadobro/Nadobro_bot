@@ -163,30 +163,3 @@ def compute_pov_duration(
         "pair_24h_volume_usd": pair_volume,
         "vol_per_minute_usd": vol_per_minute,
     }
-
-
-def bound_user_duration_minutes(
-    requested_minutes: float,
-    notional_usd: float,
-    pair_24h_volume_usd: float,
-) -> tuple[float, float, float]:
-    """Clamp a user-typed duration to ``[Aggressive_minutes, 10 × Passive_minutes]``.
-
-    Returns ``(clamped_minutes, lower_bound, upper_bound)``.
-
-    Per the plan: Aggressive sets the floor (fastest legal completion); Passive
-    sets the ceiling, scaled 10× to allow for very long, careful schedules.
-    """
-    aggressive = compute_pov_duration(notional_usd, "aggressive", pair_24h_volume_usd)
-    passive = compute_pov_duration(notional_usd, "passive", pair_24h_volume_usd)
-    lower = float(aggressive["duration_minutes"])
-    upper = 10.0 * float(passive["duration_minutes"])
-    if upper < lower:
-        # Degenerate volume produces upper < lower; widen both to a safe band.
-        upper = max(lower * 10.0, 1.0)
-    requested = max(0.0, float(requested_minutes or 0.0))
-    if requested <= 0:
-        clamped = (lower + upper) / 2.0
-    else:
-        clamped = max(lower, min(upper, requested))
-    return clamped, lower, upper
