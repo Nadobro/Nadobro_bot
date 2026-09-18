@@ -1240,18 +1240,38 @@ class MMDurationTests(unittest.TestCase):
 
     def test_resolve_run_duration(self):
         from src.nadobro.strategy.bot_runtime import _resolve_mm_run_duration_minutes
-        # Opt-out: no preset, no custom → 0 (no cap, unchanged behavior).
+        # Opt-out: no custom duration → 0 (no cap; runs until stopped).
         self.assertEqual(_resolve_mm_run_duration_minutes({}, 100.0, 1_000_000.0), 0.0)
-        # Custom duration with no volume → returned as typed.
+        # A participation preset ALONE never imposes a run cap — it paces sizing
+        # only (a preset used to derive a POV completion time and hard-stop the
+        # run after seconds-to-minutes on a high-volume pair).
+        self.assertEqual(
+            _resolve_mm_run_duration_minutes(
+                {"participation_preset": "normal"}, 1000.0, 1_440_000.0
+            ),
+            0.0,
+        )
+        # A user-typed duration is a WALL-CLOCK cap, honored VERBATIM regardless
+        # of volume or preset — never clamped to the POV window.
         self.assertEqual(
             _resolve_mm_run_duration_minutes({"mm_duration_minutes": 45}, 100.0, 0.0), 45.0
         )
-        # Preset-derived: $1000 deployed, normal (0.05), $1.44M/24h vol → 20 min.
-        d = _resolve_mm_run_duration_minutes({"participation_preset": "normal"}, 1000.0, 1_440_000.0)
-        self.assertAlmostEqual(d, 20.0, places=6)
-        # Custom over the bound is clamped to [Aggressive … 10×Passive] = [10, 1000].
-        c = _resolve_mm_run_duration_minutes({"mm_duration_minutes": 999999}, 1000.0, 1_440_000.0)
-        self.assertAlmostEqual(c, 1000.0, places=6)
+        # Regression (prod session 320, 2026-09-18): 100h (6000 min) requested on
+        # BTC-PERP, $100 × 40x = $4,000 deployed, ~$195M/24h volume, aggressive
+        # preset — used to collapse to ~30 min (10×Passive completion). Must now
+        # be honored as 6000.
+        self.assertEqual(
+            _resolve_mm_run_duration_minutes(
+                {"mm_duration_minutes": 6000, "participation_preset": "aggressive"},
+                4000.0, 194_000_000.0,
+            ),
+            6000.0,
+        )
+        # No upper clamp at all: an extreme typed value passes through.
+        self.assertEqual(
+            _resolve_mm_run_duration_minutes({"mm_duration_minutes": 999999}, 1000.0, 1_440_000.0),
+            999999.0,
+        )
 
     def test_resolve_cycle_notional(self):
         """THROUGHPUT FLOOR (2026-08-03): sizing purely off the participation
