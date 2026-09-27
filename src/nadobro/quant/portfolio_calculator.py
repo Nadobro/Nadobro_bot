@@ -391,21 +391,26 @@ _EPOCH0 = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 def _fill_signed_base_price_ts(
     row: dict[str, Any],
+    *,
+    gross_of_fees: bool = False,
 ) -> tuple[int, Decimal, Decimal, datetime | None] | None:
     """Normalize a fill/trade row to ``(product_id, signed_base, price, ts)``.
 
     ``signed_base`` is +base for long/buy, -base for short/sell. ``price`` is the
     per-unit fill price (prefers venue ``quote_filled_x18 / base_filled_x18``,
     falls back to the recorder ``fill_price``/``price``). Returns ``None`` when the
-    row has no usable base / price / side."""
+    row has no usable base / price / side.
+
+    The venue's ``quote_filled`` is NET of the fill's fee (signed quote =
+    -price*base - fee; prod-verified on every row), so ``|quote|/base`` is a
+    fee-inclusive price: a buy reads ``fee/base`` dearer, a sell ``fee/base``
+    cheaper. ``gross_of_fees=True`` strips the venue ``fee_x18`` back out of that
+    quote so the price is the real match price — for callers that report fees
+    SEPARATELY and subtract them once (GRIDFAM-2026-09-27-RAIL-FEE-2X)."""
     base = abs(_decimal_from_possible_x18(row, "base_filled_x18", "fill_size"))
     if base <= ZERO:
         base = abs(decimal_value(_pick(row, "fill_size", "size", default=0)))
     if base <= ZERO:
-        return None
-    quote = abs(_decimal_from_possible_x18(row, "quote_filled_x18", "quote_filled"))
-    price = (quote / base) if quote > ZERO else decimal_value(_pick(row, "fill_price", "price", default=0))
-    if price <= ZERO:
         return None
     side = str(_pick(row, "side", default="")).lower()
     if side in ("long", "buy"):
@@ -413,6 +418,18 @@ def _fill_signed_base_price_ts(
     elif side in ("short", "sell"):
         signed = -base
     else:
+        return None
+    quote = abs(_decimal_from_possible_x18(row, "quote_filled_x18", "quote_filled"))
+    if gross_of_fees and quote > ZERO and row.get("quote_filled_x18") is not None \
+            and row.get("fee_x18") is not None:
+        # |quote| = price*base + fee (buy) / price*base - fee (sell); fee signed
+        # (a maker rebate is negative), so this is exact either way.
+        fee = from_x18(row.get("fee_x18"))
+        gross_quote = quote - fee if signed > ZERO else quote + fee
+        if gross_quote > ZERO:
+            quote = gross_quote
+    price = (quote / base) if quote > ZERO else decimal_value(_pick(row, "fill_price", "price", default=0))
+    if price <= ZERO:
         return None
     pid = int(_pick(row, "product_id", default=0) or 0)
     return pid, signed, price, _row_time(row)
@@ -422,8 +439,15 @@ def realized_pnl_windows_from_rows(
     rows: list[dict[str, Any]] | None,
     *,
     now: datetime | None = None,
+    gross_of_fees: bool = False,
 ) -> dict[str, Any]:
     """Position-aware realized PnL over a COMPLETE set of fills.
+
+    ``gross_of_fees=True`` prices venue fills at the real match price (the venue
+    fee stripped back out of the fee-inclusive ``quote_filled``) so the result is
+    truly gross and a caller that subtracts fees separately counts them once —
+    see ``_fill_signed_base_price_ts``. The default keeps the historical
+    fee-inclusive venue pricing for the account-level callers.
 
     This venue reports no per-fill realized PnL (the indexer match has only
     base/quote/fee), so realized PnL MUST be derived: replay fills per product in
@@ -467,7 +491,7 @@ def realized_pnl_windows_from_rows(
     # (product_id, isolated) -> signed fill legs, in chronological order.
     norm: list[tuple[tuple[int, bool], Decimal, Decimal, datetime | None]] = []
     for r in (rows or []):
-        c = _fill_signed_base_price_ts(r)
+        c = _fill_signed_base_price_ts(r, gross_of_fees=gross_of_fees)
         if c is None:
             continue
         pid, signed_qty, price, ts = c

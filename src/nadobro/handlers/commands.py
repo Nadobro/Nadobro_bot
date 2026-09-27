@@ -55,6 +55,7 @@ async def build_status_dashboard_parts(
     Caller localizes text/markup with the user's active language.
     """
     status = await run_blocking(get_user_bot_status, telegram_id)
+    status.update(await run_blocking(_grid_family_live_session_figures, telegram_id, status))
     onboarding = await run_blocking(evaluate_readiness, telegram_id)
     try:
         from src.nadobro.trading.copy_service import get_user_copies
@@ -68,6 +69,39 @@ async def build_status_dashboard_parts(
         strategy_label=str(status.get("strategy") or "").upper() or None,
     )
     return text, merged
+
+
+_GRID_FAMILY_STRATEGIES = ("grid", "rgrid", "dgrid")
+
+
+def _grid_family_live_session_figures(telegram_id: int, status: dict) -> dict:
+    """The running grid-family run's live session PnL / fees / volume for the
+    /status Cost/$1M line — the SAME per-run source as the SL/TP rail and the
+    strategy dashboard (``live_session.get_live_session_snapshot``; PnL is gross
+    of fees, the card subtracts them once). DB-only (``client=None``): a
+    tap-driven path never blocks on a venue read. Blocking — call via
+    ``run_blocking``. ``{}`` when not applicable or on any failure, so the card
+    keeps its previous figures."""
+    strategy = str(status.get("strategy") or "").lower().strip()
+    if strategy not in _GRID_FAMILY_STRATEGIES or not status.get("running"):
+        return {}
+    network = str(status.get("network") or "mainnet")
+    try:
+        from src.nadobro.trading.live_session import get_live_session_snapshot
+        from src.nadobro.trading.session_resolver import resolve_current_strategy_session
+
+        sess = resolve_current_strategy_session(telegram_id, network, strategy, status=status)
+        if not sess or sess.get("id") is None:
+            return {}
+        snap = get_live_session_snapshot(telegram_id, network, sess, state=status, client=None)
+    except Exception:  # noqa: BLE001 - the status card must always render
+        logger.debug("grid-family live session figures failed user=%s", telegram_id, exc_info=True)
+        return {}
+    return {
+        "session_live_pnl_usd": float(snap.get("session_pnl") or 0.0),
+        "session_live_fees_usd": float(snap.get("fees") or 0.0),
+        "session_live_volume_usd": float(snap.get("volume") or 0.0),
+    }
 
 
 def _safe_text(text: str | None, fallback: str) -> str:

@@ -77,7 +77,7 @@ from __future__ import annotations
 import inspect
 import logging
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
 from typing import List, Optional
 
 from src.nadobro.engine.adapter.base import AdapterError
@@ -203,6 +203,7 @@ class ReverseGridController(Controller):
         self._tick_n = 0
         self._unreadable_ticks = 0
         self._foreign_ticks = 0
+        self._min_notional_ticks = 0
         self._last_reconcile_tick = -1
 
     # -- config ---------------------------------------------------------------
@@ -714,6 +715,7 @@ class ReverseGridController(Controller):
             return
         resting = {(r.side, r.level) for r in self._rungs if not r.fired}
         placed = 0
+        refused = 0
         failed = False
         for k in range(1, self.levels + 1):
             offset = self.step_pct * Decimal(k)
@@ -738,8 +740,9 @@ class ReverseGridController(Controller):
                         placed, anchor, self.user_id, self.trading_pair,
                     )
                     return
-                size = self._rung_base(level)
+                size = self._rung_base(level, side)
                 if size is None or size <= 0:
+                    refused += 1
                     continue
                 try:
                     order = await self.adapter.place_trigger_order(
@@ -761,16 +764,31 @@ class ReverseGridController(Controller):
         # A transient placement failure leaves a hole: keep re-arming (only the
         # missing rungs) on the next ticks instead of resting an asymmetric ladder.
         self._ladder_incomplete = bool(failed)
+        if refused and not self._rungs_resting():
+            self._note_min_notional_hold(refused)
+        else:
+            self._min_notional_ticks = 0
         logger.info(
             "revgrid armed %s trigger rungs around anchor %s (levels=%s step=%s "
             "user=%s pair=%s)",
             placed, anchor, self.levels, self.step_pct, self.user_id, self.trading_pair,
         )
 
-    def _rung_base(self, level: Decimal) -> Optional[Decimal]:
-        """Base size for a rung at ``level``: the per-rung notional / level, floored
-        to the venue lot and declined below the venue minimum notional (a
-        sub-minimum rung would be GROWN by the venue past the risk-approved size)."""
+    def _rung_base(self, level: Decimal, side: TradeType = TradeType.BUY) -> Optional[Decimal]:
+        """Base size for a rung at ``level``: the per-rung notional / level in whole
+        venue lots, at or above the venue minimum notional.
+
+        RGRID-B1 (audit 2026-09-27): the plan floors a stop-budget-capped rung to
+        EXACTLY the venue minimum ($100); rounding its base DOWN to the lot then
+        always landed a hair under $100 and every rung was refused — R-Grid at
+        default settings sat LIVE with 0 orders. When the plan's notional meets the
+        minimum, the base is instead the smallest whole-lot size whose notional at
+        the order's LIMIT price (a SELL rung's IOC limit sits ``entry_slippage_pct``
+        under its level) clears the minimum: at most one lot above the plan, and
+        exactly what the client would otherwise grow it to untracked. A plan
+        notional genuinely BELOW the minimum is still declined — never grown past
+        the risk-approved size — and ``_place_ladder`` surfaces that refusal as the
+        ``venue_min_notional`` hold."""
         if level <= 0:
             return None
         base = self.order_amount_quote / level
@@ -781,11 +799,35 @@ class ReverseGridController(Controller):
             return base
         if lot > 0:
             base = (base / lot).to_integral_value(rounding=ROUND_DOWN) * lot
+        if floor_quote > 0:
+            limit_px = level
+            if side is TradeType.SELL:
+                limit_px = level * (Decimal(1) - _dec(self.entry_slippage_pct) / Decimal(100))
+            if limit_px <= 0:
+                return None
+            if base * limit_px < floor_quote:
+                if self.order_amount_quote < floor_quote:
+                    return None
+                base = floor_quote / limit_px
+                if lot > 0:
+                    base = (base / lot).to_integral_value(rounding=ROUND_CEILING) * lot
         if base <= 0:
             return None
-        if floor_quote > 0 and base * level < floor_quote:
-            return None
         return base
+
+    def _note_min_notional_hold(self, refused: int) -> None:
+        """Every rung this tick was declined below the venue minimum notional: say
+        so (card line "Quoting: PAUSED (...)" + a rate-limited warning) instead of
+        the silent "LIVE, 0 orders" of RGRID-B1."""
+        self._min_notional_ticks += 1
+        self.gate_verdict, self.gate_reason = "PAUSE", "venue_min_notional"
+        if self._min_notional_ticks == 1 or self._min_notional_ticks % 12 == 0:
+            logger.warning(
+                "revgrid %s: %s rung(s) declined — per-rung notional $%s is below the "
+                "venue minimum; nothing armed (%s tick(s), user=%s)",
+                self.trading_pair, refused, self.order_amount_quote,
+                self._min_notional_ticks, self.user_id,
+            )
 
     async def _cancel_all_rungs(self) -> None:
         for r in self._rungs:

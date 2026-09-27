@@ -77,6 +77,9 @@ GATE_REASON_HUMAN: Dict[str, str] = {
     # and a same-signed one could be trimmed by the run's exits. Hold until the
     # user closes it (or stops and picks another market).
     "venue_foreign_position": "an open position on this market was not opened by this run",
+    # R-Grid declined every rung: the per-rung notional is below the venue's
+    # minimum order size (RGRID-B1, 2026-09-27 — was a silent "LIVE, 0 orders").
+    "venue_min_notional": "each rung is below the venue minimum order size",
 }
 
 # Reasons whose resume condition is "a trend forms" (reverse grid), NOT "the
@@ -88,7 +91,7 @@ REVGRID_GATE_REASONS: frozenset = frozenset({"revgrid_chop"})
 # read recovers / the residual is cleared, so the card must not promise "when the
 # market ranges again" or "when a trend forms".
 VENUE_GATE_REASONS: frozenset = frozenset({
-    "venue_unreadable", "venue_residual", "venue_foreign_position",
+    "venue_unreadable", "venue_residual", "venue_foreign_position", "venue_min_notional",
 })
 
 

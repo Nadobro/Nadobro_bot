@@ -1754,7 +1754,19 @@ def fmt_status_overview(status: dict, onboarding: dict):
     if strategy == "VOL":
         session_pnl = float(status.get("session_realized_pnl_usd") or session_pnl)
     elif strategy in ("GRID", "RGRID", "DGRID"):
-        session_pnl = float(status.get("rgrid_last_cycle_pnl_usd") or session_pnl)
+        # GRIDFAM Cost/$1M (audit 2026-09-27): the grid family used to read
+        # ``rgrid_last_cycle_pnl_usd``, a key nothing writes, and fell back to the
+        # per-row trade PnL above — NULL for engine fills — so the card showed
+        # ~ -fees/volume (D-Grid -200/$1M where the truth was +174). Use the
+        # per-run live snapshot the SL/TP rail uses (realized + uPnL - funding,
+        # GROSS of fees; attached by commands._grid_family_live_session_figures);
+        # the Cost/$1M line below subtracts its fees exactly once.
+        if status.get("session_live_pnl_usd") is not None:
+            session_pnl = float(status.get("session_live_pnl_usd") or 0.0)
+            session_fees = float(status.get("session_live_fees_usd") or 0.0)
+            _live_volume = float(status.get("session_live_volume_usd") or 0.0)
+            if _live_volume > 0:
+                session_volume = _live_volume
     elif strategy == "BRO":
         session_pnl = float((status.get("bro_state") or {}).get("total_pnl") or session_pnl)
 
@@ -1812,6 +1824,9 @@ def fmt_status_overview(status: dict, onboarding: dict):
         if _gate_reason_key == "venue_foreign_position":
             # The run will not trade on top of a position it did not open.
             _resume_line = _loc("Close that position (or Stop and pick another market) to arm.")
+        elif _gate_reason_key == "venue_min_notional":
+            # Not a venue READ problem — the configured size is too small to place.
+            _resume_line = _loc("Add margin, raise leverage or use fewer rungs so each rung meets the venue minimum.")
         elif _gate_reason_key in VENUE_GATE_REASONS:
             # A venue hold (position unreadable / residual being cleared) is not a
             # regime verdict — it resumes when the venue read recovers.

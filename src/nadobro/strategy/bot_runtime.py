@@ -3385,9 +3385,12 @@ async def _evaluate_session_pnl_rail(
     # buffer below TARGETS the realized net loss to land AT ``sl_pct`` (it reserves
     # only the move projected to occur during the flatten, so it centres the exit on
     # the user's number rather than firing early or overshooting). The user-facing
-    # figures below are the NET loss too, so the message matches the SL they set —
-    # the -3.56% GROSS that read as an "early stop" was really -10.90% NET (prod
-    # #253: price -$3.56, fees -$7.34), i.e. the $10 they configured.
+    # figures below are the NET loss too, so the message matches the SL they set.
+    # Fees are counted EXACTLY ONCE (GRIDFAM-2026-09-27-RAIL-FEE-2X): the old note
+    # here read prod #253 as "-3.56% gross = -10.90% net", but that -3.56% "price"
+    # figure was replayed from fee-inclusive venue prices, so the rail subtracted
+    # the fees a second time — #253's true net was about -2.94%. The snapshot's
+    # realized replay is now gross of fees and ``session_pnl_net`` = gross - fees.
     pnl = float(snap.get("session_pnl_net", pnl_gross) or 0.0)
     pct = float(snap.get("session_pnl_pct_net", pct_gross) or 0.0)
     pct_net = pct
@@ -3857,11 +3860,15 @@ async def _run_cycle(
             telegram_id, network, state, strategy, product, client
         )
 
-    # Option 7: overlap the two independent per-cycle reads (mid + open orders)
-    # so cycle latency is the slower of the two, not their sum. Engine strategies
-    # always take both paths and never early-return between the reads, so they
-    # gather; the legacy directional path stays sequential because its
-    # session-PnL rail can return before open orders are ever needed.
+    # Per-cycle reads: the mid always; the product's open orders ONLY for the
+    # legacy dispatch path (the one consumer of the list), fetched lazily right
+    # before it. Engine strategies used to gather an open-orders read with the mid
+    # every cycle and never use it (audit 2026-09-27, F5: 2 gateway weight per
+    # cycle, ~48% of a D-Grid session's gateway weight). It was a refresh=False
+    # read whose only side effect was warming the 5s client cache: the engine
+    # adapter's polls are refresh=True (they bypass that cache), and the rail's
+    # DB-count fallback re-reads on a miss, so dropping it can never add weight
+    # nor change what any DENIED-vs-EMPTY path sees.
     async def _fetch_mid() -> float:
         with timed_metric("runtime.market_price.fetch"):
             if strategy == "vol":
@@ -3888,12 +3895,8 @@ async def _run_cycle(
                     raise RuntimeError("VOL open-orders call timed out")
             return await run_blocking_sdk(client.get_open_orders, product_id)
 
-    _engine_cycle = strategy in ("grid", "rgrid", "dgrid", "mid", "dn", "vol")
     open_orders = None
-    if _engine_cycle:
-        mid, open_orders = await asyncio.gather(_fetch_mid(), _fetch_open_orders())
-    else:
-        mid = await _fetch_mid()
+    mid = await _fetch_mid()
     if mid <= 0:
         raise RuntimeError("Could not fetch market price")
 
@@ -3936,12 +3939,6 @@ async def _run_cycle(
         )
         if rail is not None:
             return rail
-
-    # Engine strategies already fetched this concurrently with mid above; the
-    # legacy path fetches it here, only after its session-PnL rail may have
-    # returned (so a rail exit never pays for an unused open-orders read).
-    if open_orders is None:
-        open_orders = await _fetch_open_orders()
 
     from src.nadobro.strategy.engine_runtime import (
         ENGINE_MAPPED_STRATEGIES, engine_v2_enabled, run_engine_cycle,
@@ -4134,6 +4131,11 @@ async def _run_cycle(
             "strategy": strategy,
         }
     else:
+        # The legacy dispatch is the only consumer of the open-orders list; read it
+        # here, after its session-PnL rail may have returned (a rail exit never
+        # pays for an unused read) and never on the engine path.
+        if open_orders is None:
+            open_orders = await _fetch_open_orders()
         with timed_metric(f"runtime.strategy.dispatch.{strategy}"):
             if strategy == "vol":
                 try:

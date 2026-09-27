@@ -1367,3 +1367,73 @@ def test_an_isolated_position_without_unsettled_is_unchanged():
     from src.nadobro.quant.portfolio_calculator import normalize_position
     iso = {"product_id": 3, "symbol": "SOL-PERP", "position_size": "1", "est_pnl": "5.0"}
     assert normalize_position(dict(iso), isolated=True).est_pnl == Decimal("5.0")
+
+
+# --------------------------------------------------------------------------- #
+# GRIDFAM-2026-09-27-RAIL-FEE-2X — the session SL/TP rail must count trading    #
+# fees EXACTLY ONCE. The venue's signed quote_filled is NET of fee              #
+# (quote = -price*base - fee; prod_ground_truth.md verified 100% of rows), and  #
+# the session realized replay priced every fill at |quote_filled|/base — so     #
+# realized PnL already carried the round-tripped fees — and then                #
+# live_session subtracted ``fees`` AGAIN for ``session_pnl_net``. A zero-move   #
+# round trip read -2 x fees on the rail (prod: 15 of 23 sl_hit sessions fired   #
+# with a true net loss smaller than the user's SL; s305 fees 10.5% of margin).  #
+# The same replay feeds the stored ``strategy_sessions.realized_pnl``, so the   #
+# stored (realized - fees)/volume Cost/$1M double-subtracted fees too.          #
+# FIXED (2026-09-27): the session replay prices fills gross of the venue fee    #
+# (portfolio_calculator gross_of_fees=True); strict-xfail markers removed.      #
+# Pure — the DB reads are stubbed.                                              #
+# --------------------------------------------------------------------------- #
+def _flat_zero_move_round_trip_snapshot(monkeypatch):
+    # The pytest-only CI job (self-review.yml) has no psycopg2; the repo's test
+    # stubs satisfy the DB layer's import (every DB read below is stubbed anyway).
+    from _stubs import install_test_stubs
+
+    install_test_stubs()
+    from src.nadobro.models import database as dbm
+    from src.nadobro.trading import live_session
+
+    x18 = 10 ** 18
+    fee = Decimal("0.045")                       # per leg, venue fee_x18 (incl. builder)
+    notional = Decimal("100")                    # 0.001 BTC @ 100,000 — no price move
+    buy = {"product_id": 2, "side": "long", "fill_size": 0.001, "size": 0.001,
+           "fill_price": 100000.0, "price": 100000.0, "isolated": False, "source": "strategy",
+           "submission_idx": 1, "base_filled_x18": int(Decimal("0.001") * x18),
+           "quote_filled_x18": int(-(notional + fee) * x18), "fee_x18": int(fee * x18),
+           "filled_at": None}
+    sell = dict(buy, side="short", submission_idx=2,
+                base_filled_x18=int(Decimal("-0.001") * x18),
+                quote_filled_x18=int((notional - fee) * x18))
+    agg = {"fills": 2, "volume": float(2 * notional), "fees": float(2 * fee),
+           "net_base": 0.0, "signed_cash": -float(2 * fee), "venue_pnl": 0.0,
+           "venue_rows": 0, "pending_sync": 0, "recorder_gross": 0.0}
+    monkeypatch.setattr(dbm, "query_one", lambda *_a, **_k: dict(agg))
+    monkeypatch.setattr(dbm, "query_all", lambda *_a, **_k: [dict(buy), dict(sell)])
+    monkeypatch.setattr(dbm, "get_open_position_rows_for_product", lambda *_a, **_k: [])
+    monkeypatch.setattr(dbm, "get_session_turnover", lambda *_a, **_k: {"volume": 0.0, "fills": 0})
+    monkeypatch.setattr(dbm, "count_open_orders_for_product", lambda *_a, **_k: 0)
+    session = {"id": 991, "product_id": 2, "status": "running", "notional_usd": 100.0,
+               "started_at": None}
+    return live_session.get_live_session_snapshot(
+        7, "mainnet", session, state={"notional_usd": 100.0}, client=None, mark=100000.0,
+    )
+
+
+def test_the_session_rail_counts_fees_exactly_once(monkeypatch):
+    """GRIDFAM-2026-09-27-RAIL-FEE-2X: a flat round trip with zero price move
+    must read -fees/margin on the rail, not -2 x fees/margin."""
+    snap = _flat_zero_move_round_trip_snapshot(monkeypatch)
+    assert snap["fees"] == pytest.approx(0.09)
+    assert snap["session_pnl_net"] == pytest.approx(-0.09), snap["session_pnl_net"]
+    assert snap["session_pnl_pct_net"] == pytest.approx(-0.09), snap["session_pnl_pct_net"]
+
+
+def test_session_realized_pnl_is_gross_of_the_fees_reported_beside_it(monkeypatch):
+    """GRIDFAM-2026-09-27-RAIL-FEE-2X (display/stored side): the documented
+    convention is realized GROSS of fees with fees a standalone metric — the
+    status card shows them side by side and the stored Cost/$1M subtracts
+    ``total_fees_paid`` from the stored ``realized_pnl``. A zero-move round trip
+    realizes 0, not -fees."""
+    snap = _flat_zero_move_round_trip_snapshot(monkeypatch)
+    assert snap["realized_pnl"] == pytest.approx(0.0), snap["realized_pnl"]
+    assert snap["session_pnl"] == pytest.approx(0.0)
