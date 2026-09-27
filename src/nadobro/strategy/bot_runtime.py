@@ -3404,10 +3404,26 @@ async def _evaluate_session_pnl_rail(
     # only as much as the current velocity implies (never a flat leverage haircut,
     # which stopped #253 at half its budget). TP is never buffered. Fail-safe: any
     # error falls back to the raw sl_pct.
+    # GRIDFAM-2026-09-27-SL-CLOSE-FEE: ``pct_net`` has the fees ALREADY paid taken
+    # out, but the flatten this rail fires is a TAKER order that pays one more fee
+    # on the whole open notional. Reserve that projected close fee (as %-of-margin)
+    # so the REALIZED net loss lands on the user's SL, and take profit only once
+    # the gain still clears the TP after paying it. 0 when flat / disabled.
+    close_cost = 0.0
+    try:
+        from src.nadobro.quant.sltp_overshoot import close_cost_pct
+        close_cost = close_cost_pct(snap.get("position_value"), snap.get("margin"))
+    except Exception:  # noqa: BLE001 - the reserve is advisory; the raw SL still governs
+        logger.debug("sltp close-fee reserve skipped", exc_info=True)
+        close_cost = 0.0
     sl_trigger = sl_pct
     try:
         from src.nadobro.utils.env import env_bool
-        if sl_pct > 0 and env_bool("NADO_SLTP_BUFFER_ENABLED", True):
+        if sl_pct > 0 and not env_bool("NADO_SLTP_BUFFER_ENABLED", True):
+            # Velocity buffer disabled: still reserve the close fee.
+            from src.nadobro.quant.sltp_overshoot import effective_sl_trigger
+            sl_trigger = effective_sl_trigger(sl_pct, 0.0, 0.0, close_cost_pct=close_cost)
+        elif sl_pct > 0:
             from src.nadobro.quant.sltp_overshoot import effective_sl_trigger, move_bp
             # Effective leverage = the run's notional over the rail's OWN margin
             # basis (both from this snapshot) — the quantity that actually drives
@@ -3436,7 +3452,9 @@ async def _evaluate_session_pnl_rail(
                     _SLTP_MARK_CACHE.clear()
                 _SLTP_MARK_CACHE[_sid] = _mark
             _recent_move_bp = move_bp(_prev_mark, _mark) if (_prev_mark > 0 and _mark > 0) else 0.0
-            sl_trigger = effective_sl_trigger(sl_pct, _eff_lev, _recent_move_bp)
+            sl_trigger = effective_sl_trigger(
+                sl_pct, _eff_lev, _recent_move_bp, close_cost_pct=close_cost,
+            )
     except Exception:  # noqa: BLE001 - never let the buffer math disarm the stop
         logger.debug("sltp overshoot buffer skipped", exc_info=True)
         sl_trigger = sl_pct
@@ -3456,8 +3474,9 @@ async def _evaluate_session_pnl_rail(
         # -sl_pct they set (their real loss is price - fees - funding). The buffer
         # above targets the realized net loss at -sl_pct.
         reason = "sl_hit"
-    elif not reason and tp_pct > 0 and pct_net >= tp_pct:
-        # Symmetric: the TP also clears NET (profit is what the user actually nets).
+    elif not reason and tp_pct > 0 and pct_net - close_cost >= tp_pct:
+        # Symmetric: the TP also clears NET (profit is what the user actually nets)
+        # — including the flatten's own fee (GRIDFAM-2026-09-27-SL-CLOSE-FEE).
         reason = "tp_hit"
     # Overlay drawdown kill-switch: a SECOND, independent stop for the financial
     # overlay (10% of margin by default), armed only when the overlay steers
@@ -3495,9 +3514,9 @@ async def _evaluate_session_pnl_rail(
     logger.info(
         "session rail fired reason=%s strategy=%s user=%s: NET=%.2f%% "
         "(target -%.2f%%, buffered trigger -%.2f%%) = price %.2f%% - fees/funding %.2f%% "
-        "| fees=$%.2f margin=$%.2f",
+        "| close-fee reserve %.2f%% | fees=$%.2f margin=$%.2f",
         reason, strategy, telegram_id, pct_net, sl_pct, sl_trigger, pct_gross, fees_pct,
-        float(snap.get("fees") or 0.0), float(snap.get("margin") or 0.0),
+        close_cost, float(snap.get("fees") or 0.0), float(snap.get("margin") or 0.0),
     )
     _finalize_session(state, stop_reason=reason)
     _SLTP_MARK_CACHE.pop(int(sess.get("id") or 0), None)   # session over — drop its mark

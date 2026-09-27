@@ -37,6 +37,7 @@ from typing import Dict, List, Optional
 
 from src.nadobro.engine.adapter.base import Fill
 from src.nadobro.engine.controllers.controller_base import (
+    _VENUE_GATE_REASONS,
     LADDER_RECENTER_FLOOR_BP,
     LADDER_RECENTER_MIN_INTERVAL_S,
     Controller,
@@ -543,10 +544,10 @@ class DynamicGridController(Controller):
         # never sit it out. Keep the gate call only for ATR/telemetry; both
         # pause flags off => dgrid always quotes.
         await self.evaluate_quote_gate(pair, pause_on_trend=False, pause_on_breakout=False)
-        # A venue hold (unreadable position / residual close / foreign position)
-        # is not a regime verdict; it is re-asserted below when still true, so
-        # clear it here.
-        if self.gate_reason in ("venue_unreadable", "venue_residual", "venue_foreign_position"):
+        # A venue / sizing hold (unreadable position / residual close / foreign
+        # position / the trend delegate's rung-size holds) is not a regime verdict;
+        # it is re-asserted below when still true, so clear it here.
+        if self.gate_reason in _VENUE_GATE_REASONS:
             self.gate_verdict, self.gate_reason = "QUOTE", ""
         # No phase arms before the run's venue baseline is known (see __init__).
         if self._venue_baseline is None and not await self._capture_venue_baseline():
@@ -1017,6 +1018,23 @@ class DynamicGridController(Controller):
         self._refresh_trend_config()
         if self._trend is not None:
             await self._trend.on_tick()
+            self._mirror_trend_hold()
+
+    def _mirror_trend_hold(self) -> None:
+        """Surface the trend delegate's venue / sizing hold on D-Grid's OWN gate.
+
+        engine_diag (and so the /status card) reads only the top-level controller's
+        gate, so a trend phase whose rungs were refused (``venue_min_notional``,
+        ``stop_budget_too_tight``) or that is holding on its venue read used to show
+        as a silent "Quoting: active" with 0 orders. Non-venue delegate reasons are
+        not mirrored (its chop gate is disabled under D-Grid; D-Grid's own classifier
+        owns the regime)."""
+        trend = self._trend
+        if trend is None:
+            return
+        reason = str(getattr(trend, "gate_reason", "") or "")
+        if getattr(trend, "gate_verdict", "") == "PAUSE" and reason in _VENUE_GATE_REASONS:
+            self.gate_verdict, self.gate_reason = "PAUSE", reason
 
     def _note_venue_hold(self, reason: str, detail: str) -> None:
         """Make a venue-side deferral VISIBLE: gate telemetry (the /status card
@@ -1161,6 +1179,7 @@ class DynamicGridController(Controller):
             cfg.get("order_amount_quote"), self.id,
         )
         await self._trend.on_tick()
+        self._mirror_trend_hold()
         return True
 
     async def _spawn_phase(self, phase: str, mid: Optional[Decimal]) -> bool:

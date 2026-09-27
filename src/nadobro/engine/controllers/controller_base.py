@@ -46,6 +46,7 @@ LADDER_RECENTER_MIN_INTERVAL_S = 5.0
 # duplicated as a literal so this module keeps no import edge to the routine.
 _VENUE_GATE_REASONS = frozenset({
     "venue_unreadable", "venue_residual", "venue_foreign_position", "venue_min_notional",
+    "stop_budget_too_tight",
 })
 
 

@@ -72,6 +72,22 @@ Per-rung size = `deployed / levels`, shrunk so a full pyramid reaching its own
 exit — trigger distance, taker round trip and the crossing print — stays inside
 the stop budget (`resolve_step_quote`), never below the venue minimum notional.
 
+When the budget wants less than the venue minimum the rung is **floored** at it
+($100). Then:
+
+- The controller rounds the rung UP to the smallest whole lot that clears the
+  minimum at the price the order is sent at (a SELL rung's IOC limit, floored to
+  the tick) — at most `REVGRID_RUNG_ROUND_UP_MAX_FRAC` (10%) over the plan; a
+  coarser lot is refused (`Quoting: PAUSED`, `venue_min_notional`). The card
+  labels such a rung "(+≤10% lot rounding)".
+- A floored pyramid can cost more than the stop budget to reach the ladder's own
+  stop (defaults: ~$4.14 worst case vs $0.80). The card says so ("Thin"); the
+  session PnL rail — the user's SL — ends such a failed breakout.
+- If one pyramid round trip's taker fees alone meet the budget ("Stop too tight
+  to trade"), the mapper sets `stop_budget_unfundable` and the ladder HOLDS
+  (`stop_budget_too_tight`) until the user raises the stop or adds margin.
+  D-Grid's trend phase mirrors either hold onto its own card.
+
 Retired: the maker-only `RGridController` keys `rgrid_discretion`,
 `rgrid_reset_threshold_pct`, `rgrid_reset_timeout_seconds` are not read by the
 trigger engine and are no longer offered on the card.

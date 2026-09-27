@@ -87,6 +87,7 @@ from src.nadobro.engine.types import OrderType, TradeType, _as_bool, _dec
 from src.nadobro.quant.rgrid_sizing import (
     REVGRID_ENTRY_SLIP,
     REVGRID_MAX_LEVELS,
+    REVGRID_RUNG_ROUND_UP_MAX_FRAC,
     REVGRID_STOP_SLIP,
     REVGRID_VENUE_MAX_PENDING_TRIGGERS,
     TAKER_ROUND_TRIP_RATE,
@@ -204,6 +205,8 @@ class ReverseGridController(Controller):
         self._unreadable_ticks = 0
         self._foreign_ticks = 0
         self._min_notional_ticks = 0
+        self._stop_budget_hold_ticks = 0
+        self._last_refusal = ""
         self._last_reconcile_tick = -1
 
     # -- config ---------------------------------------------------------------
@@ -287,6 +290,13 @@ class ReverseGridController(Controller):
         self._regime_range_on_vr = float(self.cfg("revgrid_regime_range_on_vr", 1.15) or 1.15)
         self._regime_trend_drift_pct = float(self.cfg("revgrid_regime_trend_drift_pct", 0.30) or 0.30)
         self._trend_confirm_ticks = int(max(1, int(self.cfg("revgrid_trend_confirm_ticks", 3) or 3)))
+        # Stop-budget hold (GRIDFAM-2026-09-27 review): the mapper sets this when the
+        # plan is floored at the venue minimum AND one pyramid round trip's taker
+        # fees alone meet the session stop budget (the card's "Stop too tight to
+        # trade"). Before RGRID-B1 such a plan placed nothing by accident; placing it
+        # now would only pay fees into a guaranteed session stop, so the ladder holds
+        # VISIBLY instead ("Quoting: PAUSED" + what to change). Exits are never gated.
+        self.stop_budget_unfundable = _as_bool(self.cfg("stop_budget_unfundable", False), False)
 
     def reload_config(self) -> None:
         """Apply a live settings edit: re-read the geometry + gate params from the
@@ -685,6 +695,24 @@ class ReverseGridController(Controller):
                 await self._cancel_all_rungs()
             self._anchor = None
             return
+        if self.stop_budget_unfundable:
+            # One round trip's fees alone would spend the whole session stop budget:
+            # arm nothing (and drop any resting ladder after a live settings edit).
+            self.gate_verdict, self.gate_reason = "PAUSE", "stop_budget_too_tight"
+            if self._rungs:
+                await self._cancel_all_rungs()
+            self._anchor = None
+            self._stop_budget_hold_ticks += 1
+            if self._stop_budget_hold_ticks == 1 or self._stop_budget_hold_ticks % 12 == 0:
+                logger.warning(
+                    "revgrid %s: holding — per-rung $%s x %s rungs costs its whole session "
+                    "stop budget in taker fees alone; raise the PnL stop or add margin "
+                    "(%s tick(s), user=%s)",
+                    self.trading_pair, self.order_amount_quote, self.levels,
+                    self._stop_budget_hold_ticks, self.user_id,
+                )
+            return
+        self._stop_budget_hold_ticks = 0
         # Armed / re-anchoring: quoting is live again.
         self.gate_verdict, self.gate_reason = "QUOTE", ""
         if self._anchor is None:
@@ -784,8 +812,10 @@ class ReverseGridController(Controller):
         default settings sat LIVE with 0 orders. When the plan's notional meets the
         minimum, the base is instead the smallest whole-lot size whose notional at
         the order's LIMIT price (a SELL rung's IOC limit sits ``entry_slippage_pct``
-        under its level) clears the minimum: at most one lot above the plan, and
-        exactly what the client would otherwise grow it to untracked. A plan
+        under its level, floored to the tick as the client sends it) clears the
+        minimum: at most one lot — and never more than ``REVGRID_RUNG_ROUND_UP_MAX_FRAC`` —
+        above the plan, and exactly what the client would otherwise grow it to
+        untracked. A plan
         notional genuinely BELOW the minimum is still declined — never grown past
         the risk-approved size — and ``_place_ladder`` surfaces that refusal as the
         ``venue_min_notional`` hold."""
@@ -795,6 +825,7 @@ class ReverseGridController(Controller):
         try:
             lot = _dec(self.adapter.lot_size(self.trading_pair) or 0)
             floor_quote = _dec(self.adapter.min_notional(self.trading_pair) or 0)
+            tick = _dec(self.adapter.tick_size(self.trading_pair) or 0)
         except Exception:  # noqa: BLE001 - no metadata ⇒ send as-is
             return base
         if lot > 0:
@@ -803,14 +834,27 @@ class ReverseGridController(Controller):
             limit_px = level
             if side is TradeType.SELL:
                 limit_px = level * (Decimal(1) - _dec(self.entry_slippage_pct) / Decimal(100))
+                # The client FLOORS the order price to the tick and re-checks the
+                # minimum there (growing it by a lot, untracked, if it now falls
+                # short) — so check at the same tick-floored price it will send.
+                if tick > 0:
+                    limit_px = (limit_px / tick).to_integral_value(rounding=ROUND_DOWN) * tick
             if limit_px <= 0:
                 return None
             if base * limit_px < floor_quote:
                 if self.order_amount_quote < floor_quote:
+                    self._last_refusal = "below_min"
                     return None
                 base = floor_quote / limit_px
                 if lot > 0:
                     base = (base / lot).to_integral_value(rounding=ROUND_CEILING) * lot
+                # A coarse lot could make that round-up a large fraction of the
+                # plan (one lot >= the whole minimum ⇒ a full extra lot). Bound it:
+                # past REVGRID_RUNG_ROUND_UP_MAX_FRAC over the planned notional the rung is
+                # refused (visible venue_min_notional hold), never silently oversized.
+                if base * level > self.order_amount_quote * (Decimal(1) + REVGRID_RUNG_ROUND_UP_MAX_FRAC):
+                    self._last_refusal = "lot_overshoot"
+                    return None
         if base <= 0:
             return None
         return base
@@ -822,10 +866,16 @@ class ReverseGridController(Controller):
         self._min_notional_ticks += 1
         self.gate_verdict, self.gate_reason = "PAUSE", "venue_min_notional"
         if self._min_notional_ticks == 1 or self._min_notional_ticks % 12 == 0:
+            why = (
+                "meeting the venue minimum would need more than "
+                f"{int(REVGRID_RUNG_ROUND_UP_MAX_FRAC * 100)}% over the plan (coarse lot)"
+                if self._last_refusal == "lot_overshoot"
+                else "it is below the venue minimum"
+            )
             logger.warning(
-                "revgrid %s: %s rung(s) declined — per-rung notional $%s is below the "
-                "venue minimum; nothing armed (%s tick(s), user=%s)",
-                self.trading_pair, refused, self.order_amount_quote,
+                "revgrid %s: %s rung(s) declined — per-rung notional $%s: %s; nothing "
+                "armed (%s tick(s), user=%s)",
+                self.trading_pair, refused, self.order_amount_quote, why,
                 self._min_notional_ticks, self.user_id,
             )
 

@@ -1827,6 +1827,9 @@ def fmt_status_overview(status: dict, onboarding: dict):
         elif _gate_reason_key == "venue_min_notional":
             # Not a venue READ problem — the configured size is too small to place.
             _resume_line = _loc("Add margin, raise leverage or use fewer rungs so each rung meets the venue minimum.")
+        elif _gate_reason_key == "stop_budget_too_tight":
+            # A sizing hold: the plan cannot trade inside the user's own PnL stop.
+            _resume_line = _loc("Raise the PnL stop, add margin or use fewer rungs to arm.")
         elif _gate_reason_key in VENUE_GATE_REASONS:
             # A venue hold (position unreadable / residual being cleared) is not a
             # regime verdict — it resumes when the venue read recovers.

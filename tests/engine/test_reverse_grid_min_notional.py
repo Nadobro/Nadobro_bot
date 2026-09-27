@@ -128,3 +128,174 @@ def test_min_notional_hold_clears_once_rungs_place():
         assert c.gate_verdict == "QUOTE" and c.gate_reason == ""
 
     asyncio.run(body())
+
+
+# --------------------------------------------------------------------------- #
+# Review follow-ups (2026-09-27): the SELL check happens at the tick-floored     #
+# price the client sends; a coarse lot can never balloon a rung; a plan whose   #
+# fees alone spend the stop budget holds visibly; D-Grid surfaces the hold.     #
+# --------------------------------------------------------------------------- #
+def _flat_cfg(**over):
+    cfg = {"levels": 4, "step_pct": Decimal("0.0015"), "order_amount_quote": Decimal("100"),
+           "revgrid_chop_stand_down": False}
+    cfg.update(over)
+    return cfg
+
+
+def test_a_sell_rung_clears_the_minimum_at_the_tick_floored_price_the_client_sends():
+    """The client floors a SELL limit to the tick and re-checks the venue minimum
+    there, growing the order by a lot (untracked) if it falls short. At this mid
+    (BTC, $1 tick) the unfloored check passed by less than one tick of notional, so
+    the venue order would have been a lot bigger than the rung the controller books."""
+    from decimal import ROUND_DOWN
+
+    mid = Decimal("111613")
+
+    async def body():
+        a = MockNadoAdapter(mid=mid, tick=Decimal("1"), lot=LOT, min_notional=MIN_NOTIONAL,
+                            venue_held={PAIR: Decimal(0)})
+        c = _controller(a, _flat_cfg())
+        await c.on_tick()
+        return a, c
+
+    a, c = asyncio.run(body())
+    sells = [o for o in a.placed_triggers if o.side is TradeType.SELL]
+    assert len(sells) == 4
+    slip = Decimal(str(c.entry_slippage_pct)) / Decimal(100)
+    for o in sells:
+        sent_px = (o.price * (Decimal(1) - slip)).to_integral_value(rounding=ROUND_DOWN)
+        assert o.amount_base * sent_px >= MIN_NOTIONAL, (o.price, o.amount_base)
+
+
+def test_a_coarse_lot_never_balloons_a_rung_past_the_round_up_cap():
+    """One lot worth ~$33 at BTC: meeting $100 needs 4 lots ($132, +32%) — past the
+    10% round-up bound, so the rung is refused and the hold is visible, never placed
+    silently a third bigger than the plan."""
+    from src.nadobro.quant.rgrid_sizing import REVGRID_RUNG_ROUND_UP_MAX_FRAC
+
+    async def body():
+        a = MockNadoAdapter(mid=MID, tick=Decimal("1"), lot=Decimal("0.0003"),
+                            min_notional=MIN_NOTIONAL, venue_held={PAIR: Decimal(0)})
+        c = _controller(a, _flat_cfg(levels=2))
+        await c.on_tick()
+        return a, c
+
+    a, c = asyncio.run(body())
+    assert REVGRID_RUNG_ROUND_UP_MAX_FRAC == Decimal("0.10")
+    assert a.placed_triggers == []
+    assert (c.gate_verdict, c.gate_reason) == ("PAUSE", "venue_min_notional")
+
+
+def test_every_placed_rung_stays_within_the_round_up_cap_of_the_plan():
+    from src.nadobro.quant.rgrid_sizing import REVGRID_RUNG_ROUND_UP_MAX_FRAC
+
+    async def body():
+        a = _adapter()
+        c = _controller(a, _flat_cfg())
+        await c.on_tick()
+        return a
+
+    a = asyncio.run(body())
+    assert len(a.placed_triggers) == 8
+    for o in a.placed_triggers:
+        assert o.amount_base * o.price <= MIN_NOTIONAL * (Decimal(1) + REVGRID_RUNG_ROUND_UP_MAX_FRAC)
+
+
+def test_a_plan_whose_fees_alone_spend_the_stop_budget_holds_visibly(monkeypatch):
+    """SL 0.3% of $100 = $0.30 budget; the venue-minimum pyramid (4 x $100) costs
+    $0.34 in taker fees per round trip — the card says "Stop too tight to trade".
+    Before RGRID-B1 it placed nothing by accident; it must not now pay fees into a
+    guaranteed session stop: the ladder holds with a named reason, and card and
+    engine agree on the verdict."""
+    from src.nadobro.engine.routines.regime_gate import GATE_REASON_HUMAN, VENUE_GATE_REASONS
+    from src.nadobro.handlers import strategy_handler as sh
+
+    tight = dict(DEFAULTS, rgrid_stop_loss_pct=0.3)
+    cfg = _engine_cfg(monkeypatch, tight, 5)
+    assert cfg["stop_budget_unfundable"] is True
+    assert sh.rgrid_stop_headroom(tight, 0.3)["fees_exceed_budget"] is True
+    # Defaults are "Thin", not unfundable: they still trade (RGRID-B1 stays fixed).
+    assert _engine_cfg(monkeypatch, DEFAULTS, 5)["stop_budget_unfundable"] is False
+    assert sh.rgrid_stop_headroom(DEFAULTS, 0.8)["fees_exceed_budget"] is False
+
+    async def body():
+        a = _adapter()
+        c = _controller(a, cfg)
+        await c.on_tick()
+        held = (list(a.placed_triggers), c.gate_verdict, c.gate_reason)
+        # A live settings edit that funds the stop re-arms on the next tick.
+        c.configs["stop_budget_unfundable"] = False
+        c.reload_config()
+        await c.on_tick()
+        return a, c, held
+
+    a, c, held = asyncio.run(body())
+    assert held == ([], "PAUSE", "stop_budget_too_tight")
+    assert "stop_budget_too_tight" in GATE_REASON_HUMAN
+    assert "stop_budget_too_tight" in VENUE_GATE_REASONS      # no gate-event storm
+    assert len(a.placed_triggers) == 2 * int(cfg["levels"])
+    assert (c.gate_verdict, c.gate_reason) == ("QUOTE", "")
+
+
+@pytest.mark.parametrize("trend_over, reason", [
+    ({"order_amount_quote": Decimal("60")}, "venue_min_notional"),
+    ({"stop_budget_unfundable": True}, "stop_budget_too_tight"),
+])
+def test_dgrid_surfaces_its_trend_phase_rung_hold_on_its_own_card(trend_over, reason):
+    """engine_diag reads only D-Grid's own gate, so a trend phase whose rungs are
+    held used to show "Quoting: active" with 0 orders. The hold is mirrored up."""
+    from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+    from src.nadobro.engine.routines import variance_regime
+
+    async def body():
+        a = _adapter()
+        trend_cfg = dict(_flat_cfg(levels=2), trading_pair=PAIR, **trend_over)
+        cfg = {"trading_pair": PAIR, "total_amount_quote": "500", "levels_count": 2,
+               "dgrid_trend_follow": 1, "trend_uses_trigger": True, "trend_rgrid": trend_cfg}
+        dg = DynamicGridController(user_id=1, orchestrator=ExecutorOrchestrator(),
+                                   adapter=a, inventory=InventoryRepository(), configs=cfg)
+        assert await dg._spawn_trend(MID) is True
+        spawned = (dg.gate_verdict, dg.gate_reason)
+        await dg._tick_trend_phase(variance_regime.RGRID, MID)
+        return a, dg, spawned
+
+    a, dg, spawned = asyncio.run(body())
+    assert a.placed_triggers == []
+    assert spawned == ("PAUSE", reason)
+    assert (dg.gate_verdict, dg.gate_reason) == ("PAUSE", reason)
+
+
+def test_dgrid_does_not_mirror_a_delegate_regime_reason():
+    from types import SimpleNamespace
+
+    from src.nadobro.engine.controllers.dynamic_grid import DynamicGridController
+    from src.nadobro.engine.inventory import InventoryRepository
+    from src.nadobro.engine.orchestrator import ExecutorOrchestrator
+
+    dg = DynamicGridController(
+        user_id=1, orchestrator=ExecutorOrchestrator(), adapter=_adapter(),
+        inventory=InventoryRepository(),
+        configs={"trading_pair": PAIR, "total_amount_quote": "500", "levels_count": 2},
+    )
+    dg._trend = SimpleNamespace(gate_verdict="PAUSE", gate_reason="revgrid_chop")
+    dg._mirror_trend_hold()
+    assert getattr(dg, "gate_reason", "") != "revgrid_chop"
+
+
+def test_the_plan_reports_a_floored_pyramid_that_outgrows_its_stop_budget(monkeypatch):
+    """At defaults the rung is floored at $100, so a full 4-rung pyramid reaching the
+    ladder's own stop (worst case: entry slip + 2 x step stop + stop slip + taker
+    round trip) costs ~$4.14 against a $0.80 budget. The plan says so (the card no
+    longer promises the pyramid fits); a roomy stop fits."""
+    from src.nadobro.handlers import strategy_handler as sh
+
+    plan = sh.rgrid_trigger_plan(DEFAULTS, 0.8)
+    assert plan.sizing.floored and not plan.sizing.fees_exceed_budget
+    assert float(plan.pyramid_stop_cost) == pytest.approx(4.144, abs=0.01)
+    assert not plan.pyramid_fits_budget
+    monkeypatch.setenv("NADO_REVGRID_TRIGGER_ENABLED", "1")
+    room = sh.rgrid_stop_headroom(DEFAULTS, 0.8)
+    assert room["pyramid_fits"] is False and room["levels"] == 4
+    assert sh.rgrid_trigger_plan(DEFAULTS, 10.0).pyramid_fits_budget

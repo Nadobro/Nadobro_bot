@@ -1885,9 +1885,15 @@ def rgrid_stop_headroom(conf: dict, sl_pct_val: float) -> dict:
     real cost is lower — pricing the bound conservatively means the displayed
     headroom is a floor, never an overstatement.
     """
+    from src.nadobro.strategy.engine_runtime import revgrid_trigger_enabled
+
     margin, plan = rgrid_step_plan(conf, sl_pct_val)
     budget = float(plan.stop_budget_usd)
     fee = float(plan.round_trip_cost)
+    # Trigger ladder only: the worst-case cost of a FULL pyramid reaching the
+    # ladder's own stop (move + fees) — what the stop-budget cap sizes against.
+    # A floored plan can exceed the budget; the card must say so, not promise it fits.
+    trig = rgrid_trigger_plan(conf, sl_pct_val) if revgrid_trigger_enabled() else None
     return {
         "margin": margin,
         "budget_usd": budget,
@@ -1898,7 +1904,25 @@ def rgrid_stop_headroom(conf: dict, sl_pct_val: float) -> dict:
         "round_trips": (budget / fee) if fee > 0 else float("inf"),
         "capped": bool(plan.capped),
         "floored": bool(plan.floored),
+        "fees_exceed_budget": bool(plan.fees_exceed_budget),
+        "levels": int(trig.levels) if trig is not None else 0,
+        "pyramid_stop_usd": float(trig.pyramid_stop_cost) if trig is not None else 0.0,
+        "pyramid_fits": bool(trig.pyramid_fits_budget) if trig is not None else True,
     }
+
+
+def rgrid_rung_usd_text(rung_usd: float) -> str:
+    """Per-rung notional as the card shows it. A rung at/near the venue minimum is
+    rounded UP to a whole lot by the engine (RGRID-B1) — at most
+    ``REVGRID_RUNG_ROUND_UP_MAX_FRAC`` over the plan, else refused — so label it
+    instead of quoting a number the engine will not place exactly."""
+    from src.nadobro.quant.mm_quote_math import DEFAULT_MIN_ORDER_NOTIONAL_USD
+    from src.nadobro.quant.rgrid_sizing import REVGRID_RUNG_ROUND_UP_MAX_FRAC
+
+    frac = float(REVGRID_RUNG_ROUND_UP_MAX_FRAC)
+    if 0 < rung_usd < float(DEFAULT_MIN_ORDER_NOTIONAL_USD) * (1.0 + frac):
+        return f"${rung_usd:,.0f} (+≤{frac * 100:.0f}% lot rounding)"
+    return f"${rung_usd:,.0f}"
 
 
 def _rgrid_step_cap_note(conf: dict, sl_pct_val: float) -> str:
@@ -1916,20 +1940,32 @@ def _rgrid_step_cap_note(conf: dict, sl_pct_val: float) -> str:
     if room["floored"]:
         # The budget wanted a step SMALLER than the venue accepts, so the cap could
         # not finish the job. How bad that is depends on what is actually left.
-        if room["ratio"] >= 1.0:
+        if room.get("fees_exceed_budget", room["ratio"] >= 1.0):
             return (
                 f"\n\n🚨 *Stop too tight to trade\\.* The smallest step the venue "
                 f"accepts \\({step}\\) costs {fee} per round trip — more than "
-                f"your whole {budget} stop budget, so the session stops out on fees "
-                "alone whichever way price goes\\. Raise the PnL stop or add margin\\."
+                f"your whole {budget} stop budget, so the session would stop out on "
+                "fees alone whichever way price goes\\. The ladder *holds* \\(arms "
+                "nothing\\) until you raise the PnL stop or add margin\\."
             )
         trips = escape_md(f"{room['round_trips']:.1f}")
-        return (
+        note = (
             f"\n\n⚠️ *Thin\\.* The step is already at the venue minimum \\({step}\\) "
             f"so it cannot be capped further: {fee} per round trip leaves only about "
             f"{trips} inside your {budget} stop budget\\. Raise the PnL stop or add "
             "margin for more room\\."
         )
+        if not room.get("pyramid_fits", True):
+            # The ladder's OWN stop no longer fits inside the session budget: the
+            # PnL rail (the user's SL) is what ends a failed pyramid.
+            cost = escape_md(f"${room['pyramid_stop_usd']:,.2f}")
+            note += (
+                f" A full {int(room.get('levels') or 0)}\\-rung pyramid stopped at the "
+                f"ladder's own stop can cost up to {cost} \\(worst case\\), more than "
+                "that budget — so your PnL stop, not the ladder's stop, will usually "
+                "end a failed breakout, and the run stops there\\."
+            )
+        return note
     if room["capped"]:
         uncapped = escape_md(f"${room['uncapped_step_usd']:,.0f}")
         trips = escape_md(f"{room['round_trips']:.0f}")
@@ -2231,7 +2267,7 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             _budget_txt = escape_md(f"${_room['budget_usd']:,.2f}")
             _margin_txt = escape_md(f"${_room['margin']:,.0f}")
             _rt_txt = escape_md(f"${_room['round_trip_usd']:,.2f}")
-            _step_txt = escape_md(f"${_room['step_usd']:,.0f}")
+            _step_txt = escape_md(rgrid_rung_usd_text(float(_room['step_usd'])))
             _budget_line = (
                 f"Stop budget: *{_budget_txt}* "
                 f"\\({escape_md(pnl_sl)} of {_margin_txt} margin\\)\n"
@@ -2247,8 +2283,13 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
                 "NET of fees — the session rail behind every position\\. Every rung "
                 "fills as a TAKER when its trigger fires and the trailing stop crosses "
                 "to exit, so the size per rung is capped so a full pyramid reaching its "
-                "own stop, fees included, fits inside that budget\\. The per\\-position "
-                "stop and trail live on the Exits tab\\."
+                "own stop, fees included, fits inside that budget"
+                + (
+                    "\\. " if _room.get("pyramid_fits", True) else
+                    " — except when the rung is already at the venue minimum \\(see "
+                    "below\\)\\. "
+                )
+                + "The per\\-position stop and trail live on the Exits tab\\."
                 f"{_rgrid_step_cap_note(conf, _sl_val)}"
             )
         if section in ("exits", "reset"):
@@ -2291,7 +2332,7 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             "⚙️ *Reverse GRID · Core*\n\n"
             f"Margin: *{escape_md(f'${notional:,.0f}')}* \\| Interval: *{escape_md(f'{interval_seconds}s')}*\n"
             f"Rungs: *{escape_md(_levels_lbl)}* \\| Spread: *{escape_md(rgrid_spread)}*{_step_note}\n"
-            f"Per rung: *{escape_md(f'${float(_plan.rung_quote):,.0f}')}* \\| "
+            f"Per rung: *{escape_md(rgrid_rung_usd_text(float(_plan.rung_quote)))}* \\| "
             f"Chop guard: *{escape_md(_chop)}* \\| POV: *{escape_md(pov_label)}*\n"
             f"{_mm_sizing_line(conf)}\n"
             f"{_run_duration_line(conf, 'rgrid')}\n\n"
@@ -3629,7 +3670,7 @@ def _build_strategy_preview_text(
             f"• Rungs: *{escape_md(_rg_rungs)}* \\| Step: *{escape_md(f'{_rg_step_bp:.0f}bp')}*"
             + (f" \\(spread {escape_md(f'{spread_bp:.0f}bp')} floored\\)" if _rg_plan.step_floored else "")
             + "\n"
-            f"• Per rung: *{escape_md(_fmt_usd(float(_rg_plan.rung_quote)))}*\n"
+            f"• Per rung: *{escape_md(rgrid_rung_usd_text(float(_rg_plan.rung_quote)))}*\n"
             f"• Timing: *{escape_md(f'{interval_seconds}s')}*\n"
             f"• Leverage: *{escape_md(f'MAX ({leverage:.0f}x per-asset)')}*\n"
             f"• Stop / Trail: *{escape_md(f'{_rg_stop_pct:.2f}% / {_rg_trail_pct:.2f}%')}*"

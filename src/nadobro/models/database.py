@@ -1341,8 +1341,10 @@ def rollup_session_from_trades(session_id: int, network: str) -> dict:
     persisted card numbers match the actual fills (and don't drift when
     venue-sync fills arrive late or when cycle increments missed a fee).
 
-    Returns the resolved totals dict (always returns; on DB error returns
-    an empty dict so callers can decide what to do).
+    Returns the recomputed totals dict (always returns; on DB error returns
+    an empty dict so callers can decide what to do). Note its
+    ``total_orders_cancelled`` is the cancelled-ROW count; the stored column is
+    merged with GREATEST and may be higher (engine-accumulated cancels).
     """
     table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
     try:
