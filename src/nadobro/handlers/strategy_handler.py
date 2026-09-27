@@ -2297,9 +2297,12 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
                 "to exit, so the size per rung is capped so a full pyramid reaching its "
                 "own stop, fees included, fits inside that budget"
                 + (
-                    "\\. " if _room.get("pyramid_fits", True) else
+                    # The caveat is only true when the rung really is floored at
+                    # the venue minimum; otherwise the cap does fit the budget.
                     " — except when the rung is already at the venue minimum \\(see "
                     "below\\)\\. "
+                    if (not _room.get("pyramid_fits", True) and _room.get("floored"))
+                    else "\\. "
                 )
                 + "The per\\-position stop and trail live on the Exits tab\\."
                 f"{_rgrid_step_cap_note(conf, _sl_val)}"

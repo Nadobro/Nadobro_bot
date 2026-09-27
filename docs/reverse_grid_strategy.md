@@ -81,8 +81,11 @@ When the budget wants less than the venue minimum the rung is **floored** at it
   coarser lot is refused (`Quoting: PAUSED`, `venue_min_notional`). The card
   labels such a rung "(+≤10% lot rounding)".
 - A floored pyramid can cost more than the stop budget to reach the ladder's own
-  stop (defaults: ~$4.14 worst case vs $0.80). The card says so ("Thin"); the
-  session PnL rail — the user's SL — ends such a failed breakout.
+  stop (e.g. the old 0.8% default: ~$4.14 worst case vs $0.80). The card says so
+  ("Thin"); the session PnL rail — the user's SL — ends such a failed breakout.
+  At the 5% default (2026-09-27) the default ladder is NOT floored: $120.66 per
+  rung at $100 margin, and a full pyramid reaching its stop costs the $5.00
+  budget.
 - If one pyramid round trip's taker fees alone meet the budget ("Stop too tight
   to trade"), the mapper sets `stop_budget_unfundable` and the ladder HOLDS
   (`stop_budget_too_tight`) until the user raises the stop or adds margin.
