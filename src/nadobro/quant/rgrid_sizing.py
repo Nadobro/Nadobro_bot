@@ -167,6 +167,18 @@ class StepPlan:
     floored: bool                 # the budget wanted LESS than min_step_usd
 
     @property
+    def fees_exceed_budget(self) -> bool:
+        """The step is floored at the venue minimum AND one pyramid round trip's
+        taker fees alone meet the stop budget: the session would stop out on fees
+        whichever way price goes (the card's "Stop too tight to trade"). The
+        trigger mapper holds such a plan instead of arming it."""
+        return (
+            self.floored
+            and self.stop_budget_usd > 0
+            and self.round_trip_cost >= self.stop_budget_usd
+        )
+
+    @property
     def round_trips_in_budget(self) -> Decimal:
         """How many entry+exit round trips fit inside the stop before costs alone
         close the session. Infinite when the stop is disarmed."""
@@ -340,6 +352,11 @@ REVGRID_STOP_SLIP = Decimal("0.005")     # 50bp (the rail's venue stop uses the 
 REVGRID_VENUE_MAX_PENDING_TRIGGERS = 25
 # Rungs per side that fit the venue limit while flat (2 x 12 = 24 <= 25).
 REVGRID_MAX_LEVELS = 12
+# How far ABOVE its planned notional the controller may round a rung UP to a whole
+# lot so it clears the venue minimum (RGRID-B1). At BTC (~$5.5 lot on a $100 rung)
+# that is ~+5%; a coarser lot needing more is refused (visible venue_min_notional
+# hold). The card labels a near-minimum rung with this bound.
+REVGRID_RUNG_ROUND_UP_MAX_FRAC = Decimal("0.10")
 
 
 @dataclass(frozen=True)
@@ -355,10 +372,31 @@ class TriggerLadderPlan:
     step_floored: bool           # the user's spread was below REVGRID_STEP_FLOOR
     stop_is_auto: bool           # stop derived from the step (no user override)
     trail_is_auto: bool          # trail derived from the step (no user override)
+    # Worst-case adverse move (fraction of price) a rung is sized to survive: entry
+    # slip + the ladder's own stop + the stop close's slip (the stop-budget PRICE
+    # bound). 0 on plans built before it was recorded.
+    exit_band_frac: Decimal = Decimal(0)
 
     @property
     def rung_quote(self) -> Decimal:
         return self.sizing.step
+
+    @property
+    def pyramid_stop_cost(self) -> Decimal:
+        """Worst-case cost (quote) of a FULL pyramid (``levels`` rungs) reaching the
+        ladder's own stop: the adverse move to the stop plus the taker round trip,
+        the same bound ``max_step_for_stop_budget`` sizes against. When the plan is
+        floored at the venue minimum this can exceed the stop budget — the session
+        PnL rail then ends the run before the ladder's own stop fires."""
+        exposure = self.sizing.step * Decimal(self.levels)
+        return exposure * (self.exit_band_frac + TAKER_ROUND_TRIP_RATE)
+
+    @property
+    def pyramid_fits_budget(self) -> bool:
+        """A full pyramid stopped out at the ladder's own stop stays inside the
+        session stop budget (always True when the stop is disarmed)."""
+        budget = self.sizing.stop_budget_usd
+        return budget <= 0 or self.pyramid_stop_cost <= budget
 
     @property
     def levels_capped(self) -> bool:
@@ -444,4 +482,5 @@ def trigger_ladder_plan(
         step_floored=raw_spread < REVGRID_STEP_FLOOR,
         stop_is_auto=stop_auto,
         trail_is_auto=trail_auto,
+        exit_band_frac=band,
     )

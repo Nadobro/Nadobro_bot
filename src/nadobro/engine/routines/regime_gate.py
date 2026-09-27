@@ -77,6 +77,13 @@ GATE_REASON_HUMAN: Dict[str, str] = {
     # and a same-signed one could be trimmed by the run's exits. Hold until the
     # user closes it (or stops and picks another market).
     "venue_foreign_position": "an open position on this market was not opened by this run",
+    # R-Grid declined every rung: the per-rung notional is below the venue's
+    # minimum order size (RGRID-B1, 2026-09-27 — was a silent "LIVE, 0 orders").
+    "venue_min_notional": "each rung is below the venue minimum order size",
+    # R-Grid holds a plan whose rungs are floored at the venue minimum AND whose
+    # pyramid round trip in taker fees alone meets the session stop budget: it
+    # could only pay fees into a guaranteed session stop (GRIDFAM-2026-09-27).
+    "stop_budget_too_tight": "stop too tight — fees alone would hit the PnL stop",
 }
 
 # Reasons whose resume condition is "a trend forms" (reverse grid), NOT "the
@@ -84,11 +91,13 @@ GATE_REASON_HUMAN: Dict[str, str] = {
 # this to word the resume line correctly per strategy.
 REVGRID_GATE_REASONS: frozenset = frozenset({"revgrid_chop"})
 
-# Reasons that are a VENUE hold, not a regime verdict: they resume when the venue
-# read recovers / the residual is cleared, so the card must not promise "when the
-# market ranges again" or "when a trend forms".
+# Reasons that are a VENUE / sizing hold, not a regime verdict: they resume when
+# the venue read recovers / the residual is cleared / the user changes the size or
+# stop, so the card must not promise "when the market ranges again" or "when a
+# trend forms", and the gate never emits pause/resume events for them.
 VENUE_GATE_REASONS: frozenset = frozenset({
-    "venue_unreadable", "venue_residual", "venue_foreign_position",
+    "venue_unreadable", "venue_residual", "venue_foreign_position", "venue_min_notional",
+    "stop_budget_too_tight",
 })
 
 

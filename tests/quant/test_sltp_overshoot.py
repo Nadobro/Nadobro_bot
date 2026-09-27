@@ -106,3 +106,35 @@ def test_effective_trigger_bounds(sl, lev, move):
     eff = effective_sl_trigger(sl, lev, move)
     floor = (1.0 - max_buffer_fraction()) * sl
     assert floor - 1e-9 <= eff <= sl + 1e-9   # within [(1-maxfrac)·sl, sl]
+
+
+# --- close-fee reserve (GRIDFAM-2026-09-27-SL-CLOSE-FEE) ---------------------
+
+def test_close_cost_pct_is_the_taker_fee_on_the_open_notional_over_margin():
+    from src.nadobro.quant.sltp_overshoot import close_cost_pct
+
+    assert close_cost_pct(4900.0, 100.0, rate=0.00043) == pytest.approx(2.107)
+    assert close_cost_pct(-4900.0, 100.0, rate=0.00043) == pytest.approx(2.107)  # short
+    assert close_cost_pct(0.0, 100.0) == 0.0          # flat: nothing to close
+    assert close_cost_pct(4900.0, 0.0) == 0.0         # no margin basis
+    assert close_cost_pct(None, None) == 0.0
+
+
+def test_close_fee_reserve_can_be_disabled_and_retuned(monkeypatch):
+    from src.nadobro.quant.sltp_overshoot import close_cost_pct
+
+    monkeypatch.setenv("NADO_SLTP_CLOSE_FEE_BP", "0")
+    assert close_cost_pct(4900.0, 100.0) == 0.0
+    monkeypatch.setenv("NADO_SLTP_CLOSE_FEE_BP", "5  # tier change")
+    assert close_cost_pct(10000.0, 100.0) == pytest.approx(5.0)
+
+
+def test_close_cost_is_reserved_alongside_the_velocity_term_under_one_cap():
+    calm = effective_sl_trigger(10.0, 49.0, 0.0, close_cost_pct=2.0)
+    assert calm == pytest.approx(8.0)
+    # velocity 3% + close 2% = 5% reserve, exactly the 0.5 cap on a 10% stop
+    both = effective_sl_trigger(10.0, 50.0, 6.0, factor=1.0, max_fraction=0.5, close_cost_pct=2.0)
+    assert both == pytest.approx(5.0)
+    capped = effective_sl_trigger(10.0, 50.0, 20.0, factor=1.0, max_fraction=0.5, close_cost_pct=2.0)
+    assert capped == pytest.approx(5.0)
+    assert effective_sl_trigger(0.0, 50.0, 0.0, close_cost_pct=2.0) == 0.0   # disarmed stays disarmed

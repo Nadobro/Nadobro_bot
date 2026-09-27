@@ -1357,6 +1357,10 @@ def _map_revgrid_config(
         "trail_giveback_pct": plan.trail_giveback_pct,
         # Chop stand-down gate ON by default (a reverse grid must not trade chop).
         "revgrid_chop_stand_down": _as_bool(settings.get("rgrid_chop_stand_down", True), True),
+        # Floored at the venue minimum AND a pyramid round trip's taker fees alone
+        # meet the stop budget (the card's "Stop too tight to trade"): the controller
+        # holds visibly instead of paying fees into a guaranteed session stop.
+        "stop_budget_unfundable": bool(plan.sizing.fees_exceed_budget),
     }
     # Honour explicit per-run geometry overrides if the operator set them (testnet
     # tuning); they win over the user-facing knobs above.

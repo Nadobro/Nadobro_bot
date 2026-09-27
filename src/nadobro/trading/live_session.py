@@ -22,9 +22,11 @@ from the venue position makes the strategy SL agree with Portfolio.
 
 * ``unrealized_pnl`` — ``venue_position_uPnL - baseline_uPnL`` (run-only). When no
   position pre-existed (the common case), this is exactly the venue uPnL.
-* ``realized_pnl`` — venue-authoritative per-match realized (gross of fees); the
-  recorder cash-flow fallback is used ONLY when the run is flat (see
-  ``get_session_live_metrics``). Fees are a standalone metric, never in PnL.
+* ``realized_pnl`` — replayed from this run's fills at the real match price
+  (gross of fees: the venue fee is stripped back out of the fee-inclusive
+  ``quote_filled``); the recorder cash-flow fallback is used ONLY when the run is
+  flat (see ``get_session_live_metrics``). Fees are a standalone metric, never in
+  PnL, and ``session_pnl_net`` subtracts them exactly once.
 * ``volume`` — real traded turnover on the product since the run started
   (``get_session_turnover``), to match Nado.
 * ``funding_paid`` — paid-positive; reduces PnL.
@@ -321,6 +323,12 @@ def get_live_session_snapshot(
     # trips at -1% gross, i.e. the true loss is -1% minus accumulated fees, so the
     # stop fires late by the fee drag (worst on high-turnover grid/vol/DN). Expose
     # a net basis for the rail without changing the displayed gross PnL.
+    # EXACTLY ONCE (GRIDFAM-2026-09-27-RAIL-FEE-2X): ``realized`` is replayed at
+    # the real match price (the venue quote_filled is net of fee, so the replay
+    # strips fee_x18 back out — database._derive_session_realized_pnl) and the
+    # cross uPnL is the indexer's price-only est_pnl, so ``fees`` is subtracted
+    # here and nowhere else. Before the fix the replay was fee-inclusive and a
+    # zero-move round trip read -2 x fees on the rail.
     session_pnl_net = session_pnl - fees
     session_pnl_pct_net = (session_pnl_net / margin * 100.0) if margin > 0 else 0.0
 

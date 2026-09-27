@@ -3385,9 +3385,12 @@ async def _evaluate_session_pnl_rail(
     # buffer below TARGETS the realized net loss to land AT ``sl_pct`` (it reserves
     # only the move projected to occur during the flatten, so it centres the exit on
     # the user's number rather than firing early or overshooting). The user-facing
-    # figures below are the NET loss too, so the message matches the SL they set —
-    # the -3.56% GROSS that read as an "early stop" was really -10.90% NET (prod
-    # #253: price -$3.56, fees -$7.34), i.e. the $10 they configured.
+    # figures below are the NET loss too, so the message matches the SL they set.
+    # Fees are counted EXACTLY ONCE (GRIDFAM-2026-09-27-RAIL-FEE-2X): the old note
+    # here read prod #253 as "-3.56% gross = -10.90% net", but that -3.56% "price"
+    # figure was replayed from fee-inclusive venue prices, so the rail subtracted
+    # the fees a second time — #253's true net was about -2.94%. The snapshot's
+    # realized replay is now gross of fees and ``session_pnl_net`` = gross - fees.
     pnl = float(snap.get("session_pnl_net", pnl_gross) or 0.0)
     pct = float(snap.get("session_pnl_pct_net", pct_gross) or 0.0)
     pct_net = pct
@@ -3401,10 +3404,26 @@ async def _evaluate_session_pnl_rail(
     # only as much as the current velocity implies (never a flat leverage haircut,
     # which stopped #253 at half its budget). TP is never buffered. Fail-safe: any
     # error falls back to the raw sl_pct.
+    # GRIDFAM-2026-09-27-SL-CLOSE-FEE: ``pct_net`` has the fees ALREADY paid taken
+    # out, but the flatten this rail fires is a TAKER order that pays one more fee
+    # on the whole open notional. Reserve that projected close fee (as %-of-margin)
+    # so the REALIZED net loss lands on the user's SL, and take profit only once
+    # the gain still clears the TP after paying it. 0 when flat / disabled.
+    close_cost = 0.0
+    try:
+        from src.nadobro.quant.sltp_overshoot import close_cost_pct
+        close_cost = close_cost_pct(snap.get("position_value"), snap.get("margin"))
+    except Exception:  # noqa: BLE001 - the reserve is advisory; the raw SL still governs
+        logger.debug("sltp close-fee reserve skipped", exc_info=True)
+        close_cost = 0.0
     sl_trigger = sl_pct
     try:
         from src.nadobro.utils.env import env_bool
-        if sl_pct > 0 and env_bool("NADO_SLTP_BUFFER_ENABLED", True):
+        if sl_pct > 0 and not env_bool("NADO_SLTP_BUFFER_ENABLED", True):
+            # Velocity buffer disabled: still reserve the close fee.
+            from src.nadobro.quant.sltp_overshoot import effective_sl_trigger
+            sl_trigger = effective_sl_trigger(sl_pct, 0.0, 0.0, close_cost_pct=close_cost)
+        elif sl_pct > 0:
             from src.nadobro.quant.sltp_overshoot import effective_sl_trigger, move_bp
             # Effective leverage = the run's notional over the rail's OWN margin
             # basis (both from this snapshot) — the quantity that actually drives
@@ -3433,7 +3452,9 @@ async def _evaluate_session_pnl_rail(
                     _SLTP_MARK_CACHE.clear()
                 _SLTP_MARK_CACHE[_sid] = _mark
             _recent_move_bp = move_bp(_prev_mark, _mark) if (_prev_mark > 0 and _mark > 0) else 0.0
-            sl_trigger = effective_sl_trigger(sl_pct, _eff_lev, _recent_move_bp)
+            sl_trigger = effective_sl_trigger(
+                sl_pct, _eff_lev, _recent_move_bp, close_cost_pct=close_cost,
+            )
     except Exception:  # noqa: BLE001 - never let the buffer math disarm the stop
         logger.debug("sltp overshoot buffer skipped", exc_info=True)
         sl_trigger = sl_pct
@@ -3453,8 +3474,9 @@ async def _evaluate_session_pnl_rail(
         # -sl_pct they set (their real loss is price - fees - funding). The buffer
         # above targets the realized net loss at -sl_pct.
         reason = "sl_hit"
-    elif not reason and tp_pct > 0 and pct_net >= tp_pct:
-        # Symmetric: the TP also clears NET (profit is what the user actually nets).
+    elif not reason and tp_pct > 0 and pct_net - close_cost >= tp_pct:
+        # Symmetric: the TP also clears NET (profit is what the user actually nets)
+        # — including the flatten's own fee (GRIDFAM-2026-09-27-SL-CLOSE-FEE).
         reason = "tp_hit"
     # Overlay drawdown kill-switch: a SECOND, independent stop for the financial
     # overlay (10% of margin by default), armed only when the overlay steers
@@ -3492,9 +3514,9 @@ async def _evaluate_session_pnl_rail(
     logger.info(
         "session rail fired reason=%s strategy=%s user=%s: NET=%.2f%% "
         "(target -%.2f%%, buffered trigger -%.2f%%) = price %.2f%% - fees/funding %.2f%% "
-        "| fees=$%.2f margin=$%.2f",
+        "| close-fee reserve %.2f%% | fees=$%.2f margin=$%.2f",
         reason, strategy, telegram_id, pct_net, sl_pct, sl_trigger, pct_gross, fees_pct,
-        float(snap.get("fees") or 0.0), float(snap.get("margin") or 0.0),
+        close_cost, float(snap.get("fees") or 0.0), float(snap.get("margin") or 0.0),
     )
     _finalize_session(state, stop_reason=reason)
     _SLTP_MARK_CACHE.pop(int(sess.get("id") or 0), None)   # session over — drop its mark
@@ -3857,11 +3879,15 @@ async def _run_cycle(
             telegram_id, network, state, strategy, product, client
         )
 
-    # Option 7: overlap the two independent per-cycle reads (mid + open orders)
-    # so cycle latency is the slower of the two, not their sum. Engine strategies
-    # always take both paths and never early-return between the reads, so they
-    # gather; the legacy directional path stays sequential because its
-    # session-PnL rail can return before open orders are ever needed.
+    # Per-cycle reads: the mid always; the product's open orders ONLY for the
+    # legacy dispatch path (the one consumer of the list), fetched lazily right
+    # before it. Engine strategies used to gather an open-orders read with the mid
+    # every cycle and never use it (audit 2026-09-27, F5: 2 gateway weight per
+    # cycle, ~48% of a D-Grid session's gateway weight). It was a refresh=False
+    # read whose only side effect was warming the 5s client cache: the engine
+    # adapter's polls are refresh=True (they bypass that cache), and the rail's
+    # DB-count fallback re-reads on a miss, so dropping it can never add weight
+    # nor change what any DENIED-vs-EMPTY path sees.
     async def _fetch_mid() -> float:
         with timed_metric("runtime.market_price.fetch"):
             if strategy == "vol":
@@ -3888,12 +3914,8 @@ async def _run_cycle(
                     raise RuntimeError("VOL open-orders call timed out")
             return await run_blocking_sdk(client.get_open_orders, product_id)
 
-    _engine_cycle = strategy in ("grid", "rgrid", "dgrid", "mid", "dn", "vol")
     open_orders = None
-    if _engine_cycle:
-        mid, open_orders = await asyncio.gather(_fetch_mid(), _fetch_open_orders())
-    else:
-        mid = await _fetch_mid()
+    mid = await _fetch_mid()
     if mid <= 0:
         raise RuntimeError("Could not fetch market price")
 
@@ -3936,12 +3958,6 @@ async def _run_cycle(
         )
         if rail is not None:
             return rail
-
-    # Engine strategies already fetched this concurrently with mid above; the
-    # legacy path fetches it here, only after its session-PnL rail may have
-    # returned (so a rail exit never pays for an unused open-orders read).
-    if open_orders is None:
-        open_orders = await _fetch_open_orders()
 
     from src.nadobro.strategy.engine_runtime import (
         ENGINE_MAPPED_STRATEGIES, engine_v2_enabled, run_engine_cycle,
@@ -4134,6 +4150,11 @@ async def _run_cycle(
             "strategy": strategy,
         }
     else:
+        # The legacy dispatch is the only consumer of the open-orders list; read it
+        # here, after its session-PnL rail may have returned (a rail exit never
+        # pays for an unused read) and never on the engine path.
+        if open_orders is None:
+            open_orders = await _fetch_open_orders()
         with timed_metric(f"runtime.strategy.dispatch.{strategy}"):
             if strategy == "vol":
                 try:

@@ -40,7 +40,26 @@ never invert or disarm the stop, and low leverage / no volatility yields ≈0 bu
 TP is never buffered (firing a take-profit early would leave profit on the table).
 
 ``leverage_reserve_frac`` / ``leverage_only_cap`` remain for reference/tuning but no
-longer feed the buffer."""
+longer feed the buffer.
+
+Close-fee reserve (GRIDFAM-2026-09-27-SL-CLOSE-FEE)
+---------------------------------------------------
+The rail judges live PnL NET of the fees ALREADY paid, but the flatten it fires
+is itself a taker order that pays one more fee on the whole open notional. So a
+calm stop that fires exactly at ``-sl_pct`` realizes ``-sl_pct - close fee``: at
+49x on a $100 margin a 10% stop realized about -12.2% (4.3bp on ~$4,900). The old
+rail hid this because it subtracted fees twice (GRIDFAM-2026-09-27-RAIL-FEE-2X),
+which fired it early by roughly the fees already paid. ``close_cost_pct`` is the
+projected flatten fee as a %-of-margin, and ``effective_sl_trigger`` reserves it
+alongside the velocity term so the REALIZED net loss lands on the number:
+
+    effective_trigger = sl_pct - min(sl_pct * max_fraction, vol_buffer + close_cost)
+
+The combined reserve shares the ``max_buffer_fraction`` cap, so a stop whose
+close fee alone exceeds half its budget (tiny SL at extreme leverage) still
+never becomes a hair-trigger that fires on the entry fees alone. The TP side is
+symmetric: the rail takes profit only once ``pct_net - close_cost`` clears
+``tp_pct`` (the profit the user keeps after paying the close)."""
 from __future__ import annotations
 
 import os
@@ -95,7 +114,38 @@ def leverage_only_cap() -> float:
     return min(max_buffer_fraction(), max(0.0, _env_float("NADO_SLTP_LEVERAGE_ONLY_CAP", 0.15)))
 
 
+# All-in TAKER rate the rail's flatten pays: the venue base taker rate (3.3bp) +
+# the 1bp builder routing, as measured in prod (4.30-4.44bp). Mirrors
+# ``quant/vol_fee_estimator`` DEFAULT_SPOT_TAKER_FEE_RATE + DEFAULT_BUILDER_FEE_RATE
+# (kept as a literal so this module stays stdlib-only; a test pins the two equal).
+DEFAULT_CLOSE_FEE_BP = 4.3
+
+
+def close_fee_rate() -> float:
+    """Fee rate (fraction) the SL/TP rail reserves for its own flatten order.
+    ``NADO_SLTP_CLOSE_FEE_BP`` overrides the 4.3bp default; ``0`` disables the
+    close-fee reserve (the rail then judges on fees already paid only)."""
+    return max(0.0, _env_float("NADO_SLTP_CLOSE_FEE_BP", DEFAULT_CLOSE_FEE_BP)) / 10_000.0
+
+
 # --- pure math ---------------------------------------------------------------
+
+def close_cost_pct(
+    position_value: object, margin: object, rate: Optional[float] = None
+) -> float:
+    """Projected fee of flattening ``position_value`` of open notional as a TAKER,
+    in %-of-``margin`` (the rail's basis). ``0`` when flat, when the margin basis
+    is unknown, or when the reserve is disabled. Never negative."""
+    try:
+        pv = abs(float(position_value or 0.0))
+        mg = float(margin or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    r = close_fee_rate() if rate is None else max(0.0, float(rate))
+    if pv <= 0.0 or mg <= 0.0 or r <= 0.0:
+        return 0.0
+    return pv * r / mg * 100.0
+
 
 def move_bp(prev_mark: float, mark: float) -> float:
     """Absolute price move between two marks, in basis points. ``0`` when either
@@ -144,6 +194,7 @@ def sl_buffer_pct(
     factor: Optional[float] = None,
     max_fraction: Optional[float] = None,
     lev_ref: Optional[float] = None,
+    close_cost_pct: float = 0.0,
 ) -> float:
     """The overshoot buffer to subtract from ``sl_pct``, clamped to
     ``[0, sl_pct * max_fraction]``.
@@ -155,11 +206,19 @@ def sl_buffer_pct(
     reserves room, and only as much as the current velocity implies. There is no
     leverage-only floor — a flat leverage haircut fires a calm high-leverage stop
     early (it stopped prod #253 at half its budget). ``0`` when disarmed
-    (``sl_pct<=0``) or when nothing is projected (no recent move / leverage)."""
+    (``sl_pct<=0``) or when nothing is projected (no recent move / leverage).
+
+    ``close_cost_pct`` (GRIDFAM-2026-09-27-SL-CLOSE-FEE) is the projected fee of
+    the flatten itself (see :func:`close_cost_pct`); it is reserved on top of the
+    velocity term, under the same ``max_fraction`` cap."""
     if sl_pct is None or sl_pct <= 0:
         return 0.0
     cap_frac = max_buffer_fraction() if max_fraction is None else min(0.9, max(0.0, max_fraction))
-    vol_frac = projected_overshoot_pct(leverage, recent_move_bp, factor) / float(sl_pct)
+    try:
+        close_cost = max(0.0, float(close_cost_pct or 0.0))
+    except (TypeError, ValueError):
+        close_cost = 0.0
+    vol_frac = (projected_overshoot_pct(leverage, recent_move_bp, factor) + close_cost) / float(sl_pct)
     reserve = max(0.0, min(cap_frac, vol_frac))
     return float(sl_pct) * reserve
 
@@ -172,15 +231,19 @@ def effective_sl_trigger(
     factor: Optional[float] = None,
     max_fraction: Optional[float] = None,
     lev_ref: Optional[float] = None,
+    close_cost_pct: float = 0.0,
 ) -> float:
     """The tightened SL trigger magnitude (still a positive %-of-margin): the
     rail should fire when ``pct_net <= -effective_sl_trigger(...)``. Equal to
     ``sl_pct`` when disarmed or when no reserve is warranted, and never below
     ``(1 - max_fraction) * sl_pct`` nor above ``sl_pct`` — so it only ever
-    tightens the user's stop, never loosens or inverts it."""
+    tightens the user's stop, never loosens or inverts it. ``close_cost_pct``
+    reserves the flatten's own fee so a calm stop REALIZES ``-sl_pct`` after the
+    close, not ``-sl_pct - close fee`` (GRIDFAM-2026-09-27-SL-CLOSE-FEE)."""
     if sl_pct is None or sl_pct <= 0:
         return float(sl_pct or 0.0)
     return float(sl_pct) - sl_buffer_pct(
         sl_pct, leverage, recent_move_bp,
         factor=factor, max_fraction=max_fraction, lev_ref=lev_ref,
+        close_cost_pct=close_cost_pct,
     )

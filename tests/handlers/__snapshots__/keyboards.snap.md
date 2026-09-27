@@ -36,24 +36,7 @@ Each cell is `[label] → callback_data`.
 
 ```
 [BTC] → alert:product:BTC  |  [ETH] → alert:product:ETH  |  [SOL] → alert:product:SOL  |  [XRP] → alert:product:XRP
-[BNB] → alert:product:BNB  |  [HYPE] → alert:product:HYPE  |  [ZEC] → alert:product:ZEC  |  [MON] → alert:product:MON
-[FARTCOIN] → alert:product:FARTCOIN  |  [SUI] → alert:product:SUI  |  [AAVE] → alert:product:AAVE  |  [XAUT] → alert:product:XAUT
-[PUMP] → alert:product:PUMP  |  [TAO] → alert:product:TAO  |  [XMR] → alert:product:XMR  |  [LIT] → alert:product:LIT
-[KPEPE] → alert:product:KPEPE  |  [PENGU] → alert:product:PENGU  |  [UNI] → alert:product:UNI  |  [ASTER] → alert:product:ASTER
-[XPL] → alert:product:XPL  |  [DOGE] → alert:product:DOGE  |  [WLFI] → alert:product:WLFI  |  [KBONK] → alert:product:KBONK
-[ZRO] → alert:product:ZRO  |  [AVAX] → alert:product:AVAX  |  [BCH] → alert:product:BCH  |  [ENA] → alert:product:ENA
-[LINK] → alert:product:LINK  |  [LTC] → alert:product:LTC  |  [NEAR] → alert:product:NEAR  |  [ONDO] → alert:product:ONDO
-[SKY] → alert:product:SKY  |  [JUP] → alert:product:JUP  |  [XAG] → alert:product:XAG  |  [WTI] → alert:product:WTI
-[EURUSD] → alert:product:EURUSD  |  [GBPUSD] → alert:product:GBPUSD  |  [USDJPY] → alert:product:USDJPY  |  [QQQ] → alert:product:QQQ
-[SPY] → alert:product:SPY  |  [AAPL] → alert:product:AAPL  |  [AMZN] → alert:product:AMZN  |  [GOOGL] → alert:product:GOOGL
-[META] → alert:product:META  |  [MSFT] → alert:product:MSFT  |  [NVDA] → alert:product:NVDA  |  [TSLA] → alert:product:TSLA
-[MEGA] → alert:product:MEGA  |  [TON] → alert:product:TON  |  [VVV] → alert:product:VVV  |  [AMD] → alert:product:AMD
-[AVGO] → alert:product:AVGO  |  [DELL] → alert:product:DELL  |  [INTC] → alert:product:INTC  |  [MRVL] → alert:product:MRVL
-[MU] → alert:product:MU  |  [SNDK] → alert:product:SNDK  |  [SPCX] → alert:product:SPCX  |  [WLD] → alert:product:WLD
-[CHIP] → alert:product:CHIP  |  [PENG] → alert:product:PENG  |  [BBX] → alert:product:BBX  |  [MSTR] → alert:product:MSTR
-[ZHIPU] → alert:product:ZHIPU  |  [CRCL] → alert:product:CRCL  |  [EIGEN] → alert:product:EIGEN  |  [NBIS] → alert:product:NBIS
-[HIMS] → alert:product:HIMS  |  [LLY] → alert:product:LLY  |  [ORCL] → alert:product:ORCL  |  [SKHY] → alert:product:SKHY
-[CASHCAT] → alert:product:CASHCAT  |  [PONS] → alert:product:PONS
+[BNB] → alert:product:BNB  |  [LINK] → alert:product:LINK  |  [DOGE] → alert:product:DOGE
 [◀ Back] → alert:menu  |  [🏠 Home] → nav:main
 ```
 
@@ -104,24 +87,7 @@ Each cell is `[label] → callback_data`.
 
 ```
 [BTC] → pos:close:BTC  |  [ETH] → pos:close:ETH  |  [SOL] → pos:close:SOL  |  [XRP] → pos:close:XRP
-[BNB] → pos:close:BNB  |  [HYPE] → pos:close:HYPE  |  [ZEC] → pos:close:ZEC  |  [MON] → pos:close:MON
-[FARTCOIN] → pos:close:FARTCOIN  |  [SUI] → pos:close:SUI  |  [AAVE] → pos:close:AAVE  |  [XAUT] → pos:close:XAUT
-[PUMP] → pos:close:PUMP  |  [TAO] → pos:close:TAO  |  [XMR] → pos:close:XMR  |  [LIT] → pos:close:LIT
-[KPEPE] → pos:close:KPEPE  |  [PENGU] → pos:close:PENGU  |  [UNI] → pos:close:UNI  |  [ASTER] → pos:close:ASTER
-[XPL] → pos:close:XPL  |  [DOGE] → pos:close:DOGE  |  [WLFI] → pos:close:WLFI  |  [KBONK] → pos:close:KBONK
-[ZRO] → pos:close:ZRO  |  [AVAX] → pos:close:AVAX  |  [BCH] → pos:close:BCH  |  [ENA] → pos:close:ENA
-[LINK] → pos:close:LINK  |  [LTC] → pos:close:LTC  |  [NEAR] → pos:close:NEAR  |  [ONDO] → pos:close:ONDO
-[SKY] → pos:close:SKY  |  [JUP] → pos:close:JUP  |  [XAG] → pos:close:XAG  |  [WTI] → pos:close:WTI
-[EURUSD] → pos:close:EURUSD  |  [GBPUSD] → pos:close:GBPUSD  |  [USDJPY] → pos:close:USDJPY  |  [QQQ] → pos:close:QQQ
-[SPY] → pos:close:SPY  |  [AAPL] → pos:close:AAPL  |  [AMZN] → pos:close:AMZN  |  [GOOGL] → pos:close:GOOGL
-[META] → pos:close:META  |  [MSFT] → pos:close:MSFT  |  [NVDA] → pos:close:NVDA  |  [TSLA] → pos:close:TSLA
-[MEGA] → pos:close:MEGA  |  [TON] → pos:close:TON  |  [VVV] → pos:close:VVV  |  [AMD] → pos:close:AMD
-[AVGO] → pos:close:AVGO  |  [DELL] → pos:close:DELL  |  [INTC] → pos:close:INTC  |  [MRVL] → pos:close:MRVL
-[MU] → pos:close:MU  |  [SNDK] → pos:close:SNDK  |  [SPCX] → pos:close:SPCX  |  [WLD] → pos:close:WLD
-[CHIP] → pos:close:CHIP  |  [PENG] → pos:close:PENG  |  [BBX] → pos:close:BBX  |  [MSTR] → pos:close:MSTR
-[ZHIPU] → pos:close:ZHIPU  |  [CRCL] → pos:close:CRCL  |  [EIGEN] → pos:close:EIGEN  |  [NBIS] → pos:close:NBIS
-[HIMS] → pos:close:HIMS  |  [LLY] → pos:close:LLY  |  [ORCL] → pos:close:ORCL  |  [SKHY] → pos:close:SKHY
-[CASHCAT] → pos:close:CASHCAT  |  [PONS] → pos:close:PONS
+[BNB] → pos:close:BNB  |  [LINK] → pos:close:LINK  |  [DOGE] → pos:close:DOGE
 [◀ Back] → nav:main
 ```
 
@@ -496,24 +462,7 @@ Each cell is `[label] → callback_data`.
 ```
 (ReplyKeyboardMarkup)
 [BTC]  |  [ETH]  |  [SOL]  |  [XRP]
-[BNB]  |  [HYPE]  |  [ZEC]  |  [MON]
-[FARTCOIN]  |  [SUI]  |  [AAVE]  |  [XAUT]
-[PUMP]  |  [TAO]  |  [XMR]  |  [LIT]
-[KPEPE]  |  [PENGU]  |  [UNI]  |  [ASTER]
-[XPL]  |  [DOGE]  |  [WLFI]  |  [KBONK]
-[ZRO]  |  [AVAX]  |  [BCH]  |  [ENA]
-[LINK]  |  [LTC]  |  [NEAR]  |  [ONDO]
-[SKY]  |  [JUP]  |  [XAG]  |  [WTI]
-[EURUSD]  |  [GBPUSD]  |  [USDJPY]  |  [QQQ]
-[SPY]  |  [AAPL]  |  [AMZN]  |  [GOOGL]
-[META]  |  [MSFT]  |  [NVDA]  |  [TSLA]
-[MEGA]  |  [TON]  |  [VVV]  |  [AMD]
-[AVGO]  |  [DELL]  |  [INTC]  |  [MRVL]
-[MU]  |  [SNDK]  |  [SPCX]  |  [WLD]
-[CHIP]  |  [PENG]  |  [BBX]  |  [MSTR]
-[ZHIPU]  |  [CRCL]  |  [EIGEN]  |  [NBIS]
-[HIMS]  |  [LLY]  |  [ORCL]  |  [SKHY]
-[CASHCAT]  |  [PONS]
+[BNB]  |  [LINK]  |  [DOGE]
 [◀ Back]  |  [◀ Home]
 ```
 

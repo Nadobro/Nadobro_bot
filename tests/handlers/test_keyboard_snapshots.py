@@ -131,6 +131,20 @@ def _cases() -> list[tuple[str, str, tuple, dict]]:
 
 
 def _render_all() -> str:
+    # Hermetic product list: ``alert_product_kb`` reads the LIVE venue catalog
+    # (``config.get_perp_products`` -> ``product_catalog.list_perp_names``), so
+    # every new Nado listing drifted this snapshot and broke CI on unrelated PRs
+    # (2026-09-27: "USELESS" was listed). Pin it to the static config list — the
+    # snapshot guards layout and callback wiring, not today's listings.
+    original = K._perp_products
+    K._perp_products = lambda network="mainnet", client=None: list(K.PERP_PRODUCTS)
+    try:
+        return _render_cases()
+    finally:
+        K._perp_products = original
+
+
+def _render_cases() -> str:
     cases = _cases()
     chunks = [
         "# Keyboard snapshots",

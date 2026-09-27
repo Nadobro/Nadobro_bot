@@ -1341,8 +1341,10 @@ def rollup_session_from_trades(session_id: int, network: str) -> dict:
     persisted card numbers match the actual fills (and don't drift when
     venue-sync fills arrive late or when cycle increments missed a fee).
 
-    Returns the resolved totals dict (always returns; on DB error returns
-    an empty dict so callers can decide what to do).
+    Returns the recomputed totals dict (always returns; on DB error returns
+    an empty dict so callers can decide what to do). Note its
+    ``total_orders_cancelled`` is the cancelled-ROW count; the stored column is
+    merged with GREATEST and may be higher (engine-accumulated cancels).
     """
     table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
     try:
@@ -1395,8 +1397,23 @@ def rollup_session_from_trades(session_id: int, network: str) -> dict:
         "win_count": int(row.get("wins") or 0),
         "loss_count": int(row.get("losses") or 0),
     }
+    # total_orders_cancelled is ACCUMULATED by the engine (increment_session_metrics
+    # adds each cycle's cancel delta); engine quotes never write status='cancelled'
+    # trade rows, so overwriting it with the row count zeroed it on every rollup —
+    # every session read 0 cancels (audit 2026-09-27, A5). Merge instead: the row
+    # count may RAISE the counter (non-engine paths record cancel rows), never
+    # lower it. GREATEST in SQL so a concurrent increment is never lost.
+    stored = {k: v for k, v in totals.items() if k != "total_orders_cancelled"}
     try:
-        update_strategy_session(int(session_id), totals)
+        update_strategy_session(int(session_id), stored)
+    except Exception:
+        pass
+    try:
+        execute(
+            "UPDATE strategy_sessions SET total_orders_cancelled = "
+            "GREATEST(COALESCE(total_orders_cancelled, 0), %s) WHERE id = %s",
+            (int(totals["total_orders_cancelled"]), int(session_id)),
+        )
     except Exception:
         pass
     return totals
@@ -1488,7 +1505,7 @@ def _derive_session_realized_pnl(
             SELECT product_id FROM strategy_sessions WHERE id = %s
           )) AS product_id,
           side, fill_size, size, fill_price, price, isolated, source,
-          submission_idx, base_filled_x18, quote_filled_x18,
+          submission_idx, base_filled_x18, quote_filled_x18, fee_x18,
           COALESCE(filled_at, created_at) AS filled_at
         FROM {table}
         WHERE {where}
@@ -1503,7 +1520,14 @@ def _derive_session_realized_pnl(
         """,
         (int(session_id), *tuple(params), int(session_id)),
     )
-    realized = float(realized_pnl_windows_from_rows(rows).get("total_pnl") or 0)
+    # GROSS of fees (GRIDFAM-2026-09-27-RAIL-FEE-2X): the venue quote_filled is
+    # net of fee, so pricing fills at |quote|/base baked the round-tripped fees
+    # into realized PnL — and every consumer ALSO subtracts ``fees`` (the SL/TP
+    # rail's session_pnl_net, the stored (realized - total_fees)/volume Cost/$1M).
+    # Replay at the real match price; fees stay the standalone metric.
+    realized = float(
+        realized_pnl_windows_from_rows(rows, gross_of_fees=True).get("total_pnl") or 0
+    )
     _log_session_replay_diagnostics(session_id, rows, realized)
     return realized
 

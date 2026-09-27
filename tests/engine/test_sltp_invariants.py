@@ -224,7 +224,7 @@ def test_sl_and_tp_judge_the_users_net_total_loss():
     src = (repo / "src" / "nadobro" / "strategy" / "bot_runtime.py").read_text()
     assert "pct_net = pct" in src                          # rail judges the net basis
     assert "pct_net <= -sl_trigger" in src                 # SL on net total loss, buffered
-    assert "pct_net >= tp_pct" in src                      # TP on net total gain
+    assert "pct_net - close_cost >= tp_pct" in src         # TP on net total gain, after the close fee
     assert "pct_drawdown" not in src                       # no gross-only stop basis
 
 
@@ -1367,3 +1367,190 @@ def test_an_isolated_position_without_unsettled_is_unchanged():
     from src.nadobro.quant.portfolio_calculator import normalize_position
     iso = {"product_id": 3, "symbol": "SOL-PERP", "position_size": "1", "est_pnl": "5.0"}
     assert normalize_position(dict(iso), isolated=True).est_pnl == Decimal("5.0")
+
+
+# --------------------------------------------------------------------------- #
+# GRIDFAM-2026-09-27-RAIL-FEE-2X — the session SL/TP rail must count trading    #
+# fees EXACTLY ONCE. The venue's signed quote_filled is NET of fee              #
+# (quote = -price*base - fee; prod_ground_truth.md verified 100% of rows), and  #
+# the session realized replay priced every fill at |quote_filled|/base — so     #
+# realized PnL already carried the round-tripped fees — and then                #
+# live_session subtracted ``fees`` AGAIN for ``session_pnl_net``. A zero-move   #
+# round trip read -2 x fees on the rail (prod: 15 of 23 sl_hit sessions fired   #
+# with a true net loss smaller than the user's SL; s305 fees 10.5% of margin).  #
+# The same replay feeds the stored ``strategy_sessions.realized_pnl``, so the   #
+# stored (realized - fees)/volume Cost/$1M double-subtracted fees too.          #
+# FIXED (2026-09-27): the session replay prices fills gross of the venue fee    #
+# (portfolio_calculator gross_of_fees=True); strict-xfail markers removed.      #
+# Pure — the DB reads are stubbed.                                              #
+# --------------------------------------------------------------------------- #
+def _flat_zero_move_round_trip_snapshot(monkeypatch):
+    # The pytest-only CI job (self-review.yml) has no psycopg2; the repo's test
+    # stubs satisfy the DB layer's import (every DB read below is stubbed anyway).
+    from _stubs import install_test_stubs
+
+    install_test_stubs()
+    from src.nadobro.models import database as dbm
+    from src.nadobro.trading import live_session
+
+    x18 = 10 ** 18
+    fee = Decimal("0.045")                       # per leg, venue fee_x18 (incl. builder)
+    notional = Decimal("100")                    # 0.001 BTC @ 100,000 — no price move
+    buy = {"product_id": 2, "side": "long", "fill_size": 0.001, "size": 0.001,
+           "fill_price": 100000.0, "price": 100000.0, "isolated": False, "source": "strategy",
+           "submission_idx": 1, "base_filled_x18": int(Decimal("0.001") * x18),
+           "quote_filled_x18": int(-(notional + fee) * x18), "fee_x18": int(fee * x18),
+           "filled_at": None}
+    sell = dict(buy, side="short", submission_idx=2,
+                base_filled_x18=int(Decimal("-0.001") * x18),
+                quote_filled_x18=int((notional - fee) * x18))
+    agg = {"fills": 2, "volume": float(2 * notional), "fees": float(2 * fee),
+           "net_base": 0.0, "signed_cash": -float(2 * fee), "venue_pnl": 0.0,
+           "venue_rows": 0, "pending_sync": 0, "recorder_gross": 0.0}
+    monkeypatch.setattr(dbm, "query_one", lambda *_a, **_k: dict(agg))
+    replay_sql: list = []
+
+    def _query_all(sql, *_a, **_k):
+        replay_sql.append(str(sql))
+        return [dict(buy), dict(sell)]
+
+    monkeypatch.setattr(dbm, "query_all", _query_all)
+    monkeypatch.setattr(dbm, "get_open_position_rows_for_product", lambda *_a, **_k: [])
+    monkeypatch.setattr(dbm, "get_session_turnover", lambda *_a, **_k: {"volume": 0.0, "fills": 0})
+    monkeypatch.setattr(dbm, "count_open_orders_for_product", lambda *_a, **_k: 0)
+    session = {"id": 991, "product_id": 2, "status": "running", "notional_usd": 100.0,
+               "started_at": None}
+    snap = live_session.get_live_session_snapshot(
+        7, "mainnet", session, state={"notional_usd": 100.0}, client=None, mark=100000.0,
+    )
+    # The stub hands back fee_x18, so also pin that the REAL replay query selects it:
+    # dropping the column would silently restore the fee-inclusive (2x) pricing.
+    fill_reads = [q for q in replay_sql if "quote_filled_x18" in q]
+    assert fill_reads, "the session realized replay no longer reads venue fills"
+    assert all("fee_x18" in q for q in fill_reads), fill_reads
+    return snap
+
+
+def test_the_session_rail_counts_fees_exactly_once(monkeypatch):
+    """GRIDFAM-2026-09-27-RAIL-FEE-2X: a flat round trip with zero price move
+    must read -fees/margin on the rail, not -2 x fees/margin."""
+    snap = _flat_zero_move_round_trip_snapshot(monkeypatch)
+    assert snap["fees"] == pytest.approx(0.09)
+    assert snap["session_pnl_net"] == pytest.approx(-0.09), snap["session_pnl_net"]
+    assert snap["session_pnl_pct_net"] == pytest.approx(-0.09), snap["session_pnl_pct_net"]
+
+
+def test_session_realized_pnl_is_gross_of_the_fees_reported_beside_it(monkeypatch):
+    """GRIDFAM-2026-09-27-RAIL-FEE-2X (display/stored side): the documented
+    convention is realized GROSS of fees with fees a standalone metric — the
+    status card shows them side by side and the stored Cost/$1M subtracts
+    ``total_fees_paid`` from the stored ``realized_pnl``. A zero-move round trip
+    realizes 0, not -fees."""
+    snap = _flat_zero_move_round_trip_snapshot(monkeypatch)
+    assert snap["realized_pnl"] == pytest.approx(0.0), snap["realized_pnl"]
+    assert snap["session_pnl"] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# GRIDFAM-2026-09-27-SL-CLOSE-FEE — the rail fires on live PnL NET of the fees  #
+# already paid, but the flatten it fires pays one more TAKER fee on the whole   #
+# open notional, which nothing reserved. A calm stop at exactly -SL therefore   #
+# REALIZED -SL - close fee (49x on $100 margin: 4.3bp x ~$4,900 = $2.1, so a    #
+# 10% stop realized ~-12.1%; R-Grid defaults: ~24% past a $0.80 stop). The old  #
+# double fee count (RAIL-FEE-2X) used to hide this by firing early. The rail    #
+# must reserve the projected close fee (SL) and only take profit once the gain  #
+# clears the TP AFTER paying it. FIXED (2026-09-27): quant/sltp_overshoot       #
+# close_cost_pct reserved in the rail; strict-xfail markers removed.            #
+# Pure — the snapshot is stubbed.                                               #
+# --------------------------------------------------------------------------- #
+def _run_rail_once(snap, *, sl, tp):
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    from _stubs import install_test_stubs
+
+    install_test_stubs()
+    from src.nadobro.strategy import bot_runtime, engine_runtime
+
+    async def _inline(fn, *a, **k):
+        return fn(*a, **k)
+
+    closed = {}
+
+    async def close_coro():
+        closed["called"] = True
+        return {"success": True}
+
+    state = {"sl_pct": sl, "tp_pct": tp, "strategy": "rgrid",
+             "strategy_session_id": 77, "running": True}
+    sess = {"id": 77, "product_id": 2, "status": "running", "started_at": None, "stopped_at": None}
+    bot_runtime._SLTP_MARK_CACHE.pop(77, None)
+    with patch.object(bot_runtime, "run_blocking", _inline), \
+         patch("src.nadobro.models.database.get_strategy_session_by_id", return_value=sess), \
+         patch("src.nadobro.models.database.get_active_strategy_session_for_strategy"), \
+         patch("src.nadobro.trading.live_session.get_live_session_snapshot", return_value=dict(snap)), \
+         patch.object(engine_runtime.RUNTIME, "stop", new=AsyncMock()), \
+         patch.object(bot_runtime, "_finalize_session") as fin, \
+         patch.object(bot_runtime, "_save_state"), \
+         patch.object(bot_runtime, "_notify", new=AsyncMock()), \
+         patch.object(bot_runtime, "_strategy_display_name", return_value="RGRID"):
+        res = asyncio.run(bot_runtime._evaluate_session_pnl_rail(
+            42, "mainnet", state, "rgrid", "BTC", client=None, close_coro=close_coro,
+        ))
+    bot_runtime._SLTP_MARK_CACHE.pop(77, None)
+    reason = fin.call_args.kwargs.get("stop_reason") if fin.called else None
+    return res, reason
+
+
+def _calm_snap(pct_net, *, position_value=4900.0, margin=100.0):
+    # A calm market: first poll (no prior mark) => the velocity buffer is 0.
+    return {"session_pnl": pct_net, "session_pnl_pct": pct_net,
+            "session_pnl_net": pct_net, "session_pnl_pct_net": pct_net,
+            "margin": margin, "leverage": position_value / margin,
+            "position_value": position_value, "mark": 110000.0}
+
+
+def test_a_calm_stop_realizes_the_users_sl_after_paying_the_close_fee():
+    """GRIDFAM-2026-09-27-SL-CLOSE-FEE: at 49x ($4,900 open on $100) the flatten
+    costs ~2.1% of margin. A net -8.2% already realizes ~-10.3% after the close,
+    past a 10% SL, so the rail must fire now — and must NOT fire while the
+    post-close loss is still inside the SL."""
+    from src.nadobro.quant.sltp_overshoot import close_cost_pct
+
+    cc = close_cost_pct(4900.0, 100.0)
+    assert cc == pytest.approx(2.107, abs=1e-3)
+    res, reason = _run_rail_once(_calm_snap(-8.2), sl=10.0, tp=0.0)
+    assert (res, reason) == ((True, None), "sl_hit"), "stop waited until the close fee overshot the SL"
+    res2, reason2 = _run_rail_once(_calm_snap(-7.5), sl=10.0, tp=0.0)   # ~-9.6% after close
+    assert res2 is None and reason2 is None
+
+
+def test_the_take_profit_clears_the_target_after_paying_the_close_fee():
+    """GRIDFAM-2026-09-27-SL-CLOSE-FEE (TP side): +5.5% net at 49x keeps only
+    ~+3.4% after the flatten fee — below a 5% TP, so the rail must keep running;
+    +7.5% (~+5.4% kept) takes profit."""
+    res, reason = _run_rail_once(_calm_snap(5.5), sl=0.0, tp=5.0)
+    assert res is None and reason is None, "TP fired on a gain the close fee eats"
+    res2, reason2 = _run_rail_once(_calm_snap(7.5), sl=0.0, tp=5.0)
+    assert (res2, reason2) == ((True, None), "tp_hit")
+
+
+def test_the_close_fee_reserve_never_turns_a_stop_into_a_hair_trigger():
+    """The close-fee reserve shares the buffer's max_fraction cap: a 2% SL at 49x
+    (close fee ~2.1% > the whole SL) still fires no earlier than half its SL, and a
+    flat session (no open notional) reserves nothing. The rate mirrors the measured
+    all-in taker fee the rest of the codebase prices with."""
+    from src.nadobro.quant.sltp_overshoot import (
+        DEFAULT_CLOSE_FEE_BP, close_cost_pct, effective_sl_trigger,
+    )
+    from src.nadobro.quant.vol_fee_estimator import (
+        DEFAULT_BUILDER_FEE_RATE, DEFAULT_SPOT_TAKER_FEE_RATE,
+    )
+
+    assert Decimal(str(DEFAULT_CLOSE_FEE_BP)) / Decimal(10000) == (
+        DEFAULT_SPOT_TAKER_FEE_RATE + DEFAULT_BUILDER_FEE_RATE)
+    assert close_cost_pct(0.0, 100.0) == 0.0
+    tight = effective_sl_trigger(2.0, 49.0, 0.0, close_cost_pct=close_cost_pct(4900.0, 100.0))
+    assert tight == pytest.approx(1.0)
+    calm = effective_sl_trigger(10.0, 49.0, 0.0, close_cost_pct=close_cost_pct(4900.0, 100.0))
+    assert calm + close_cost_pct(4900.0, 100.0) == pytest.approx(10.0)
