@@ -94,6 +94,14 @@ Layering (enforced by `tests/lint/test_architecture_layers.py` — domain packag
   whole account position, so trading on top of one is unsafe and closing it is not ours to do
   — and persist a zero baseline that a mid-session rebuild restores (`venue_baseline`).
   See `docs/reverse_grid_strategy.md`.
+- Grid-family vol model (`quant/vol_model.py`, `strategy/vol_baseline.py`, `docs/grid_vol_model.md`)
+  is OPT-IN per behaviour. Every threshold is a multiple of the product's own 7-day median rv60 —
+  never an absolute bp value. Two invariants in `tests/engine/test_sltp_invariants.py` bind it:
+  with every `gvol_*` switch OFF the controllers must match the base-branch golden logs
+  (`tests/engine/fixtures/gvol_off_golden.json`; regenerate only from a base checkout), and a
+  vol stand-down withdraws entries and HOLDS — it never sends a taker / crossing entry and never
+  cancels a reduce-only close leg. An empty candle read means UNKNOWN, never CALM. Telemetry uses
+  the `gvol_` prefix (`vol_*` is the Volume Bot's).
 
 ## Hard rules
 

@@ -40,6 +40,7 @@ from src.nadobro.engine.risk import RiskEngine
 from src.nadobro.engine.routines.regime_gate import GATE_REASON_HUMAN as GATE_REASON_HUMAN  # noqa: F401
 from src.nadobro.engine.routines.regime_gate import REVGRID_GATE_REASONS as REVGRID_GATE_REASONS  # noqa: F401
 from src.nadobro.engine.routines.regime_gate import VENUE_GATE_REASONS as VENUE_GATE_REASONS  # noqa: F401
+from src.nadobro.engine.routines.regime_gate import VOL_GATE_REASONS as VOL_GATE_REASONS  # noqa: F401
 from src.nadobro.engine.types import (
     RiskLimits,
     RiskState,
@@ -823,6 +824,9 @@ def _apply_dgrid_controller_config(controller: Controller, configs: Dict[str, ob
     _tf = configs.get("dgrid_trend_follow")
     if _tf is not None:
         controller.trend_follow_enabled = _as_bool(_tf)  # type: ignore[attr-defined]
+    _model = configs.get("dgrid_regime_model")
+    if _model is not None:
+        controller.regime_model = str(_model).strip().lower() or "vr"  # type: ignore[attr-defined]
     packed = configs.get("trend_rgrid")
     trend = getattr(controller, "_trend", None)
     if trend is not None and isinstance(packed, dict):
@@ -925,6 +929,19 @@ async def _apply_live_controller_update(
     controller.configs = dict(configs)
     controller.limits = limits
     _apply_orchestrator_risk_limits(orch, limits)
+    # OPT-IN vol model: re-read the gvol_* switches live (no restart). Computed
+    # outputs (spacing / skew / gate state) live on the controller, never in
+    # configs, so they cannot churn the live signature.
+    _reload_vol = getattr(controller, "reload_vol_cfg", None)
+    if callable(_reload_vol):
+        _reload_vol()
+    if getattr(controller, "_step_override_bp", None) is not None:
+        # A live edit re-lays the ladder at the configured step; re-apply the vol
+        # step at the next tick.
+        try:
+            controller._gvol_recenter_pending = True  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001  # policy: degrade-ok(best-effort re-space)
+            pass
 
     if isinstance(controller, ReverseGridController):
         # Trigger Reverse Grid: re-read the geometry/gate params from the refreshed
@@ -1053,6 +1070,8 @@ _LIVE_CONFIG_SIGNATURE_EXCLUDE = frozenset({
     "signal_provider",
     "markout_provider",
     "levels_provider",
+    # The vol model's baseline provider: a per-cycle closure like candle_provider.
+    "gvol_baseline_provider",
     # DN-only restore fields; excluded defensively if a future strategy shares
     # this helper.
     "restore_cycles_completed",
@@ -1202,6 +1221,69 @@ def _min_quote_lifetime_s(strategy: str, settings) -> Decimal:
 
     cadence = effective_interval_seconds(strategy, settings.get("interval_seconds", 60))
     return Decimal(str(min(_MAX_AUTO_QUOTE_LIFETIME_S, 2.0 * cadence)))
+
+
+def _clamp_setting(settings, key: str, default: float, lo: float, hi: float) -> float:
+    v = _f(settings, key, default)
+    if v != v:          # NaN
+        v = default
+    return max(lo, min(hi, v))
+
+
+def _gvol_config(settings, strategy: str, *, fa: bool) -> dict:
+    """The OPT-IN realized-volatility model's engine keys (docs/grid_vol_model.md).
+
+    Every feature defaults OFF, so a user who never touched the Vol settings gets
+    the same engine config as before plus inert ``gvol_*`` keys (pinned by
+    tests/engine/test_gvol_mapping.py). Bounds match the button + typed-input
+    validators. D-Grid's gate is its ``dgrid_regime_model == "vol"``."""
+    from src.nadobro.quant import vol_model as _vm
+
+    if strategy == "dgrid":
+        pfx = "dgrid_"
+        gate = str(settings.get("dgrid_regime_model") or "vr").strip().lower() == "vol"
+        smin = _f(settings, "dgrid_min_spread_bp", 2.0)
+        smax = _f(settings, "dgrid_max_spread_bp", 50.0)
+    else:
+        pfx = "grid_"
+        gate = bool(_f(settings, "grid_vol_gate", 0.0))
+        smin = _f(settings, "min_spread_bp", 2.0)
+        smax = _f(settings, "max_spread_bp", 20.0)
+    return {
+        "gvol_gate_enabled": bool(gate),
+        "gvol_gate_mult": _clamp_setting(settings, f"{pfx}vol_gate_mult", _vm.DEFAULT_GATE_MULT, 0.3, 2.0),
+        "gvol_spacing_enabled": bool(_f(settings, f"{pfx}vol_spacing", 0.0)),
+        "gvol_spacing_k": _clamp_setting(settings, f"{pfx}vol_spacing_k", _vm.DEFAULT_SPACING_K, 0.5, 6.0),
+        # Fees are absolute, so the floor does not scale with the product: a
+        # completed classic level must clear the mixed round trip (6.8bp); the
+        # fill-anchored book captures one ``s`` per round trip (4.0 maker + 2).
+        "gvol_spacing_floor_bp": _vm.FA_SPACING_FLOOR_BP if fa else _vm.CLASSIC_SPACING_FLOOR_BP,
+        # The card's existing "Spread band" knobs bound the vol spacing.
+        "gvol_spacing_min_bp": max(0.0, smin),
+        "gvol_spacing_max_bp": max(0.0, smax),
+        "gvol_skew_enabled": bool(_f(settings, f"{pfx}inv_skew", 0.0)),
+        "gvol_cap_hard": bool(_f(settings, f"{pfx}inv_cap_hard", 0.0)),
+        "gvol_cap_pct": _clamp_setting(settings, f"{pfx}inv_cap_pct", 30.0, 5.0, 100.0),
+    }
+
+
+def _gvol_rgrid_config(settings) -> dict:
+    """R-Grid's OPT-IN vol-arm filter keys (default OFF; UNVALIDATED thresholds)."""
+    from src.nadobro.quant import vol_model as _vm
+
+    return {
+        "gvol_arm_enabled": bool(_f(settings, "rgrid_vol_arm", 0.0)),
+        "gvol_arm_compress_mult": _clamp_setting(
+            settings, "rgrid_vol_compress_mult", _vm.DEFAULT_COMPRESS_MULT, 0.3, 1.5),
+        "gvol_arm_expand_mult": _clamp_setting(
+            settings, "rgrid_vol_expand_mult", _vm.DEFAULT_EXPAND_MULT, 0.8, 4.0),
+    }
+
+
+# Engine keys whose feature READS the volatility estimate (so the cycle driver
+# injects the baseline provider). The hard cap alone needs no data.
+_GVOL_DATA_KEYS = ("gvol_gate_enabled", "gvol_spacing_enabled", "gvol_skew_enabled",
+                   "gvol_arm_enabled")
 
 
 def _quote_defense_defaults(settings, notional, *, auto_spread: bool) -> dict:
@@ -1362,6 +1444,9 @@ def _map_revgrid_config(
         # holds visibly instead of paying fees into a guaranteed session stop.
         "stop_budget_unfundable": bool(plan.sizing.fees_exceed_budget),
     }
+    # OPT-IN vol-arm filter (default OFF). D-Grid's nested trend delegate strips
+    # these (see map_strategy_config's dgrid branch) — its phase is D-Grid's call.
+    cfg.update(_gvol_rgrid_config(settings))
     # Honour explicit per-run geometry overrides if the operator set them (testnet
     # tuning); they win over the user-facing knobs above.
     for key in ("stop_pct", "trail_arm_pct", "trail_giveback_pct", "reanchor_bands"):
@@ -2071,6 +2156,9 @@ def map_strategy_config(
             # net-exposure cap, the trailing soft reset and the session SL/TP rails
             # are the backstops.
             **({"regime_gate_enabled": 0.0} if "regime_gate_enabled" not in settings else {}),
+            # OPT-IN vol-arm filter (default OFF). Never on D-Grid's nested trend
+            # delegate: D-Grid owns that phase decision.
+            **({} if _for_dgrid_trend else _gvol_rgrid_config(settings)),
             # ADD EXECUTION MODEL. "maker" (default) rests the add post-only, which
             # cannot fill a clean trend (0 fills, measured). "cross" fires a bounded
             # marketable-limit add on confirmed momentum (mid extended one
@@ -2172,6 +2260,8 @@ def map_strategy_config(
             # soft-reset + session SL/TP rail are the backstops). An explicit
             # regime_gate_enabled=1 re-arms the gate.
             **({"regime_gate_enabled": 0.0} if "regime_gate_enabled" not in settings else {}),
+            # OPT-IN vol model (default OFF; docs/grid_vol_model.md).
+            **_gvol_config(settings, "grid", fa=True),
         }
     #
     # NO_ORDERS_AUDIT-FIX-R4: spread_bp is now interpreted as the per-level
@@ -2286,6 +2376,9 @@ def map_strategy_config(
         # margin_quote = DEPLOYED notional so the net-exposure cap scales with
         # leverage instead of choking a leveraged ladder at 30% of collateral.
         **_quote_defense_defaults(settings, deployed, auto_spread=spread_frac <= 0),
+        # OPT-IN vol model (default OFF; docs/grid_vol_model.md). Grid and D-Grid
+        # both pass through here; D-Grid's gate is its regime model.
+        **_gvol_config(settings, strategy, fa=False),
     }
     # NO_ORDERS_AUDIT-FIX-R2: DynamicGridController requires a candle_provider
     # callable to classify the volatility regime. Without one, _candles()
@@ -2318,6 +2411,13 @@ def map_strategy_config(
         cfg["dgrid_trend_follow"] = _as_bool(
             settings.get("dgrid_trend_follow"), _dgrid_trend_uses_trigger
         )
+        # Regime model (OPT-IN): "vr" (default, the variance-ratio classifier) or
+        # "vol" (the realized-volatility gate; never switches to the trend phase).
+        # dgrid_trend_follow is NOT rewritten: the controller ignores it under
+        # "vol" (the card says so) and honours it again on "vr".
+        _dg_model = str(settings.get("dgrid_regime_model") or "vr").strip().lower()
+        cfg["dgrid_regime_model"] = _dg_model if _dg_model in ("vr", "vol") else "vr"
+        cfg["gvol_gate_enabled"] = cfg["dgrid_regime_model"] == "vol"
         # (recycle_levels is set for the whole GridExecutor family above.)
         cfg["dgrid_short_window"] = int(max(2, _f(settings, "dgrid_short_window_points", 4)))
         cfg["dgrid_long_window"] = int(max(4, _f(settings, "dgrid_long_window_points", 12)))
@@ -2417,6 +2517,11 @@ def map_strategy_config(
                 leverage=leverage,
             )
             _trend_cfg["revgrid_chop_stand_down"] = False
+            # The nested delegate never runs the vol-arm filter: under "vr" D-Grid's
+            # classifier owns its phase, under "vol" the trend phase is off.
+            for _gk in list(_trend_cfg):
+                if _gk.startswith("gvol_"):
+                    _trend_cfg.pop(_gk, None)
             cfg["trend_rgrid"] = _trend_cfg
             cfg["trend_uses_trigger"] = True
         else:
@@ -3210,6 +3315,24 @@ async def _run_engine_cycle_locked(
 
         configs["candle_provider"] = _candle_provider
 
+    # OPT-IN vol model (docs/grid_vol_model.md): the per-product 7-day baseline.
+    # Injected only when a feature that reads it is on; all IO runs off the loop
+    # inside strategy/vol_baseline (DENIED != EMPTY paging, memo shared per
+    # product). Excluded from the live signature like candle_provider.
+    if (strategy in ("grid", "rgrid", "dgrid")
+            and configs.get("gvol_baseline_provider") is None
+            and any(bool(configs.get(_k)) for _k in _GVOL_DATA_KEYS)):
+        _gv_cli = client
+        _gv_pid = int(product_id)
+        _gv_net = str(network)
+
+        async def _gvol_baseline_provider(_pair: str, candles: list) -> object:
+            from src.nadobro.strategy import vol_baseline as _vb
+
+            return await _vb.get_baseline(_gv_cli, _gv_net, _gv_pid, candles)
+
+        configs["gvol_baseline_provider"] = _gvol_baseline_provider
+
     # Mid Mode v3 Phase 6: the forecast and mark-out providers. Injected HERE
     # for the same reason candle_provider is — this is where the network and
     # product are known — and as callables because engine/ has no module-level
@@ -3755,6 +3878,14 @@ async def _run_engine_cycle_locked(
                 engine_diag["phase"] = getattr(controller, "current_phase", None)
             if hasattr(controller, "variance_ratio"):
                 engine_diag["variance_ratio"] = float(getattr(controller, "variance_ratio", 0.0) or 0.0)
+            # OPT-IN vol model: a dark stand-down is diagnosable from one line.
+            _gv = getattr(controller, "gvol_arm", None) or getattr(controller, "gvol_gate", None)
+            if _gv is not None:
+                engine_diag["gvol_state"] = str(getattr(_gv, "state", "") or "")
+                _rv = getattr(_gv, "rv60_bp", None)
+                engine_diag["gvol_rv60"] = round(float(_rv), 2) if _rv is not None else None
+                _gb = getattr(_gv, "gate_bp", None) or getattr(_gv, "expand_bp", None)
+                engine_diag["gvol_gate"] = round(float(_gb), 2) if _gb is not None else None
             # RE-QUOTE DIAGNOSTIC: why the ladder did (not) follow price this
             # cycle. A grid that stops moving while the market trends loses its
             # edge, and the gate is invisible without these three numbers:

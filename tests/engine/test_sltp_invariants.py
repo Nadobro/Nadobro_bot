@@ -1554,3 +1554,76 @@ def test_the_close_fee_reserve_never_turns_a_stop_into_a_hair_trigger():
     assert tight == pytest.approx(1.0)
     calm = effective_sl_trigger(10.0, 49.0, 0.0, close_cost_pct=close_cost_pct(4900.0, 100.0))
     assert calm + close_cost_pct(4900.0, 100.0) == pytest.approx(10.0)
+
+
+# ── GRID-FAMILY VOL MODEL (opt-in, docs/grid_vol_model.md) ──────────────────
+# Two invariants bind every future change to the vol model:
+#   GVOL-OFF-IDENTITY: with every gvol_* feature OFF the grid family trades
+#     byte-for-byte as before the model existed (golden venue-call logs recorded
+#     on the base branch, tests/engine/fixtures/gvol_off_golden.json).
+#   GVOL-EXITS-NEVER-GATED: whatever the verdict (HOT / UNKNOWN / WARMING /
+#     CALM), the model never sends a crossing or MARKET order that is not
+#     reduce-only and never cancels a reduce-only close leg — stand-down means
+#     "withdraw entries and hold", never a taker dump; R-Grid's arm filter never
+#     arms a taker entry unless the verdict is ARMED (first arm included).
+
+def _gvol_guard_providers(state: str) -> dict:
+    import time as _time
+
+    from src.nadobro.quant import vol_model as _vm
+    from tests.engine import gvol_scenarios as _gs
+
+    async def candles(_pair):
+        if state == "unknown":
+            return []
+        return _gs.synthetic_candles(_time.time(), amp_bp=8.0 if state == "hot" else 2.0)
+
+    async def baseline(_pair, _candles):
+        if state == "warming":
+            return _vm.VolBaseline(median_rv60_bp=None, coverage_h=10.0, n_minutes=600, newest_ts=0)
+        return _vm.VolBaseline(median_rv60_bp=4.0, coverage_h=168.0, n_minutes=10080, newest_ts=0)
+
+    return {"candle_provider": candles, "gvol_baseline_provider": baseline}
+
+
+def test_gvol_off_identity_matches_the_base_branch_golden_logs():
+    import json
+    import pathlib
+
+    from tests.engine import gvol_scenarios as _gs
+
+    golden = json.loads(
+        (pathlib.Path(__file__).parent / "fixtures" / "gvol_off_golden.json").read_text())
+    for name, run in _gs.SCENARIOS.items():
+        assert json.loads(json.dumps(run(None))) == golden[name], name
+
+
+@pytest.mark.parametrize("state", ["hot", "unknown", "warming", "calm"])
+def test_gvol_exits_never_gated_and_no_taker_dump(state):
+    from tests.engine import gvol_scenarios as _gs
+
+    prov = _gvol_guard_providers(state)
+    grid_on = {"gvol_gate_enabled": True, "gvol_spacing_enabled": True,
+               "gvol_skew_enabled": True, "gvol_cap_hard": True, "gvol_cap_pct": 30.0, **prov}
+    logs = {
+        "grid": _gs.run_grid(grid_on),
+        "grid_fill_anchored": _gs.run_fa({**grid_on, "gvol_spacing_floor_bp": 6.0}),
+        "dgrid": _gs.run_dgrid({**grid_on, "dgrid_regime_model": "vol",
+                                "dgrid_trend_follow": True}),
+    }
+    for name, log in logs.items():
+        reduce_ids = {e[1] for e in log if e[0] == "place" and e[6]}
+        for e in log:
+            if e[0] == "place" and not e[6]:
+                assert e[3] == "LIMIT_MAKER", (name, state, e)      # never a taker entry
+            if e[0] == "cancel":
+                assert e[1] not in reduce_ids, (name, state, e)     # never a close-leg cancel
+        if state != "calm":
+            # standing down from the first tick: no entry is ever placed
+            assert not [e for e in log if e[0] == "place" and not e[6]], (name, state)
+        else:
+            assert [e for e in log if e[0] == "place" and not e[6]], (name, "calm must trade")
+    rg = _gs.run_rgrid({"gvol_arm_enabled": True, **prov})
+    assert not [e for e in rg if e[0] == "place" and e[3] == "MARKET"]
+    # these tapes never show a burst after a quiet spell -> never ARMED -> no rung
+    assert not [e for e in rg if e[0] == "trigger"], (state, rg[:3])

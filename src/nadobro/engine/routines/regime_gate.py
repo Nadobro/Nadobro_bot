@@ -84,7 +84,16 @@ GATE_REASON_HUMAN: Dict[str, str] = {
     # pyramid round trip in taker fees alone meets the session stop budget: it
     # could only pay fees into a guaranteed session stop (GRIDFAM-2026-09-27).
     "stop_budget_too_tight": "stop too tight — fees alone would hit the PnL stop",
+    # OPT-IN realized-volatility model (quant/vol_model, docs/grid_vol_model.md).
+    "vol_hot": "volatility high: standing down",
+    "vol_unknown": "volatility unreadable: standing down",
+    "vol_warming": "learning this market's volatility",
+    "rgrid_vol_wait": "waiting for a volatility breakout",
 }
+
+# Reasons asserted by the opt-in vol model (not a regime verdict). Each has its
+# own resume wording on the card. Mirrors controller_base._VOL_GATE_REASONS.
+VOL_GATE_REASONS: frozenset = frozenset({"vol_hot", "vol_unknown", "vol_warming", "rgrid_vol_wait"})
 
 # Reasons whose resume condition is "a trend forms" (reverse grid), NOT "the
 # market ranges again" (grid/mid). The /status card and the pause notice read

@@ -1639,8 +1639,14 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         # custom-size/hold/cycles reply was rejected, the pending state cleared,
         # and the typed number fell through to the LOWIQPTS points relay.
         "fixed_margin_usd", "dn_hold_seconds", "dn_cycles",
+        # Vol model (docs/grid_vol_model.md) numeric knobs — same as the buttons.
+        "grid_vol_gate_mult", "grid_vol_spacing_k", "grid_inv_cap_pct",
+        "dgrid_vol_gate_mult", "dgrid_vol_spacing_k", "dgrid_inv_cap_pct",
+        "rgrid_vol_compress_mult", "rgrid_vol_expand_mult",
     )
-    if strategy not in supported or field not in supported_fields:
+    from src.nadobro.strategy.strategy_registry import gvol_field_allowed as _gvol_ok
+
+    if strategy not in supported or field not in supported_fields or not _gvol_ok(strategy, field):
         context.user_data.pop("pending_strategy_input", None)
         await run_blocking(clear_strategy_pending_input, int(telegram_id))
         return False
@@ -1730,6 +1736,23 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
         "mm_leverage_override": (1, 50),
         "mm_duration_minutes": (1, 14400),
         "twap_pause_move_bp": (0, 5000),
+        # Vol model (docs/grid_vol_model.md). Must match strategy_handler.py.
+        "grid_vol_gate": (0, 1),
+        "grid_vol_gate_mult": (0.3, 2.0),
+        "grid_vol_spacing": (0, 1),
+        "grid_vol_spacing_k": (0.5, 6.0),
+        "grid_inv_skew": (0, 1),
+        "grid_inv_cap_hard": (0, 1),
+        "grid_inv_cap_pct": (5, 100),
+        "dgrid_vol_gate_mult": (0.3, 2.0),
+        "dgrid_vol_spacing": (0, 1),
+        "dgrid_vol_spacing_k": (0.5, 6.0),
+        "dgrid_inv_skew": (0, 1),
+        "dgrid_inv_cap_hard": (0, 1),
+        "dgrid_inv_cap_pct": (5, 100),
+        "rgrid_vol_arm": (0, 1),
+        "rgrid_vol_compress_mult": (0.3, 1.5),
+        "rgrid_vol_expand_mult": (0.8, 4.0),
     }
     # The trigger Reverse Grid arms ``levels`` rungs on EACH side and Nado holds at
     # most 25 pending triggers per product, so R-Grid levels stop at 12 (the
@@ -1782,6 +1805,8 @@ async def _handle_pending_strategy_input(update, context, telegram_id, text):
             "interval_seconds", "levels", "quote_ttl_seconds", "rgrid_reset_timeout_seconds",
             "grid_reset_timeout_seconds", "dgrid_short_window_points", "dgrid_long_window_points",
             "dn_hold_seconds", "dn_cycles", "mm_leverage_override", "dgrid_flip_confirm_ticks",
+            "grid_vol_gate", "grid_vol_spacing", "grid_inv_skew", "grid_inv_cap_hard",
+            "dgrid_vol_spacing", "dgrid_inv_skew", "dgrid_inv_cap_hard", "rgrid_vol_arm",
         }
         if field in int_fields:
             cfg[field] = int(value)

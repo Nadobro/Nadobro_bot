@@ -1206,6 +1206,22 @@ class RGridController(MarketMakingController):
             await self._classify_regime()
             allow_buy, allow_sell = self._trend_gate_sides(allow_buy, allow_sell)
 
+        # OPT-IN VOL-ARM FILTER (docs/grid_vol_model.md; default OFF): while FLAT,
+        # open only on a volatility burst after a quiet spell (AND with the chop
+        # guard above). Gates ENTRIES only — the trail / exposure-band exits below
+        # are triggers that never read allow_buy/allow_sell, and adds to an open
+        # position are not gated. UNKNOWN / WARMING do not open. UNVALIDATED: a
+        # stand-down filter that cannot make R-Grid profitable at taker fees.
+        await self._gvol_refresh(self.trading_pair)
+        if self.vol_cfg.arm_enabled and net == 0 and (
+                self.gvol_arm is None or not self.gvol_arm.armed):
+            allow_buy = allow_sell = False
+            if not self.gate_paused:
+                arm = self.gvol_arm
+                self.gate_verdict = "PAUSE"
+                self.gate_reason = ("rgrid_vol_wait" if arm is not None and arm.state == "WAITING"
+                                    else ((arm.reason if arm is not None else "") or "vol_unknown"))
+
         # Flat and holding stale entries: the closed position's prices still
         # anchor us, and their average sits far from the new mid. Re-anchor so a
         # genuine fresh move is required.
@@ -1501,6 +1517,7 @@ class RGridController(MarketMakingController):
         else:
             reset_side = "SELL" if net_base > 0 else "BUY"
         return {
+            **self.gvol_metrics(),
             "grid_mode": "rgrid",
             "grid_anchor_price": float(anchor) if anchor else 0.0,
             "grid_drift_from_anchor_pct": drift_pct,

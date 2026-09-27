@@ -19,6 +19,7 @@ from src.nadobro.engine.controllers.controller_base import (
 from src.nadobro.engine.executors.grid_executor import GridExecutor, GridExecutorConfig
 from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.types import TradeType, TripleBarrierConfig, _dec
+from src.nadobro.quant import vol_model
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,11 @@ class GridController(Controller):
         self.realized_move_bp: float = 0.0
         self._reset_active: bool = False
         self._last_recenter_ts = 0.0
+        # OPT-IN vol model (docs/grid_vol_model.md). All inert while the gvol_*
+        # features are off: no override, no skew, no pending recenter.
+        self._step_override_bp: Optional[float] = None
+        self._gvol_recenter_pending: bool = False
+        self._skew_bp: float = 0.0
 
     async def on_start(self) -> None:
         # PRESENCE-FIRST (user directive): always place the ladder on start so the
@@ -110,14 +116,24 @@ class GridController(Controller):
         await self.evaluate_quote_gate(
             str(self.configs.get("trading_pair")), adverse_trend=self.GATE_ADVERSE_TREND
         )
-        await self._spawn()
+        # OPT-IN VOL GATE — the one explicit exception to presence-first: with the
+        # user's vol gate ON and volatility not calm (HOT / UNKNOWN / WARMING),
+        # the ladder is built but places NO entries until it is calm (the card
+        # says so). Inert when the gate is off.
+        await self.gvol_tick(str(self.configs.get("trading_pair")))
+        await self._spawn(suppress_at_create=self.gvol_stand_down)
 
-    async def _spawn(self) -> None:
+    async def _spawn(self, *, suppress_at_create: bool = False) -> None:
         cfg = build_grid_config(self.configs, self.SIDE)
         ex = self.EXECUTOR_CLS(
             cfg, user_id=self.user_id, controller_id=self.id, adapter=self.adapter,
             inventory=self.inventory,
         )
+        # OPT-IN hard cap binds from the first placement (None = off, classic).
+        ex.cap_quote = self.gvol_cap_quote()
+        if suppress_at_create:
+            ex.suppress_new_entries = True
+            self._gvol_recenter_pending = True   # re-lay around the mid on resume
         ok = await self.spawn_executor(
             ex, ExecutorRequest(order_amount_quote=cfg.total_amount_quote,
                                 position_size_quote=cfg.total_amount_quote)
@@ -136,9 +152,16 @@ class GridController(Controller):
         if mid <= 0:
             return {}
         step = _dec(self.cfg("step_pct", 0) or 0)
+        if self._step_override_bp is not None and step > 0:
+            # OPT-IN vol spacing (gvol_spacing_enabled): the vol-scaled step.
+            step = _dec(self._step_override_bp) / Decimal(10000)
         levels = int(self.cfg("levels_count", 0) or 0)
         if step <= 0 or levels < 1:
             return {}
+        if self._skew_bp:
+            # OPT-IN inventory skew: shift the NEW opens' band against the held
+            # inventory (bounded at half a step). Close legs are unchanged.
+            mid = mid * (Decimal(1) + _dec(self._skew_bp) / Decimal(10000))
         span = step * Decimal(max(levels - 1, 1))
         # POST-ONLY-CROSS fix: keep the near-mid boundary a strict maker (buys
         # below mid, sells above) so a post-only re-quote never crosses the book.
@@ -160,15 +183,18 @@ class GridController(Controller):
             "limit_price": Decimal(0),
         }
 
-    async def _maybe_recenter(self, mid: Optional[Decimal]) -> None:
+    async def _maybe_recenter(self, mid: Optional[Decimal], *, force: bool = False) -> None:
+        """``force`` (vol model only: a resume after a stand-down, or a new vol
+        spacing) bypasses the drift threshold — never the rate limit or the
+        venue-budget deferral; a deferred forced recenter stays pending."""
         self._reset_active = False
-        if self.reset_threshold_bp <= 0 or mid is None or mid <= 0:
+        if (self.reset_threshold_bp <= 0 and not force) or mid is None or mid <= 0:
             return
         if self._anchor_mid and self._anchor_mid > 0:
             self.realized_move_bp = float(
                 abs((mid - self._anchor_mid) / self._anchor_mid) * Decimal(10000)
             )
-        if self.realized_move_bp < self.reset_threshold_bp:
+        if self.realized_move_bp < self.reset_threshold_bp and not force:
             return
         # Rate-limit re-centers so a fast move can't churn cancel/replace bursts
         # at the venue (on_tick still ticks the executor every cycle, so fills /
@@ -201,6 +227,11 @@ class GridController(Controller):
         for ex in self.my_executors(active_only=True):
             rc = getattr(ex, "recenter", None)
             if callable(rc):
+                if self._step_override_bp is not None and hasattr(ex, "config"):
+                    # Fresh levels get the vol step + close-leg distance; held
+                    # levels keep the close leg they were opened for.
+                    ex.config.min_spread_between_orders = (
+                        _dec(self._step_override_bp) / Decimal(10000))
                 await rc(start, end)
                 recentered = True
         if recentered:
@@ -208,28 +239,50 @@ class GridController(Controller):
             self.realized_move_bp = 0.0
             self._reset_active = True
             self._last_recenter_ts = now
+            self._gvol_recenter_pending = False
             logger.info("grid %s recenter side=%s mid=%s band=[%s, %s]",
                         self.id, self.SIDE.name, mid, start, end)
 
     async def on_tick(self) -> None:
         pair = str(self.configs.get("trading_pair"))
         await self.evaluate_quote_gate(pair, adverse_trend=self.GATE_ADVERSE_TREND)
+        await self.gvol_tick(pair)          # OPT-IN vol model; no-op when off
         active = self.my_executors()
         if not active and self._executor_id is None:
             # Presence-first: the ladder is spawned at on_start regardless of the
             # gate, so this only fires if that initial spawn FAILED (e.g. a transient
             # venue error). Retry it — the market entry is never gate-blocked; the
-            # gate only suppresses NEW entry levels below.
-            await self._spawn()
+            # gate only suppresses NEW entry levels below. (Exception: the opt-in
+            # vol gate, which builds it without entries until calm.)
+            await self._spawn(suppress_at_create=self.gvol_stand_down)
             active = self.my_executors()
         # Inventory cap: a long grid's only worsening side is its entries.
         try:
             mid = await self.adapter.mid_price(pair)
         except Exception:  # noqa: BLE001 - cap check degrades to gate-only
             mid = None
-        # Reset & continue: re-center the ladder around the new mid as price
-        # drifts (no position close).
-        await self._maybe_recenter(_dec(mid) if mid is not None else None)
+        mid_d = _dec(mid) if mid is not None else None
+        if self.gvol_stand_down:
+            # VOL STAND-DOWN (opt-in): withdraw resting ENTRIES nearest-first and
+            # hold. Close legs, fills and stops keep running in the tick below;
+            # no market / crossing / reduce-only order is sent. No recenter
+            # while standing down — it would only re-lay entries.
+            for ex in active:
+                ex.suppress_new_entries = True
+                wd = getattr(ex, "withdraw_opens", None)
+                if callable(wd):
+                    self.gvol_withdrawn += int(await wd() or 0)
+        else:
+            if self._gvol_resumed:
+                # Withdrawn levels carry stale prices: re-lay once around the mid.
+                self._gvol_recenter_pending = True
+            if mid_d is not None and mid_d > 0:
+                self._gvol_apply_spacing(mid_d)
+                self._gvol_apply_skew(mid_d, active)
+            # Reset & continue: re-center the ladder around the new mid as price
+            # drifts (no position close).
+            await self._maybe_recenter(mid_d, force=self._gvol_recenter_pending)
+        await self._gvol_apply_cap(mid_d, active)
         exposure = self.exposure_allowed_sides(pair, mid) if mid else {"buy": True, "sell": True}
         entry_side_allowed = exposure["buy"] if self.SIDE is TradeType.BUY else exposure["sell"]
         for ex in active:
@@ -238,9 +291,53 @@ class GridController(Controller):
             ex.suppress_new_entries = self.gate_paused or not entry_side_allowed
             await self.orchestrator.tick(ex.id)
 
+    # -- OPT-IN vol model helpers (docs/grid_vol_model.md) ---------------------
+    def _base_step_bp(self) -> float:
+        return float(_dec(self.cfg("step_pct", 0) or 0) * Decimal(10000))
+
+    def _refresh_reset_threshold(self) -> None:
+        step_bp = self._step_override_bp if self._step_override_bp is not None else self._base_step_bp()
+        levels_count = int(self.cfg("levels_count", 0) or 0)
+        _user_reset = float(self.cfg("reset_threshold_bp", 0.0) or 0.0)
+        self.reset_threshold_bp, _ = ladder_recenter_threshold_bp(step_bp, levels_count, _user_reset)
+
+    def _gvol_apply_spacing(self, mid: Decimal) -> None:
+        """Vol-scaled spacing: applied only on a change of at least max(1bp, 15%)
+        (no per-minute churn) and only through a recenter — resting rungs are
+        never moved tick by tick. Toggling the feature OFF restores the
+        configured step at the next recenter."""
+        if not self.vol_cfg.spacing_enabled:
+            if self._step_override_bp is not None:
+                self._step_override_bp = None
+                self.gvol_spacing_bp_live = 0.0
+                for ex in self.my_executors(active_only=True):
+                    if hasattr(ex, "config"):
+                        ex.config.min_spread_between_orders = _dec(
+                            self.cfg("min_spread_between_orders", "0.005"))
+                self._refresh_reset_threshold()
+                self._gvol_recenter_pending = True
+            return
+        target = self.gvol_spacing_target(mid)
+        if target is None:
+            return
+        current = self._step_override_bp if self._step_override_bp is not None else self._base_step_bp()
+        self.gvol_spacing_bp_live = float(current)
+        if not vol_model.spacing_change_significant(current, target):
+            return
+        self._step_override_bp = float(target)
+        self.gvol_spacing_bp_live = float(target)
+        self._refresh_reset_threshold()
+        self._gvol_recenter_pending = True
+
+    def _gvol_apply_skew(self, mid: Decimal, active: list) -> None:
+        """A-S inventory skew for NEW opens (applied at the next recenter)."""
+        step = self._step_override_bp if self._step_override_bp is not None else self._base_step_bp()
+        self._skew_bp = self._gvol_ladder_skew(mid, active, step, sell_side=self.SIDE is TradeType.SELL)
+
     def grid_metrics(self) -> Dict[str, object]:
         """Anchor / side / drift / reset telemetry for the /status card."""
         return {
+            **self.gvol_metrics(),
             "grid_anchor_price": float(self._anchor_mid) if self._anchor_mid else 0.0,
             "grid_reset_side": self.SIDE.name,
             "grid_drift_from_anchor_pct": self.realized_move_bp / 100.0,

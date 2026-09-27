@@ -203,6 +203,13 @@ class GridExecutor(Executor):
         self._book_recorded_base = Decimal(0)
         self._book_recorded_quote = Decimal(0)
         self._book_recorded_fee = Decimal(0)
+        # OPT-IN hard inventory cap (vol model, docs/grid_vol_model.md). None =
+        # off: placement and every other path are exactly the classic ladder.
+        # When set by the controller, held + resting opens may not exceed it by
+        # more than one level ("+1 level" so a flat book can always place its
+        # first rung); opens are placed NEAREST-to-mid first and trimmed
+        # DEEPEST-first.
+        self.cap_quote: Optional[Decimal] = None
 
     @property
     def open_side(self) -> TradeType:
@@ -304,6 +311,9 @@ class GridExecutor(Executor):
             if time.time() - self._last_place_ts < self.config.order_frequency:
                 return
         mid = await self._guard(lambda: self.adapter.mid_price(self.trading_pair), label="mid")
+        if self.cap_quote is not None:
+            await self._maybe_place_opens_capped(mid)
+            return
         placed = 0
         for level in self.levels:
             if placed >= self.config.max_orders_per_batch:
@@ -324,6 +334,178 @@ class GridExecutor(Executor):
                 placed += 1
         if placed:
             self._last_place_ts = time.time()
+
+    # -- OPT-IN vol model: hard cap + stand-down (docs/grid_vol_model.md) ------
+    def _nearest_first(self, levels: List[GridLevel]) -> List[GridLevel]:
+        """Nearest-to-mid first: the highest buy / the lowest sell."""
+        return sorted(levels, key=lambda lv: lv.open_price,
+                      reverse=self.open_side is TradeType.BUY)
+
+    def resting_open_quote(self) -> Decimal:
+        """Notional of the resting (unfilled) entry orders, at full size."""
+        return sum(
+            (lv.amount_base * lv.open_price for lv in self.levels
+             if lv.state is GridLevelState.OPEN_ORDER_PLACED),
+            Decimal(0),
+        )
+
+    def held_quote(self, mid: object) -> Decimal:
+        return self._unclosed_base() * _dec(mid)
+
+    def level_quote(self) -> Decimal:
+        return self.config.total_amount_quote / Decimal(max(1, self.config.max_open_orders))
+
+    async def _maybe_place_opens_capped(self, mid: Decimal) -> None:
+        cap = self.cap_quote if self.cap_quote is not None else Decimal(0)
+        held = self.held_quote(mid)
+        resting = self.resting_open_quote()
+        placed = 0
+        free = [lv for lv in self.levels if lv.state is GridLevelState.NOT_ACTIVE]
+        for level in self._nearest_first(free):
+            if placed >= self.config.max_orders_per_batch:
+                break
+            if self.adapter.opening_budget_exhausted() or self.adapter.execute_budget_exhausted():
+                break
+            if not self._within_bounds(level.open_price, mid):
+                continue
+            # held + resting + this level <= cap + one level  <=>  held + resting <= cap
+            if held + resting > cap:
+                break
+            await self._place_open(level)
+            resting += level.amount_base * level.open_price
+            placed += 1
+        if placed:
+            self._last_place_ts = time.time()
+
+    async def _release_open(self, lv: GridLevel, *, purpose: str) -> str:
+        """Cancel one resting open and re-poll it for a fill that landed before
+        the cancel. Returns ``"freed"`` (off the book, nothing filled — the slot
+        may be reused), ``"kept"`` (fail closed: the cancel or the status probe
+        failed, so the level stays bound to its order) or ``"held"`` (a partial
+        fill is now held and its close leg was booked)."""
+        oid = lv.open_order_id
+        if oid is None:
+            return "freed"
+        cancelled = False
+        try:
+            # Deliberately NOT via self._guard: _guard counts failures against the
+            # executor's budget and TERMINATES it FAILED after a few, and
+            # _terminate() does not cancel resting orders — so a spell of cancel
+            # errors killed the ladder outright and it never re-quoted again,
+            # reproducing the very stale-quote symptom this branch exists to fix
+            # (probed: 4 failed re-centers -> FAILED, then zero orders on every
+            # later tick). A re-center / withdraw is OPPORTUNISTIC and runs again
+            # next cycle, so a transient cancel failure must cost nothing but this
+            # round. Audit round 3.
+            await self.adapter.cancel_order(oid)
+            self.orders_cancelled += 1
+            cancelled = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "grid %s: %s cancel failed for %s (retrying next "
+                "cycle, level kept): %s", self.id, purpose, oid, exc,
+            )
+        if not cancelled:
+            # RECENTER-ORPHAN (fail closed). ``cancel_order`` only returns after
+            # verifying the order really is off the book, so an exception here
+            # means it is STILL LIVE on the venue. Freeing the slot would re-quote
+            # on top of it AND drop its id, so nothing could ever cancel it again —
+            # the ladder would run at double the intended exposure. Keep the level
+            # bound to its live order and let the next cycle retry.
+            # Latent while the re-center almost never fired; routine once the
+            # threshold was capped to the band (6946ee5).
+            return "kept"
+        try:
+            refreshed = await self.adapter.order_status(oid)
+            self._ingest(lv, refreshed, self.open_side, opening=True)
+        except Exception as exc:  # noqa: BLE001
+            # FAIL CLOSED, like the cancel above (audit round 4). The cancel
+            # SUCCEEDED, so this order is off the book — but we do not know how
+            # much of it FILLED before it went. Freeing the slot here discards
+            # that fill: the level is re-quoted as if empty, the held base is
+            # never given a close leg, and the position silently drifts from what
+            # the ladder thinks it holds. Keep the level and re-probe next cycle;
+            # the id is retained so the fill can still be recovered.
+            logger.warning(
+                "grid %s: %s status probe failed for %s (%s) — keeping "
+                "the level so an unknown partial fill is not discarded",
+                self.id, purpose, oid, exc,
+            )
+            return "kept"
+        lv.open_order_id = None
+        if lv.filled_base > 0:
+            # Partial inventory now held — book its close leg and keep it.
+            lv.state = GridLevelState.OPEN_ORDER_FILLED
+            await self._place_close(lv)
+            return "held"
+        return "freed"
+
+    async def withdraw_opens(self, *, keep_quote: object = 0) -> int:
+        """Vol-model STAND-DOWN: cancel resting ENTRY orders nearest-to-mid first
+        (the ones about to fill) until the resting open notional is at most
+        ``keep_quote`` (0 = withdraw all). Freed levels become NOT_ACTIVE and are
+        not re-placed while ``suppress_new_entries`` holds.
+
+        Never touches a close leg, never sends a MARKET / crossing / reduce-only
+        order, never flattens: stand-down means "stop digging and hold". Same
+        fail-closed rules as the re-center (a failed cancel or status probe keeps
+        the level bound; a partial fill books its close leg). Skips the cycle
+        under an execute-budget throttle and retries next tick. Returns the
+        number of entries withdrawn."""
+        if self.is_terminated:
+            return 0
+        keep = _dec(keep_quote)
+        withdrawn = 0
+        resting = [lv for lv in self.levels
+                   if lv.state is GridLevelState.OPEN_ORDER_PLACED and lv.open_order_id]
+        total = sum((lv.amount_base * lv.open_price for lv in resting), Decimal(0))
+        for lv in self._nearest_first(resting):
+            if total <= keep:
+                break
+            if self.adapter.execute_budget_exhausted():
+                break
+            lq = lv.amount_base * lv.open_price
+            outcome = await self._release_open(lv, purpose="withdraw")
+            if outcome == "kept":
+                continue
+            total -= lq
+            if outcome == "freed":
+                lv.state = GridLevelState.NOT_ACTIVE
+                withdrawn += 1
+        return withdrawn
+
+    async def trim_to_cap(self, mid: object) -> int:
+        """Hard cap: cancel resting opens DEEPEST-first while held + resting
+        exceeds the cap by more than one level. The deep rungs fill only in
+        extended moves — the fills that mark out worst — so they go first.
+        No-op when the hard cap is off."""
+        if self.cap_quote is None or self.is_terminated:
+            return 0
+        m = _dec(mid)
+        if m <= 0:
+            return 0
+        allowance = self.cap_quote + self.level_quote()
+        held = self.held_quote(m)
+        resting = [lv for lv in self.levels
+                   if lv.state is GridLevelState.OPEN_ORDER_PLACED and lv.open_order_id]
+        total = sum((lv.amount_base * lv.open_price for lv in resting), Decimal(0))
+        trimmed = 0
+        for lv in reversed(self._nearest_first(resting)):
+            if held + total <= allowance:
+                break
+            if self.adapter.execute_budget_exhausted():
+                break
+            lq = lv.amount_base * lv.open_price
+            outcome = await self._release_open(lv, purpose="cap trim")
+            if outcome == "kept":
+                continue
+            total -= lq
+            if outcome == "held":
+                held = self.held_quote(m)
+            else:
+                lv.state = GridLevelState.NOT_ACTIVE
+                trimmed += 1
+        return trimmed
 
     async def recenter(self, start_price: object, end_price: object) -> None:
         """Re-quote the resting (unfilled) open ladder around a new ``[start,
@@ -348,62 +530,9 @@ class GridExecutor(Executor):
             if lv.state is GridLevelState.OPEN_ORDER_PLACED and lv.open_order_id is not None:
                 # Cancel the stale resting open, then re-poll to capture any
                 # partial fill that landed before the cancel (BUG-GR-1 pattern).
-                oid = lv.open_order_id
-                cancelled = False
-                try:
-                    # Deliberately NOT via self._guard: _guard counts failures
-                    # against the executor's budget and TERMINATES it FAILED after
-                    # a few, and _terminate() does not cancel resting orders — so a
-                    # spell of cancel errors killed the ladder outright and it never
-                    # re-quoted again, reproducing the very stale-quote symptom this
-                    # branch exists to fix (probed: 4 failed re-centers -> FAILED,
-                    # then zero orders on every later tick). A re-center is
-                    # OPPORTUNISTIC and runs again next cycle, so a transient cancel
-                    # failure must cost nothing but this round. Audit round 3.
-                    await self.adapter.cancel_order(oid)
-                    self.orders_cancelled += 1
-                    cancelled = True
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "grid %s: recenter cancel failed for %s (retrying next "
-                        "cycle, level kept): %s", self.id, oid, exc,
-                    )
-                if not cancelled:
-                    # RECENTER-ORPHAN (fail closed). ``cancel_order`` only returns
-                    # after verifying the order really is off the book, so an
-                    # exception here means it is STILL LIVE on the venue. Freeing
-                    # the slot would re-quote on top of it AND drop its id, so
-                    # nothing could ever cancel it again — the ladder would run at
-                    # double the intended exposure. Keep the level bound to its
-                    # live order and let the next re-center retry.
-                    # Latent while the re-center almost never fired; routine once
-                    # the threshold was capped to the band (6946ee5).
-                    kept.append(lv)
-                    continue
-                try:
-                    refreshed = await self.adapter.order_status(oid)
-                    self._ingest(lv, refreshed, self.open_side, opening=True)
-                except Exception as exc:  # noqa: BLE001
-                    # FAIL CLOSED, like the cancel above (audit round 4). The
-                    # cancel SUCCEEDED, so this order is off the book — but we do
-                    # not know how much of it FILLED before it went. Freeing the
-                    # slot here discards that fill: the level is re-quoted as if
-                    # empty, the held base is never given a close leg, and the
-                    # position silently drifts from what the ladder thinks it
-                    # holds. Keep the level and re-probe next cycle; the id is
-                    # retained so the fill can still be recovered.
-                    logger.warning(
-                        "grid %s: recenter status probe failed for %s (%s) — keeping "
-                        "the level so an unknown partial fill is not discarded",
-                        self.id, oid, exc,
-                    )
-                    kept.append(lv)
-                    continue
-                lv.open_order_id = None
-                if lv.filled_base > 0:
-                    # Partial inventory now held — book its close leg and keep it.
-                    lv.state = GridLevelState.OPEN_ORDER_FILLED
-                    await self._place_close(lv)
+                # The fail-closed rules (RECENTER-ORPHAN, audit rounds 3/4) live
+                # in _release_open, shared with the vol-model withdraw / cap trim.
+                if await self._release_open(lv, purpose="recenter") != "freed":
                     kept.append(lv)
                     continue
             # NOT_ACTIVE, COMPLETE, or an emptied open: this slot is free to recycle.

@@ -68,9 +68,36 @@ exposure (closed as a residual at the next phase change, flattened on Stop).
 | PnL SL / TP (% of margin, both phases) | `rgrid_stop_loss_pct`, `rgrid_take_profit_pct` |
 | Trend-phase exits (auto = 2 × step) | `rgrid_stop_pct`, `rgrid_trail_pct` |
 
+| Regime model (OPT-IN, default `vr`) | `dgrid_regime_model` (`vr` / `vol`) |
+| Vol gate / spacing / skew / hard cap (OPT-IN, default off) | `dgrid_vol_gate_mult`, `dgrid_vol_spacing`, `dgrid_vol_spacing_k`, `dgrid_inv_skew`, `dgrid_inv_cap_hard`, `dgrid_inv_cap_pct` |
+
 `/status` shows the phase, variance ratio, realized move, auto-reset, the
 trigger ladder while the trend phase runs (rungs armed / step / stop / trail)
 and any pre-existing position the run left alone.
+
+## Vol regime model (opt-in, `dgrid_regime_model = "vol"`)
+
+This is the realized-volatility alternative to the variance ratio; see
+`docs/grid_vol_model.md`. It is off by default, and the evidence is in-sample
+only.
+
+- D-Grid runs the grid ladder only while the product's 60-minute realized
+  volatility sits in the calm part of its own 7-day range.
+- When volatility is high, unreadable, or the baseline is still loading, D-Grid
+  **withdraws its resting buys and holds what it has**. Close legs, profit tiers
+  and the session rail keep running, and nothing is sold at market. It re-enters
+  after 15 calm minutes, re-laying the ladder once around the current mid.
+- Under this model D-Grid **never switches to the trend phase or fires the
+  reversal flip**. The variance ratio stays on the card as telemetry only
+  (`Model: Vol`).
+- The user's Auto-switch setting is preserved and shown as "ignored under Vol
+  model"; switching back to `vr` honours it again.
+- A live switch `vr → vol` while the trend delegate holds a position lets the
+  delegate finish through its own stop / trail. A settings change never
+  flattens by taker.
+
+The model's spacing uses `dgrid_min_spread_bp` / `dgrid_max_spread_bp` as its
+band, which revives those previously dead knobs.
 
 ## Validation
 
