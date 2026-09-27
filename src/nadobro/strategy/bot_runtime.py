@@ -5,6 +5,16 @@ import os
 import time
 from datetime import datetime, timezone
 
+# Grid-family vol-model telemetry (engine Controller.gvol_metrics; docs/grid_vol_model.md).
+# The ``gvol_`` prefix keeps it clear of the Volume Bot's ``vol_*`` keys.
+_GVOL_TELEMETRY_KEYS = (
+    "gvol_state", "gvol_reason", "gvol_detail", "gvol_features",
+    "gvol_rv60_bp", "gvol_rv15_bp", "gvol_base_bp", "gvol_base_hours", "gvol_gate_bp",
+    "gvol_calm_min", "gvol_resume_in_min", "gvol_data_age_s",
+    "gvol_spacing_bp", "gvol_skew_bp", "gvol_cap_usd", "gvol_cap_used_usd",
+    "gvol_withdrawn", "gvol_compress_bp", "gvol_expand_bp", "gvol_compressed_ago_min",
+)
+
 # Keys that must never be overwritten from persisted strategy *settings* into live runtime state.
 _STRATEGY_SETTINGS_RUNTIME_BLOCKLIST = frozenset({
     "running", "strategy", "strategy_id_v2", "product", "last_run_ts", "runs", "started_at",
@@ -42,7 +52,9 @@ _STRATEGY_SETTINGS_RUNTIME_BLOCKLIST = frozenset({
     # `vol_direction` must not overwrite live runtime each tick — that caused opposite-side
     # entries when UI showed one direction and stale settings said another.
     "vol_direction",
-})
+    # Vol-model notification throttle (runtime-owned).
+    "gvol_last_notify_ts",
+}) | frozenset(_GVOL_TELEMETRY_KEYS)
 
 from src.nadobro.config import (
     get_dn_pair,
@@ -577,6 +589,92 @@ async def _notify(telegram_id: int, text: str, **fmt_kwargs):
             await _bot_app.bot.send_message(chat_id=telegram_id, text=translated)
     except Exception as e:
         logger.warning("Notify failed for %s: %s", telegram_id, e)
+
+
+_GVOL_NOTIFY_THROTTLE_S = 3600.0
+
+
+def _gvol_status_fields(state: dict) -> dict:
+    """Vol-model telemetry for the /status payload (floats / ints / strings)."""
+    # D-Grid's regime model is a USER setting (merged into state from settings),
+    # not controller telemetry — passed through so the card can say "Model: Vol".
+    out: dict = {"dgrid_regime_model": str(state.get("dgrid_regime_model") or "")}
+    for k in _GVOL_TELEMETRY_KEYS:
+        v = state.get(k)
+        if k in ("gvol_state", "gvol_reason", "gvol_detail", "gvol_features"):
+            out[k] = str(v or "")
+        elif k in ("gvol_calm_min", "gvol_resume_in_min", "gvol_withdrawn", "gvol_compressed_ago_min"):
+            try:
+                out[k] = int(v if v is not None else (-1 if k == "gvol_compressed_ago_min" else 0))
+            except (TypeError, ValueError):
+                out[k] = 0
+        else:
+            try:
+                out[k] = float(v or 0.0)
+            except (TypeError, ValueError):
+                out[k] = 0.0
+    return out
+
+
+def _is_vol_gate_event(event: dict) -> bool:
+    from src.nadobro.engine.routines.regime_gate import VOL_GATE_REASONS
+
+    return (str(event.get("reason") or "") in VOL_GATE_REASONS
+            or str(event.get("prev_reason") or "") in VOL_GATE_REASONS)
+
+
+async def _notify_vol_gate_event(telegram_id: int, network: str, strategy: str, product: str,
+                                 state: dict, event: dict, result: object) -> None:
+    """Vol-model stand-down / re-entry notices: dedicated wording, at most one
+    PAUSE and one RESUME message per session per hour (the card is always
+    current). WARMING and the R-Grid arm wait are card-only (start-up state /
+    would flap with every arm)."""
+    kind = "pause" if str(event.get("state")) == "PAUSE" else "resume"
+    reason = str(event.get("reason") or "")
+    if kind == "pause" and reason in ("vol_warming", "rgrid_vol_wait"):
+        return
+    if kind == "resume" and str(event.get("prev_reason") or "") in ("vol_warming", "rgrid_vol_wait"):
+        return
+    now = time.time()
+    last = state.get("gvol_last_notify_ts")
+    if not isinstance(last, dict):
+        last = {}
+    try:
+        if now - float(last.get(kind) or 0.0) < _GVOL_NOTIFY_THROTTLE_S:
+            return
+    except (TypeError, ValueError):
+        pass
+    last[kind] = now
+    state["gvol_last_notify_ts"] = last
+    metrics: dict = {}
+    if isinstance(result, dict):
+        metrics.update(result.get("dgrid_metrics") or {})
+        metrics.update(result.get("grid_metrics") or {})
+    name = _STRATEGY_DISPLAY_NAMES.get(str(strategy).lower(), str(strategy).upper())
+    if kind == "pause" and reason == "vol_hot":
+        await _notify(
+            telegram_id,
+            "⏸ {strategy} stood down on {product} ({network}): volatility {rv} bp/min is "
+            "above its gate {gate}. Resting entries were withdrawn; open positions and "
+            "exits keep running. It re-enters after 15 calm minutes.",
+            strategy=name, product=product, network=network,
+            rv=f"{float(metrics.get('gvol_rv60_bp') or 0.0):.1f}",
+            gate=f"{float(metrics.get('gvol_gate_bp') or 0.0):.1f}",
+        )
+    elif kind == "pause":
+        await _notify(
+            telegram_id,
+            "⏸ {strategy} stood down on {product} ({network}): volatility can't be read "
+            "right now (candle data unavailable). Exits keep running.",
+            strategy=name, product=product, network=network,
+        )
+    else:
+        await _notify(
+            telegram_id,
+            "▶️ {strategy} re-entered on {product} ({network}): volatility has been calm "
+            "for 15 minutes.",
+            strategy=name, product=product, network=network,
+        )
 
 
 def _strategy_defaults(strategy: str) -> dict:
@@ -2325,6 +2423,8 @@ def get_user_bot_status(telegram_id: int) -> dict:
         "dgrid_dynamic_spread_bp": float(state.get("dgrid_dynamic_spread_bp") or 0.0),
         "dgrid_reset_threshold_bp": float(state.get("dgrid_reset_threshold_bp") or 0.0),
         "dgrid_phase_changed": bool(state.get("dgrid_phase_changed")),
+        # Grid-family vol model (opt-in; docs/grid_vol_model.md).
+        **_gvol_status_fields(state),
         "other_running_networks": other_running_networks,
         "strategy_session_id": strategy_session_id,
         "running_sessions": running_sessions,
@@ -4012,7 +4112,10 @@ async def _run_cycle(
         # touches open positions — exits/close legs keep managing; only NEW
         # opening quotes wait for the range to return.
         gate_event = result.get("gate_event") if isinstance(result, dict) else None
-        if gate_event:
+        if gate_event and _is_vol_gate_event(gate_event):
+            await _notify_vol_gate_event(telegram_id, network, strategy, product, state,
+                                         gate_event, result)
+        elif gate_event:
             from src.nadobro.engine.routines.regime_gate import (
                 GATE_REASON_HUMAN as _gate_reasons,
             )
@@ -4053,6 +4156,13 @@ async def _run_cycle(
                           "dgrid_reset_threshold_bp")
             if strategy != "dgrid" and _k in state and _k not in _telemetry
         ]
+        # Same self-heal for the vol model: a key the controller no longer emits
+        # (feature toggled off, strategy switched) must not leave a stale Vol line.
+        if _telemetry:
+            _stale_dgrid += [
+                _k for _k in _GVOL_TELEMETRY_KEYS
+                if _k in state and _k not in _telemetry and _k not in _stale_dgrid
+            ]
         if _telemetry or _stale_dgrid:
             for _k in _stale_dgrid:
                 state.pop(_k, None)
@@ -4070,7 +4180,8 @@ async def _run_cycle(
                        # trigger Reverse Grid ladder + D-Grid baseline (2026-09-16)
                        "grid_rungs_armed", "grid_rungs_per_side", "grid_step_bp",
                        "grid_stop_level", "grid_trail_armed", "dgrid_venue_baseline",
-                       "grid_venue_baseline", "grid_stop_digest", "grid_trigger_digests"):
+                       "grid_venue_baseline", "grid_stop_digest", "grid_trigger_digests",
+                       *_GVOL_TELEMETRY_KEYS):
                 if _k in _telemetry:
                     state[_k] = _telemetry[_k]
             await _save_state_async(telegram_id, network, state)
@@ -4375,13 +4486,14 @@ async def _run_cycle(
         logger.info(
             "engine_diag user=%s strategy=%s controller=%s active=%s gate=%s/%s "
             "candles=%s mid=%s phase=%s vr=%s spawn_refused=%s "
-            "move_bp=%s reset_bp=%s anchor=%s",
+            "move_bp=%s reset_bp=%s anchor=%s gvol=%s rv=%s gate_bp=%s",
             telegram_id, strategy, _diag.get("controller") or "?",
             _diag.get("active_executors"),
             _diag.get("gate_verdict"), _diag.get("gate_reason") or "-",
             _dv("candle_count"), _dv("mid"), _dv("phase"),
             _dv("variance_ratio"), _diag.get("spawn_refused") or "-",
             _dv("move_bp"), _dv("reset_bp"), _dv("anchor"),
+            _dv("gvol_state"), _dv("gvol_rv60"), _dv("gvol_gate"),
         )
 
     # Increment strategy session metrics from cycle result

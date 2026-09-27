@@ -66,6 +66,7 @@ card (`strategy_handler.rgrid_trigger_plan`) so they can never disagree.
 | Stop | `rgrid_stop_pct` (% of price, 0 = auto) | protective stop distance; auto = 2 × step |
 | Trail | `rgrid_trail_pct` (% of price, 0 = auto) | arm distance and giveback; auto = 2 × step |
 | Chop guard | `rgrid_chop_stand_down` | gates the RE-arm after a close |
+| Vol arm (OPT-IN, default off; UNVALIDATED) | `rgrid_vol_arm`, `rgrid_vol_compress_mult` (0.91), `rgrid_vol_expand_mult` (1.42) | arms only on a volatility burst after a quiet spell, first arm included; AND with the chop guard; exits never gated (see below) |
 | PnL SL / TP | `rgrid_stop_loss_pct`, `rgrid_take_profit_pct` | the session rail (% of margin, net of fees); the SL also sizes the rung |
 
 Per-rung size = `deployed / levels`, shrunk so a full pyramid reaching its own
@@ -91,6 +92,42 @@ When the budget wants less than the venue minimum the rung is **floored** at it
 Retired: the maker-only `RGridController` keys `rgrid_discretion`,
 `rgrid_reset_threshold_pct`, `rgrid_reset_timeout_seconds` are not read by the
 trigger engine and are no longer offered on the card.
+
+## Vol arm filter (opt-in, `rgrid_vol_arm`)
+
+See `docs/grid_vol_model.md`.
+
+**When it arms.** While FLAT, the ladder arms only when both hold:
+- rv15 ≥ `rgrid_vol_expand_mult` × the product's 7-day median rv60, within the
+  last 5 minutes;
+- rv60 was ≤ `rgrid_vol_compress_mult` × that median at some point in the prior
+  2 hours.
+
+This includes the first arm, which is the one explicit exception to
+presence-first, taken only under this opt-in.
+
+**When it does not arm.**
+- `UNKNOWN` (candles unreadable or stale) and `WARMING` (baseline < 72 h) never
+  arm.
+- Otherwise the card shows `Quoting: PAUSED (waiting for a volatility
+  breakout)`.
+
+**How it combines with the chop guard.** It is an AND: when the filter says
+ARMED, the chop guard still gates re-arms after a close.
+
+**What it never touches.** Exits are never gated:
+- the filter runs only in the flat branch;
+- an open position's stop, trail and same-side adds are untouched;
+- stand-down cancels ENTRY rungs only.
+
+**Engines.** It works on the trigger engine and on the legacy exposure-anchored
+controller (where it gates flat entries only). D-Grid's nested trend delegate
+never carries it.
+
+**Honest status.** This is a stand-down filter that can only remove arms. No
+harness or replica run has tested the rule. No lever has made R-Grid profitable
+at taker fees (replica −350 to −490 per $1M; gating only the first arm measured
++136/$1M relative). The card says this.
 
 ## Cleanup guarantees
 

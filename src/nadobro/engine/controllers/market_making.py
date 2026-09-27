@@ -1007,17 +1007,43 @@ class MarketMakingController(Controller):
             if desc != self._last_plan_desc:
                 self._last_plan_desc = desc
                 logger.debug("MM %s ladder: %s", self.trading_pair, desc)
-        for lvl in plan:
+        admitted = len(plan)
+        if is_opening and self.vol_cfg.cap_hard:
+            admitted = self._gvol_hard_cap_admit(plan, mid)
+        for n, lvl in enumerate(plan):
             await self._reconcile(
                 side,
                 self._level_price(base_target, lvl.offset_bp, is_bid),
-                allowed,
+                allowed and n < admitted,
                 mid,
                 level=lvl.index,
                 size_quote=lvl.size_quote,
                 is_opening=is_opening,
             )
         await self._retire_levels_beyond(is_bid, len(plan))
+
+    def _gvol_hard_cap_admit(self, plan: List[LadderLevel], mid: Decimal) -> int:
+        """OPT-IN hard cap (Grid's vol model, ``gvol_cap_hard``; never set for
+        Mid): admit growth-side levels NEAREST-first while their cumulative size
+        fits ``cap + one level`` together with the held inventory. The rest are reconciled with allowed=False, which cancels
+        them deepest-first by construction. Returns the admitted count."""
+        cap = self.gvol_cap_quote()
+        if cap is None or not plan:
+            return len(plan)
+        held = abs(self._base_value(mid))
+        cum = Decimal(0)
+        admitted = 0
+        for lvl in plan:
+            # held + resting + this level <= cap + one level (same rule as the
+            # grid executor): a flat book always places its first rung, a book
+            # already at the cap places nothing more on the growth side.
+            if held + cum > cap:
+                break
+            cum += lvl.size_quote
+            admitted += 1
+        self.gvol_cap_usd = float(cap)
+        self.gvol_cap_used_usd = float(held + cum)
+        return admitted
 
     def _resting_side_notional(self, is_bid: bool, exclude_level: int) -> Decimal:
         """Notional already resting on this side, EXCLUDING the level being
@@ -1092,7 +1118,12 @@ class MarketMakingController(Controller):
         # the ladder sums to exactly), not one level. Flooring at a single level
         # would admit L0 and refuse the rest, silently quoting a fraction of the
         # size the user deployed.
-        cap_quote = max(cap_quote, self.order_amount_quote)
+        if self.vol_cfg.cap_hard:
+            # OPT-IN hard cap (Grid vol model): floor at ONE LEVEL, not one full
+            # side, so the cap actually binds. Never set for Mid.
+            cap_quote = max(cap_quote, order_quote if order_quote is not None else self.order_amount_quote)
+        else:
+            cap_quote = max(cap_quote, self.order_amount_quote)
         current_quote = self._base_value(mid)
         pending = (
             self.order_amount_quote if order_quote is None else order_quote

@@ -160,6 +160,23 @@ NATURAL_LANGUAGE_STRATEGY_PHRASES: tuple[StrategyPhrase, ...] = (
 )
 
 
+def gvol_field_allowed(strategy_id: str, field: str) -> bool:
+    """The vol-model settings are per strategy (docs/grid_vol_model.md): a
+    ``grid_vol_*`` / ``grid_inv_*`` key belongs to Grid only, ``dgrid_vol_*`` /
+    ``dgrid_inv_*`` / ``dgrid_regime_model`` to D-Grid only, ``rgrid_vol_*`` to
+    R-Grid only. A stale callback must never store a dead key on another
+    strategy. Fields outside the vol model are always allowed here."""
+    f = str(field or "")
+    sid = str(strategy_id or "")
+    if f.startswith(("grid_vol_", "grid_inv_")):
+        return sid == "grid"
+    if f.startswith(("dgrid_vol_", "dgrid_inv_")) or f == "dgrid_regime_model":
+        return sid == "dgrid"
+    if f.startswith("rgrid_vol_"):
+        return sid == "rgrid"
+    return True
+
+
 SETTINGS_STRATEGY_DEFAULTS: Mapping[str, dict] = {
     "grid": {
         "notional_usd": 75.0, "spread_bp": 4.0, "interval_seconds": 45, "tp_pct": 0.6, "sl_pct": 0.5,
@@ -178,6 +195,11 @@ SETTINGS_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "session_notional_cap_usd": 0.0,
         "grid_reset_threshold_pct": 0.2,
         "grid_reset_timeout_seconds": 120,
+        # OPT-IN realized-volatility model (docs/grid_vol_model.md) — every
+        # behaviour OFF by default; never flipped on an unvalidated backtest.
+        "grid_vol_gate": 0, "grid_vol_gate_mult": 0.82,
+        "grid_vol_spacing": 0, "grid_vol_spacing_k": 2.6,
+        "grid_inv_skew": 0, "grid_inv_cap_hard": 0, "grid_inv_cap_pct": 30.0,
     },
     "rgrid": {
         "notional_usd": 100.0, "spread_bp": 10.0, "rgrid_spread_bp": 10.0, "interval_seconds": 60,
@@ -186,6 +208,8 @@ SETTINGS_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "rgrid_reset_threshold_pct": 0.2, "rgrid_reset_timeout_seconds": 120,
         # Legacy keys kept for one migration cycle.
         "min_range_pct": 1.0, "max_range_pct": 1.0,
+        # OPT-IN vol-arm filter (docs/grid_vol_model.md) — OFF; UNVALIDATED.
+        "rgrid_vol_arm": 0, "rgrid_vol_compress_mult": 0.91, "rgrid_vol_expand_mult": 1.42,
     },
     "dgrid": {
         "notional_usd": 100.0, "cycle_notional_usd": 100.0, "spread_bp": 8.0,
@@ -204,6 +228,11 @@ SETTINGS_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "rgrid_reset_threshold_pct": 0.2,
         "grid_reset_timeout_seconds": 120,
         "rgrid_reset_timeout_seconds": 120,
+        # OPT-IN vol regime model (docs/grid_vol_model.md): "vr" = the variance
+        # ratio (default); "vol" = trade the ladder only while volatility is calm.
+        "dgrid_regime_model": "vr", "dgrid_vol_gate_mult": 0.82,
+        "dgrid_vol_spacing": 0, "dgrid_vol_spacing_k": 2.6,
+        "dgrid_inv_skew": 0, "dgrid_inv_cap_hard": 0, "dgrid_inv_cap_pct": 30.0,
     },
     "mid": {
         # Tread Mid Mode parity: pure mid ± spread×level pricing, no anchor logic,
@@ -307,6 +336,11 @@ RUNTIME_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "interval_seconds": 45,
         "threshold_bp": 12.0,
         "close_offset_bp": 24.0,
+        # OPT-IN realized-volatility model (docs/grid_vol_model.md) — every
+        # behaviour OFF by default; never flipped on an unvalidated backtest.
+        "grid_vol_gate": 0, "grid_vol_gate_mult": 0.82,
+        "grid_vol_spacing": 0, "grid_vol_spacing_k": 2.6,
+        "grid_inv_skew": 0, "grid_inv_cap_hard": 0, "grid_inv_cap_pct": 30.0,
     },
     "rgrid": {
         "notional_usd": 100.0,
@@ -322,6 +356,8 @@ RUNTIME_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         # Legacy fallback (read-only compatibility).
         "min_range_pct": 1.0,
         "max_range_pct": 1.0,
+        # OPT-IN vol-arm filter (docs/grid_vol_model.md) — OFF; UNVALIDATED.
+        "rgrid_vol_arm": 0, "rgrid_vol_compress_mult": 0.91, "rgrid_vol_expand_mult": 1.42,
     },
     "dgrid": {
         "notional_usd": 100.0,
@@ -345,6 +381,11 @@ RUNTIME_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "rgrid_reset_threshold_pct": 0.2,
         "grid_reset_timeout_seconds": 120,
         "rgrid_reset_timeout_seconds": 120,
+        # OPT-IN vol regime model (docs/grid_vol_model.md): "vr" = the variance
+        # ratio (default); "vol" = trade the ladder only while volatility is calm.
+        "dgrid_regime_model": "vr", "dgrid_vol_gate_mult": 0.82,
+        "dgrid_vol_spacing": 0, "dgrid_vol_spacing_k": 2.6,
+        "dgrid_inv_skew": 0, "dgrid_inv_cap_hard": 0, "dgrid_inv_cap_pct": 30.0,
     },
     "mid": {
         "notional_usd": 100.0,

@@ -50,6 +50,7 @@ from src.nadobro.engine.executors.grid_executor import GridExecutor
 from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.routines import variance_regime
 from src.nadobro.engine.types import OrderType, TradeType, _as_bool, _dec
+from src.nadobro.quant import vol_model
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +182,17 @@ class DynamicGridController(Controller):
         # which is its home regime — until the Phase-2 rework fixes the classifier
         # and the trend phase. Opt back in with ``dgrid_trend_follow=1``.
         self.trend_follow_enabled: bool = _as_bool(self.cfg("dgrid_trend_follow", False), False)
+        # Regime model (OPT-IN, docs/grid_vol_model.md): "vr" = the variance-ratio
+        # classifier (default, unchanged); "vol" = the realized-volatility gate —
+        # trade the ladder only while volatility is calm, stand down (withdraw
+        # entries, hold) when it is not, and NEVER switch to the trend phase or
+        # fire the reversal flip (no taker dump). The user's dgrid_trend_follow is
+        # preserved (the card shows it "ignored under Vol model") and honoured
+        # again the moment they switch back to "vr".
+        self.regime_model: str = str(self.cfg("dgrid_regime_model", "vr") or "vr").strip().lower()
+        self._step_override_bp: Optional[float] = None
+        self._gvol_recenter_pending: bool = False
+        self._skew_bp: float = 0.0
         self.realized_move_bp: float = 0.0
         self.last_direction: str = variance_regime.FLAT
         # Did the last classification actually declare a trend (vs a flat/ranging
@@ -242,6 +254,12 @@ class DynamicGridController(Controller):
                 self._venue_baseline = None
         self._venue_hold_ticks: int = 0
 
+    @property
+    def trend_follow_effective(self) -> bool:
+        """Trend phase / reversal flip allowed: the user's switch, and never under
+        the Vol regime model."""
+        return self.trend_follow_enabled and self.regime_model != "vol"
+
     async def on_start(self) -> None:
         return None
 
@@ -292,7 +310,11 @@ class DynamicGridController(Controller):
             return {}
         step = _dec(self.cfg("step_pct", 0) or 0)
         levels = int(self.cfg("levels_count", 0) or 0)
-        if step <= 0 and bool(self.cfg("auto_spread", False)) and self.gate_atr_pct > 0:
+        if self._step_override_bp is not None and step > 0:
+            # OPT-IN vol spacing (gvol_spacing_enabled) — the vol-scaled step,
+            # within dgrid_min/max_spread_bp and never below the fee floor.
+            step = _dec(self._step_override_bp) / Decimal(10000)
+        elif step <= 0 and bool(self.cfg("auto_spread", False)) and self.gate_atr_pct > 0:
             # ATR auto-step (Phase 3): level spacing tracks k x ATR so the
             # captured edge scales with realized volatility; floored so the
             # round trip clears fees, capped to stay a market-making grid.
@@ -312,17 +334,26 @@ class DynamicGridController(Controller):
         # stop from sl_pct (premature wick stop-outs on top of the margin-%
         # rail). SL is the avg-entry barrier + the fee-aware session rail; the
         # rebuild only adjusts the band bounds.
+        extra: dict = {}
+        if self._step_override_bp is not None:
+            extra["min_spread_between_orders"] = step
+        if self._skew_bp:
+            # OPT-IN inventory skew: shift the NEW opens' band (bounded at half a
+            # step). Close legs of held levels are unchanged.
+            mid = mid * (Decimal(1) + _dec(self._skew_bp) / Decimal(10000))
         if side is TradeType.SELL:
             return {
                 "start_price": mid * (Decimal(1) + maker_offset),
                 "end_price": mid * (Decimal(1) + maker_offset + span),
                 "limit_price": Decimal(0),
+                **extra,
             }
         # BUY (long grid)
         return {
             "start_price": mid * (Decimal(1) - maker_offset - span),
             "end_price": mid * (Decimal(1) - maker_offset),
             "limit_price": Decimal(0),
+            **extra,
         }
 
     # -- regime classification -------------------------------------------
@@ -500,7 +531,7 @@ class DynamicGridController(Controller):
         # GRID again (churn), and on a green-then-retrace in chop it is exactly the
         # August pyramiding bleed the flag exists to stop. Stand the flip down; the
         # hard guard in _spawn_phase is the belt-and-suspenders backstop.
-        if not self.trend_follow_enabled:
+        if not self.trend_follow_effective:
             self._reversal_streak = 0
             return False
         if (self.reversal_flip_pct <= 0 or not self._run_armed or mid is None or mid <= 0
@@ -549,6 +580,9 @@ class DynamicGridController(Controller):
         # it is re-asserted below when still true, so clear it here.
         if self.gate_reason in _VENUE_GATE_REASONS:
             self.gate_verdict, self.gate_reason = "QUOTE", ""
+        # OPT-IN Vol regime model: fold the vol gate in (gvol_gate_enabled is set
+        # by the mapper only when dgrid_regime_model == "vol"). No-op when off.
+        await self.gvol_tick(pair)
         # No phase arms before the run's venue baseline is known (see __init__).
         if self._venue_baseline is None and not await self._capture_venue_baseline():
             return
@@ -558,7 +592,7 @@ class DynamicGridController(Controller):
         # RGRID (pyramiding) phase — it holds the mean-reversion GRID ladder in
         # every regime. A session already in RGRID flips back to GRID via the
         # normal debounced path below (flatten the delegate, re-arm the ladder).
-        if not self.trend_follow_enabled:
+        if not self.trend_follow_effective:
             desired = variance_regime.GRID
         mid = await self._mid()
         self._last_mid = mid
@@ -587,8 +621,19 @@ class DynamicGridController(Controller):
             else:
                 self._phase_confirm_streak = 0
             now = time.time()
-            if (self.reset_threshold_bp > 0 and mid is not None
-                    and self.realized_move_bp >= self.reset_threshold_bp
+            force = False
+            if not self.gvol_stand_down:
+                if self._gvol_resumed:
+                    # Withdrawn levels carry stale prices: re-lay once on resume.
+                    self._gvol_recenter_pending = True
+                if mid is not None and mid > 0:
+                    self._gvol_apply_spacing(mid)
+                    self._skew_bp = self._gvol_ladder_skew(
+                        mid, active, self._current_step_bp())
+                force = self._gvol_recenter_pending
+            if (not self.gvol_stand_down and mid is not None
+                    and (force or (self.reset_threshold_bp > 0
+                                   and self.realized_move_bp >= self.reset_threshold_bp))
                     and (now - self._last_recenter_ts) >= _DGRID_RECENTER_MIN_INTERVAL_S
                     # AUDIT-DENY-2026-09-02-F3: never recenter (cancel+replace the
                     # whole ladder) while the venue is denying status reads. This
@@ -603,12 +648,20 @@ class DynamicGridController(Controller):
                     and not self.adapter.execute_budget_contended()):
                 self._last_recenter_ts = now
                 await self._recenter(mid)
+            await self._gvol_apply_cap(mid, active)
             exposure = self.exposure_allowed_sides(pair, mid) if mid else {"buy": True, "sell": True}
+            stand_down = self.gvol_stand_down
             for ex in active:
                 worsening_allowed = (
                     exposure["buy"] if ex.__class__ is GridExecutor else exposure["sell"]
                 )
                 ex.suppress_new_entries = self.gate_paused or not worsening_allowed
+                if stand_down:
+                    # VOL STAND-DOWN (opt-in): withdraw resting ENTRIES and hold —
+                    # close legs, profit tiers and stops keep running; no taker.
+                    wd = getattr(ex, "withdraw_opens", None)
+                    if callable(wd):
+                        self.gvol_withdrawn += int(await wd() or 0)
                 await self.orchestrator.tick(ex.id)
             await self._maybe_book_profit(mid)
             return
@@ -740,11 +793,15 @@ class DynamicGridController(Controller):
         for ex in self.my_executors(active_only=True):
             rc = getattr(ex, "recenter", None)
             if callable(rc):
+                if self._step_override_bp is not None and hasattr(ex, "config"):
+                    ex.config.min_spread_between_orders = (
+                        _dec(self._step_override_bp) / Decimal(10000))
                 await rc(start, end)
                 recentered = True
         if recentered:
             self._grid_anchor_mid = _dec(mid)
             self.realized_move_bp = 0.0
+            self._gvol_recenter_pending = False
             logger.info(
                 "dgrid recenter phase=%s mid=%s band=[%s, %s] move=%.1fbp (controller=%s)",
                 self.current_phase, mid, start, end, self.reset_threshold_bp, self.id,
@@ -1007,7 +1064,32 @@ class DynamicGridController(Controller):
         except (TypeError, ValueError):
             pass
 
+    def _trend_holds_position(self) -> bool:
+        trend = self._trend
+        if trend is None:
+            return False
+        pos = getattr(trend, "_pos_base", None)
+        if pos is not None:
+            try:
+                return _dec(pos) != 0
+            except Exception:  # noqa: BLE001  # policy: degrade-ok(unknown -> assume held, never taker-flip)
+                return True
+        return self._inventory_net_base() != 0
+
     async def _tick_trend_phase(self, desired: str, mid: Optional[Decimal]) -> None:
+        if (desired != variance_regime.RGRID and self.regime_model == "vol"
+                and self._trend_holds_position()):
+            # LIVE SWITCH vr -> vol while the trend delegate holds a position: a
+            # settings change must never cause a taker flatten. Keep managing the
+            # delegate until its own venue stop / trail (or the session rail)
+            # closes it; only then does the flip below cancel its rungs and arm
+            # the grid.
+            self._phase_confirm_streak = 0
+            self._refresh_trend_config()
+            if self._trend is not None:
+                await self._trend.on_tick()
+                self._mirror_trend_hold()
+            return
         if desired != variance_regime.RGRID:
             self._phase_confirm_streak += 1
             if self._phase_confirm_streak >= self._required_confirm_ticks(desired):
@@ -1198,7 +1280,7 @@ class DynamicGridController(Controller):
         # the phase back to the mean-reversion GRID ladder so no path can bypass
         # the flag. (Audit finding, 2026-08-24: the reversal flip did bypass the
         # on_tick classifier guard and reached here with phase=RGRID.)
-        if phase == variance_regime.RGRID and not self.trend_follow_enabled:
+        if phase == variance_regime.RGRID and not self.trend_follow_effective:
             phase = variance_regime.GRID
         if phase == variance_regime.RGRID:
             return await self._spawn_trend(mid)
@@ -1222,6 +1304,8 @@ class DynamicGridController(Controller):
         cfg = build_grid_config(merged, side)
         ex = cls(cfg, user_id=self.user_id, controller_id=self.id, adapter=self.adapter,
                  inventory=self.inventory)
+        # OPT-IN hard cap binds from the first placement (None = off, classic).
+        ex.cap_quote = self.gvol_cap_quote()
         logger.info(
             "dgrid spawning %s grid pair=%s phase=%s vr=%.3f mid=%s levels=%s "
             "notional=%s start=%s end=%s (controller=%s)",
@@ -1281,12 +1365,53 @@ class DynamicGridController(Controller):
             "grid_stop_digest": None, "grid_trigger_digests": [],
         }
 
+    # -- OPT-IN vol model helpers (docs/grid_vol_model.md) ---------------------
+    def _base_step_bp(self) -> float:
+        return float(_dec(self.cfg("step_pct", 0) or 0) * Decimal(10000))
+
+    def _current_step_bp(self) -> float:
+        return self._step_override_bp if self._step_override_bp is not None else self._base_step_bp()
+
+    def _refresh_reset_threshold(self) -> None:
+        levels_count = int(self.cfg("levels_count", 0) or 0)
+        _user_reset = float(self.cfg("dgrid_reset_threshold_bp", 0.0) or 0.0)
+        self.reset_threshold_bp, _ = ladder_recenter_threshold_bp(
+            self._current_step_bp(), levels_count, _user_reset)
+
+    def _gvol_apply_spacing(self, mid: Decimal) -> None:
+        """Vol-scaled spacing (deadband max(1bp, 15%)), applied through a
+        recenter only; toggling OFF restores the configured step."""
+        if not self.vol_cfg.spacing_enabled:
+            if self._step_override_bp is not None:
+                self._step_override_bp = None
+                self.gvol_spacing_bp_live = 0.0
+                for ex in self.my_executors(active_only=True):
+                    if hasattr(ex, "config"):
+                        ex.config.min_spread_between_orders = _dec(
+                            self.cfg("min_spread_between_orders", "0.005"))
+                self._refresh_reset_threshold()
+                self._gvol_recenter_pending = True
+            return
+        target = self.gvol_spacing_target(mid)
+        if target is None:
+            return
+        current = self._current_step_bp()
+        self.gvol_spacing_bp_live = float(current)
+        if not vol_model.spacing_change_significant(current, target):
+            return
+        self._step_override_bp = float(target)
+        self.gvol_spacing_bp_live = float(target)
+        self._refresh_reset_threshold()
+        self._gvol_recenter_pending = True
+
     def dgrid_metrics(self) -> Dict[str, object]:
         """Live phase + variance + anchor/side telemetry for the /status card."""
         side = (
             "SELL" if self.last_direction == variance_regime.DOWN else "BUY"
         )
         return {
+            **self.gvol_metrics(),
+            "dgrid_regime_model": self.regime_model,
             "dgrid_phase": self.current_phase,
             "dgrid_variance_ratio": float(self.variance_ratio),
             "dgrid_realized_move_bp": float(self.realized_move_bp),

@@ -1806,7 +1806,7 @@ def fmt_status_overview(status: dict, onboarding: dict):
         # Via the strategy layer: handlers must not import engine directly
         # (tests/lint/test_architecture_layers.py pins the edge set).
         from src.nadobro.strategy.engine_runtime import (
-            GATE_REASON_HUMAN, REVGRID_GATE_REASONS, VENUE_GATE_REASONS,
+            GATE_REASON_HUMAN, REVGRID_GATE_REASONS, VENUE_GATE_REASONS, VOL_GATE_REASONS,
         )
         _gate_reason_key = str(status.get("mm_gate_reason") or "").strip()
         gate_why = GATE_REASON_HUMAN.get(_gate_reason_key, "unfavourable regime")
@@ -1830,6 +1830,10 @@ def fmt_status_overview(status: dict, onboarding: dict):
         elif _gate_reason_key == "stop_budget_too_tight":
             # A sizing hold: the plan cannot trade inside the user's own PnL stop.
             _resume_line = _loc("Raise the PnL stop, add margin or use fewer rungs to arm.")
+        elif _gate_reason_key in VOL_GATE_REASONS:
+            # OPT-IN vol model (docs/grid_vol_model.md): each stand-down reason has
+            # its own resume condition.
+            _resume_line = _gvol_resume_line(_gate_reason_key, status)
         elif _gate_reason_key in VENUE_GATE_REASONS:
             # A venue hold (position unreadable / residual being cleared) is not a
             # regime verdict — it resumes when the venue read recovers.
@@ -2018,14 +2022,20 @@ def fmt_status_overview(status: dict, onboarding: dict):
             move_bp = float(status.get("dgrid_realized_move_bp") or 0.0)
             reset_bp = float(status.get("dgrid_reset_threshold_bp") or 0.0)
             lines.extend(["", "*Dynamic GRID*"])
+            _model_md = (
+                f"{_loc('Model')}: *{_loc_md('Vol')}* \\| "
+                if str(status.get("dgrid_regime_model") or "") == "vol" else ""
+            )
             lines.append(
-                f"{_loc('Phase')}: *{escape_md(phase)}* \\| "
+                f"{_model_md}{_loc('Phase')}: *{escape_md(phase)}* \\| "
                 f"{_loc('Variance')}: *{escape_md(f'{vr:.2f}')}* \\| "
                 f"{_loc('Move')}: *{escape_md(f'{move_bp:.1f}bp')}*"
             )
             lines.append(f"{_loc('Auto reset')}: *{escape_md(f'{reset_bp:.1f}bp')}*")
         else:
             lines.extend(["", "*Reverse GRID*" if strategy == "RGRID" else "*GRID*"])
+        # OPT-IN realized-volatility model: what the model is doing right now.
+        lines.extend(_fmt_gvol_lines(status))
         if strategy in ("RGRID", "DGRID") and int(status.get("rgrid_rungs_per_side") or 0) > 0:
             # Trigger ladder telemetry (rgrid; dgrid while its trend phase runs).
             _rungs = int(status.get("rgrid_rungs_armed") or 0)
@@ -2082,6 +2092,96 @@ def fmt_status_overview(status: dict, onboarding: dict):
 
     lines.extend(_fmt_copy_mirror_lines(status, _loc))
     return "\n".join(lines)
+
+
+def _gvol_resume_line(reason: str, status: dict) -> str:
+    """Resume wording for a vol-model stand-down (docs/grid_vol_model.md)."""
+    if reason == "vol_hot":
+        calm = int(status.get("gvol_calm_min") or 0)
+        return _loc("New entries resume after 15 calm minutes ({calm}/15).").format(calm=calm)
+    if reason == "vol_unknown":
+        return _loc("Resumes once candle data is readable again.")
+    if reason == "vol_warming":
+        return _loc("Resumes once 72h of this market's history is loaded.")
+    return _loc("Arms on a volatility breakout after a quiet spell.")
+
+
+def _fmt_gvol_lines(status: dict) -> list[str]:
+    """The /status Vol line(s) for Grid / D-Grid / R-Grid. Empty when the vol
+    model is off (``gvol_state`` empty)."""
+    state = str(status.get("gvol_state") or "").strip().upper()
+    if not state:
+        return []
+    features = str(status.get("gvol_features") or "")
+    gate_on = "gate" in features.split(",")
+    rv = float(status.get("gvol_rv60_bp") or 0.0)
+    gate = float(status.get("gvol_gate_bp") or 0.0)
+    base = float(status.get("gvol_base_bp") or 0.0)
+    detail = str(status.get("gvol_detail") or "")
+    out: list[str] = []
+    vol = f"🌡 {_loc('Vol')}"
+    bpm = _loc("bp/min")
+    if state in ("ARMED", "WAITING"):
+        comp = float(status.get("gvol_compress_bp") or 0.0)
+        exp = float(status.get("gvol_expand_bp") or 0.0)
+        rv15 = float(status.get("gvol_rv15_bp") or 0.0)
+        head = f"🌡 {_loc('Vol arm')}: *{_loc_md(state)}*"
+        if state == "ARMED":
+            ago = int(status.get("gvol_compressed_ago_min") if status.get("gvol_compressed_ago_min") is not None else -1)
+            ago_txt = (
+                f", {_loc_md('quiet')} {escape_md(str(ago))}{_loc_md('m ago')}" if ago >= 0 else ""
+            )
+            out.append(
+                f"{head} · {_loc_md('burst')} {escape_md(f'{rv15:.1f} ≥ {exp:.1f}')}{ago_txt}"
+            )
+        else:
+            out.append(
+                f"{head} · {_loc_md('needs a quiet spell')} \\(rv60 ≤ {escape_md(f'{comp:.1f}')}\\) "
+                f"{_loc_md('then a burst')} \\(rv15 ≥ {escape_md(f'{exp:.1f}')}\\) · "
+                f"{_loc_md('now')} {escape_md(f'{rv:.1f} / {rv15:.1f}')}"
+            )
+    elif state == "CALM" or (state == "HOT" and not gate_on):
+        mult = (gate / base) if base > 0 else 0.0
+        txt = f"{vol}: *{_loc_md(state)}* {escape_md(f'{rv:.1f}')}{bpm}"
+        if gate > 0:
+            txt += (
+                f" · {_loc_md('gate')} {escape_md(f'{gate:.1f}')} "
+                f"\\({escape_md(f'{mult:.2f}×')} {_loc_md('7d median')} {escape_md(f'{base:.1f}')}\\)"
+            )
+        sp = float(status.get("gvol_spacing_bp") or 0.0)
+        if sp > 0:
+            txt += f" · {_loc_md('spacing')} {escape_md(f'{sp:.1f}bp')}"
+        sk = float(status.get("gvol_skew_bp") or 0.0)
+        if "skew" in features.split(","):
+            txt += f" · {_loc_md('skew')} {escape_md(f'{sk:+.1f}bp')}"
+        out.append(txt)
+    elif state == "HOT":
+        wd = int(status.get("gvol_withdrawn") or 0)
+        out.append(
+            f"{vol}: *{_loc_md('HOT')}* {escape_md(f'{rv:.1f}')}{bpm} \\> {_loc_md('gate')} "
+            f"{escape_md(f'{gate:.1f}')} · {_loc_md('standing down')}: "
+            f"{escape_md(str(wd))} {_loc_md('entries withdrawn')} · {_loc_md('exits working')}"
+        )
+    elif state == "WARMING":
+        hours = float(status.get("gvol_base_hours") or 0.0)
+        tail = f" · {_loc_md('standing down')}" if gate_on else ""
+        out.append(
+            f"{vol}: *{_loc_md('LEARNING')}* {_loc_md('this market')} "
+            f"\\({escape_md(f'{hours:.0f}h / 72h')}\\){tail}"
+        )
+    elif state == "UNKNOWN":
+        tail = f" · {_loc_md('standing down')} · {_loc_md('exits working')}" if gate_on else ""
+        out.append(
+            f"{vol}: *{_loc_md('UNREADABLE')}* \\({escape_md(detail or 'no candles')}\\){tail}"
+        )
+    cap = float(status.get("gvol_cap_usd") or 0.0)
+    if cap > 0:
+        used = float(status.get("gvol_cap_used_usd") or 0.0)
+        out.append(
+            f"{_loc('Cap')}: *{escape_md(f'${used:,.0f} / ${cap:,.0f}')}* "
+            f"\\({_loc_md('held + resting, hard')}\\)"
+        )
+    return out
 
 
 def _fmt_copy_mirror_lines(status: dict, loc) -> list[str]:

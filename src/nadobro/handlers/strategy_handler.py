@@ -26,6 +26,7 @@ from src.nadobro.users.settings_service import (
     update_user_settings,
 )
 from src.nadobro.strategy.strategy_pending_input import persist_strategy_pending_input
+from src.nadobro.strategy.strategy_registry import gvol_field_allowed
 from src.nadobro.users.user_service import get_user_readonly_client, get_user_wallet_info, get_user, ensure_active_wallet_ready
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -948,8 +949,18 @@ async def _handle_strategy(query, data, context, telegram_id):
             "mm_duration_minutes",
             # TWAP fast-move pause threshold (bp/cycle); 0 = off.
             "twap_pause_move_bp",
+            # OPT-IN realized-volatility model (docs/grid_vol_model.md), every
+            # behaviour default OFF. Mapped by engine_runtime._gvol_config /
+            # _gvol_rgrid_config and re-read live (reload_vol_cfg).
+            "grid_vol_gate", "grid_vol_gate_mult", "grid_vol_spacing", "grid_vol_spacing_k",
+            "grid_inv_skew", "grid_inv_cap_hard", "grid_inv_cap_pct",
+            "dgrid_vol_gate_mult", "dgrid_vol_spacing", "dgrid_vol_spacing_k",
+            "dgrid_inv_skew", "dgrid_inv_cap_hard", "dgrid_inv_cap_pct",
+            "rgrid_vol_arm", "rgrid_vol_compress_mult", "rgrid_vol_expand_mult",
         }
         if field not in allowed_numeric_fields:
+            return
+        if not gvol_field_allowed(strategy_id, field):
             return
         # Mid Mode: directional_bias is only valid as a number for the mid strategy
         # (other strategies still use the set_text path with neutral/long/short).
@@ -1030,6 +1041,23 @@ async def _handle_strategy(query, data, context, telegram_id):
             "mm_leverage_override": (1, 50),
             "mm_duration_minutes": (1, 14400),   # 1 min .. 240h wall-clock run cap
             "twap_pause_move_bp": (0, 5000),     # 0 = off .. 50% per-cycle move
+            # Vol model (docs/grid_vol_model.md). Must match messages.py.
+            "grid_vol_gate": (0, 1),
+            "grid_vol_gate_mult": (0.3, 2.0),
+            "grid_vol_spacing": (0, 1),
+            "grid_vol_spacing_k": (0.5, 6.0),
+            "grid_inv_skew": (0, 1),
+            "grid_inv_cap_hard": (0, 1),
+            "grid_inv_cap_pct": (5, 100),
+            "dgrid_vol_gate_mult": (0.3, 2.0),
+            "dgrid_vol_spacing": (0, 1),
+            "dgrid_vol_spacing_k": (0.5, 6.0),
+            "dgrid_inv_skew": (0, 1),
+            "dgrid_inv_cap_hard": (0, 1),
+            "dgrid_inv_cap_pct": (5, 100),
+            "rgrid_vol_arm": (0, 1),
+            "rgrid_vol_compress_mult": (0.3, 1.5),
+            "rgrid_vol_expand_mult": (0.8, 4.0),
         }
         # A whitelisted field with no limits entry is a wiring bug — reject
         # loudly in logs instead of crashing the callback with a KeyError.
@@ -1065,6 +1093,8 @@ async def _handle_strategy(query, data, context, telegram_id):
             "dn_hold_seconds", "dn_cycles", "dn_cycle_gap_seconds", "mm_leverage_override",
             "fill_anchored", "mm_duration_minutes", "twap_pause_move_bp",
             "rgrid_chop_stand_down", "dgrid_trend_follow", "dgrid_flip_confirm_ticks",
+            "grid_vol_gate", "grid_vol_spacing", "grid_inv_skew", "grid_inv_cap_hard",
+            "dgrid_vol_spacing", "dgrid_inv_skew", "dgrid_inv_cap_hard", "rgrid_vol_arm",
         }
 
         def _mutate(s):
@@ -1109,9 +1139,14 @@ async def _handle_strategy(query, data, context, telegram_id):
             # linear/geometric put progressively more size on the deeper
             # levels, i.e. scale harder into an adverse move.
             "size_curve": {"flat", "linear", "geometric"},
+            # D-Grid regime model (docs/grid_vol_model.md): variance ratio (default)
+            # or the opt-in realized-volatility gate.
+            "dgrid_regime_model": {"vr", "vol"},
         }
         allowed_vals = allowed_text.get(field, set())
         if raw_value not in allowed_vals:
+            return
+        if not gvol_field_allowed(strategy_id, field):
             return
         # participation_preset is only meaningful for the MM family.
         if field == "participation_preset" and strategy_id not in ("grid", "rgrid", "dgrid", "mid"):
@@ -1164,10 +1199,16 @@ async def _handle_strategy(query, data, context, telegram_id):
             "session_margin_usd", "target_volume_usd",
             # Delta Neutral (engine v2) custom inputs.
             "fixed_margin_usd", "dn_hold_seconds", "dn_cycles",
+            # Vol model (docs/grid_vol_model.md) numeric knobs.
+            "grid_vol_gate_mult", "grid_vol_spacing_k", "grid_inv_cap_pct",
+            "dgrid_vol_gate_mult", "dgrid_vol_spacing_k", "dgrid_inv_cap_pct",
+            "rgrid_vol_compress_mult", "rgrid_vol_expand_mult",
         )
         if strategy_id == "vol" and field not in {"tp_pct", "sl_pct", "session_margin_usd", "target_volume_usd"}:
             return
         if field not in allowed_inputs:
+            return
+        if not gvol_field_allowed(strategy_id, field):
             return
         section = context.user_data.get(f"strategy_config_section:{strategy_id}") or _strategy_section_for_field(strategy_id, field)
         context.user_data[f"strategy_config_section:{strategy_id}"] = section
@@ -1228,6 +1269,14 @@ async def _handle_strategy(query, data, context, telegram_id):
             "fixed_margin_usd": "Enter per\\-leg size in USD \\(example: `100`\\)",
             "dn_hold_seconds": "Enter *minimum* hold in seconds \\(60 – 86400; example: `3600` for 1h\\)\\. After this, the hedge stays open while funding is favorable and closes on a funding flip\\.",
             "dn_cycles": "Enter how many open→hold→close cycles to run \\(example: `3`\\)",
+            "grid_vol_gate_mult": "Enter the gate as a multiple of this market's 7‑day median volatility \\(0\\.82 ≈ calmest third; example: `0\\.82`\\)",
+            "dgrid_vol_gate_mult": "Enter the gate as a multiple of this market's 7‑day median volatility \\(0\\.82 ≈ calmest third; example: `0\\.82`\\)",
+            "grid_vol_spacing_k": "Enter spacing multiple \\(level spacing \\= k × volatility per minute, never below the fee floor; example: `2\\.6`\\)",
+            "dgrid_vol_spacing_k": "Enter spacing multiple \\(level spacing \\= k × volatility per minute, never below the fee floor; example: `2\\.6`\\)",
+            "grid_inv_cap_pct": "Enter hard cap % of position size \\(counts resting orders; example: `30`\\)",
+            "dgrid_inv_cap_pct": "Enter hard cap % of position size \\(counts resting orders; example: `30`\\)",
+            "rgrid_vol_compress_mult": "Enter quiet threshold × 7‑day median \\(example: `0\\.91`\\)",
+            "rgrid_vol_expand_mult": "Enter burst threshold × 7‑day median \\(example: `1\\.42`\\)",
         }
         if field == "mm_leverage_override":
             _lev_product = str(
@@ -1636,7 +1685,7 @@ def _strategy_config_sections(strategy: str) -> list[tuple[str, str]]:
         # together with a vol market that can actually run short.
         return [("risk", "🛡 TP / SL")]
     if strategy == "grid":
-        return [("setup", "⚙️ Core"), ("execution", "📐 Spread"), ("risk", "🛡 Risk")]
+        return [("setup", "⚙️ Core"), ("execution", "📐 Spread"), ("vol", "🌡 Vol"), ("risk", "🛡 Risk")]
     if strategy == "rgrid":
         # Exits = the trigger Reverse Grid's protective stop + trailing stop (the
         # one venue reduce-only order that is both its stop-loss and take-profit).
@@ -1658,6 +1707,8 @@ def _strategy_section_for_field(strategy: str, field: str) -> str:
     if strategy == "vol":
         return "risk"
     if strategy == "grid":
+        if field.startswith(("grid_vol_", "grid_inv_")):
+            return "vol"
         if field in {"min_spread_bp", "max_spread_bp", "grid_reset_threshold_pct"}:
             return "execution"
         if field in {"cycle_notional_usd", "inventory_soft_limit_usd", "session_notional_cap_usd"}:
@@ -2165,6 +2216,94 @@ def _leg_size_display(user_leg_usd: float, spot_base: str | None, network: str) 
     )
 
 
+# ── OPT-IN realized-volatility model (docs/grid_vol_model.md) ────────────────
+# Every behaviour below defaults OFF. BTC evidence (TUNE 08-28..09-11): median
+# rv60 3.70 bp/min, so the default gate 0.82x is ~3.0 bp/min on BTC.
+_GVOL_BTC_MEDIAN_BP = 3.70
+
+
+def _gvol_on(conf: dict, key: str) -> bool:
+    try:
+        return float(conf.get(key, 0) or 0) >= 0.5
+    except (TypeError, ValueError):
+        return False
+
+
+def _gvol_num(conf: dict, key: str, default: float) -> float:
+    try:
+        v = conf.get(key)
+        return float(default if v is None else v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _gvol_onoff(flag: bool) -> str:
+    return "ON" if flag else "OFF"
+
+
+def _gvol_summary_line(conf: dict, pfx: str, *, gate_on: bool) -> str:
+    """One Core-tab line so the model is visible without opening its tab."""
+    spacing = _gvol_on(conf, f"{pfx}vol_spacing")
+    skew = _gvol_on(conf, f"{pfx}inv_skew")
+    cap = _gvol_on(conf, f"{pfx}inv_cap_hard")
+    if not (gate_on or spacing or skew or cap):
+        return "Vol model: *off*"
+    return (
+        f"Vol model: gate *{_gvol_onoff(gate_on)}* · spacing *{_gvol_onoff(spacing)}* · "
+        f"skew *{_gvol_onoff(skew)}* · cap *{'hard' if cap else 'soft'}*"
+    )
+
+
+def _gvol_section_body(conf: dict, pfx: str, *, gate_on: bool, fa: bool,
+                       min_key: str, max_key: str, min_default: float,
+                       max_default: float) -> str:
+    """Shared Vol-model copy for the Grid Vol tab and the D-Grid Regime tab."""
+    mult = _gvol_num(conf, f"{pfx}vol_gate_mult", 0.82)
+    k = _gvol_num(conf, f"{pfx}vol_spacing_k", 2.6)
+    cap_pct = _gvol_num(conf, f"{pfx}inv_cap_pct", 30.0)
+    floor = 6.0 if fa else 6.8
+    lo = max(floor, _gvol_num(conf, min_key, min_default))
+    hi = max(lo, _gvol_num(conf, max_key, max_default))
+    spacing = _gvol_on(conf, f"{pfx}vol_spacing")
+    skew = _gvol_on(conf, f"{pfx}inv_skew")
+    cap = _gvol_on(conf, f"{pfx}inv_cap_hard")
+    btc = mult * _GVOL_BTC_MEDIAN_BP
+    lines = [
+        f"Gate: *{_gvol_onoff(gate_on)}* · ≤ *{escape_md(f'{mult:.2f}×')}* this market's 7\\-day "
+        f"median volatility \\(BTC ≈ {escape_md(f'{btc:.1f}')} bp/min\\)",
+        f"Spacing: *{_gvol_onoff(spacing)}* · {escape_md(f'{k:.1f}')} × volatility, within "
+        f"{escape_md(f'{lo:.1f}–{hi:.0f}')} bp \\(fee floor … max spread\\)",
+        f"Skew: *{_gvol_onoff(skew)}* · Hard cap: *{_gvol_onoff(cap)}* "
+        f"\\({escape_md(f'{cap_pct:.0f}%')} of position size \\+ 1 level, counts resting orders\\)",
+    ]
+    if fa and spacing:
+        lines.append("Spacing: vol model \\(overlay spread scaling off\\)")
+    return "\n".join(lines)
+
+
+_GVOL_GATE_HELP = (
+    "The gate trades only in the calmer part of this market's own volatility range\\. "
+    "When it is high, the grid withdraws its resting entries and holds what it has\\. "
+    "Exits keep working and nothing is sold at market\\. It re\\-enters after 15 calm "
+    "minutes\\. With the gate on, the grid does not enter until volatility is calm\\.\n"
+    "Measured on BTC \\(15 days, in\\-sample\\): calm\\-only symmetric grid \\+169 per $1M "
+    "vs −628 ungated\\. Not yet confirmed out\\-of\\-sample\\. Treat it as an experiment — "
+    "and expect much lower volume: most grid fills happen in busy minutes\\.\n"
+    "Spacing widens the levels as volatility rises and never goes below the fee floor\\. "
+    "Skew leans quotes against your inventory\\. Hard cap counts resting orders toward "
+    "the cap, so inventory cannot run past it the way the default cap can\\."
+)
+
+_RGRID_VOL_ARM_HELP = (
+    "Vol arm \\(filter\\): arms the trigger ladder only when volatility breaks out after a "
+    "quiet spell \\(≤ {quiet} × this market's 7\\-day median in the last 2h, then ≥ {burst} × "
+    "now\\)\\. Includes the first arm\\. It only cuts arms in quiet chop\\. R\\-Grid still pays "
+    "taker fees on every rung, and no setting has made it profitable in testing \\(replay: "
+    "−350 to −490 per $1M\\)\\. Exits and stops are never gated\\. These thresholds are "
+    "untested\\."
+)
+
+
 def _strategy_config_section_text(strategy: str, conf: dict, network: str, section: str) -> str:
     if strategy == "vol":
         direction = "SHORT" if str(conf.get("vol_direction", "long")).lower() == "short" else "LONG"
@@ -2218,16 +2357,35 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
                 "The band floors and caps the auto\\-spread\\. Soft reset re\\-anchors both "
                 "legs to mid when price runs away from the last fill\\."
             )
+        if section == "vol":
+            _gfa = bool(float(conf.get("fill_anchored", 0) or 0))
+            _body = _gvol_section_body(
+                conf, "grid_", gate_on=_gvol_on(conf, "grid_vol_gate"), fa=_gfa,
+                min_key="min_spread_bp", max_key="max_spread_bp",
+                min_default=2.0, max_default=20.0,
+            )
+            return f"🌡 *GRID · Vol model*\n\n{_body}\n\n{_GVOL_GATE_HELP}"
         if section == "risk":
+            if _gvol_on(conf, "grid_inv_cap_hard"):
+                _cap_pct = _gvol_num(conf, "grid_inv_cap_pct", 30.0)
+                _cap_copy = (
+                    f"Hard cap ON: held \\+ resting entries ≤ {escape_md(f'{_cap_pct:.0f}%')} "
+                    "of position size \\+ one level \\(Vol tab\\)\\."
+                )
+            else:
+                _cap_copy = (
+                    "The net\\-exposure cap governs FILLED inventory: once a side is "
+                    "over the cap only the reducing side keeps quoting\\. Resting "
+                    "orders are not capped below one full deployment — a bid and an "
+                    "ask net to zero, and refusing the first quote would leave a flat "
+                    "book unable to start\\. Your margin is the hard ceiling\\. "
+                    "The Vol tab has an opt\\-in hard cap that counts resting orders\\."
+                )
             return (
                 "⚙️ *GRID · Risk*\n\n"
                 f"PnL TP/SL: *{escape_md(f'{tp_pct:.2f}% / {sl_pct:.2f}%')}* of margin\n\n"
                 "Judged NET of fees on live PnL including unrealised\\.\n\n"
-                "The net\\-exposure cap governs FILLED inventory: once a side is "
-                "over the cap only the reducing side keeps quoting\\. Resting "
-                "orders are not capped below one full deployment — a bid and an "
-                "ask net to zero, and refusing the first quote would leave a flat "
-                "book unable to start\\. Your margin is the hard ceiling\\."
+                f"{_cap_copy}"
             )
         pov_label = str(conf.get("participation_preset") or "OFF").upper()
         # Grid runs one of TWO controllers and the card must not describe the
@@ -2254,7 +2412,8 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             f"{_mode_line}"
             f"POV: *{escape_md(pov_label)}* \\(per\\-cycle pacing from Nado 24h volume\\)\n"
             f"{_mm_sizing_line(conf)}\n"
-            f"{_run_duration_line(conf, 'grid')}\n\n"
+            f"{_run_duration_line(conf, 'grid')}\n"
+            f"{_gvol_summary_line(conf, 'grid_', gate_on=_gvol_on(conf, 'grid_vol_gate'))}\n\n"
             f"{_mode_help}"
         )
 
@@ -2328,12 +2487,17 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
         )
         pov_label = str(conf.get("participation_preset") or "OFF").upper()
         _chop = "On" if float(conf.get("rgrid_chop_stand_down", 1) or 0) >= 0.5 else "Off"
+        _vol_arm = "On" if _gvol_on(conf, "rgrid_vol_arm") else "Off"
+        _quiet = _gvol_num(conf, "rgrid_vol_compress_mult", 0.91)
+        _burst = _gvol_num(conf, "rgrid_vol_expand_mult", 1.42)
         return (
             "⚙️ *Reverse GRID · Core*\n\n"
             f"Margin: *{escape_md(f'${notional:,.0f}')}* \\| Interval: *{escape_md(f'{interval_seconds}s')}*\n"
             f"Rungs: *{escape_md(_levels_lbl)}* \\| Spread: *{escape_md(rgrid_spread)}*{_step_note}\n"
             f"Per rung: *{escape_md(rgrid_rung_usd_text(float(_plan.rung_quote)))}* \\| "
             f"Chop guard: *{escape_md(_chop)}* \\| POV: *{escape_md(pov_label)}*\n"
+            f"Vol arm: *{escape_md(_vol_arm)}* \\(quiet ≤ {escape_md(f'{_quiet:.2f}×')}, "
+            f"burst ≥ {escape_md(f'{_burst:.2f}×')}\\)\n"
             f"{_mm_sizing_line(conf)}\n"
             f"{_run_duration_line(conf, 'rgrid')}\n\n"
             "A ladder of venue *price triggers*: BUY rungs one step apart ABOVE the "
@@ -2343,7 +2507,9 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             "count\\)\\. One trailing venue stop exits the whole position\\. Profits in "
             "trends, gives back a little in chop — the mirror of GRID\\. The first ladder "
             "always arms; with the chop guard on, a re\\-arm after a stop\\-out waits "
-            "for a confirmed trend\\. *Position size \\= margin × leverage*\\."
+            "for a confirmed trend\\. *Position size \\= margin × leverage*\\.\n\n"
+            + _RGRID_VOL_ARM_HELP.format(
+                quiet=escape_md(f"{_quiet:.2f}"), burst=escape_md(f"{_burst:.2f}"))
         )
 
     if strategy == "dgrid":
@@ -2365,8 +2531,31 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
                 if range_on > trend_on else ""
             )
             _drift_lbl = f"{drift:.2f}%" if drift > 0 else "off"
+            _vol_model = str(conf.get("dgrid_regime_model") or "vr").lower() == "vol"
+            _model_lbl = "Vol \\(calm\\-only\\)" if _vol_model else "Variance ratio"
+            _vol_block = (
+                f"Model: *{_model_lbl}*\n"
+                + _gvol_section_body(
+                    conf, "dgrid_", gate_on=_vol_model, fa=False,
+                    min_key="dgrid_min_spread_bp", max_key="dgrid_max_spread_bp",
+                    min_default=2.0, max_default=50.0,
+                )
+                + "\n"
+                + (
+                    "Trend switch: *off under the Vol model* \\(Auto\\-switch is ignored "
+                    "while this is on\\)\n" if _vol_model else ""
+                )
+                + "\nThe Vol model runs the grid only while volatility is calm\\. When it is "
+                "high, D\\-Grid withdraws its resting buys and holds what it has, instead of "
+                "selling at market and switching to the trend ladder\\. Recent volatility "
+                "predicts the next hour's range far better than the variance ratio does "
+                "\\(0\\.60 vs 0\\.12\\)\\. Variance\\-ratio trend switches showed no "
+                "directional edge\\. Measured in\\-sample only — an experiment, off by "
+                "default\\.\n\n"
+            )
             return (
                 "⚡ *Dynamic GRID · Regime*\n\n"
+                f"{_vol_block}"
                 f"Switch to RGRID: *{escape_md(f'{trend_on:.2f}')}* variance ratio\n"
                 f"Switch to GRID: *{escape_md(f'{range_on:.2f}')}* variance ratio{_inverted}\n"
                 f"Trend drift: *{escape_md(_drift_lbl)}* over the long window \\| "
@@ -2397,14 +2586,22 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
             )
         levels = str(int(conf.get("levels", 4)))
         pov_label = str(conf.get("participation_preset") or "OFF").upper()
-        _mode = "Auto-switch" if _auto_switch else "Grid only"
+        _dg_vol = str(conf.get("dgrid_regime_model") or "vr").lower() == "vol"
+        if _dg_vol:
+            # Never silently override: the user's Auto-switch is preserved and shown
+            # as ignored; it is honoured again the moment they switch back to "vr".
+            _mode = "Grid only (Vol model)" + (
+                " — Auto-switch ignored under Vol model" if _auto_switch else "")
+        else:
+            _mode = "Auto-switch" if _auto_switch else "Grid only"
         return (
             "⚡ *Dynamic GRID · Core*\n\n"
             f"Margin: *{escape_md(f'${notional:,.0f}')}* \\| Interval: *{escape_md(f'{interval_seconds}s')}*\n"
             f"Levels: *{escape_md(levels)}* \\| Starting spread: *{escape_md(f'{spread_bp:.1f} bp')}*\n"
             f"Mode: *{escape_md(_mode)}* \\| POV: *{escape_md(pov_label)}*\n"
             f"{_mm_sizing_line(conf)}\n"
-            f"{_run_duration_line(conf, 'dgrid')}\n\n"
+            f"{_run_duration_line(conf, 'dgrid')}\n"
+            f"{_gvol_summary_line(conf, 'dgrid_', gate_on=_dg_vol)}\n\n"
             "In ranges DGRID rests a maker ladder below the mid and sells each fill "
             "one step up; when the regime turns to a trend it flips to the Reverse "
             "GRID trigger ladder \\(buys above / sells below the mid, pyramiding with "
@@ -2664,6 +2861,46 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                     InlineKeyboardButton("Custom Interval", callback_data="strategy:input:grid:interval_seconds"),
                 ],
             ]
+        elif section == "vol":
+            # OPT-IN realized-volatility model (docs/grid_vol_model.md) — every
+            # toggle defaults OFF; the card text shows the current state.
+            rows = [
+                [
+                    InlineKeyboardButton("🌡 Vol gate: On", callback_data="strategy:set:grid:grid_vol_gate:1"),
+                    InlineKeyboardButton("Off (default)", callback_data="strategy:set:grid:grid_vol_gate:0"),
+                ],
+                [
+                    InlineKeyboardButton("Gate p20", callback_data="strategy:set:grid:grid_vol_gate_mult:0.65"),
+                    InlineKeyboardButton("p33 (default)", callback_data="strategy:set:grid:grid_vol_gate_mult:0.82"),
+                    InlineKeyboardButton("p40", callback_data="strategy:set:grid:grid_vol_gate_mult:0.91"),
+                    InlineKeyboardButton("Median", callback_data="strategy:set:grid:grid_vol_gate_mult:1.0"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:grid:grid_vol_gate_mult"),
+                ],
+                [
+                    InlineKeyboardButton("📏 Vol spacing: On", callback_data="strategy:set:grid:grid_vol_spacing:1"),
+                    InlineKeyboardButton("Off (default)", callback_data="strategy:set:grid:grid_vol_spacing:0"),
+                ],
+                [
+                    InlineKeyboardButton("k 2.0", callback_data="strategy:set:grid:grid_vol_spacing_k:2"),
+                    InlineKeyboardButton("2.6 (default)", callback_data="strategy:set:grid:grid_vol_spacing_k:2.6"),
+                    InlineKeyboardButton("3.0", callback_data="strategy:set:grid:grid_vol_spacing_k:3"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:grid:grid_vol_spacing_k"),
+                ],
+                [
+                    InlineKeyboardButton("⚖️ Skew: On", callback_data="strategy:set:grid:grid_inv_skew:1"),
+                    InlineKeyboardButton("Off (default)", callback_data="strategy:set:grid:grid_inv_skew:0"),
+                ],
+                [
+                    InlineKeyboardButton("🧱 Hard cap: On", callback_data="strategy:set:grid:grid_inv_cap_hard:1"),
+                    InlineKeyboardButton("Off (default)", callback_data="strategy:set:grid:grid_inv_cap_hard:0"),
+                ],
+                [
+                    InlineKeyboardButton("Cap 10%", callback_data="strategy:set:grid:grid_inv_cap_pct:10"),
+                    InlineKeyboardButton("20%", callback_data="strategy:set:grid:grid_inv_cap_pct:20"),
+                    InlineKeyboardButton("30% (default)", callback_data="strategy:set:grid:grid_inv_cap_pct:30"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:grid:grid_inv_cap_pct"),
+                ],
+            ]
         elif section == "execution":
             # Spread bounds: the floor/cap the ATR auto-spread clamps to (and the
             # manual-spread floor). Replaces the previous dead controls
@@ -2779,6 +3016,40 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
             ]
         elif section == "regime":
             rows = [
+                # OPT-IN Vol regime model (docs/grid_vol_model.md) — default: VR.
+                [
+                    InlineKeyboardButton("Model: Variance ratio (default)", callback_data="strategy:set_text:dgrid:dgrid_regime_model:vr"),
+                    InlineKeyboardButton("🌡 Vol (calm-only)", callback_data="strategy:set_text:dgrid:dgrid_regime_model:vol"),
+                ],
+                [
+                    InlineKeyboardButton("Gate p20", callback_data="strategy:set:dgrid:dgrid_vol_gate_mult:0.65"),
+                    InlineKeyboardButton("p33 (default)", callback_data="strategy:set:dgrid:dgrid_vol_gate_mult:0.82"),
+                    InlineKeyboardButton("p40", callback_data="strategy:set:dgrid:dgrid_vol_gate_mult:0.91"),
+                    InlineKeyboardButton("Median", callback_data="strategy:set:dgrid:dgrid_vol_gate_mult:1.0"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:dgrid:dgrid_vol_gate_mult"),
+                ],
+                [
+                    InlineKeyboardButton("📏 Vol spacing: On", callback_data="strategy:set:dgrid:dgrid_vol_spacing:1"),
+                    InlineKeyboardButton("Off (default)", callback_data="strategy:set:dgrid:dgrid_vol_spacing:0"),
+                ],
+                [
+                    InlineKeyboardButton("k 2.0", callback_data="strategy:set:dgrid:dgrid_vol_spacing_k:2"),
+                    InlineKeyboardButton("2.6 (default)", callback_data="strategy:set:dgrid:dgrid_vol_spacing_k:2.6"),
+                    InlineKeyboardButton("3.0", callback_data="strategy:set:dgrid:dgrid_vol_spacing_k:3"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:dgrid:dgrid_vol_spacing_k"),
+                ],
+                [
+                    InlineKeyboardButton("⚖️ Skew: On", callback_data="strategy:set:dgrid:dgrid_inv_skew:1"),
+                    InlineKeyboardButton("Off", callback_data="strategy:set:dgrid:dgrid_inv_skew:0"),
+                    InlineKeyboardButton("🧱 Hard cap: On", callback_data="strategy:set:dgrid:dgrid_inv_cap_hard:1"),
+                    InlineKeyboardButton("Off", callback_data="strategy:set:dgrid:dgrid_inv_cap_hard:0"),
+                ],
+                [
+                    InlineKeyboardButton("Cap 10%", callback_data="strategy:set:dgrid:dgrid_inv_cap_pct:10"),
+                    InlineKeyboardButton("20%", callback_data="strategy:set:dgrid:dgrid_inv_cap_pct:20"),
+                    InlineKeyboardButton("30% (default)", callback_data="strategy:set:dgrid:dgrid_inv_cap_pct:30"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:dgrid:dgrid_inv_cap_pct"),
+                ],
                 [
                     InlineKeyboardButton("Trend 1.25", callback_data="strategy:set:dgrid:dgrid_trend_on_variance_ratio:1.25"),
                     InlineKeyboardButton("Trend 1.50", callback_data="strategy:set:dgrid:dgrid_trend_on_variance_ratio:1.50"),
@@ -2903,6 +3174,23 @@ def _strategy_config_section_kb(strategy: str, section: str, product_max_leverag
                 [
                     InlineKeyboardButton("🛡️ Chop guard: On", callback_data="strategy:set:rgrid:rgrid_chop_stand_down:1"),
                     InlineKeyboardButton("Off (re-arm always)", callback_data="strategy:set:rgrid:rgrid_chop_stand_down:0"),
+                ],
+                # OPT-IN vol-arm filter (default OFF; UNVALIDATED — see card copy).
+                [
+                    InlineKeyboardButton("🌡 Vol arm: On", callback_data="strategy:set:rgrid:rgrid_vol_arm:1"),
+                    InlineKeyboardButton("Off (default)", callback_data="strategy:set:rgrid:rgrid_vol_arm:0"),
+                ],
+                [
+                    InlineKeyboardButton("Quiet ≤0.82×", callback_data="strategy:set:rgrid:rgrid_vol_compress_mult:0.82"),
+                    InlineKeyboardButton("0.91× (default)", callback_data="strategy:set:rgrid:rgrid_vol_compress_mult:0.91"),
+                    InlineKeyboardButton("1.0×", callback_data="strategy:set:rgrid:rgrid_vol_compress_mult:1.0"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:rgrid:rgrid_vol_compress_mult"),
+                ],
+                [
+                    InlineKeyboardButton("Burst ≥1.1×", callback_data="strategy:set:rgrid:rgrid_vol_expand_mult:1.1"),
+                    InlineKeyboardButton("1.42× (default)", callback_data="strategy:set:rgrid:rgrid_vol_expand_mult:1.42"),
+                    InlineKeyboardButton("1.8×", callback_data="strategy:set:rgrid:rgrid_vol_expand_mult:1.8"),
+                    InlineKeyboardButton("✍️", callback_data="strategy:input:rgrid:rgrid_vol_expand_mult"),
                 ],
                 [
                     InlineKeyboardButton("Custom Levels", callback_data="strategy:input:rgrid:levels"),
@@ -3520,9 +3808,12 @@ def _build_strategy_preview_text(
         _dg_sl = float(conf.get("rgrid_stop_loss_pct", conf.get("sl_pct", 0.8)) or 0.0)
         _dg_spread_key = "rgrid_spread_bp" if float(conf.get("rgrid_spread_bp", 0) or 0) > 0 else "dgrid_spread_bp"
         _dg_plan = rgrid_trigger_plan(conf, _dg_sl, spread_key=_dg_spread_key)
+        _dg_vol_model = str(conf.get("dgrid_regime_model") or "vr").lower() == "vol"
         _dg_trend_lbl = (
-            f"{_dg_plan.levels} rungs/side x {float(_dg_plan.step_pct) * 10000.0:.0f}bp"
-            if float(conf.get("dgrid_trend_follow", 1) or 0) >= 0.5 else "off (Grid only)"
+            "off (Vol model)" if _dg_vol_model else (
+                f"{_dg_plan.levels} rungs/side x {float(_dg_plan.step_pct) * 10000.0:.0f}bp"
+                if float(conf.get("dgrid_trend_follow", 1) or 0) >= 0.5 else "off (Grid only)"
+            )
         )
         phase = str(bot_status.get("dgrid_phase") or "grid").upper()
         variance = float(bot_status.get("dgrid_variance_ratio") or 0.0)
@@ -3561,7 +3852,8 @@ def _build_strategy_preview_text(
             f"• Phase: *{escape_md(phase)}* \\| Variance: *{escape_md(f'{variance:.2f}')}*\n"
             f"• Realized move: *{escape_md(f'{realized_move:.1f}bp')}* \\| Reset: *{escape_md(f'{reset_bp:.1f}bp')}*\n"
             f"• Hysteresis: *{escape_md(f'{range_on:.2f} / {trend_on:.2f}')}* \\| Spread: *{escape_md(f'{min_spread:.0f}-{max_spread:.0f}bp')}*\n"
-            f"• Trend phase: *{escape_md(_dg_trend_lbl)}*\n\n"
+            f"• Trend phase: *{escape_md(_dg_trend_lbl)}*\n"
+            f"• {_gvol_summary_line(conf, 'dgrid_', gate_on=_dg_vol_model)}\n\n"
             "📊 *Statistics*\n"
             f"• Total Volume: *{escape_md(_fmt_usd(session_volume))}*\n"
             f"• Total Trades: *{escape_md(str(trades_count))}*\n"
@@ -3613,7 +3905,8 @@ def _build_strategy_preview_text(
             f"• Timing: *{escape_md(f'{interval_seconds}s')}*\n"
             f"• Leverage: *{escape_md(f'MAX ({leverage:.0f}x per-asset)')}*\n"
             f"• Reset: *{escape_md(f'{reset_threshold:.2f}% / {reset_timeout}s')}*\n"
-            f"• TP/SL: *{escape_md(f'{tp_pct:.1f}% / {sl_pct:.1f}%')}*\n\n"
+            f"• TP/SL: *{escape_md(f'{tp_pct:.1f}% / {sl_pct:.1f}%')}*\n"
+            f"• {_gvol_summary_line(conf, 'grid_', gate_on=_gvol_on(conf, 'grid_vol_gate'))}\n\n"
             "📊 *Statistics*\n"
             f"• Total Volume: *{escape_md(_fmt_usd(session_volume))}*\n"
             f"• Total Trades: *{escape_md(str(trades_count))}*\n"
@@ -3676,7 +3969,7 @@ def _build_strategy_preview_text(
             f"• Stop / Trail: *{escape_md(f'{_rg_stop_pct:.2f}% / {_rg_trail_pct:.2f}%')}*"
             + (" \\(auto\\)" if (_rg_plan.stop_is_auto and _rg_plan.trail_is_auto) else "")
             + "\n"
-            f"• Chop guard: *{escape_md(_rg_chop)}*\n"
+            f"• Chop guard: *{escape_md(_rg_chop)}* \\| Vol arm: *{escape_md('On' if _gvol_on(conf, 'rgrid_vol_arm') else 'Off')}*\n"
             f"• PnL SL/TP: *{escape_md(f'{max_loss_pct:.2f}% / {grid_tp:.2f}%')}*\n\n"
             "📊 *Statistics*\n"
             f"• Total Volume: *{escape_md(_fmt_usd(session_volume))}*\n"

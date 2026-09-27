@@ -81,7 +81,7 @@ from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
 from typing import List, Optional
 
 from src.nadobro.engine.adapter.base import AdapterError
-from src.nadobro.engine.controllers.controller_base import Controller
+from src.nadobro.engine.controllers.controller_base import Controller, VolModelConfig
 from src.nadobro.engine.routines import variance_regime
 from src.nadobro.engine.types import OrderType, TradeType, _as_bool, _dec
 from src.nadobro.quant.rgrid_sizing import (
@@ -297,6 +297,11 @@ class ReverseGridController(Controller):
         # now would only pay fees into a guaranteed session stop, so the ladder holds
         # VISIBLY instead ("Quoting: PAUSED" + what to change). Exits are never gated.
         self.stop_budget_unfundable = _as_bool(self.cfg("stop_budget_unfundable", False), False)
+        # -- OPT-IN vol-arm filter (docs/grid_vol_model.md) --
+        # Arm the ladder only on a volatility EXPANSION after COMPRESSION. A
+        # stand-down filter to cut losing arms in quiet chop — UNVALIDATED, and it
+        # cannot make R-Grid profitable at taker fees. Exits are never gated.
+        self.vol_cfg = VolModelConfig.from_configs(self.configs)
 
     def reload_config(self) -> None:
         """Apply a live settings edit: re-read the geometry + gate params from the
@@ -352,6 +357,8 @@ class ReverseGridController(Controller):
         # Refresh the regime read every tick so the flat gate and the debounce stay
         # current (cheap; exits never consult it).
         await self._classify_regime()
+        # OPT-IN vol-arm filter: refresh the volatility reading (no-op when off).
+        await self._gvol_refresh(self.trading_pair)
         # Ladder vs venue: drop rungs/stops the venue no longer holds so the
         # bookkeeping below never trusts a trigger that is gone (see _reconcile).
         if pending is not None:
@@ -687,6 +694,26 @@ class ReverseGridController(Controller):
         # position is never here — its stop manages it and the gate never touches
         # an exit.) The finite ladder + venue reduce-only stop + session %-margin
         # rail remain the risk bounds on the presence-first entry.
+        # OPT-IN VOL-ARM FILTER: arm only on a volatility burst after a quiet
+        # spell — INCLUDING the first arm (presence-first is bypassed only under
+        # this explicit opt-in; the card says so). UNKNOWN / WARMING do not arm
+        # (the safe direction is "no new taker entries"). Only ENTRY rungs are
+        # cancelled; this branch runs only while FLAT, so the stop, the trail and
+        # every exit of an open position are never gated. AND with the chop guard
+        # below: when this says ARMED, the chop guard still applies unchanged.
+        if self.vol_cfg.arm_enabled and (self.gvol_arm is None or not self.gvol_arm.armed):
+            arm = self.gvol_arm
+            if arm is None:
+                reason = "vol_unknown"
+            elif arm.state == "WAITING":
+                reason = "rgrid_vol_wait"
+            else:
+                reason = arm.reason or "vol_unknown"
+            self.gate_verdict, self.gate_reason = "PAUSE", reason
+            if self._rungs:
+                await self._cancel_all_rungs()
+            self._anchor = None
+            return
         if self.chop_stand_down and self._has_opened and not self._trend_confirmed():
             # Re-arm after a close, no confirmed trend: stand down. Drop any resting
             # ladder and re-anchor fresh when a trend resumes.
@@ -1107,6 +1134,7 @@ class ReverseGridController(Controller):
             drift_pct = float((self._last_mid - anchor) / anchor * Decimal(100))
         entry = float(self._avg_entry) if self._avg_entry else 0.0
         return {
+            **self.gvol_metrics(),
             # --- keys the rgrid /status card consumes ---
             "grid_anchor_price": float(anchor) if anchor else 0.0,
             "grid_net_base": float(self._pos_base),

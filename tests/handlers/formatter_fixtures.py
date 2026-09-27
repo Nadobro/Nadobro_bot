@@ -179,6 +179,34 @@ STATUS_STOPPED = {
     "missing_step": "wallet",
 }
 
+# Grid-family vol model (docs/grid_vol_model.md) — one status per model state.
+STATUS_GRID_VOL_CALM = {**STATUS_RUNNING, "gvol_state": "CALM", "gvol_features": "gate,spacing,skew",
+                        "gvol_rv60_bp": 2.4, "gvol_gate_bp": 3.1, "gvol_base_bp": 3.8,
+                        "gvol_spacing_bp": 8.0, "gvol_skew_bp": -1.2}
+STATUS_GRID_VOL_HOT = {**STATUS_RUNNING, "gvol_state": "HOT", "gvol_features": "gate,cap",
+                       "gvol_rv60_bp": 5.6, "gvol_gate_bp": 3.1, "gvol_base_bp": 3.8,
+                       "gvol_withdrawn": 4, "gvol_cap_usd": 1470.0, "gvol_cap_used_usd": 1120.0,
+                       "gvol_calm_min": 3, "mm_gate_verdict": "PAUSE", "mm_gate_reason": "vol_hot",
+                       "mm_gate_since_ts": 1_756_000_000.0}
+STATUS_GRID_VOL_WARMING = {**STATUS_RUNNING, "gvol_state": "WARMING", "gvol_features": "gate",
+                           "gvol_base_hours": 41.0, "mm_gate_verdict": "PAUSE",
+                           "mm_gate_reason": "vol_warming", "mm_gate_since_ts": 1_756_000_000.0}
+STATUS_GRID_VOL_UNKNOWN = {**STATUS_RUNNING, "gvol_state": "UNKNOWN", "gvol_features": "gate",
+                           "gvol_detail": "candles 240s old", "mm_gate_verdict": "PAUSE",
+                           "mm_gate_reason": "vol_unknown", "mm_gate_since_ts": 1_756_000_000.0}
+STATUS_DGRID_VOL = {**STATUS_RUNNING, "strategy": "dgrid", "dgrid_regime_model": "vol",
+                    "dgrid_phase": "grid", "dgrid_variance_ratio": 1.31,
+                    "gvol_state": "CALM", "gvol_features": "gate", "gvol_rv60_bp": 2.0,
+                    "gvol_gate_bp": 3.1, "gvol_base_bp": 3.8}
+STATUS_RGRID_VOL_WAITING = {**STATUS_RUNNING, "strategy": "rgrid", "gvol_state": "WAITING",
+                            "gvol_features": "arm", "gvol_rv60_bp": 4.1, "gvol_rv15_bp": 3.9,
+                            "gvol_compress_bp": 3.4, "gvol_expand_bp": 5.3,
+                            "mm_gate_verdict": "PAUSE", "mm_gate_reason": "rgrid_vol_wait",
+                            "mm_gate_since_ts": 1_756_000_000.0}
+STATUS_RGRID_VOL_ARMED = {**STATUS_RUNNING, "strategy": "rgrid", "gvol_state": "ARMED",
+                          "gvol_features": "arm", "gvol_rv15_bp": 6.2, "gvol_expand_bp": 5.3,
+                          "gvol_compressed_ago_min": 38}
+
 ONBOARDING_DONE = {"onboarding_complete": True, "funded": True, "has_key": True}
 ONBOARDING_TODO = {"onboarding_complete": False, "funded": False, "has_key": False, "missing_step": "wallet"}
 
@@ -397,6 +425,13 @@ CASES: list[tuple[str, str, tuple, dict]] = [
     # --- strategy / status / ops ---
     ("status_overview__running", "fmt_status_overview", (STATUS_RUNNING, ONBOARDING_DONE), {}),
     ("status_overview__stopped", "fmt_status_overview", (STATUS_STOPPED, ONBOARDING_TODO), {}),
+    ("status_overview__grid_vol_calm", "fmt_status_overview", (STATUS_GRID_VOL_CALM, ONBOARDING_DONE), {}),
+    ("status_overview__grid_vol_hot", "fmt_status_overview", (STATUS_GRID_VOL_HOT, ONBOARDING_DONE), {}),
+    ("status_overview__grid_vol_warming", "fmt_status_overview", (STATUS_GRID_VOL_WARMING, ONBOARDING_DONE), {}),
+    ("status_overview__grid_vol_unknown", "fmt_status_overview", (STATUS_GRID_VOL_UNKNOWN, ONBOARDING_DONE), {}),
+    ("status_overview__dgrid_vol_model", "fmt_status_overview", (STATUS_DGRID_VOL, ONBOARDING_DONE), {}),
+    ("status_overview__rgrid_vol_waiting", "fmt_status_overview", (STATUS_RGRID_VOL_WAITING, ONBOARDING_DONE), {}),
+    ("status_overview__rgrid_vol_armed", "fmt_status_overview", (STATUS_RGRID_VOL_ARMED, ONBOARDING_DONE), {}),
     ("strategy_update", "fmt_strategy_update", ("grid", "mainnet", STRATEGY_CONF), {}),
     ("ops_overview", "fmt_ops_overview", (STATUS_RUNNING, OPS), {}),
 

@@ -34,6 +34,7 @@ from src.nadobro.engine.controllers.market_making import MarketMakingController
 from src.nadobro.engine.executors.order_executor import OrderExecutor, OrderExecutorConfig
 from src.nadobro.engine.risk import ExecutorRequest
 from src.nadobro.engine.types import ExecutionStrategy, PositionAction, TradeType, _dec
+from src.nadobro.quant import vol_model
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,9 @@ class FillAnchoredQuotingController(MarketMakingController):
         self.concession_fraction = max(Decimal("0.05"), min(_frac, Decimal(1)))
         self._stall_ticks: int = 0
         self._last_net_base: Decimal = Decimal(0)
+        # OPT-IN vol spacing (docs/grid_vol_model.md): the vol-scaled per-side
+        # spacing in bp while the feature is on, else None (config spacing).
+        self._fa_vol_spacing_bp: Optional[float] = None
         # SESSION ISOLATION: the exposure VWAP must reflect THIS run's fills only.
         # In-memory absorption already guarantees that (my_executors is scoped to
         # this controller_id = strategy:user:network and a per-run orchestrator),
@@ -274,7 +278,12 @@ class FillAnchoredQuotingController(MarketMakingController):
         allow_sell = exposure["sell"]
 
         await self.evaluate_quote_gate(self.trading_pair)
-        if self.gate_paused and base_value != 0:
+        await self.gvol_tick(self.trading_pair)       # OPT-IN vol model; no-op when off
+        # VOL STAND-DOWN (opt-in) drops the flat-book presence-first exception:
+        # flat, both sides are growth sides, so both are withdrawn (the
+        # reconciler cancels a resting slot with allowed=False). Regime-gate
+        # pauses keep today's presence-first semantics.
+        if self.gate_paused and (base_value != 0 or self.gvol_stand_down):
             # PRESENCE-FIRST: a paused gate is reduce-only only once a position is
             # HELD (stop adding, keep closing). While FLAT the grid still places its
             # entry quotes so it ENTERS the market first — the gate governs adds only
@@ -289,6 +298,8 @@ class FillAnchoredQuotingController(MarketMakingController):
             half = max(self.spread_floor_half_pct, min(half, self.spread_cap_half_pct))
             self.spread_bid_pct = half
             self.spread_ask_pct = half
+        if self.vol_cfg.spacing_enabled or self._fa_vol_spacing_bp is not None:
+            self._gvol_apply_fa_spacing(mid)
 
         ref = self._current_reference(mid)
         self._last_ref = ref
@@ -301,6 +312,16 @@ class FillAnchoredQuotingController(MarketMakingController):
         # own setting) must steer this book too — previously both were computed
         # and then silently dropped here. bias=0 is symmetric, i.e. unchanged.
         spread_bid_pct, spread_ask_pct = self.effective_spreads()
+        # OPT-IN inventory skew: shift the pricing anchors (not the drift test)
+        # against the held inventory. The no-cross clamps below still apply
+        # AFTER the shift, so skew can never sell below the last buy + spread.
+        skew = self._gvol_fa_skew(mid, base_value)
+        if skew:
+            factor = Decimal(1) + _dec(skew) / Decimal(10000)
+            ref = ref * factor
+            mid_anchor = mid * factor
+        else:
+            mid_anchor = mid
 
         if soft_reset:
             # SOFT RESET (drift escaped the band): re-anchor BOTH legs to mid so
@@ -309,8 +330,8 @@ class FillAnchoredQuotingController(MarketMakingController):
             # below cost (the documented "switch the behind leg to mid-market"
             # circuit-breaker). The profit/flat leg keeps no-cross, so it never
             # adds at a loss. net long ⇒ SELL behind; net short ⇒ BUY behind.
-            target_bid = mid * (Decimal(1) - spread_bid_pct)
-            target_ask = mid * (Decimal(1) + spread_ask_pct)
+            target_bid = mid_anchor * (Decimal(1) - spread_bid_pct)
+            target_ask = mid_anchor * (Decimal(1) + spread_ask_pct)
             sell_behind = base_value > 0
             buy_behind = base_value < 0
             if not buy_behind and self._last_sell_px is not None:
@@ -344,7 +365,56 @@ class FillAnchoredQuotingController(MarketMakingController):
 
         # Step 2 of the stall escalation: if the soft-reset's maker concession
         # can't rebalance, escalate to a bounded reduce-only taker before SL.
-        await self._maybe_escalate_concession(mid)
+        # Not while the opt-in vol gate stands down: stand-down HOLDS inventory
+        # and never sends a taker (V2 "hold, no stop" vs an IOC stop, audit H8).
+        # concession_enabled itself is untouched (the card discloses this).
+        if not self.gvol_stand_down:
+            await self._maybe_escalate_concession(mid)
+
+    # -- OPT-IN vol model (docs/grid_vol_model.md) -----------------------------
+    def _gvol_apply_fa_spacing(self, mid: Decimal) -> None:
+        """Vol-scaled per-side spacing (FA captures one ``s`` per round trip, so
+        the floor is the FA floor). Recomputed at most once per closed minute
+        (the vol refresh cadence) behind a max(1bp, 15%) deadband; takes
+        precedence over the ATR auto-spread. The overlay's spread factor is not
+        applied on top (disclosed on the card). Toggle OFF restores the
+        configured spacing."""
+        if not self.vol_cfg.spacing_enabled:
+            self._fa_vol_spacing_bp = None
+            self.gvol_spacing_bp_live = 0.0
+            self.spread_bid_pct = max(_dec(self.cfg("spread_bid_pct", "0.001")), self.spread_floor_half_pct)
+            self.spread_ask_pct = max(_dec(self.cfg("spread_ask_pct", "0.001")), self.spread_floor_half_pct)
+            self.ladder_step_bp = _dec(self.cfg("ladder_step_bp", "0") or "0")
+            return
+        target = self.gvol_spacing_target(mid)
+        if target is not None:
+            current = self._fa_vol_spacing_bp
+            if current is None or vol_model.spacing_change_significant(current, target):
+                self._fa_vol_spacing_bp = float(target)
+        s_bp = self._fa_vol_spacing_bp
+        if s_bp is None:
+            return
+        frac = _dec(s_bp) / Decimal(10000)
+        self.spread_bid_pct = frac
+        self.spread_ask_pct = frac
+        self.ladder_step_bp = _dec(s_bp)
+        self.gvol_spacing_bp_live = float(s_bp)
+
+    def _gvol_fa_skew(self, mid: Decimal, base_value: Decimal) -> float:
+        cfg = self.vol_cfg
+        if not cfg.skew_enabled:
+            if self.gvol_skew_bp:
+                self.gvol_skew_bp = 0.0
+            return 0.0
+        margin = _dec(self.cfg("margin_quote") or 0)
+        cap = margin * _dec(cfg.cap_pct) / Decimal(100)
+        if cap <= 0:
+            return 0.0
+        q = max(-1.0, min(1.0, float(base_value / cap)))
+        s_bp = float(self.spread_bid_pct * Decimal(10000))
+        off = vol_model.skew_offset_bp(q, getattr(self, "gvol_rv60", None), s_bp)
+        self.gvol_skew_bp = off
+        return off
 
     # Introspection for dashboards/tests.
     def anchor_state(self) -> dict:
@@ -369,6 +439,7 @@ class FillAnchoredQuotingController(MarketMakingController):
         if self.inventory is not None:
             net_base = float(self.inventory.get(self.user_id, self.trading_pair, self.id).net_amount_base)
         return {
+            **self.gvol_metrics(),
             "grid_mode": self.mode,
             "grid_anchor_price": float(ref) if ref else 0.0,
             "grid_reset_threshold_bp": float(self.reset_threshold_pct * Decimal(10000)),
