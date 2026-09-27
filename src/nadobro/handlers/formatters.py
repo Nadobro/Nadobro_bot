@@ -2237,12 +2237,17 @@ def fmt_strategy_update(strategy: str, network: str, conf: dict) -> str:
     spread_key = {"rgrid": "rgrid_spread_bp", "dgrid": "dgrid_spread_bp"}.get(sid, "spread_bp")
     spread_bp = float(conf.get(spread_key, conf.get("spread_bp", 5.0)) or 0.0)
     interval_seconds = int(conf.get("interval_seconds", 60))
+    # Fallback = the strategy's own registry default (grid family 5%, Mid 0.5%),
+    # so the confirmation never echoes a default the engine does not use.
+    from src.nadobro.strategy.strategy_registry import SETTINGS_STRATEGY_DEFAULTS
+
+    _default_sl = float(SETTINGS_STRATEGY_DEFAULTS.get(sid, {}).get("sl_pct", 0.5) or 0.5)
     if sid in ("rgrid", "dgrid"):
         tp_pct = float(conf.get("rgrid_take_profit_pct", conf.get("tp_pct", 1.0)) or 0.0)
-        sl_pct = float(conf.get("rgrid_stop_loss_pct", conf.get("sl_pct", 0.5)) or 0.0)
+        sl_pct = float(conf.get("rgrid_stop_loss_pct", conf.get("sl_pct", _default_sl)) or 0.0)
     else:
         tp_pct = float(conf.get("tp_pct", 1.0))
-        sl_pct = float(conf.get("sl_pct", 0.5))
+        sl_pct = float(conf.get("sl_pct", _default_sl))
     return (
         f"✅ *{escape_md(strategy.upper())} {_loc('updated')}* \\({escape_md(network.upper())}\\)\n\n"
         f"{_loc('Margin')}: {escape_md(f'${notional:,.2f}')}\n"
