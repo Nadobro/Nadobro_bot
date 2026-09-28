@@ -87,6 +87,7 @@ from src.nadobro.strategy.strategy_registry import (
     strategy_display_name,
 )
 from src.nadobro.strategy.strategy_lifecycle import cleanup_strategy_positions
+from src.nadobro.strategy import pending_cleanup
 
 logger = logging.getLogger(__name__)
 
@@ -960,6 +961,11 @@ async def _boot_stand_down_one(telegram_id: int, network: str, state: dict, stra
             "Stopped by a restart. Some resting orders may remain on Nado — "
             "please check and cancel them. Tap Start to resume."
         )
+        # Retriable by Stop / /stop_all / the network switch (never re-arms).
+        await run_blocking_db(
+            pending_cleanup.record_failed, telegram_id, network, state,
+            "redeploy_stand_down", "resting orders not confirmed cancelled",
+        )
     await run_blocking_db(_finalize_session, state, "redeploy_stand_down")
     await _save_state_async(telegram_id, network, state)
     # 4) Notify the owner. Resuming is strictly user-initiated.
@@ -1807,10 +1813,99 @@ def _cancel_leftover_resting_orders(telegram_id: int, network: str, state: dict,
     return res
 
 
-async def _sweep_session_triggers_async(client, network: str, state: dict) -> None:
+def cancel_orders_on_products(telegram_id: int, network: str, product_ids) -> dict:
+    """Cancel-only sweep of the user's resting orders on each of ``product_ids``
+    (every resting order on those products — the precision of every stop path's
+    sweep). Success only when EVERY product's book is confirmed clear (DENIED !=
+    EMPTY); no products means nothing could be scoped, which is a failure — never
+    widen to an unscoped cancel. Positions are never touched."""
+    pids = [int(p) for p in (product_ids or [])]
+    if not pids:
+        return {"success": False, "cancelled_orders": 0,
+                "error": "cannot resolve the product to scope the cancel"}
+    from src.nadobro.trading.trade_service import cancel_resting_orders_for_user
+
+    cancelled = 0
+    errors: list[str] = []
+    for pid in pids:
+        leg = cancel_resting_orders_for_user(telegram_id, network, only_pid=pid)
+        cancelled += int(leg.get("cancelled_orders") or 0)
+        if not leg.get("success"):
+            errors.append(str(leg.get("error") or f"product {pid}: cancel not confirmed"))
+    return {"success": not errors, "cancelled_orders": cancelled, "error": "; ".join(errors) or None}
+
+
+def retry_pending_cleanups(telegram_id: int, network: str) -> list[dict]:
+    """Retry every recorded pending stop cleanup on ``network``
+    (``strategy/pending_cleanup.py``): a CANCEL-ONLY sweep of the products the
+    stop recorded, plus the run's own entry triggers for the single-perp
+    strategies (its protective reduce-only stop is kept — a position may still
+    be open). Never flattens. Each confirmed entry is deleted. RAISES when the
+    entries cannot be listed. One result per entry: ``{"strategy", "product",
+    "ok", "error", "cancelled_orders", "flatten_unconfirmed"}``."""
+    results: list[dict] = []
+    for key, entry in pending_cleanup.list_entries(telegram_id, network):
+        strategy = str(entry.get("strategy") or "")
+        product = str(entry.get("product") or "")
+        pids = entry.get("product_ids") or pending_cleanup.product_ids_for(
+            strategy, product, network, market=entry.get("market"),
+        )
+        res = {
+            "strategy": strategy, "product": product, "ok": False, "error": None,
+            "cancelled_orders": 0, "flatten_unconfirmed": bool(entry.get("flatten_unconfirmed")),
+        }
+        if not pids:
+            res["error"] = f"cannot resolve the {strategy or 'stopped run'} product to scope its cleanup"
+            results.append(res)
+            continue
+        errors: list[str] = []
+        try:
+            swept = cancel_orders_on_products(telegram_id, network, pids)
+            res["cancelled_orders"] = int(swept.get("cancelled_orders") or 0)
+            if not swept.get("success"):
+                errors.append(str(swept.get("error")))
+            if strategy in pending_cleanup.PERP_STRATEGIES:
+                sweep_state = dict(entry.get("trigger_state") or {}, strategy=strategy, product=product)
+                sweep = _sweep_bot_trigger_orders_sync(
+                    telegram_id, network, sweep_state, int(pids[0]), keep_protective=True,
+                )
+                if sweep is not None and not sweep.get("success"):
+                    errors.append(f"venue triggers not confirmed cancelled: {sweep.get('error')}")
+            if not errors:
+                pending_cleanup.delete(key)
+        except Exception as exc:  # noqa: BLE001 - per entry; reported unconfirmed, retried next time
+            errors.append(str(exc))
+        res["ok"] = not errors
+        res["error"] = "; ".join(errors) or None
+        results.append(res)
+    return results
+
+
+def _retry_stop_leftovers(telegram_id: int, network: str, state: dict, strategy: str) -> dict | None:
+    """The retriable half of Stop / /stop_all for a run that is no longer
+    running: retry the recorded pending cleanups on ``network``; with none
+    recorded, fall back to the product-scoped sweep of the saved run
+    (STOP-NOT-RETRIABLE). ``None`` = nothing scoped to sweep."""
+    try:
+        results = retry_pending_cleanups(telegram_id, network)
+    except Exception:  # policy: degrade-ok(unreadable record list -> the saved run's own sweep below; the network switch fails closed on it)
+        logger.warning("stop retry: pending cleanups unreadable user=%s network=%s", telegram_id, network, exc_info=True)
+        results = []
+    if results:
+        errors = [f"{r['strategy']} {r['product']}: {r['error']}" for r in results if not r["ok"]]
+        return {
+            "success": not errors,
+            "cancelled_orders": sum(int(r["cancelled_orders"]) for r in results),
+            "error": "; ".join(errors) or None,
+        }
+    return _cancel_leftover_resting_orders(telegram_id, network, state, strategy)
+
+
+async def _sweep_session_triggers_async(client, network: str, state: dict) -> bool:
     """Cancel the run's own venue triggers after a session-end FLATTEN (rail
     SL/TP, duration cap, stale session): the position is gone, so the run's
-    protective stop and any leftover entry rung are stale. Best-effort."""
+    protective stop and any leftover entry rung are stale. Best-effort; returns
+    whether the sweep is CONFIRMED (the caller keeps the stop retriable if not)."""
     try:
         from src.nadobro.strategy.venue_triggers import cancel_session_trigger_orders_for_state
         res = await cancel_session_trigger_orders_for_state(client, network, state, keep_protective=False)
@@ -1819,8 +1914,25 @@ async def _sweep_session_triggers_async(client, network: str, state: dict) -> No
                 "session end: venue trigger sweep not confirmed user=? strategy=%s: %s",
                 state.get("strategy"), res.get("error"),
             )
-    except Exception:  # noqa: BLE001 - best-effort
+            return False
+        return True
+    except Exception:  # noqa: BLE001 - best-effort; reported as unconfirmed
         logger.debug("session end: venue trigger sweep failed", exc_info=True)
+        return False
+
+
+async def _end_session_stop(pending, close_res, triggers_ok: bool) -> None:
+    """Close out an automatic session stop's pending-cleanup record: deleted when
+    the flatten/cancel and the trigger sweep are confirmed, otherwise kept for
+    Stop / /stop_all / the network switch to retry (cancel-only)."""
+    close_ok = isinstance(close_res, dict) and bool(close_res.get("success"))
+    await run_blocking_db(
+        pending_cleanup.end, pending,
+        ok=bool(close_ok and triggers_ok),
+        error=(None if close_ok else str((close_res or {}).get("error") or "cleanup failed"))
+        or "venue triggers not confirmed cancelled",
+        flatten_unconfirmed=not close_ok,
+    )
 
 
 def _sweep_bot_trigger_orders_sync(
@@ -1828,6 +1940,8 @@ def _sweep_bot_trigger_orders_sync(
 ) -> dict | None:
     """Run the venue trigger sweep from a SYNC stop path. Returns the sweep result,
     or ``None`` when the client is unavailable / the strategy owns no triggers.
+    (Every caller pairs it with a resting-order cancel that needs the same client
+    and fails loud without one, so ``None`` here never confirms a stop on its own.)
     ``keep_protective``: the position is being left open — keep the run's and the
     rail's reduce-only stops; otherwise (flat) cancel them too."""
     strategy = _normalize_strategy_id(str(state.get("strategy") or ""))
@@ -1867,41 +1981,26 @@ def _sweep_bot_trigger_orders_sync(
     return box.get("res") or {"success": False, "cancelled": 0, "error": "sweep did not run"}
 
 
-def stop_user_bot(telegram_id: int, cancel_orders: bool = True) -> tuple[bool, str]:
-    user = get_user(telegram_id)
-    network = user.network_mode.value if user else "mainnet"
-    state = _load_state(telegram_id, network)
-    if not state.get("running"):
-        # STOP-NOT-RETRIABLE (prod 2026-09-04): a prior stop may have cleared
-        # ``running`` while its venue cancel failed (rate-limited), leaving orders
-        # resting. Re-attempt a precisely-scoped cancel-only sweep so a repeat Stop
-        # clears them instead of a silent "No running strategy bot found" no-op over
-        # live orders. The helper returns None when it cannot scope safely (non
-        # single-perp strategy, or unresolvable product) — then fall through unchanged.
-        strategy = _normalize_strategy_id(str(state.get("strategy") or ""))
-        if cancel_orders:
-            try:
-                res = _cancel_leftover_resting_orders(telegram_id, network, state, strategy)
-            except Exception as exc:  # policy: degrade-ok(surfaced to the user as a stop-retry-failed message)
-                return False, f"Stop retry failed: {exc}"
-            if res is not None:
-                if not res.get("success"):
-                    return False, (
-                        "Nothing was actively running, but leftover resting orders could not be "
-                        "confirmed cancelled — the venue may be rate-limited. Try again in a moment, "
-                        f"or check Orders/Positions. ({res.get('error', 'unknown')})"
-                    )
-                n = int(res.get("cancelled_orders") or 0)
-                if n > 0:
-                    return True, (
-                        f"No active loop was running — cancelled {n} leftover resting order(s) from a "
-                        "previous stop. Any open position is untouched; use Close-All to flatten it."
-                    )
-        return False, "No running strategy bot found."
+def _stop_running_strategy(
+    telegram_id: int, network: str, state: dict, *, stop_reason: str, cancel_orders: bool = True,
+) -> dict:
+    """Stop ONE running strategy on ``network`` with the Stop button's full
+    semantics — the single implementation behind Stop, /stop_all and the network
+    switch (the switch used to run a weaker copy that skipped the scheduler
+    unregister and the venue trigger sweep, and only logged its failures).
 
-    _finalize_session(state, stop_reason="user_stop")
+    ``running`` is cleared and saved FIRST so no further cycle re-places orders;
+    then the stop is recorded as a pending cleanup (``strategy/pending_cleanup``)
+    BEFORE its venue half runs — task / scheduler registration, engine stop,
+    flatten + order cancel, the run's trigger sweep — and the record is deleted
+    only once all of it is confirmed. A crash or an unconfirmed venue half leaves
+    it pending for Stop / /stop_all / the network switch to retry.
+    Returns ``{"engine_ok", "engine_error", "cleanup_ok", "cleanup_error",
+    "triggers_ok"}``."""
+    _finalize_session(state, stop_reason=stop_reason)
     state["running"] = False
     _save_state(telegram_id, network, state)
+    pending = pending_cleanup.begin(telegram_id, network, state, stop_reason) if cancel_orders else None
 
     tk = _task_key(telegram_id, network)
     task = _tasks.pop(tk, None)
@@ -1921,6 +2020,8 @@ def stop_user_bot(telegram_id: int, cancel_orders: bool = True) -> tuple[bool, s
 
     engine_ok, engine_error = _stop_engine_runtime_for_state(telegram_id, network, state)
 
+    cleanup_ok, cleanup_error = True, None
+    triggers_ok = True
     if cancel_orders:
         try:
             close_res = cleanup_strategy_positions(telegram_id, network, state)
@@ -1943,16 +2044,77 @@ def stop_user_bot(telegram_id: int, cancel_orders: bool = True) -> tuple[bool, s
                     ) if _pid else None
                 )
                 if _sweep is not None and not _sweep.get("success"):
+                    # An armed entry rung is NOT reduce-only — it can still open a
+                    # position — so an unconfirmed sweep leaves the stop retriable.
+                    triggers_ok = False
                     logger.warning(
                         "stop: venue trigger sweep not confirmed user=%s strategy=%s: %s",
                         telegram_id, state.get("strategy"), _sweep.get("error"),
                     )
-            except Exception:  # noqa: BLE001 - never block the stop on the sweep
-                logger.debug("stop: venue trigger sweep failed", exc_info=True)
-        if not close_res.get("success"):
-            return False, f"Strategy loop stopped, but cleanup failed: {close_res.get('error', 'unknown')}"
-    if not engine_ok:
-        return False, f"Strategy loop stopped, but engine cleanup failed: {engine_error or 'unknown'}"
+            except Exception:  # noqa: BLE001 - never block the stop on the sweep; it stays retriable
+                triggers_ok = False
+                logger.warning("stop: venue trigger sweep failed user=%s", telegram_id, exc_info=True)
+        cleanup_ok = bool(close_res.get("success"))
+        cleanup_error = None if cleanup_ok else str(close_res.get("error") or "unknown")
+
+    pending_cleanup.end(
+        pending,
+        ok=bool(engine_ok and cleanup_ok and triggers_ok),
+        error=cleanup_error or (f"engine cleanup failed: {engine_error}" if not engine_ok else None)
+        or "venue triggers not confirmed cancelled",
+        flatten_unconfirmed=not cleanup_ok,
+    )
+    return {
+        "engine_ok": engine_ok,
+        "engine_error": engine_error,
+        "cleanup_ok": cleanup_ok,
+        "cleanup_error": cleanup_error,
+        "triggers_ok": triggers_ok,
+    }
+
+
+def stop_user_bot(telegram_id: int, cancel_orders: bool = True) -> tuple[bool, str]:
+    user = get_user(telegram_id)
+    network = user.network_mode.value if user else "mainnet"
+    state = _load_state(telegram_id, network)
+    if not state.get("running"):
+        # STOP-NOT-RETRIABLE (prod 2026-09-04): a prior stop may have cleared
+        # ``running`` while its venue cancel failed (rate-limited), leaving orders
+        # resting. Re-attempt a precisely-scoped cancel-only sweep so a repeat Stop
+        # clears them instead of a silent "No running strategy bot found" no-op over
+        # live orders. The helper returns None when it cannot scope safely (non
+        # single-perp strategy, or unresolvable product) — then fall through unchanged.
+        strategy = _normalize_strategy_id(str(state.get("strategy") or ""))
+        if cancel_orders:
+            try:
+                res = _retry_stop_leftovers(telegram_id, network, state, strategy)
+            except Exception as exc:  # policy: degrade-ok(surfaced to the user as a stop-retry-failed message)
+                return False, f"Stop retry failed: {exc}"
+            if res is not None:
+                if not res.get("success"):
+                    return False, (
+                        "Nothing was actively running, but leftover resting orders could not be "
+                        "confirmed cancelled — the venue may be rate-limited. Try again in a moment, "
+                        f"or check Orders/Positions. ({res.get('error', 'unknown')})"
+                    )
+                n = int(res.get("cancelled_orders") or 0)
+                if n > 0:
+                    return True, (
+                        f"No active loop was running — cancelled {n} leftover resting order(s) from a "
+                        "previous stop. Any open position is untouched; use Close-All to flatten it."
+                    )
+        return False, "No running strategy bot found."
+
+    res = _stop_running_strategy(telegram_id, network, state, stop_reason="user_stop", cancel_orders=cancel_orders)
+    if not res["cleanup_ok"]:
+        return False, f"Strategy loop stopped, but cleanup failed: {res['cleanup_error']}"
+    if not res["engine_ok"]:
+        return False, f"Strategy loop stopped, but engine cleanup failed: {res['engine_error'] or 'unknown'}"
+    if not res["triggers_ok"]:
+        return False, (
+            "Strategy loop stopped, but its venue trigger orders could not be confirmed "
+            "cancelled — tap Stop again to retry."
+        )
 
     summary = _session_fee_truth_summary(state)
     base_msg = "Strategy bot stopped. Open orders cancellation requested."
@@ -2025,7 +2187,7 @@ def stop_all_user_bots(telegram_id: int, cancel_orders: bool = True) -> tuple[bo
                 strategy = _normalize_strategy_id(str(state.get("strategy") or ""))
                 if cancel_orders:
                     try:
-                        res = _cancel_leftover_resting_orders(telegram_id, network, state, strategy)
+                        res = _retry_stop_leftovers(telegram_id, network, state, strategy)
                         if res is None:
                             pass  # not safely scopeable (vol/dn/unresolvable) — skip, don't cancel network-wide
                         elif res.get("success"):
@@ -2035,23 +2197,15 @@ def stop_all_user_bots(telegram_id: int, cancel_orders: bool = True) -> tuple[bo
                     except Exception as exc:  # policy: degrade-ok(recorded per-row; one row's cleanup must not block the rest)
                         residual_errors.append(f"{network}/{strategy}: {exc}")
                 continue
-            _finalize_session(state, stop_reason="user_stop_all")
-            state["running"] = False
-            set_bot_state(key, state)
-            tk = _task_key(telegram_id, network)
-            task = _tasks.pop(tk, None)
-            if task:
-                task.cancel()
-            engine_ok, engine_error = _stop_engine_runtime_for_state(telegram_id, network, state)
-            if not engine_ok:
-                close_errors.append(f"{network}: engine cleanup failed: {engine_error or 'unknown'}")
-            if cancel_orders:
-                try:
-                    close_res = cleanup_strategy_positions(telegram_id, network, state)
-                except Exception as e:  # an unreadable position book (DENIED-vs-EMPTY) is a failed cleanup, retriable
-                    close_res = {"success": False, "error": str(e)}
-                if not close_res.get("success"):
-                    close_errors.append(f"{network}: {close_res.get('error', 'close_all_positions failed')}")
+            res = _stop_running_strategy(
+                telegram_id, network, state, stop_reason="user_stop_all", cancel_orders=cancel_orders,
+            )
+            if not res["engine_ok"]:
+                close_errors.append(f"{network}: engine cleanup failed: {res['engine_error'] or 'unknown'}")
+            if not res["cleanup_ok"]:
+                close_errors.append(f"{network}: {res['cleanup_error']}")
+            if not res["triggers_ok"]:
+                close_errors.append(f"{network}: venue trigger orders not confirmed cancelled")
             stopped += 1
         except Exception as exc:
             key = str(row.get("key", ""))
@@ -2382,71 +2536,29 @@ def get_runtime_diagnostics() -> dict:
     }
 
 
-def stop_all_strategies_for_user(telegram_id: int) -> None:
-    """Stop all running strategies for a given user. Used on network switch."""
-    rows = query_all(
-        "SELECT key, value FROM bot_state WHERE key LIKE %s",
-        (f"{STATE_PREFIX}{telegram_id}:%",),
-    )
-    stopped = []
-    for row in rows:
-        try:
-            key = row.get("key", "")
-            user_network = key.replace(STATE_PREFIX, "")
-            user_id_str, network = user_network.split(":", 1)
-            if int(user_id_str) != int(telegram_id):
-                continue
-            state = json.loads(row.get("value") or "{}")
-            if not state.get("running"):
-                continue
-            strategy = state.get("strategy", "unknown")
-            _finalize_session(state, stop_reason="network_switch")
-            state["running"] = False
-            state["last_error"] = "Stopped due to network switch"
-            set_bot_state(key, state)
-            tk = _task_key(telegram_id, network)
-            task = _tasks.pop(tk, None)
-            if task:
-                task.cancel()
-            engine_ok, engine_error = _stop_engine_runtime_for_state(telegram_id, network, state)
-            if not engine_ok:
-                logger.warning(
-                    "Network switch engine cleanup failed for user=%s network=%s strategy=%s: %s",
-                    telegram_id,
-                    network,
-                    strategy,
-                    engine_error or "unknown",
-                )
-                state["last_error"] = (
-                    "Stopped due to network switch; engine cleanup failed: "
-                    f"{str(engine_error or 'unknown')[:180]}"
-                )
-                set_bot_state(key, state)
-            close_res = cleanup_strategy_positions(telegram_id, network, state)
-            if not close_res.get("success"):
-                logger.warning(
-                    "Network switch cleanup failed for user=%s network=%s strategy=%s: %s",
-                    telegram_id,
-                    network,
-                    strategy,
-                    close_res.get("error", "unknown"),
-                )
-                state["last_error"] = (
-                    "Stopped due to network switch; cleanup failed: "
-                    f"{str(close_res.get('error') or 'unknown')[:180]}"
-                )
-                set_bot_state(key, state)
-            stopped.append(f"{strategy}@{network}")
-        except Exception as e:
-            logger.warning("Error stopping strategy for user %s: %s", telegram_id, e)
-            continue
-    if stopped:
-        logger.info(
-            "stop_all_strategies_for_user: stopped %d strategy/strategies for user %s: %s",
-            len(stopped), telegram_id, ", ".join(stopped),
+def stop_strategy_for_network_switch(telegram_id: int, network: str, state: dict) -> dict:
+    """The strategy half of the fail-closed network switch
+    (``strategy/network_switch.py``): stop the RUNNING run on the network being
+    left with the Stop button's semantics (``_stop_running_strategy``). The
+    runtime is single-active-network — Stop, /status and the cards only read the
+    active network — so a run left behind would be stranded out of reach.
+
+    Returns ``{"strategy", "product", "ok", "error"}``; ``ok`` is True only when
+    the engine stop, the flatten + cancel and the trigger sweep are all
+    CONFIRMED (anything else stays recorded as a pending cleanup)."""
+    strategy = _normalize_strategy_id(str(state.get("strategy") or ""))
+    product = str(state.get("product") or "").upper()
+    state["last_error"] = "Stopped due to network switch"
+    res = _stop_running_strategy(telegram_id, network, state, stop_reason="network_switch")
+    ok = bool(res["engine_ok"] and res["cleanup_ok"] and res["triggers_ok"])
+    error = None
+    if not ok:
+        error = (
+            res["cleanup_error"]
+            or (f"engine cleanup failed: {res['engine_error'] or 'unknown'}" if not res["engine_ok"] else None)
+            or "venue triggers not confirmed cancelled"
         )
-    else:
-        logger.debug("stop_all_strategies_for_user: no running strategies found for user %s", telegram_id)
+    return {"strategy": strategy, "product": product, "ok": ok, "error": error}
 
 
 def stop_runtime():
@@ -3153,6 +3265,7 @@ async def _evaluate_mm_duration_rail(
     state["running"] = False
     state["last_action"] = "mm_duration_reached"
     await _save_state_async(telegram_id, network, state)
+    pending = await run_blocking_db(pending_cleanup.begin, telegram_id, network, state, "duration_reached")
     # Stop the engine controller FIRST so its resting maker orders are cancelled
     # before we flatten — otherwise close_all_positions races the still-live
     # controller and leaves "1 open orders remain" (mirrors the SL/TP rail).
@@ -3179,12 +3292,14 @@ async def _evaluate_mm_duration_rail(
     # VENUE-STOP-ORPHAN: the duration cap flattens without going through the SL
     # rail, so cancel any resting venue-side reduce-only stop here too (gated OFF;
     # best-effort) — a stale trigger left on the product could clip a later run.
+    triggers_ok = False
     try:
         from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
         await cancel_session_venue_stop(client, state)
-        await _sweep_session_triggers_async(client, network, state)
+        triggers_ok = await _sweep_session_triggers_async(client, network, state)
     except Exception:  # noqa: BLE001 - cleanup is best-effort; never mask the duration result
         logger.debug("venue stop cancel on duration cap failed", exc_info=True)
+    await _end_session_stop(pending, close_res, triggers_ok)
     return True, None
 
 
@@ -3336,6 +3451,7 @@ async def _evaluate_session_pnl_rail(
             "orders were cleaned up to prevent untracked fills."
         )
         await _save_state_async(telegram_id, network, state)
+        pending = await run_blocking_db(pending_cleanup.begin, telegram_id, network, state, "stale_session")
         try:
             from src.nadobro.strategy import engine_runtime as _er_stop
             if strategy in _er_stop.ENGINE_MAPPED_STRATEGIES:
@@ -3356,12 +3472,14 @@ async def _evaluate_session_pnl_rail(
         )
         # VENUE-STOP-ORPHAN: stale-session teardown also flattens outside the SL
         # rail — clear any resting venue-side reduce-only stop (gated OFF).
+        triggers_ok = False
         try:
             from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
             await cancel_session_venue_stop(client, state)
-            await _sweep_session_triggers_async(client, network, state)
+            triggers_ok = await _sweep_session_triggers_async(client, network, state)
         except Exception:  # noqa: BLE001 - best-effort cleanup
             logger.debug("venue stop cancel on stale session failed", exc_info=True)
+        await _end_session_stop(pending, close_res, triggers_ok)
         _SLTP_MARK_CACHE.pop(int(sess.get("id") or 0), None)   # session over — drop its mark
         return True, None
 
@@ -3544,6 +3662,7 @@ async def _evaluate_session_pnl_rail(
             f"${float(snap.get('margin') or 0.0):,.2f} margin)."
         )
     await _save_state_async(telegram_id, network, state)
+    pending = await run_blocking_db(pending_cleanup.begin, telegram_id, network, state, reason)
 
     label = market_label or f"{product}-PERP"
     strategy_label = _strategy_display_name(strategy)
@@ -3599,12 +3718,14 @@ async def _evaluate_session_pnl_rail(
     # The position is being flattened, so any venue-side reduce-only stop is now
     # stale — cancel it (gated OFF; best-effort). A lingering reduce-only trigger
     # can only reduce, but a stale one could clip a future position, so clear it.
+    triggers_ok = False
     try:
         from src.nadobro.strategy.venue_stop import cancel_session_venue_stop
         await cancel_session_venue_stop(client, state)
-        await _sweep_session_triggers_async(client, network, state)
+        triggers_ok = await _sweep_session_triggers_async(client, network, state)
     except Exception:  # noqa: BLE001 - cleanup is best-effort; never mask the stop result
         logger.debug("venue stop cancel on session stop failed", exc_info=True)
+    await _end_session_stop(pending, close_res, triggers_ok)
     return True, None
 
 
@@ -3682,6 +3803,7 @@ async def _run_cycle(
             state["running"] = False
             state["last_error"] = "Auto-closed on maintenance pause."
             await _save_state_async(telegram_id, network, state)
+            pending = await run_blocking_db(pending_cleanup.begin, telegram_id, network, state, "maintenance_pause")
             close_res = await run_blocking(
                 close_delta_neutral_legs,
                 telegram_id,
@@ -3691,6 +3813,7 @@ async def _run_cycle(
                 "dn",
                 state.get("strategy_session_id"),
             )
+            await _end_session_stop(pending, close_res, True)
             if close_res.get("success"):
                 await _notify(telegram_id, "Delta Neutral stopped and auto-closed due to maintenance pause.")
             else:
@@ -3714,6 +3837,13 @@ async def _run_cycle(
         state["running"] = False
         state["last_error"] = f"Stopped because active mode switched to {user.network_mode.value}"
         await _save_state_async(telegram_id, network, state)
+        # This stand-down cancels nothing on the venue (only reachable by racing
+        # the fail-closed switch): record it so Stop / /stop_all / the next switch
+        # sweep whatever the run left resting.
+        await run_blocking_db(
+            pending_cleanup.record_failed, telegram_id, network, state,
+            "mode_switch", "loop stood down without a venue cancel",
+        )
         await _notify(
             telegram_id,
             "Stopped {strategy} loop on {network}: active mode changed to {new_mode}.",
@@ -4245,6 +4375,7 @@ async def _run_cycle(
         # sized from vol_open_base (what the bot actually still holds), so a
         # normal completion that ended flat is a no-op and can never touch the
         # user's own spot balance.
+        vol_sweep_error: str | None = None
         if strategy == "vol":
             _merge_vol_order_counters(state, result)
             try:
@@ -4257,7 +4388,10 @@ async def _run_cycle(
                         "finalizing user=%s result=%s",
                         reason, telegram_id, _swept.get("success"),
                     )
-            except Exception:  # noqa: BLE001  # policy: degrade-ok(finalize still runs; sweep is logged)
+                if isinstance(_swept, dict) and not _swept.get("success"):
+                    vol_sweep_error = str(_swept.get("error") or _swept.get("errors") or "vol sweep not confirmed")
+            except Exception as exc:  # noqa: BLE001  # policy: degrade-ok(finalize still runs; sweep is logged + recorded pending)
+                vol_sweep_error = str(exc) or "vol sweep failed"
                 logger.error(
                     "vol completion sweep FAILED user=%s reason=%s — a position "
                     "may still be open", telegram_id, reason, exc_info=True,
@@ -4266,6 +4400,11 @@ async def _run_cycle(
         state["running"] = False
         state["last_action"] = "engine_completed"
         await _save_state_async(telegram_id, network, state)
+        if vol_sweep_error:
+            await run_blocking_db(
+                pending_cleanup.record_failed, telegram_id, network, state, reason,
+                vol_sweep_error, flatten_unconfirmed=True,
+            )
         try:
             from src.nadobro.strategy import engine_runtime as _er_done
             if strategy in _er_done.ENGINE_MAPPED_STRATEGIES:

@@ -72,6 +72,26 @@ def register_stop_loss_rule(
     return {"success": True, "rule_id": rule_id, "stop_price": stop_price_f}
 
 
+def list_active_stop_loss_rules(telegram_id: int, network: str) -> list[dict]:
+    """The user's ACTIVE stop-loss rules on one network (read-only). Rules are
+    keyed by their own network and keep protecting that network's position when
+    the user switches the active one. Raises on a DB error."""
+    rows = query_all(
+        "SELECT key, value FROM bot_state WHERE key LIKE %s",
+        (f"{_SL_KEY_PREFIX}{int(telegram_id)}:{network}:%",),
+    )
+    rules = []
+    for row in rows or []:
+        raw = row.get("value")
+        try:
+            rule = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:  # policy: degrade-ok(a corrupt rule is inert — process_stop_losses skips it too)
+            continue
+        if isinstance(rule, dict) and rule.get("active"):
+            rules.append(rule)
+    return rules
+
+
 def process_stop_losses(prices: dict) -> list[dict]:
     rows = query_all("SELECT key, value FROM bot_state WHERE key LIKE %s", (f"{_SL_KEY_PREFIX}%",))
     notifications = []

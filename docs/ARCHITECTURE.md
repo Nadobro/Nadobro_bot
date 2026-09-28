@@ -49,7 +49,7 @@ Package responsibilities:
 | `llm/` | `llm_gateway` (ALL LLM calls route here; Grok X-search stays native xAI), NanoGPT client, AI chat (`bro_llm`), knowledge + vector store, HOWL/night-HOWL, edge scanner, signals, briefs, managed agent, `howl_ui` | venue, market_data, users, trading, strategy (managed agent) |
 | `engine/` | Engine v2: orchestrator, controllers (grid/rgrid/dgrid/mid/vol/dn/desk), executors, risk, cost-aware backtester | venue (adapter), quant, utils |
 | `trading/` | order/trade domain: `trade_service`, `order_intents` (digest tagging), `live_session` (session PnL snapshot), `engine_persistence`, desk suite, `copy_service` (LIVE copy mirroring plane: venue read-only polling, sizing, TP/SL brackets, full+partial close mirroring, bracket-fill sweep, derived-PnL accounting — each mirror run is a `strategy_sessions` row with strategy='copy'), `copy_discovery` (NadoExplorer leaderboard/preview plane), stop-loss, readiness, risk/budget | engine, venue, users, llm (desk parser), market_data (copy discovery) |
-| `strategy/` | strategy lifecycle: `bot_runtime` (session SL/TP rail), `engine_runtime` (`map_strategy_config`, `CONTROLLER_REGISTRY`, `ENGINE_MAPPED_STRATEGIES`), registry, FSM, schedulers, MM overlay + dashboard | trading, engine, llm, users, venue |
+| `strategy/` | strategy lifecycle: `bot_runtime` (session SL/TP rail), `engine_runtime` (`map_strategy_config`, `CONTROLLER_REGISTRY`, `ENGINE_MAPPED_STRATEGIES`), registry, FSM, schedulers, MM overlay + dashboard, `network_switch` (fail-closed testnet<->mainnet switch) | trading, engine, llm, users, venue |
 | `users/` | user accounts, settings, onboarding, invites/referrals/points (`points_ui`), admin, audit log, wallet flows | strategy (registry defaults, stop-on-unlink), venue |
 | `portfolio/` | portfolio views, history worker, PnL cards | trading, engine, users, venue |
 | `vault/` | NLP vault metrics, deposit watcher | venue, users |
@@ -96,6 +96,18 @@ that is what keeps domain→handlers imports at zero.
 - asyncio discipline: no sync IO in coroutine bodies — dispatch through
   `core/async_utils` (`run_blocking`, `run_blocking_db`, `run_blocking_sdk`).
 - Redeploys NEVER auto-resume any trade/plan/strategy. Boot = stand-down.
+- The runtime is single-active-network (Stop, /status, cards and /desk read the
+  user's ACTIVE network). The testnet<->mainnet switch is fail-closed
+  (`strategy/network_switch.py`): it stops the old network's strategy run (Stop
+  semantics), retries earlier unconfirmed stops, cancels its desk plans (sweeping a
+  running plan's product), and flips `users.network_mode` only once every item is
+  confirmed. Copy mirrors, stop-loss rules and the managed agent are network-scoped
+  and keep running. Never call `user_service.set_network_mode` from a UI path.
+- Every stop path (Stop, /stop_all, rails, duration cap, boot stand-down, the
+  switch) records a pending cleanup (`strategy/pending_cleanup.py`, its own
+  `bot_state` key) BEFORE its venue half and deletes it only once the cancel /
+  flatten / trigger sweep is confirmed. Stop, /stop_all and the switch retry what
+  is left — cancel-only, never a flatten.
 - Env values may carry inline `# comments` — read through `utils/env.py`
   (`env_bool/env_int/env_float/env_str`, `clean_env_value`), never raw `os.environ`
   parsing.

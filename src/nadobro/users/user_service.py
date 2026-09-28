@@ -110,37 +110,20 @@ def get_user(telegram_id: int) -> Optional[UserRow]:
     return user
 
 
-def switch_network(telegram_id: int, network: str) -> tuple[bool, str]:
+def set_network_mode(telegram_id: int, network: str) -> None:
+    """Persist the user's active Nado network — the raw flip only.
+
+    Never call this directly from a UI path: ``strategy/network_switch.py::
+    switch_network`` is the fail-closed switch that first stops what is live on
+    the network being left and only then calls this. Raises on a DB error."""
     user = get_user(telegram_id)
-    if not user:
-        return False, _loc("User not found. Use /start first.")
-
-    # Stop all active strategies before changing the active mode so teardown
-    # runs against the old network state instead of racing the new one.
-    try:
-        from src.nadobro.strategy.bot_runtime import stop_all_strategies_for_user
-        stop_all_strategies_for_user(telegram_id)
-        logger.info("Stopped all strategies for user %s due to network switch", telegram_id)
-    except Exception as e:
-        logger.warning("Failed to stop strategies on network switch for %s: %s", telegram_id, e)
-
     execute("UPDATE users SET network_mode = %s WHERE telegram_id = %s", (network, telegram_id))
     # SCALE FIX: invalidate only THIS user's client caches across both networks
     # so a single user switching mode never disrupts the other 999 users' cached
     # SDK sessions. Previously this cleared every user's NadoClient + readonly
     # cache, causing a thundering-herd against the venue.
-    _invalidate_user_caches(user.main_address, telegram_id)
+    _invalidate_user_caches(user.main_address if user else None, telegram_id)
     invalidate_user_cache(telegram_id)
-
-    addr = user.main_address
-    if addr:
-        msg = f"{_loc('Switched to')} {network} {_loc('mode.')}\n{_loc('Active wallet:')} `{addr}`"
-    else:
-        msg = (
-            f"{_loc('Switched to')} {network} {_loc('mode.')}\n"
-            f"{_loc('Link your wallet via the Wallet button to trade.')}"
-        )
-    return True, msg
 
 
 def get_user_nado_client(telegram_id: int, network: str | None = None, **kwargs) -> Optional[NadoClient]:

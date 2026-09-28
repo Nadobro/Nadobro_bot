@@ -551,30 +551,40 @@ class RuntimeAndLeverageTests(unittest.TestCase):
         cleanup_mock.assert_called_once()
         ensure_task_mock.assert_not_called()
 
-    def test_stop_all_strategies_for_user_cleans_up_on_network_switch(self):
+    def test_network_switch_stop_uses_full_stop_semantics(self):
+        from src.nadobro.strategy import pending_cleanup
+
         telegram_id = 42
         network = "mainnet"
-        rows = [
-            {
-                "key": f"{bot_runtime.STATE_PREFIX}{telegram_id}:{network}",
-                "value": json.dumps({"running": True, "strategy": "vol", "product": "KBTC"}),
-            }
-        ]
+        saved = {}
+        state = {"running": True, "strategy": "grid", "product": "BTC", "strategy_session_id": 3}
 
-        with patch.object(bot_runtime, "query_all", return_value=rows), patch.object(
-            bot_runtime, "set_bot_state"
-        ) as set_state_mock, patch.object(
+        with patch.object(
+            bot_runtime, "set_bot_state", side_effect=lambda k, v: saved.__setitem__(k, dict(v)),
+        ), patch.object(
             bot_runtime, "cleanup_strategy_positions", return_value={"success": True}
         ) as cleanup_mock, patch.object(
             bot_runtime, "_finalize_session"
-        ):
-            bot_runtime.stop_all_strategies_for_user(telegram_id)
+        ), patch.object(
+            bot_runtime, "_stop_engine_runtime_for_state", return_value=(True, None)
+        ) as engine_mock, patch.object(
+            bot_runtime, "get_product_id", return_value=2
+        ), patch.object(
+            bot_runtime, "_sweep_bot_trigger_orders_sync", return_value={"success": True, "cancelled": 1}
+        ) as sweep_mock:
+            res = bot_runtime.stop_strategy_for_network_switch(telegram_id, network, state)
 
+        self.assertTrue(res["ok"])
+        self.assertEqual((res["strategy"], res["product"]), ("grid", "BTC"))
+        engine_mock.assert_called_once()
         cleanup_mock.assert_called_once()
-        cleanup_state = cleanup_mock.call_args.args[2]
-        self.assertFalse(cleanup_state.get("running"))
-        self.assertEqual(cleanup_state.get("last_error"), "Stopped due to network switch")
-        set_state_mock.assert_called_once()
+        # Stop-button parity: the venue trigger sweep runs (flat -> protective stops go too).
+        sweep_mock.assert_called_once()
+        self.assertFalse(sweep_mock.call_args.kwargs["keep_protective"])
+        final = saved[f"{bot_runtime.STATE_PREFIX}{telegram_id}:{network}"]
+        self.assertFalse(final.get("running"))
+        self.assertEqual(final.get("last_error"), "Stopped due to network switch")
+        self.assertEqual(pending_cleanup.list_entries(telegram_id, network), [])
 
     def test_stop_all_user_bots_closes_each_running_network(self):
         telegram_id = 42
