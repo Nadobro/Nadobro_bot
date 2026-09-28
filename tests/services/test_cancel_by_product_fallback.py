@@ -197,3 +197,37 @@ def test_client_cancel_product_orders_ip_query_only_arms_the_write_circuit():
         out = c.cancel_product_orders([2])
     assert out["success"] is False and out.get("ip_query_only") is True
     assert armed.called
+
+
+class _ReadableClient(_UnreadableClient):
+    """Records the read scope; returns a clean book."""
+
+    def __init__(self):
+        super().__init__()
+        self.read_kwargs: list = []
+
+    def get_all_open_orders(self, *a, **k):
+        self.read_kwargs.append(k)
+        return []
+
+
+def test_a_product_scoped_sweep_reads_only_that_product():
+    # The venue charges 2 x product_ids per orders read: one product's sweep must
+    # not pay the ~192-weight whole-catalog read (2026-09-16 storm; every stop's
+    # cancel and the network switch's cleanup go through here).
+    client = _ReadableClient()
+    out = _run(client, only_pid=BTC)
+    assert out["success"] is True, out
+    assert client.read_kwargs == [{"product_ids": [BTC]}]
+
+
+def test_an_unscoped_sweep_still_reads_the_whole_book():
+    client = _ReadableClient()
+    with patch.object(trade_service, "get_user", return_value=_FakeUser()), \
+         patch.object(trade_service, "get_user_nado_client", return_value=client), \
+         patch.object(trade_service, "_order_sender_params", return_value=list(SENDERS)), \
+         patch("src.nadobro.models.database.get_open_order_product_ids", return_value=[]), \
+         patch("src.nadobro.models.database.get_open_position_product_ids", return_value=[]):
+        out = trade_service.cancel_resting_orders_for_user(1, "mainnet")
+    assert out["success"] is True, out
+    assert client.read_kwargs == [{}]

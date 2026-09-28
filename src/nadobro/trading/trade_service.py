@@ -638,7 +638,15 @@ def _resting_orders_by_sender(
     grouped: dict[tuple[int, str | None], list[str]] = {}
     errors: list[str] = []
     try:
-        rows = client.get_all_open_orders()
+        # A product-scoped sweep reads ONLY that product: the venue charges
+        # 2 x product_ids per read, so the unscoped whole-catalog read (~192
+        # weight of a 400/10s budget) for one product's orders is what starved
+        # every stop's cancel during a rate-limit storm (measured 2026-09-16).
+        rows = (
+            client.get_all_open_orders(product_ids=[int(only_pid)])
+            if only_pid is not None
+            else client.get_all_open_orders()
+        )
     except Exception as e:
         rows = None
         errors.append(f"{_UNKNOWN_BOOK} (batched read raised: {e})")
