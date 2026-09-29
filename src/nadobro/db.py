@@ -1623,6 +1623,59 @@ def init_db():
                     exc_info=True,
                 )
 
+        # --- Venue selection + Arcus credentials
+        # (migrations/0022_venue_selection_and_arcus_credentials.sql) ---
+        # Its OWN block, deliberately outside every Nado `for net in ("testnet",
+        # "mainnet")` loop and `_NETWORK_*_DDL` template: those run per-network
+        # backfills, retags and legacy copies, and `.format(net=...)` would also
+        # choke on the regex quantifiers below. Additive only — every existing
+        # user reads as Nado through the column default (no backfill). Venues run
+        # in parallel: this column only picks which venue's screens a user sees.
+        # Fail-soft: Arcus plumbing must never stop the Nado bot from booting. On
+        # failure the whole block rolls back, UserRow reads every user as 'nado',
+        # and the venue switch errors instead of flipping.
+        with conn.cursor() as cur:
+            try:
+                cur.execute("""
+                    ALTER TABLE users
+                      ADD COLUMN IF NOT EXISTS active_venue TEXT NOT NULL DEFAULT 'nado'
+                        CONSTRAINT users_active_venue_check CHECK (active_venue IN ('nado', 'arcus'));
+                    ALTER TABLE users
+                      ADD COLUMN IF NOT EXISTS arcus_network_mode TEXT NOT NULL DEFAULT 'testnet'
+                        CONSTRAINT users_arcus_network_mode_check CHECK (arcus_network_mode IN ('testnet', 'mainnet'));
+                    CREATE TABLE IF NOT EXISTS arcus_credentials (
+                        id                    BIGSERIAL PRIMARY KEY,
+                        user_id               BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                        network               TEXT NOT NULL CHECK (network IN ('testnet', 'mainnet')),
+                        address               TEXT NOT NULL CHECK (address ~ '^0x[0-9a-f]{40}$'),
+                        account_index         INT NOT NULL DEFAULT 0 CHECK (account_index BETWEEN 0 AND 9),
+                        all_subaccounts       BOOLEAN NOT NULL DEFAULT false,
+                        api_public_key        TEXT NOT NULL CHECK (api_public_key ~ '^[0-9a-f]{64}$'),
+                        encrypted_signing_key TEXT NOT NULL,
+                        api_wallet_name       TEXT,
+                        valid_until_ms        BIGINT CHECK (valid_until_ms >= 0),
+                        status                TEXT NOT NULL DEFAULT 'active'
+                                                CHECK (status IN ('active', 'invalid', 'expired', 'unlinked')),
+                        attested_at           TIMESTAMPTZ,
+                        linked_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        last_verified_at      TIMESTAMPTZ,
+                        updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        UNIQUE (user_id, network)
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS arcus_credentials_active_subaccount_uq
+                        ON arcus_credentials (network, address, account_index)
+                        WHERE status = 'active';
+                """)
+                conn.commit()
+                logger.info("venue selection + arcus_credentials verified/created")
+            except Exception:
+                conn.rollback()
+                logger.warning(
+                    "venue selection / arcus_credentials DDL failed; every user "
+                    "stays on Nado and the venue switch is unavailable",
+                    exc_info=True,
+                )
+
         logger.info("Database tables verified/created")
     except Exception:
         conn.rollback()

@@ -50,7 +50,7 @@ Package responsibilities:
 | `engine/` | Engine v2: orchestrator, controllers (grid/rgrid/dgrid/mid/vol/dn/desk), executors, risk, cost-aware backtester | venue (adapter), quant, utils |
 | `trading/` | order/trade domain: `trade_service`, `order_intents` (digest tagging), `live_session` (session PnL snapshot), `engine_persistence`, desk suite, `copy_service` (LIVE copy mirroring plane: venue read-only polling, sizing, TP/SL brackets, full+partial close mirroring, bracket-fill sweep, derived-PnL accounting — each mirror run is a `strategy_sessions` row with strategy='copy'), `copy_discovery` (NadoExplorer leaderboard/preview plane), stop-loss, readiness, risk/budget | engine, venue, users, llm (desk parser), market_data (copy discovery) |
 | `strategy/` | strategy lifecycle: `bot_runtime` (session SL/TP rail), `engine_runtime` (`map_strategy_config`, `CONTROLLER_REGISTRY`, `ENGINE_MAPPED_STRATEGIES`), registry, FSM, schedulers, MM overlay + dashboard, `network_switch` (fail-closed testnet<->mainnet switch) | trading, engine, llm, users, venue |
-| `users/` | user accounts, settings, onboarding, invites/referrals/points (`points_ui`), admin, audit log, wallet flows | strategy (registry defaults, stop-on-unlink), venue |
+| `users/` | user accounts, settings, onboarding, invites/referrals/points (`points_ui`), admin, audit log, wallet flows, `venue_service` (/venue view selection — `users.active_venue`; never stops/starts anything) | strategy (registry defaults, stop-on-unlink), venue |
 | `portfolio/` | portfolio views, history worker, PnL cards | trading, engine, users, venue |
 | `vault/` | NLP vault metrics, deposit watcher | venue, users |
 | `notify/` | rate-limited `telegram_sender`, alert evaluation/dispatch | users, models |

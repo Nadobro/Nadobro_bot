@@ -108,3 +108,28 @@ def env_tristate(name: str) -> bool | None:
     if raw in _FALSY:
         return False
     return None
+
+
+_WARNED_INT_SET_TOKENS: set[tuple[str, str]] = set()
+
+
+def env_int_set(name: str) -> frozenset[int]:
+    """Comma-separated integer set (e.g. Telegram user ids).
+
+    Unset or blank resolves to an EMPTY set. Inline ``# comments`` are stripped
+    first and blank tokens are ignored. A non-integer token is skipped with one
+    WARNING per (name, token) — never raises, so a garbage entry can only shrink
+    the set, never widen it.
+    """
+    ids: set[int] = set()
+    for token in clean_env_value(os.environ.get(name)).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            ids.add(int(token))
+        except ValueError:
+            if (name, token) not in _WARNED_INT_SET_TOKENS:
+                _WARNED_INT_SET_TOKENS.add((name, token))
+                logger.warning("env %s entry %r is not an integer; skipping", name, token[:32])
+    return frozenset(ids)

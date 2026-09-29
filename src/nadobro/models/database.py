@@ -790,6 +790,17 @@ class UserRow:
         self.private_access_code_id = self._data.get("private_access_code_id")
         self.private_access_granted_at = self._data.get("private_access_granted_at")
         self.private_access_granted_by = self._data.get("private_access_granted_by")
+        # Venue selection (migrations/0022). 'arcus' only on an EXACT match; a
+        # NULL, a missing column (row read before the DDL ran, or the Arcus block
+        # failed) or anything else is Nado, so no stray value can route a user to
+        # Arcus. Plain strs, deliberately NOT NetworkMode: arcus_network_mode must
+        # never be passable where Nado code reads `.network_mode.value`.
+        # Function-local import: models -> utils is not an allowed module-level
+        # edge (tests/lint/test_architecture_layers.py).
+        from src.nadobro.utils.venue_scope import active_venue_from_db, arcus_network_from_db
+
+        self.active_venue = active_venue_from_db(self._data.get("active_venue"))
+        self.arcus_network_mode = arcus_network_from_db(self._data.get("arcus_network_mode"))
 
 
 # --- New copy trading ORM functions (Nado-native v2) ---

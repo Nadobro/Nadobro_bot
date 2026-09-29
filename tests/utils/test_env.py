@@ -107,3 +107,51 @@ def test_env_str_cleans_and_defaults(monkeypatch):
     assert env_str("NADO_TEST_STR", "fallback") == "value"
     monkeypatch.setenv("NADO_TEST_STR", "   ")
     assert env_str("NADO_TEST_STR", "fallback") == "fallback"
+
+
+# --- env_int_set (comma-separated id allowlists, e.g. ARCUS_ALLOWED_USER_IDS) ---
+
+import logging  # noqa: E402
+
+from src.nadobro.utils import env as env_mod  # noqa: E402
+from src.nadobro.utils.env import env_int_set  # noqa: E402
+
+
+@pytest.fixture()
+def _int_set_env(monkeypatch):
+    monkeypatch.delenv("NADO_TEST_INT_SET", raising=False)
+    monkeypatch.setattr(env_mod, "_WARNED_INT_SET_TOKENS", set())
+    yield
+
+
+def test_env_int_set_unset_is_empty(_int_set_env):
+    assert env_int_set("NADO_TEST_INT_SET") == frozenset()
+
+
+@pytest.mark.parametrize("raw", ["", "   ", ",", " , ,", "  # owner only"])
+def test_env_int_set_blank_or_comment_only_is_empty(monkeypatch, _int_set_env, raw):
+    monkeypatch.setenv("NADO_TEST_INT_SET", raw)
+    assert env_int_set("NADO_TEST_INT_SET") == frozenset()
+
+
+def test_env_int_set_parses_list_with_blanks_padding_and_comment(monkeypatch, _int_set_env):
+    monkeypatch.setenv("NADO_TEST_INT_SET", "111, 222 ,,333 # owner")
+    result = env_int_set("NADO_TEST_INT_SET")
+    assert result == frozenset({111, 222, 333})
+    assert isinstance(result, frozenset)
+
+
+def test_env_int_set_skips_garbage_and_warns_once(monkeypatch, _int_set_env, caplog):
+    monkeypatch.setenv("NADO_TEST_INT_SET", "abc,5")
+    with caplog.at_level(logging.WARNING, logger="src.nadobro.utils.env"):
+        assert env_int_set("NADO_TEST_INT_SET") == frozenset({5})
+        assert env_int_set("NADO_TEST_INT_SET") == frozenset({5})
+    warnings = [r for r in caplog.records if "NADO_TEST_INT_SET" in r.getMessage()]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "'abc'" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("raw", ["1.5", "0x10", "12a", "#,", "∞", "9" * 5000, "1 2"])
+def test_env_int_set_never_raises_and_garbage_only_shrinks(monkeypatch, _int_set_env, raw):
+    monkeypatch.setenv("NADO_TEST_INT_SET", f"{raw},7")
+    assert env_int_set("NADO_TEST_INT_SET") == frozenset({7})

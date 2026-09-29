@@ -1,3 +1,5 @@
+import ast
+import re
 from pathlib import Path
 
 
@@ -198,3 +200,73 @@ def test_signal_outcomes_ddl_agrees_across_all_THREE_places():
             f"insert_signal_outcome allows {col!r}, which is not a "
             f"signal_outcomes column — the INSERT would raise at runtime"
         )
+
+
+def _sql_statements(text: str) -> list[str]:
+    no_comments = re.sub(r"--[^\n]*", "", text)
+    return [" ".join(s.split()) for s in no_comments.split(";") if s.strip()]
+
+
+def test_venue_selection_migration_matches_startup_ddl_statement_for_statement():
+    """migrations/0022 and db.py's init_db block must be the SAME DDL.
+
+    Nothing runs the .sql files at boot — init_db is the schema — so a column
+    or CHECK that exists only in the migration would silently never ship.
+    Compared statement by statement after stripping comments and collapsing
+    whitespace, so a drifted type/default/constraint fails here."""
+    sql = Path("src/nadobro/migrations/0022_venue_selection_and_arcus_credentials.sql").read_text()
+    ddl = " ".join(re.sub(r"--[^\n]*", "", Path("src/nadobro/db.py").read_text()).split())
+    stmts = _sql_statements(sql)
+    assert len(stmts) == 4, stmts  # 2x ALTER users, CREATE TABLE, CREATE UNIQUE INDEX
+    for stmt in stmts:
+        assert stmt in ddl, f"0022 statement missing from db.py init_db: {stmt[:90]}"
+    # Tests and operators execute() this file with params=None: a '%' would be
+    # harmless there but a trap the day someone passes params.
+    assert "%" not in sql
+    for text in (
+        "ADD COLUMN IF NOT EXISTS active_venue TEXT NOT NULL DEFAULT 'nado'",
+        "CHECK (active_venue IN ('nado', 'arcus'))",
+        "ADD COLUMN IF NOT EXISTS arcus_network_mode TEXT NOT NULL DEFAULT 'testnet'",
+        "CHECK (arcus_network_mode IN ('testnet', 'mainnet'))",
+        "REFERENCES users(telegram_id) ON DELETE CASCADE",
+        "CHECK (account_index BETWEEN 0 AND 9)",
+        "CHECK (status IN ('active', 'invalid', 'expired', 'unlinked'))",
+        "UNIQUE (user_id, network)",
+        "ON arcus_credentials (network, address, account_index)",
+        "WHERE status = 'active'",
+    ):
+        assert text in sql, text
+    # Additive + idempotent only: every statement is an IF NOT EXISTS add/create
+    # (no backfill UPDATE, no DROP), and the Nado-only users.network_mode is untouched.
+    for stmt in stmts:
+        assert stmt.startswith((
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS ",
+            "CREATE TABLE IF NOT EXISTS ",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ",
+        )), stmt[:90]
+        assert stmt.count(" ADD COLUMN ") <= 1, stmt[:90]
+    assert not re.search(r"(?<!arcus_)network_mode", " ".join(stmts))
+
+
+def test_arcus_ddl_is_never_inside_a_nado_per_network_loop():
+    """The Arcus DDL is its own init_db block — never inside a Nado
+    ``for net in ("testnet", "mainnet")`` loop (per-network backfills, retags,
+    legacy copies) nor a ``_NETWORK_*`` template rendered with .format()."""
+    tree = ast.parse(Path("src/nadobro/db.py").read_text())
+    init = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "init_db")
+
+    def _mentions(node):
+        return any(
+            isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and ("arcus" in n.value or "active_venue" in n.value)
+            for n in ast.walk(node)
+        )
+
+    assert _mentions(init), "init_db does not carry the 0022 DDL"
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.For, ast.While)):
+            assert not _mentions(node), f"Arcus DDL inside a loop (db.py:{node.lineno})"
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id.startswith("_NETWORK_") for t in node.targets
+        ):
+            assert not _mentions(node.value), f"Arcus DDL in a per-network template (db.py:{node.lineno})"

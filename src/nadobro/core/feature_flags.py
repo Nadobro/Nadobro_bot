@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from src.nadobro.utils.env import env_bool
+from src.nadobro.utils.env import env_bool, env_int_set
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -136,3 +136,34 @@ def lowiqpts_relay_poll_enabled() -> bool:
     ``LOWIQPTS_RELAY_POLL_ENABLED=1`` to turn it back on.
     """
     return env_flag("LOWIQPTS_RELAY_POLL_ENABLED", False)
+
+
+def arcus_enabled() -> bool:
+    """Arcus multi-venue master switch. Default OFF.
+
+    Phase 1 is plumbing only (no Arcus client, no Arcus trading). While this is
+    off and no user is already on Arcus, neither the venue gate nor /venue is
+    registered, so production is byte-identical. Venues run in parallel: this
+    flag never stops, cancels or resumes anything on Nado.
+    """
+    return env_flag("ARCUS_ENABLED", False)
+
+
+def arcus_allowed_user_ids() -> frozenset[int]:
+    """Telegram ids that may switch to Arcus (comma list). Empty, the default, = nobody."""
+    return env_int_set("ARCUS_ALLOWED_USER_IDS")
+
+
+def arcus_enabled_for(telegram_id: int | None) -> bool:
+    """True only when the flag is on AND the user is on the allowlist. Fail-closed:
+    anything but an int (or a decimal-int string) is refused — never ``int()``-folded,
+    so ``True`` or ``123.9`` can never borrow an allowlisted id."""
+    if isinstance(telegram_id, bool) or not isinstance(telegram_id, (int, str)):
+        return False
+    if not arcus_enabled():
+        return False
+    try:
+        uid = int(telegram_id)
+    except (TypeError, ValueError):
+        return False
+    return uid in arcus_allowed_user_ids()

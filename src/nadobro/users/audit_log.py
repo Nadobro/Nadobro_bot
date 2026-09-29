@@ -11,6 +11,7 @@ Sensitive events currently recorded:
   - order_placed                           (every signed order; agent + manual)
   - howl_suggestion_rejected               (blocked unsafe auto-tuning)
   - agent_enabled / agent_disabled         (autonomous execution toggles)
+  - venue_switched                         (/venue view selection; details "nado->arcus")
 """
 from __future__ import annotations
 

@@ -67,6 +67,13 @@ ARCUS_SCOPES = (ARCUS_TESTNET_SCOPE, ARCUS_MAINNET_SCOPE)
 ARCUS_STRATEGY_BOT_PREFIX = "arcus_strategy_bot:"
 ARCUS_USER_SETTINGS_PREFIX = "arcus_user_settings:"
 
+# --- Arcus network modes (``users.arcus_network_mode``) --------------------
+# The same two words as Nado's networks but a DIFFERENT domain: always a plain
+# str, never ``NetworkMode``, never passed where Nado code expects a network.
+ARCUS_NETWORK_TESTNET = "testnet"
+ARCUS_NETWORK_MAINNET = "mainnet"
+ARCUS_NETWORK_MODES = (ARCUS_NETWORK_TESTNET, ARCUS_NETWORK_MAINNET)
+
 _OTHER_NETWORK = {NADO_TESTNET: NADO_MAINNET, NADO_MAINNET: NADO_TESTNET}
 
 # Bounded (site, value) dedupe for the non-canonical WARNING: a garbage stream
@@ -245,6 +252,25 @@ def coerce_nado_network(value: object, policy: NetworkPolicy, *, site: str) -> s
     return result
 
 
+def active_venue_from_db(raw: object) -> str:
+    """``users.active_venue`` -> the venue a user SEES.
+
+    ``'arcus'`` only on an EXACT match; ``None``, a missing column, ``'ARCUS'``,
+    ``'arcus_mainnet'`` or anything else is ``'nado'``, so no stray value can
+    route a user to Arcus. Pure: never logs, never raises (it runs inside
+    ``UserRow.__init__`` on every update).
+    """
+    return VENUE_ARCUS if isinstance(raw, str) and raw == VENUE_ARCUS else VENUE_NADO
+
+
+def arcus_network_from_db(raw: object) -> str:
+    """``users.arcus_network_mode`` -> ``'mainnet'`` only on an EXACT match,
+    otherwise ``'testnet'`` (the safe side). Pure: never logs, never raises."""
+    if isinstance(raw, str) and raw == ARCUS_NETWORK_MAINNET:
+        return ARCUS_NETWORK_MAINNET
+    return ARCUS_NETWORK_TESTNET
+
+
 def _reset_warnings_for_tests() -> None:
     _warned.clear()
 
@@ -262,6 +288,9 @@ __all__ = [
     "ARCUS_SCOPES",
     "ARCUS_STRATEGY_BOT_PREFIX",
     "ARCUS_USER_SETTINGS_PREFIX",
+    "ARCUS_NETWORK_TESTNET",
+    "ARCUS_NETWORK_MAINNET",
+    "ARCUS_NETWORK_MODES",
     "VenueScopeError",
     "NetworkPolicy",
     "LOWER_ELSE_MAINNET",
@@ -275,4 +304,6 @@ __all__ = [
     "is_non_nado_scope",
     "guard_nado_scope",
     "coerce_nado_network",
+    "active_venue_from_db",
+    "arcus_network_from_db",
 ]

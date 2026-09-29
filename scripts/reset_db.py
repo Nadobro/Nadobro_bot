@@ -51,6 +51,7 @@ DROP TABLE IF EXISTS
   trades_mainnet,
   trades_testnet,
   trades,
+  arcus_credentials,
   users
 CASCADE;
 """
