@@ -198,7 +198,7 @@ def _runtime_health_payload() -> dict:
     return payload
 
 
-def setup_bot():
+def setup_bot(venue_gate: bool = False):
     from telegram.ext import (
         Application,
         ApplicationHandlerStop,
@@ -313,8 +313,10 @@ def setup_bot():
         .build()
     )
 
-    app.add_handler(TypeHandler(Update, _private_chat_only), group=-2)
-    app.add_handler(TypeHandler(Update, _language_middleware), group=-1)
+    # Group order: private-chat filter (-3) -> language middleware (-2) -> the
+    # Arcus venue gate (-1, registered below only when enabled) -> handlers (0).
+    app.add_handler(TypeHandler(Update, _private_chat_only), group=-3)
+    app.add_handler(TypeHandler(Update, _language_middleware), group=-2)
 
     app.add_handler(CommandHandler("start", with_user_serialized(cmd_start)))
     app.add_handler(CommandHandler("help", with_user_serialized(cmd_help)))
@@ -337,6 +339,15 @@ def setup_bot():
 
     app.add_handler(CommandHandler("desk", with_user_serialized(cmd_desk)))
 
+    # Arcus P1 (flag off by default): the per-venue gate (its own group, -1),
+    # /venue and the venue:/ax: callbacks. Added ONLY when ARCUS_ENABLED is on or
+    # a user is already on the Arcus view; otherwise nothing is registered and
+    # every update routes exactly as before. Must come BEFORE the catch-all
+    # CallbackQueryHandler below: PTB runs the first matching handler per group.
+    from src.nadobro.handlers.venue_gate import register_venue_handlers
+
+    register_venue_handlers(app, enabled=venue_gate)
+
     # ``with_callback_ack`` sits OUTSIDE the serialization wrapper on purpose: the
     # button spinner is cleared before we queue behind this user's previous
     # action, so a tap feels instant even when the prior handler is still working.
@@ -357,7 +368,14 @@ async def run_bot():
     logger.info("Database initialized")
 
     logger.info("Setting up Telegram bot...")
-    bot_app = setup_bot()
+    # Arcus P1: decided once at boot, off the loop — the flag, else one COUNT of
+    # users already on the Arcus view (never strand one). Venues run in parallel:
+    # this only decides whether the view gate exists; it stops nothing.
+    from src.nadobro.core.async_utils import run_blocking_db
+    from src.nadobro.handlers.venue_gate import should_register_venue_gate
+
+    venue_gate_enabled = await run_blocking_db(should_register_venue_gate)
+    bot_app = setup_bot(venue_gate=venue_gate_enabled)
 
     from src.nadobro.runtime.scheduler import set_bot_app, set_check_client, start_scheduler
     from src.nadobro.strategy.bot_runtime import (

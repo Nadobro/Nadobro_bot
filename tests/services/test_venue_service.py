@@ -140,6 +140,25 @@ def test_get_active_venue_accepts_str_id(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# peek_active_venue (the venue gate's no-IO fast path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("cached", "expected"), [
+    (None, None),  # a cache miss is "unknown", never 'nado'
+    (SimpleNamespace(active_venue="arcus"), "arcus"),
+    (SimpleNamespace(active_venue="nado"), "nado"),
+    (SimpleNamespace(active_venue="ARCUS"), "nado"),
+    (SimpleNamespace(network_mode=NetworkMode.MAINNET), "nado"),
+])
+def test_peek_active_venue_reads_the_cache_only(monkeypatch, cached, expected):
+    seen = []
+    monkeypatch.setattr(vs, "_get_cached_user", lambda uid: seen.append(uid) or cached)
+    monkeypatch.setattr(vs, "get_user", lambda *a: pytest.fail("peek must never touch Postgres"))
+    assert vs.peek_active_venue(str(_UID)) == expected
+    assert seen == [_UID]
+
+
+# ---------------------------------------------------------------------------
 # set_active_venue
 # ---------------------------------------------------------------------------
 

@@ -39,7 +39,7 @@ Package responsibilities:
 
 | Package | Owns | May import (notable) |
 |---|---|---|
-| `utils/` | env parsing (inline-`#` tolerant), x18 conversions | stdlib only |
+| `utils/` | env parsing (inline-`#` tolerant), x18 conversions, `venue_scope` (Nado/Arcus scope tokens + legacy-preserving network coercion), `venue_capabilities` (per-venue callback/command classification for the venue gate) | stdlib only |
 | `core/` | thread pools (`async_utils`), caches, rate limits/circuits, HTTP session, log redaction, perf/SLI, feature flags | utils |
 | `quant/` | pure math: `margin`, `portfolio_calculator` (fill pairing/PnL windows), `mm_quote_math`, `pov_engine` | utils |
 | `db.py`/`models/` | psycopg2 pool + raw-SQL CRUD; per-network tables (`trades_testnet`/`trades_mainnet`), `bot_state` KV | core, quant, utils |
@@ -55,7 +55,7 @@ Package responsibilities:
 | `vault/` | NLP vault metrics, deposit watcher | venue, users |
 | `notify/` | rate-limited `telegram_sender`, alert evaluation/dispatch | users, models |
 | `runtime/` | `scheduler` (APScheduler jobs), `runtime_supervisor` | everything except handlers |
-| `handlers/` | Telegram UI: commands, single callback router (`callbacks.handle_callback`), free-text flow (`messages`), keyboards, cards/views | anything |
+| `handlers/` | Telegram UI: commands, single callback router (`callbacks.handle_callback`), free-text flow (`messages`), keyboards, cards/views; `venue_gate` (group -1 per-venue gate, registered only when ARCUS_ENABLED or a user is on the Arcus view) + `venue_handler` (/venue view switch, Arcus placeholder screens) | anything |
 
 Domain-owned UI fragments: keyboards a domain service must send itself live in that
 domain (`users/points_ui.py`, `llm/howl_ui.py`), not in `handlers/keyboards.py` —

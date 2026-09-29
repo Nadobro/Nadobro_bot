@@ -96,6 +96,20 @@ def install_test_stubs() -> None:
         sys.modules["telegram.ext"] = telegram_ext
         sys.modules["telegram.error"] = telegram_error
 
+    # Present on the real library; filled in on the stub (whichever one this
+    # session got first) so handler code that stops an update (the venue gate)
+    # or sends HTML works under both. No-ops against the real PTB.
+    if not hasattr(telegram_ext, "ApplicationHandlerStop"):
+        class _ApplicationHandlerStop(Exception):
+            def __init__(self, state=None):
+                super().__init__()
+                self.state = state
+
+        telegram_ext.ApplicationHandlerStop = _ApplicationHandlerStop
+    _parse_mode = getattr(telegram_constants, "ParseMode", None)
+    if _parse_mode is not None and not hasattr(_parse_mode, "HTML"):
+        _parse_mode.HTML = "HTML"
+
     # apscheduler
     if "apscheduler" not in sys.modules:
         apscheduler_mod = types.ModuleType("apscheduler")

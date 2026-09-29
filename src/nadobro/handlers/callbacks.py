@@ -218,6 +218,15 @@ def interaction_seq(chat_id: int) -> int:
     return _CB_SEQ.get(int(chat_id), 0)
 
 
+def bump_interaction_seq(chat_id: int) -> int:
+    """Advance the chat's sequence for a screen edited OUTSIDE handle_callback
+    (the venue gate / venue handler), so a background edit job started from an
+    earlier screen stands down instead of clobbering the new one."""
+    key = int(chat_id)
+    _CB_SEQ[key] = _CB_SEQ.get(key, 0) + 1
+    return _CB_SEQ[key]
+
+
 async def _handle_callback_inner(update, context, query, data, telegram_id, started):
     _seq_chat = getattr(getattr(query, "message", None), "chat_id", None) or int(telegram_id)
     _CB_SEQ[int(_seq_chat)] = _CB_SEQ.get(int(_seq_chat), 0) + 1

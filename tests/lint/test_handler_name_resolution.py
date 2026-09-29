@@ -33,6 +33,8 @@ HANDLER_MODULES = [
     "src/nadobro/handlers/wallet_handler.py",
     "src/nadobro/handlers/alerts_handler.py",
     "src/nadobro/handlers/desk_handler.py",
+    "src/nadobro/handlers/venue_gate.py",
+    "src/nadobro/handlers/venue_handler.py",
 ]
 
 _BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}

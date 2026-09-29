@@ -17,7 +17,7 @@ from typing import Literal
 from src.nadobro.core.feature_flags import arcus_enabled_for
 from src.nadobro.db import execute_returning, query_count
 from src.nadobro.users.audit_log import record_audit_event
-from src.nadobro.users.user_service import get_user, invalidate_user_cache
+from src.nadobro.users.user_service import _get_cached_user, get_user, invalidate_user_cache
 from src.nadobro.utils.venue_scope import VENUE_ARCUS, VENUE_NADO, VENUES
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,19 @@ def get_active_venue(telegram_id: int) -> str:
     user = get_user(int(telegram_id))
     if user is None:
         return VENUE_NADO
+    return VENUE_ARCUS if getattr(user, "active_venue", None) == VENUE_ARCUS else VENUE_NADO
+
+
+def peek_active_venue(telegram_id: int) -> str | None:
+    """The venue from the in-process user cache ONLY, or None on a miss.
+
+    Never touches Postgres, so a coroutine may call it directly (the venue gate
+    runs on every update, right after the language middleware warmed this
+    cache for the same update). A miss means "unknown", never 'nado': the
+    caller falls back to ``get_active_venue`` through ``run_blocking_db``."""
+    user = _get_cached_user(int(telegram_id))
+    if user is None:
+        return None
     return VENUE_ARCUS if getattr(user, "active_venue", None) == VENUE_ARCUS else VENUE_NADO
 
 
