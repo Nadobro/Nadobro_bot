@@ -556,6 +556,75 @@ def fmt_limit_close_result(result: dict) -> str:
     return f"❌ *{_loc('Trade Failed')}:* limit close\n\n{escape_md(err)}"
 
 
+def fmt_network_switch_result(result) -> str:
+    """MarkdownV2 body for a ``strategy.network_switch.NetworkSwitchResult`` —
+    what the switch stopped, kept, or could not confirm (then the user stays on
+    the old network)."""
+    from src.nadobro.strategy import network_switch as ns
+    from src.nadobro.strategy.strategy_registry import strategy_display_name
+
+    def _label(item) -> str:
+        name = f"{strategy_display_name(item.label)} {item.product}".strip()
+        if item.kind == ns.STRATEGY:
+            return name
+        if item.kind == ns.LEFTOVER_ORDERS:
+            return _loc("leftover orders of {name}").format(name=name)
+        if item.kind == ns.DESK_PLAN:
+            return _loc("desk plan {name}").format(name=item.product or item.label)
+        if item.kind == ns.COPY_MIRROR:
+            return _loc("copy of {trader}").format(trader=item.label)
+        if item.kind == ns.STOP_LOSS_RULE:
+            return _loc("stop-loss on {product}").format(product=item.product)
+        return ""
+
+    def _join(items) -> str:
+        return ", ".join(label for label in (_label(i) for i in items) if label)
+
+    old = result.from_network
+    if result.error == ns.ERR_USER_NOT_FOUND:
+        return _loc_md("User not found. Use /start first.")
+    if result.error == ns.ERR_INVALID_NETWORK:
+        return _loc_md("Unknown network.")
+
+    stopped = _join(result.by_outcome(ns.STOPPED))
+    maybe_open = _join(i for i in result.items if i.warning == ns.POSITION_MAY_BE_OPEN)
+    position_line = (
+        _loc("Check {network} for a position that may still be open: {items}").format(network=old, items=maybe_open)
+        if maybe_open else ""
+    )
+    lines: list[str] = []  # plain text; escaped once below
+    if not result.switched:
+        if result.error == ns.ERR_FLIP_FAILED:
+            lines.append(_loc("Could not save the network change — you are still on {network}. Try again.").format(network=old))
+        else:
+            lines.append(_loc("Network not switched — you are still on {network}. Not confirmed stopped:").format(network=old))
+            for item in result.by_outcome(ns.FAILED):
+                label = _label(item) or item.kind
+                lines.append(f"• {label}" + (f" — {item.error}" if item.error else ""))
+            lines.append(_loc(
+                "Try again in a moment (the venue may be rate-limited), or use Stop, /stop_all or /desk while on {network}."
+            ).format(network=old))
+        if stopped:
+            lines.append(_loc("Already stopped on {network}: {items}").format(network=old, items=stopped))
+        if position_line:
+            lines.append(position_line)
+        return "\n".join(escape_md(line) for line in lines)
+
+    head = escape_md(f"{_loc('Switched to')} {result.to_network} {_loc('mode.')}")
+    if result.wallet_address:
+        head += f"\n{_loc_md('Active wallet:')} `{escape_md_code(result.wallet_address)}`"
+    else:
+        lines.append(_loc("Link your wallet via the Wallet button to trade."))
+    if stopped:
+        lines.append(_loc("Stopped on {network} before switching: {items}").format(network=old, items=stopped))
+    kept = _join(result.by_outcome(ns.KEPT))
+    if kept:
+        lines.append(_loc("Still running on {network} (unaffected by the switch): {items}").format(network=old, items=kept))
+    if position_line:
+        lines.append(position_line)
+    return "\n".join([head, *(escape_md(line) for line in lines)])
+
+
 def fmt_wallet_info(wallet_info):
     if not wallet_info:
         return _loc("💼 *Wallet Vault*") + "\n" + md2_rule() + "\n\n" + _loc("Wallet not found\\. Use /start first\\.")

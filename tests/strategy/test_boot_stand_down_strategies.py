@@ -91,6 +91,21 @@ def test_a_failed_cancel_warns_the_user_and_still_finalizes(monkeypatch):
     warned = [t for _, t, _ in calls["notify"] if "could not be confirmed" in t]
     assert warned, "the user must be warned when resting orders could not be confirmed cancelled"
     assert any(st.get("last_error") for st, _ in calls["finalize"]), "last_error should record the unconfirmed cancel"
+    # The unconfirmed cancel is recorded as a pending cleanup, so Stop / /stop_all /
+    # the network switch retry the sweep instead of treating the run as clean.
+    from src.nadobro.strategy import pending_cleanup
+
+    assert [e["reason"] for _k, e in pending_cleanup.list_entries(111, "mainnet")] == ["redeploy_stand_down"]
+    assert [e["reason"] for _k, e in pending_cleanup.list_entries(444, "testnet")] == ["redeploy_stand_down"]
+
+
+def test_a_confirmed_cancel_records_no_pending_cleanup(monkeypatch):
+    from src.nadobro.strategy import pending_cleanup
+
+    _stood, calls = _run(monkeypatch, cancel_success=True)
+    assert calls["saved"]
+    assert pending_cleanup.list_entries(111, "mainnet") == []
+    assert pending_cleanup.list_entries(444, "testnet") == []
 
 
 def test_the_env_gate_disables_the_sweep(monkeypatch):

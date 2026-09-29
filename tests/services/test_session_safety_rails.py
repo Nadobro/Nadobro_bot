@@ -70,6 +70,47 @@ class SessionPnlRailTests(unittest.IsolatedAsyncioTestCase):
         # cancelled via _stop_out) BEFORE the position is flattened.
         self._engine_stop.assert_awaited_once_with(42, "mainnet", "dgrid")
 
+    async def test_a_failed_rail_close_is_recorded_as_a_pending_cleanup(self):
+        # The rail fires exactly when the venue is under stress; a close it could
+        # not confirm must stay retriable (Stop / /stop_all / network switch)
+        # instead of looking clean once running=False is saved.
+        from src.nadobro.strategy import pending_cleanup
+
+        snap = {"session_pnl": -32.0, "session_pnl_pct": -32.0, "margin": 100.0}
+        state = {"sl_pct": 1.0, "tp_pct": 2.0, "strategy": "dgrid", "product": "BTC",
+                 "strategy_session_id": 11, "running": True}
+
+        async def close_coro():
+            return {"success": False, "error": "rate limited"}
+
+        sess = {"id": 11, "product_id": 2, "status": "running", "started_at": None, "stopped_at": None}
+        with patch.object(bot_runtime, "run_blocking", _fake_run_blocking), \
+             patch.object(bot_runtime, "run_blocking_db", _fake_run_blocking), \
+             patch("src.nadobro.models.database.get_strategy_session_by_id", return_value=sess), \
+             patch("src.nadobro.models.database.get_active_strategy_session_for_strategy"), \
+             patch("src.nadobro.trading.live_session.get_live_session_snapshot", return_value=snap), \
+             patch.object(engine_runtime.RUNTIME, "stop", new=AsyncMock()), \
+             patch.object(bot_runtime, "_finalize_session"), \
+             patch.object(bot_runtime, "_save_state"), \
+             patch.object(bot_runtime, "_notify", new=AsyncMock()), \
+             patch.object(bot_runtime, "_sweep_session_triggers_async", new=AsyncMock(return_value=True)), \
+             patch.object(bot_runtime, "_strategy_display_name", return_value="DGRID"):
+            res = await bot_runtime._evaluate_session_pnl_rail(
+                42, "mainnet", state, "dgrid", "BTC", client=None, close_coro=close_coro,
+            )
+        self.assertEqual(res, (True, None))
+        [(_key, entry)] = pending_cleanup.list_entries(42, "mainnet")
+        self.assertEqual(entry["status"], pending_cleanup.FAILED)
+        self.assertEqual(entry["reason"], "sl_hit")
+        self.assertTrue(entry["flatten_unconfirmed"])
+
+    async def test_a_confirmed_rail_close_leaves_no_pending_cleanup(self):
+        from src.nadobro.strategy import pending_cleanup
+
+        snap = {"session_pnl": -32.0, "session_pnl_pct": -32.0, "margin": 100.0}
+        await self._run_rail(snap, sl=1.0)
+        self.assertEqual(pending_cleanup.list_entries(42, "mainnet"), [])
+
     async def test_tp_fires_when_pct_above_target(self):
         snap = {"session_pnl": 2.5, "session_pnl_pct": 2.5, "margin": 100.0}
         res, closed, state, fin = await self._run_rail(snap, tp=2.0)
@@ -747,3 +788,110 @@ class LiqProximityRailTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(closed.get("called"))
         finally:
             del os.environ["NADO_LIQ_GUARD_ENABLED"]
+
+
+# --------------------------------------------------------------------------- #
+# NETSWITCH-FAIL-OPEN (Arcus plan research 2026-09-27, venue-switch-onboarding  #
+# F2/F3): the testnet<->mainnet switch ran the strategy teardown inside a       #
+# log-and-continue ``try/except`` and then flipped ``users.network_mode``       #
+# unconditionally. A teardown the venue refused (rate-limited cleanup) still    #
+# flipped the network, leaving the old network's strategy/orders behind where   #
+# the user's Stop, /status and cards (all active-network scoped) can't see it.  #
+# --------------------------------------------------------------------------- #
+class _BotStateFake:
+    """In-memory ``bot_state`` KV: the three primitives the stop paths use."""
+
+    def __init__(self, rows: dict[str, dict]):
+        import json as _json
+
+        self._json = _json
+        self.rows = {k: _json.dumps(v) for k, v in rows.items()}
+
+    def get_raw(self, key):
+        return self.rows.get(key)
+
+    def set(self, key, value):
+        self.rows[key] = value if isinstance(value, str) else self._json.dumps(value)
+
+    def query_all(self, _sql, params=()):
+        prefix = str(params[0]).rstrip("%") if params else ""
+        return [{"key": k, "value": v} for k, v in self.rows.items() if k.startswith(prefix)]
+
+    def state(self, key) -> dict:
+        return self._json.loads(self.rows[key])
+
+
+def _drive_mode_switch(*, from_network: str, to_network: str, bot_rows: dict, cleanup_result: dict):
+    """Tap Execution Mode -> ``to_network`` through the real handler and return
+    (network_mode UPDATE params seen, the rendered edit call, the bot_state fake)."""
+    from src.nadobro.handlers import callbacks
+    from src.nadobro.llm import managed_agent_state
+    from src.nadobro.models.database import UserRow
+    from src.nadobro.trading import copy_service, desk_store, stop_loss_service
+    from src.nadobro.users import user_service
+
+    uid = 4242
+    user = UserRow({
+        "telegram_id": uid,
+        "network_mode": from_network,
+        "main_address": "0x" + "ab" * 20,
+    })
+    user_service.invalidate_user_cache(uid)
+    user_service._cache_user(user)  # every get_user() import resolves through this cache
+
+    fake = _BotStateFake(bot_rows)
+    flips: list = []
+
+    def _execute(sql, params=None):
+        if "network_mode" in str(sql):
+            flips.append(params)
+
+    async def _run_blocking(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    edit = AsyncMock()
+    query = AsyncMock()
+    with patch.object(callbacks, "run_blocking", _run_blocking), \
+         patch.object(callbacks, "_edit_loc", edit), \
+         patch.object(user_service, "execute", side_effect=_execute), \
+         patch.object(user_service, "_invalidate_user_caches"), \
+         patch.object(bot_runtime, "query_all", side_effect=fake.query_all), \
+         patch.object(bot_runtime, "get_bot_state_raw", side_effect=fake.get_raw), \
+         patch.object(bot_runtime, "set_bot_state", side_effect=fake.set), \
+         patch.object(bot_runtime, "_finalize_session"), \
+         patch.object(bot_runtime, "_stop_engine_runtime_for_state", return_value=(True, None)), \
+         patch.object(bot_runtime, "cleanup_strategy_positions", return_value=cleanup_result), \
+         patch.object(bot_runtime, "_sweep_bot_trigger_orders_sync", return_value=None), \
+         patch.object(bot_runtime, "get_product_id", return_value=2), \
+         patch.object(desk_store, "list_active_plans", return_value=[]), \
+         patch.object(copy_service, "get_user_copies", return_value=[]), \
+         patch.object(stop_loss_service, "query_all", return_value=[]), \
+         patch.object(managed_agent_state, "get_managed_agent_state", return_value={"enabled": False}):
+        try:
+            asyncio.run(callbacks._handle_mode(query, f"mode:{to_network}", uid))
+        finally:
+            user_service.invalidate_user_cache(uid)
+    return flips, edit, fake
+
+
+def test_network_switch_does_not_flip_when_old_network_teardown_fails():
+    # NETSWITCH-FAIL-OPEN — fixed: was a strict xfail until the fail-closed switch
+    # (strategy/network_switch.py) landed.
+    key = f"{bot_runtime.STATE_PREFIX}4242:testnet"
+    flips, edit, fake = _drive_mode_switch(
+        from_network="testnet",
+        to_network="mainnet",
+        bot_rows={key: {"running": True, "strategy": "grid", "product": "BTC", "strategy_session_id": 7}},
+        cleanup_result={"success": False, "error": "Could not confirm the order book is clear: rate limited"},
+    )
+    # Fail-closed: the venue could not confirm the old network is clean, so the
+    # user must stay on it (where Stop / /status can still reach the leftovers).
+    assert flips == [], f"network_mode flipped despite a failed teardown: {flips}"
+    template = str(edit.call_args.args[1]) if edit.call_args else ""
+    assert "Switched to" not in template, template
+    # ...and the unconfirmed cleanup stays retriable instead of looking clean.
+    assert fake.state(key).get("running") is False
+    from src.nadobro.strategy import pending_cleanup
+
+    [entry] = pending_cleanup.list_entries(4242, "testnet")
+    assert entry[1]["status"] == pending_cleanup.FAILED and entry[1]["reason"] == "network_switch"

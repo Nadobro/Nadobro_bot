@@ -23,6 +23,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -104,3 +106,36 @@ def pytest_sessionstart(session):
         import warnings
 
         warnings.warn(f"test-DB schema bootstrap failed: {exc}")
+
+
+class MemoryPendingCleanupStore:
+    """In-memory stand-in for ``strategy/pending_cleanup._STORE`` (bot_state rows)."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict] = {}
+
+    def put(self, key: str, value: dict) -> None:
+        self.rows[key] = dict(value)
+
+    def delete(self, key: str) -> None:
+        self.rows.pop(key, None)
+
+    def scan(self, prefix: str) -> list[tuple[str, dict]]:
+        return [(k, dict(v)) for k, v in self.rows.items() if k.startswith(prefix)]
+
+
+@pytest.fixture(autouse=True)
+def pending_cleanup_store(monkeypatch):
+    """Every stop path records a pending cleanup (``strategy/pending_cleanup.py``)
+    in ``bot_state``. Keep each test's records in memory: against CI's real test
+    database a record one test leaves behind would otherwise be retried by a
+    later test that happens to share its uid/network. Tests that assert on the
+    records request this fixture by name."""
+    try:
+        from src.nadobro.strategy import pending_cleanup
+    except Exception:  # the pytest-only self-review venv cannot import the app
+        yield None
+        return
+    store = MemoryPendingCleanupStore()
+    monkeypatch.setattr(pending_cleanup, "_STORE", store)
+    yield store

@@ -11,7 +11,7 @@ from src.nadobro.handlers.formatters import (
     fmt_close_all_confirm, fmt_dashboard_home, fmt_mode_view, fmt_positions,
     fmt_trade_preview, fmt_trade_result,
     fmt_wallet_balance_card, fmt_wallet_balance_error, fmt_wallet_connect_card,
-    fmt_wallet_info, fmt_alerts, fmt_portfolio, fmt_wallet_revoke_steps_card,
+    fmt_wallet_info, fmt_alerts, fmt_portfolio, fmt_wallet_revoke_steps_card, fmt_network_switch_result,
     fmt_settings, fmt_help, fmt_price, fmt_points_dashboard,
     fmt_trade_history, fmt_analytics, fmt_strategy_hub_intro,
     fmt_referral_dashboard, fmt_getting_started,
@@ -41,8 +41,9 @@ from src.nadobro.handlers.commands import build_status_dashboard_parts
 from src.nadobro.handlers.state_reset import clear_pending_user_state
 from src.nadobro.users.user_service import (
     get_or_create_user, get_user_nado_client, get_user_readonly_client, get_user_wallet_info,
-    switch_network, get_user, remove_user_private_key, ensure_active_wallet_ready, update_user_language,
+    get_user, remove_user_private_key, ensure_active_wallet_ready, update_user_language,
 )
+from src.nadobro.strategy.network_switch import switch_network
 from src.nadobro.trading.trade_service import (
     execute_market_order, execute_limit_order, close_position,
     close_all_positions, get_trade_history, get_trade_analytics,
@@ -409,8 +410,11 @@ async def _handle_mode(query, data, telegram_id, context=None):
                 raise
         return
 
-    success, result_msg = await run_blocking(switch_network, telegram_id, target_network)
-    if success:
+    # Fail-closed: stops what is live on the network being left and flips only
+    # once all of it is confirmed stopped (strategy/network_switch.py).
+    result = await run_blocking(switch_network, telegram_id, target_network)
+    result_msg = fmt_network_switch_result(result)
+    if result.switched:
         # A mode switch invalidates any in-flight confirmation flow (pending
         # text trade / close-all / trade card) — a "confirm" typed after the
         # switch must never execute a preview built against the other network.
@@ -421,14 +425,14 @@ async def _handle_mode(query, data, telegram_id, context=None):
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=mode_kb(target_network),
             label=escape_md(network_label),
-            msg=escape_md(result_msg),
+            msg=result_msg,
         )
     else:
         await _edit_loc(query,
             "❌ {msg}",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=mode_kb(current_network),
-            msg=escape_md(result_msg),
+            msg=result_msg,
         )
 
 

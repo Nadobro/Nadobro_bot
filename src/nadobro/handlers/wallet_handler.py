@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import logging
 
-from src.nadobro.handlers.formatters import escape_md, fmt_wallet_balance_card, fmt_wallet_balance_error, fmt_wallet_connect_card, fmt_wallet_info, fmt_wallet_revoke_steps_card
+from src.nadobro.handlers.formatters import escape_md, fmt_network_switch_result, fmt_wallet_balance_card, fmt_wallet_balance_error, fmt_wallet_connect_card, fmt_wallet_info, fmt_wallet_revoke_steps_card
 from src.nadobro.handlers.keyboards import wallet_kb, wallet_kb_not_linked, wallet_revoke_confirm_kb
 from src.nadobro.core.async_utils import run_blocking, run_blocking_sdk_capped
-from src.nadobro.users.user_service import get_user_readonly_client, get_user_wallet_info, switch_network, get_user, remove_user_private_key
+from src.nadobro.strategy.network_switch import switch_network
+from src.nadobro.users.user_service import get_user_readonly_client, get_user_wallet_info, get_user, remove_user_private_key
 from telegram.constants import ParseMode
 
 from src.nadobro.handlers.callbacks import _edit_loc  # noqa: E402
@@ -133,9 +134,12 @@ async def _handle_wallet(query, data, telegram_id, context):
         if net not in ("testnet", "mainnet"):
             return
 
-        success, result_msg = await run_blocking(switch_network, telegram_id, net)
+        # Stale-message path (no keyboard emits wallet:network:* anymore) — same
+        # fail-closed switch as Execution Mode.
+        result = await run_blocking(switch_network, telegram_id, net)
+        result_msg = fmt_network_switch_result(result)
 
-        if success:
+        if result.switched:
             # Mode switch invalidates in-flight confirmation flows (pending
             # text trade / close-all) so a later "confirm" can't execute a
             # preview built against the other network.
@@ -148,7 +152,7 @@ async def _handle_wallet(query, data, telegram_id, context):
                 "{switch_msg}\n\n{wallet_info}",
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=wallet_kb(),
-                switch_msg=escape_md(result_msg),
+                switch_msg=result_msg,
                 wallet_info=msg,
             )
         else:
@@ -156,5 +160,5 @@ async def _handle_wallet(query, data, telegram_id, context):
                 "❌ {msg}",
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=wallet_kb(),
-                msg=escape_md(result_msg),
+                msg=result_msg,
             )

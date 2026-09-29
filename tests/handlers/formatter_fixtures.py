@@ -321,6 +321,37 @@ BALANCE_MISSING = {"exists": False, "balances": {}}
 STRATEGY_CONF = {"notional_usd": 100.0, "spread_bp": 8, "interval_seconds": 60, "tp_pct": 1.5, "sl_pct": 0.75}
 
 
+def _network_switch_results():
+    from src.nadobro.strategy.network_switch import NetworkSwitchResult, SwitchItem
+
+    ok = NetworkSwitchResult(
+        True, "testnet", "mainnet",
+        items=(
+            SwitchItem("strategy", "stopped", label="grid", product="BTC"),
+            SwitchItem("desk_plan", "stopped", label="p1", product="ETH", warning="position_may_be_open"),
+            SwitchItem("copy_mirror", "kept", label="whale"),
+            SwitchItem("stop_loss_rule", "kept", product="SOL"),
+            SwitchItem("managed_agent", "kept"),
+        ),
+        wallet_address="0x1111111111111111111111111111111111111111",
+    )
+    refused = NetworkSwitchResult(
+        False, "testnet", "mainnet",
+        items=(
+            SwitchItem("strategy", "stopped", label="grid", product="BTC"),
+            SwitchItem("leftover_orders", "failed", label="rgrid", product="ETH",
+                       error="Could not confirm the order book is clear: rate limited"),
+            SwitchItem("desk_plan", "skipped", label="p3", product="SOL"),
+        ),
+        error="not_confirmed",
+    )
+    unlinked = NetworkSwitchResult(True, "mainnet", "testnet")
+    return ok, refused, unlinked
+
+
+NETWORK_SWITCH_OK, NETWORK_SWITCH_REFUSED, NETWORK_SWITCH_UNLINKED = _network_switch_results()
+
+
 # --------------------------------------------------------------------------
 # case registry — (case_id, formatter_name, args, kwargs)
 #
@@ -376,6 +407,9 @@ CASES: list[tuple[str, str, tuple, dict]] = [
     # --- wallet ---
     ("wallet_info__linked", "fmt_wallet_info", (WALLET_LINKED,), {}),
     ("wallet_info__unlinked", "fmt_wallet_info", (WALLET_UNLINKED,), {}),
+    ("network_switch__switched", "fmt_network_switch_result", (NETWORK_SWITCH_OK,), {}),
+    ("network_switch__refused", "fmt_network_switch_result", (NETWORK_SWITCH_REFUSED,), {}),
+    ("network_switch__unlinked", "fmt_network_switch_result", (NETWORK_SWITCH_UNLINKED,), {}),
     ("balance__present", "fmt_balance", (BALANCE,), {"wallet_addr": "0x1111111111111111111111111111111111111111"}),
     ("balance__missing", "fmt_balance", (BALANCE_MISSING,), {}),
     ("wallet_balance_card", "fmt_wallet_balance_card", (2481.09,), {}),
