@@ -1487,16 +1487,16 @@ def _session_match_where(session_id: int, user_id: Optional[int] = None) -> tupl
 
 
 def _session_realized_pnl(
-    session_id: int, table: str, user_id: Optional[int] = None
+    session_id: int, network: str, user_id: Optional[int] = None
 ) -> float:
     """Session realized PnL — position-aware and DERIVED from session fills.
 
     This venue reports NO per-fill realized PnL, so realized is replayed from the
     run's own fills. Delegates to ``get_session_live_metrics`` so the finalize
     rollup and the live dashboard compute realized PnL identically and can never
-    disagree. ``table`` selects the network; ``user_id`` auto-resolves from the
-    session when not supplied."""
-    network = "testnet" if str(table).lower().endswith("testnet") else "mainnet"
+    disagree. ``network`` is the caller's canonical Nado network (never re-derived
+    from a table name: ``"trades_arcus_testnet"`` also ends with ``"testnet"``);
+    ``user_id`` auto-resolves from the session when not supplied."""
     metrics = get_session_live_metrics(int(session_id), network, user_id=user_id)
     return float(metrics.get("realized_pnl") or 0.0)
 
@@ -2353,7 +2353,6 @@ def rollup_engine_session_pnl_funding(session_id: int, network: str) -> dict:
     Returns the resolved ``{realized_pnl, total_funding_paid}`` (empty on error).
     """
     net = _nado_ledger_network(network, "rollup_engine_session_pnl_funding")
-    table = f"trades_{net}"
     funding_table = f"funding_payments_{net}"
     try:
         sess = query_one(
@@ -2373,7 +2372,7 @@ def rollup_engine_session_pnl_funding(session_id: int, network: str) -> dict:
     started_at = sess.get("started_at")
     stopped_at = sess.get("stopped_at")
     realized_pnl = _session_realized_pnl(
-        int(session_id), table, int(sess["user_id"]) if sess.get("user_id") is not None else None
+        int(session_id), net, int(sess["user_id"]) if sess.get("user_id") is not None else None
     )
 
     # 2) Funding: realized funding payments on the session's product within the

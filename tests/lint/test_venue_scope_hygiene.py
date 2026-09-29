@@ -1,13 +1,17 @@
 """Static guards for the Nado/Arcus venue boundary (Arcus P1, AD-11 layer 7).
 
 1. No NEW network-coercion compares: every comparison of a value against a
-   ``'testnet'`` / ``'mainnet'`` literal (``==``, ``!=``, ``is``, ``in (...)``,
-   ``.startswith/.endswith("testnet")``) outside ``utils/venue_scope.py`` must be
-   on the allowlist below (UI labels, strict validators, enum policy checks) or
-   compare the canonical output of ``coerce_nado_network(...)``. Anything else
-   is a local ternary that would silently fold ``arcus_mainnet`` into a Nado
-   network — route it through ``utils.venue_scope`` with the site's legacy
-   policy instead.
+   ``'testnet'`` / ``'mainnet'`` literal or a ``*TESTNET`` / ``*MAINNET``
+   name/attribute (incl. ``NetworkMode.TESTNET.value``) — ``==``, ``!=``,
+   ``is``, ``in (...)``, a substring test (``"testnet" in net``, which also
+   matches ``arcus_testnet``), ``match``/``case``, a ``{"testnet": ...}.get(net,
+   default)`` fallback, ``.startswith/.endswith("testnet")`` — outside
+   ``utils/venue_scope.py`` must be on the allowlist below (UI labels, strict
+   validators, enum policy checks) or compare the canonical output of
+   ``coerce_nado_network(...)``. Anything else is a local ternary that would
+   silently fold ``arcus_mainnet`` into a Nado network — route it through
+   ``utils.venue_scope`` with the site's legacy policy instead. Operator
+   ``scripts/`` are scanned too: they write the same Nado tables.
 2. The bot_state ``LIKE`` enumerators are pinned per file, and no Arcus key
    (``arcus_strategy_bot:`` / ``arcus_user_settings:``) can ever match a Nado
    LIKE pattern (``_`` is a LIKE wildcard — translated faithfully).
@@ -34,10 +38,14 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 SRC = REPO / "src" / "nadobro"
-SCAN = sorted(p for p in SRC.rglob("*.py") if "__pycache__" not in p.parts) + [REPO / "main.py"]
+SCRIPTS = REPO / "scripts"
+SCAN = sorted(
+    p for root in (SRC, SCRIPTS) for p in root.rglob("*.py") if "__pycache__" not in p.parts
+) + [REPO / "main.py"]
 HELPER = SRC / "utils" / "venue_scope.py"
 
 _NET = {"testnet", "mainnet"}
+_NET_NAME_SUFFIXES = ("TESTNET", "MAINNET")  # NADO_TESTNET, NetworkMode.MAINNET, ...
 
 
 def _rel(path: pathlib.Path) -> str:
@@ -55,15 +63,35 @@ def _nodes(path: pathlib.Path) -> tuple[tuple[ast.AST, ...], tuple[str, ...]]:
 # ---------------------------------------------------------------------------
 
 def _is_net_literal(node: ast.AST) -> bool:
+    """A network token: ``"testnet"`` / ``"mainnet"`` (any case/padding), or a
+    name/attribute ending in TESTNET/MAINNET, optionally followed by ``.value``
+    (``NADO_TESTNET``, ``NetworkMode.MAINNET``, ``NetworkMode.TESTNET.value``)."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str) and node.value.strip().lower() in _NET
+    if isinstance(node, ast.Attribute) and node.attr == "value":
+        node = node.value
+    if isinstance(node, ast.Name):
+        return node.id.endswith(_NET_NAME_SUFFIXES)
+    if isinstance(node, ast.Attribute):
+        return node.attr.endswith(_NET_NAME_SUFFIXES)
+    return False
+
+
+def _mentions_net(node: ast.AST) -> bool:
+    """A string constant containing a network token (``net in "testnet,mainnet"``)."""
     return (
         isinstance(node, ast.Constant)
         and isinstance(node.value, str)
-        and node.value.strip().lower() in _NET
-    ) or (isinstance(node, ast.Name) and node.id in ("NADO_TESTNET", "NADO_MAINNET"))
+        and any(t in node.value.lower() for t in _NET)
+    )
 
 
 def _is_net_collection(node: ast.AST) -> bool:
-    return isinstance(node, (ast.Tuple, ast.List, ast.Set)) and any(_is_net_literal(e) for e in node.elts)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return any(_is_net_literal(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return any(k is not None and _is_net_literal(k) for k in node.keys)
+    return False
 
 
 def _is_helper_call(node: ast.AST) -> bool:
@@ -77,17 +105,27 @@ def _is_network_compare(node: ast.AST) -> bool:
             return False  # comparing the helper's canonical output is fine
         eq = any(isinstance(op, (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)) for op in node.ops)
         member = any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops)
+        # Membership flags a network token on EITHER side: ``"testnet" in net``
+        # is a substring test that also matches the Arcus scope "arcus_testnet".
         return (eq and any(_is_net_literal(o) for o in operands)) or (
-            member and any(_is_net_collection(o) for o in operands)
+            member
+            and any(_is_net_literal(o) or _mentions_net(o) or _is_net_collection(o) for o in operands)
         )
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in ("startswith", "endswith")
-        and node.args
-        and _is_net_literal(node.args[0])
-    ):
-        return True
+    if isinstance(node, ast.MatchValue):  # match net: case "testnet": ...
+        return _is_net_literal(node.value)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if (
+            node.func.attr in ("startswith", "endswith")
+            and node.args
+            and (_is_net_literal(node.args[0]) or _is_net_collection(node.args[0]))
+        ):
+            return True
+        if (  # {"testnet": A, "mainnet": B}.get(net, B) — a default is a fold
+            node.func.attr == "get"
+            and isinstance(node.func.value, ast.Dict)
+            and _is_net_collection(node.func.value)
+        ):
+            return True
     return False
 
 
@@ -119,10 +157,6 @@ ALLOWED_NETWORK_COMPARES: dict[tuple[str, str], int] = {
     ("src/nadobro/venue/nado_sync.py", 'if normalized not in {"mainnet", "testnet"}:'): 1,
     # --- policy check on the enum-canonical UserRow value ---
     ("src/nadobro/users/user_service.py", 'if user.network_mode.value == "mainnet":'): 1,
-    # --- maps a TABLE NAME (only ever trades_testnet/trades_mainnet, from the
-    # ledger helper) back to its network; reviewed in SPEC-A §2 ---
-    ("src/nadobro/models/database.py",
-     'network = "testnet" if str(table).lower().endswith("testnet") else "mainnet"'): 1,
 }
 
 
@@ -169,11 +203,32 @@ def test_detector_flags_the_legacy_ternary_shapes():
         "if isinstance(n, str) and n.strip().lower() == 'testnet':\n    pass",
         'x = "t" if t.endswith("testnet") else "m"',
         'x = "t" if net == NADO_TESTNET else "m"',
+        # Shapes the first detector missed (review A2-LINT-01). The substring
+        # test is the one that matches the Arcus scope tokens themselves.
+        'x = "t" if "testnet" in net else "m"',
+        'x = "t" if "TESTNET" not in str(net).upper() else "m"',
+        'x = "t" if net in "testnet,mainnet" else "m"',
+        'x = "t" if net in {"testnet": 1, "mainnet": 2} else "m"',
+        'x = "t" if net == NetworkMode.TESTNET.value else "m"',
+        'x = "t" if net is NetworkMode.MAINNET else "m"',
+        'x = "t" if net == TESTNET else "m"',
+        'x = {"testnet": A, "mainnet": B}.get(net, B)',
+        'x = {"testnet": A}.get(str(net).lower())',
+        'match net:\n    case "testnet":\n        pass',
+        'match net:\n    case "a" | NetworkMode.MAINNET:\n        pass',
+        'x = "t" if t.endswith(("testnet", "mainnet")) else "m"',
     ]
     for src in samples:
         assert any(_is_network_compare(n) for n in ast.walk(ast.parse(src))), src
-    ok = 'if coerce_nado_network(v, LOWER_ELSE_MAINNET, site="s") == "testnet":\n    pass'
-    assert not any(_is_network_compare(n) for n in ast.walk(ast.parse(ok)))
+    ok = [
+        'if coerce_nado_network(v, LOWER_ELSE_MAINNET, site="s") == "testnet":\n    pass',
+        'x = {"testnet": A, "mainnet": B}[coerce_nado_network(v, LOWER_ELSE_MAINNET, site="s")]',
+        'x = NADO_TESTNET_REST if flag else NADO_MAINNET_REST',
+        'x = "t" if "arcus" in net else "m"',
+        'x = {"a": 1}.get(net, 2)',
+    ]
+    for src in ok:
+        assert not any(_is_network_compare(n) for n in ast.walk(ast.parse(src))), src
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +245,7 @@ PINNED_LIKE_SITES = {
     "src/nadobro/trading/stop_loss_service.py": 2,  # list rules, process rules
     "src/nadobro/strategy/pending_cleanup.py": 1,   # _BotStateStore.scan
     "src/nadobro/models/database.py": 1,            # order_intents intent_id (get_bot_linked_digests)
+    "scripts/reconcile_attribution.py": 1,          # order_intents 'close:%' (read-only audit)
 }
 
 
@@ -325,6 +381,9 @@ PINNED_NETWORKLESS_CLIENT_FETCHES = {
     "src/nadobro/users/user_service.py": 1,
     "src/nadobro/vault/nlp_vault_service.py": 3,
     "src/nadobro/venue/nado_tooling_service.py": 2,
+    # operator shape-capture scripts (read-only, run by hand against a Nado wallet)
+    "scripts/capture_nado_shapes.py": 1,
+    "scripts/capture_nlp_shapes.py": 1,
 }
 
 

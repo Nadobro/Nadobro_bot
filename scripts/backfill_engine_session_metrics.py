@@ -38,14 +38,26 @@ from src.nadobro.strategy.engine_runtime import (
     ENGINE_MAPPED_STRATEGIES,
     deterministic_controller_id,
 )
+from src.nadobro.utils.venue_scope import (
+    LOWER_ELSE_MAINNET,
+    coerce_nado_network,
+    is_non_nado_scope,
+)
 
 
+# Legacy ``"testnet" if str(network).lower() == "testnet" else "mainnet"``,
+# routed through utils.venue_scope: an Arcus scope raises instead of tagging
+# Nado's trades_mainnet rows with an Arcus session id.
 def _trades_table(network: str) -> str:
-    return "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    return "trades_" + coerce_nado_network(
+        network, LOWER_ELSE_MAINNET, site="scripts.backfill_engine_session_metrics._trades_table"
+    )
 
 
 def _funding_table(network: str) -> str:
-    return "funding_payments_testnet" if str(network).lower() == "testnet" else "funding_payments_mainnet"
+    return "funding_payments_" + coerce_nado_network(
+        network, LOWER_ELSE_MAINNET, site="scripts.backfill_engine_session_metrics._funding_table"
+    )
 
 
 def _candidate_sessions(session_id: int | None, network: str | None) -> list[dict]:
@@ -57,13 +69,17 @@ def _candidate_sessions(session_id: int | None, network: str | None) -> list[dic
     if network:
         where.append("network = %s")
         params.append(network)
-    return query_all(
+    rows = query_all(
         f"SELECT id, user_id, strategy, network, product_id, product_name, "
         f"started_at, stopped_at, total_volume_usd, realized_pnl, total_fees_paid, "
         f"total_funding_paid FROM strategy_sessions "
         f"WHERE {' AND '.join(where)} ORDER BY id",
         tuple(params),
     )
+    # Arcus sessions carry scope tokens (``arcus_mainnet``) in ``network`` and
+    # share strategy names with Nado: they are never attributed against Nado's
+    # trades_<network> / funding_payments_<network> tables.
+    return [row for row in rows if not is_non_nado_scope(row.get("network"))]
 
 
 def _venue_totals(sess: dict) -> dict | None:

@@ -165,6 +165,39 @@ def test_models_rollup_engine_session_pnl_funding(monkeypatch):
     _check(run, golden, lambda v: (f"funding_payments_{_lt(v)}", f"trades_{_lt(v)}"))
 
 
+def test_models_session_realized_pnl_takes_the_canonical_network(monkeypatch):
+    # Review A2-LINT-02: _session_realized_pnl used to re-derive the network from
+    # a TABLE NAME with ``str(table).lower().endswith("testnet")`` — and
+    # "trades_arcus_testnet" / "arcus_testnet" end with "testnet" too, so an
+    # Arcus scope silently read Nado's trades_testnet. It now takes the caller's
+    # canonical network and forwards it to the guarded ledger reader.
+    from src.nadobro.models import database
+
+    spy = _SqlSpy()
+    _patch_db(monkeypatch, database, spy)
+    for scope in ("arcus_testnet", "arcus_mainnet", "ARCUS_TESTNET", " arcus_testnet"):
+        with pytest.raises(VenueScopeError):
+            database._session_realized_pnl(1, scope, user_id=1)
+    assert spy.sql == []  # raised before any SQL
+
+    seen: list = []
+    monkeypatch.setattr(
+        database, "get_session_live_metrics",
+        lambda sid, network, user_id=None: seen.append(network) or {"realized_pnl": 0.0},
+    )
+    sess = {"user_id": 1, "product_id": 2, "started_at": "2026-01-01", "stopped_at": None}
+
+    def run(v):
+        seen.clear()
+        _patch_db(monkeypatch, database, _SqlSpy(
+            one=lambda sql: dict(sess) if "FROM strategy_sessions WHERE id" in sql else None))
+        database.rollup_engine_session_pnl_funding(1, v)
+        assert len(seen) == 1, seen
+        return seen[0]
+
+    _check(run, [RAISE if g == RAISE else g for g in LT_GOLDEN], _lt)
+
+
 def test_models_userrow_network_mode():
     # F1: empty → mainnet; anything not exactly "mainnet" → testnet ('MAINNET' → testnet!).
     from src.nadobro.models.database import UserRow
@@ -537,6 +570,53 @@ def test_vault_snapshot_nlp_default(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Operator script: scripts/backfill_engine_session_metrics.py (review A1)
+# ---------------------------------------------------------------------------
+
+def _load_backfill_script():
+    import importlib.util
+
+    path = REPO / "scripts" / "backfill_engine_session_metrics.py"
+    spec = importlib.util.spec_from_file_location("_backfill_engine_session_metrics", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_backfill_script_tables_follow_the_lt_legacy_policy():
+    # Its --tag-rows path runs ``UPDATE <_trades_table(network)> SET
+    # strategy_session_id = <session id>``: an Arcus session folded to
+    # trades_mainnet would stamp Nado History rows with an Arcus session id.
+    mod = _load_backfill_script()
+    _check(mod._trades_table, [RAISE if g == RAISE else f"trades_{g}" for g in LT_GOLDEN],
+           lambda v: f"trades_{_lt(v)}")
+    _check(mod._funding_table, [RAISE if g == RAISE else f"funding_payments_{g}" for g in LT_GOLDEN],
+           lambda v: f"funding_payments_{_lt(v)}")
+
+
+def test_backfill_script_never_selects_or_tags_an_arcus_session(monkeypatch):
+    mod = _load_backfill_script()
+    nets = ["mainnet", "testnet", "arcus_mainnet", " ARCUS_testnet", "MAINNET", None, ""]
+    rows = [{"id": i, "network": n} for i, n in enumerate(nets)]
+    spy = _SqlSpy()
+    monkeypatch.setattr(mod, "query_all", lambda sql, params=None: (spy._rec(sql), [dict(r) for r in rows])[1])
+    kept = mod._candidate_sessions(None, None)
+    # Every non-Arcus row is kept exactly as before (legacy selection); only
+    # the Arcus scopes are dropped.
+    assert [r["network"] for r in kept] == ["mainnet", "testnet", "MAINNET", None, ""]
+
+    # Defence in depth: an Arcus session that reaches the tagger raises before
+    # any UPDATE is issued.
+    monkeypatch.setattr(mod, "execute", spy.execute)
+    sess = {"id": 9, "user_id": 1, "product_id": 2, "network": "arcus_mainnet",
+            "started_at": "2026-01-01", "stopped_at": None}
+    with pytest.raises(VenueScopeError):
+        mod._tag_rows(sess)
+    assert not any("UPDATE" in q for q in spy.sql)
+
+
+# ---------------------------------------------------------------------------
 # AST pins for the two sites not driven end to end
 # ---------------------------------------------------------------------------
 
@@ -606,6 +686,9 @@ _SITE_POLICIES = {
     ("venue/product_catalog.py", "_rest_url"): "LOWER_ELSE_TESTNET",
     ("venue/product_catalog.py", "_archive_v2_url"): "LOWER_ELSE_TESTNET",
     ("venue/nado_tooling_service.py", "_network_to_data_env"): "LOWER_ELSE_TESTNET",
+    # operator scripts (keyed relative to the repo root)
+    ("scripts/backfill_engine_session_metrics.py", "_trades_table"): "LOWER_ELSE_MAINNET",
+    ("scripts/backfill_engine_session_metrics.py", "_funding_table"): "LOWER_ELSE_MAINNET",
 }
 
 
@@ -633,11 +716,12 @@ class _CoerceCallCollector(ast.NodeVisitor):
 
 def _coerce_call_sites() -> dict[tuple[str, str], list[str]]:
     found: dict[tuple[str, str], list[str]] = {}
-    for path in sorted(SRC.rglob("*.py")):
-        if "__pycache__" in path.parts or path.name == "venue_scope.py":
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        _CoerceCallCollector(str(path.relative_to(SRC)), found).visit(tree)
+    for root, rel_to in ((SRC, SRC), (REPO / "scripts", REPO)):
+        for path in sorted(root.rglob("*.py")):
+            if "__pycache__" in path.parts or path.name == "venue_scope.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            _CoerceCallCollector(str(path.relative_to(rel_to)), found).visit(tree)
     return found
 
 
