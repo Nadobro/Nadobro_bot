@@ -32,8 +32,21 @@ from src.nadobro.quant.portfolio_calculator import (
 )
 from src.nadobro.users.user_service import get_user, get_user_nado_client
 from src.nadobro.utils.x18 import from_x18
+from src.nadobro.utils.venue_scope import (
+    LOWER_ELSE_MAINNET,
+    VenueScopeError,
+    coerce_nado_network,
+    is_non_nado_scope,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _gateway_for(canonical_network: str) -> str:
+    """Nado REST gateway for a CANONICAL network (``_normalize_network`` output,
+    never a raw value). Module globals are read at call time, as before."""
+    return {"testnet": NADO_TESTNET_REST, "mainnet": NADO_MAINNET_REST}[canonical_network]
+
 
 _snapshot_cache: dict[tuple[int, str], dict[str, Any]] = {}
 _inflight: dict[tuple[int, str], asyncio.Lock] = {}
@@ -107,7 +120,7 @@ def _gateway_circuit_open(network: str) -> bool:
     try:
         from src.nadobro.core.http_session import is_circuit_open
 
-        gateway = NADO_MAINNET_REST if _normalize_network(network) == "mainnet" else NADO_TESTNET_REST
+        gateway = _gateway_for(_normalize_network(network))
         return bool(is_circuit_open(gateway))
     except Exception:
         return False
@@ -268,6 +281,11 @@ async def sync_active_users(reason: str = "poll") -> None:
                 ),
                 timeout=user_timeout,
             )
+        except VenueScopeError as exc:
+            # A non-Nado scope in users.network_mode (unreachable for Nado
+            # values) must not abort the tick before the cursor advances, or
+            # every user after it would stall. Log, skip, advance.
+            logger.warning("portfolio sync user=%s skipped: %s", user_id, exc)
         except asyncio.TimeoutError:
             # Only the FULL per-user timeout signals a wedged connection.
             # A budget-truncated timeout (user_timeout < the configured
@@ -416,7 +434,7 @@ async def sync_user(
                 from src.nadobro.venue.gateway_budget import is_gateway_blocked
                 from src.nadobro.venue.ws_health import is_healthy, reconcile_due
 
-                gateway = NADO_MAINNET_REST if network == "mainnet" else NADO_TESTNET_REST
+                gateway = _gateway_for(network)
                 if is_gateway_blocked(gateway):
                     cached = _snapshot_cache.get(key)
                     if cached:
@@ -1739,7 +1757,13 @@ def _back_link_intent(
             )
         except Exception:
             session_row = None
-        if not session_row or _normalize_network(session_row.get("network")) != _normalize_network(network):
+        # A non-Nado (Arcus) session can never own a Nado fill: drop the link
+        # (tri-state intact) instead of letting the normalizer raise.
+        if (
+            not session_row
+            or is_non_nado_scope(session_row.get("network"))
+            or _normalize_network(session_row.get("network")) != _normalize_network(network)
+        ):
             logger.debug(
                 "back-link dropped: session=%s network=%s != fill network=%s",
                 session_id,
@@ -1963,8 +1987,9 @@ def _timestamp_or_now(value: Any) -> datetime:
 
 
 def _normalize_network(network: Any) -> str:
-    text = str(network or "mainnet").lower()
-    return "testnet" if text == "testnet" else "mainnet"
+    # Legacy ``str(network or "mainnet").lower() == "testnet"`` → testnet, else
+    # mainnet — kept exactly; an Arcus scope token raises VenueScopeError.
+    return coerce_nado_network(network, LOWER_ELSE_MAINNET, site="nado_sync._normalize_network")
 
 
 def _network_table_suffix(network: Any) -> str:

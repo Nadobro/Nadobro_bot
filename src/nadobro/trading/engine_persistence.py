@@ -25,6 +25,7 @@ from typing import List, Optional
 from src.nadobro.engine.inventory import PositionHold
 from src.nadobro.engine.risk import KillSwitchStore
 from src.nadobro.engine.types import TradeType, _dec
+from src.nadobro.utils.venue_scope import LOWER_ELSE_MAINNET, coerce_nado_network
 
 _STRATEGY_TYPES = {
     "OrderExecutor": "order",
@@ -397,7 +398,9 @@ class DbTradeRecorder:
             # executor's fill detection by tens of seconds), this guard stops the
             # recorder from double-counting the fill.
             from src.nadobro.db import query_one as _qone
-            _tbl = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+            _tbl = "trades_" + coerce_nado_network(
+                network, LOWER_ELSE_MAINNET, site="engine_persistence.DbTradeRecorder._record"
+            )
             try:
                 if _qone(
                     f"SELECT 1 FROM {_tbl} WHERE order_digest = %s "

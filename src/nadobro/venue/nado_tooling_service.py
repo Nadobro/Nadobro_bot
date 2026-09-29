@@ -10,6 +10,7 @@ from typing import Any
 from src.nadobro.trading.execution_queue import get_queue_diagnostics
 from src.nadobro.core.perf import snapshot as perf_snapshot
 from src.nadobro.utils.env import env_bool, env_float
+from src.nadobro.utils.venue_scope import LOWER_ELSE_TESTNET, coerce_nado_network
 from src.nadobro.config import (
     get_dn_products,
     get_perp_products,
@@ -40,7 +41,10 @@ def trigger_preview_enabled() -> bool:
 
 
 def _network_to_data_env(network: str) -> str:
-    return "nadoMainnet" if str(network or "").lower() == "mainnet" else "nadoTestnet"
+    # Legacy ``str(network or "").lower() == "mainnet"`` → nadoMainnet, else
+    # nadoTestnet (kept exactly); an Arcus scope raises VenueScopeError.
+    net = coerce_nado_network(network, LOWER_ELSE_TESTNET, site="nado_tooling_service._network_to_data_env")
+    return {"testnet": "nadoTestnet", "mainnet": "nadoMainnet"}[net]
 
 
 def _catalog_symbols_for_network(network: str, client) -> set[str]:

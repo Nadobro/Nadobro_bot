@@ -27,6 +27,7 @@ from src.nadobro.users.user_service import get_user, get_user_nado_client, get_u
 from src.nadobro.venue.nado_archive import query_order_by_digest
 from src.nadobro.venue.product_catalog import is_product_id_isolated_only
 from src.nadobro.venue.nado_tooling_service import get_account_snapshot
+from src.nadobro.utils.venue_scope import LOWER_ELSE_MAINNET, coerce_nado_network
 
 logger = logging.getLogger(__name__)
 _submit_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="nadobro-submit")
@@ -3480,7 +3481,9 @@ def compute_round_trips(
 
         return clean_env_value(os.environ.get("NADO_HISTORY_EPOCH")) or "2026-07-09T00:00:00+00:00"
 
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    table = "trades_" + coerce_nado_network(
+        network, LOWER_ELSE_MAINNET, site="trade_service.compute_round_trips"
+    )
     try:
         rows = _query_all(
             f"""

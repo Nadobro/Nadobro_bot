@@ -15,6 +15,11 @@ from src.nadobro.venue.nado_client import (
 from src.nadobro.i18n import get_active_language, localize_text
 from src.nadobro.config import get_nado_builder_routing_config, get_product_id
 from src.nadobro.utils.env import env_bool
+from src.nadobro.utils.venue_scope import (
+    STRIP_LOWER_ELSE_MAINNET,
+    coerce_nado_network,
+    guard_nado_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +121,9 @@ def set_network_mode(telegram_id: int, network: str) -> None:
     Never call this directly from a UI path: ``strategy/network_switch.py::
     switch_network`` is the fail-closed switch that first stops what is live on
     the network being left and only then calls this. Raises on a DB error."""
+    # users.network_mode is Nado-only (no CHECK constraint): an Arcus scope
+    # written here would make every get_user for this user raise.
+    guard_nado_scope(network, site="user_service.set_network_mode")
     user = get_user(telegram_id)
     execute("UPDATE users SET network_mode = %s WHERE telegram_id = %s", (network, telegram_id))
     # SCALE FIX: invalidate only THIS user's client caches across both networks
@@ -127,6 +135,9 @@ def set_network_mode(telegram_id: int, network: str) -> None:
 
 
 def get_user_nado_client(telegram_id: int, network: str | None = None, **kwargs) -> Optional[NadoClient]:
+    # Before the try below (it swallows everything into None): an Arcus scope
+    # must fail loudly, never quietly become "no client".
+    guard_nado_scope(network, site="user_service.get_user_nado_client")
     user = get_user(telegram_id)
     if not user or not user.linked_signer_address or not user.main_address:
         return None
@@ -208,6 +219,7 @@ def _is_wallet_fully_linked(user: Optional[UserRow]) -> bool:
 
 
 def get_user_readonly_client(telegram_id: int, network: str | None = None) -> Optional[NadoClient]:
+    guard_nado_scope(network, site="user_service.get_user_readonly_client")
     user = get_user(telegram_id)
     if not user or not user.main_address:
         return None
@@ -413,8 +425,13 @@ def update_trade_stats(
     *,
     network: str = "mainnet",
 ):
-    network = str(network or "mainnet").strip().lower()
-    volume_column = "testnet_volume_usd" if network == "testnet" else "mainnet_volume_usd"
+    # Legacy strip/lower fold → testnet column only for "testnet", else mainnet
+    # (kept exactly); an Arcus scope raises. The canonical value forwarded to
+    # record_referred_volume normalizes to the same referral network as before.
+    network = coerce_nado_network(
+        network, STRIP_LOWER_ELSE_MAINNET, site="user_service.update_trade_stats"
+    )
+    volume_column = f"{network}_volume_usd"
     trade_delta = 1 if increment_trade_count else 0
     volume_delta = float(volume_usd or 0.0)
     execute(

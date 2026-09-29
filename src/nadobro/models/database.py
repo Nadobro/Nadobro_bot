@@ -66,6 +66,18 @@ def _alerts_table(network: str) -> str:
     return f"alerts_{network}"
 
 
+def _nado_ledger_network(network, site: str) -> str:
+    """The ``trades_<network>`` / ``funding_payments_<network>`` readers' legacy
+    coercion — ``"testnet" if str(network).lower() == "testnet" else "mainnet"``
+    — routed through ``utils.venue_scope`` so an Arcus scope token raises
+    ``VenueScopeError`` instead of silently reading Nado's mainnet tables. Every
+    other input maps exactly as before. Function-local import: models→utils is
+    not an allowed layering edge (tests/lint/test_architecture_layers.py)."""
+    from src.nadobro.utils.venue_scope import LOWER_ELSE_MAINNET, coerce_nado_network
+
+    return coerce_nado_network(network, LOWER_ELSE_MAINNET, site=f"models.database.{site}")
+
+
 def init_db():
     from src.nadobro.db import init_db as _init
     _init()
@@ -752,8 +764,21 @@ class UserRow:
         self.salt = self._data.get("salt")
         self.language = self._data.get("language") or "en"
         self.strategy_settings = self._data.get("strategy_settings") or {}
-        nm = self._data.get("network_mode") or "mainnet"
-        self.network_mode = NetworkMode.MAINNET if nm == "mainnet" else NetworkMode.TESTNET
+        # Legacy policy kept exactly: empty → mainnet, any other value that is not
+        # exactly "mainnet" → testnet; an Arcus scope token raises (never a Nado
+        # network). Function-local import: models→utils is not a layering edge.
+        from src.nadobro.utils.venue_scope import (
+            EMPTY_MAINNET_EXACT_ELSE_TESTNET,
+            coerce_nado_network,
+        )
+
+        self.network_mode = NetworkMode(
+            coerce_nado_network(
+                self._data.get("network_mode"),
+                EMPTY_MAINNET_EXACT_ELSE_TESTNET,
+                site="models.database.UserRow",
+            )
+        )
         self.created_at = self._data.get("created_at")
         self.last_active = self._data.get("last_active")
         self.last_trade_at = self._data.get("last_trade_at")
@@ -1010,7 +1035,7 @@ def settle_closed_manual_positions(user_id: int, network: str) -> None:
     whose close fills already aged out stays NULL and is simply omitted from History
     rather than shown with a guessed exit.
     """
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    table = "trades_" + _nado_ledger_network(network, "settle_closed_manual_positions")
     execute(
         f"""
         WITH pos AS (
@@ -1346,7 +1371,7 @@ def rollup_session_from_trades(session_id: int, network: str) -> dict:
     ``total_orders_cancelled`` is the cancelled-ROW count; the stored column is
     merged with GREATEST and may be higher (engine-accumulated cancels).
     """
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    table = "trades_" + _nado_ledger_network(network, "rollup_session_from_trades")
     try:
         row = query_one(
             f"""
@@ -1593,7 +1618,7 @@ def get_session_live_metrics(
     (see _session_match_where). ``user_id`` is auto-resolved from the session
     when not supplied; an unresolvable owner yields empty rather than an
     account-wide query."""
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    table = "trades_" + _nado_ledger_network(network, "get_session_live_metrics")
     if user_id is None:
         user_id = _resolve_session_user_id(session_id)
         if user_id is None:
@@ -1697,7 +1722,7 @@ def get_session_turnover(
 
     Scoped to user_id + product_id + the session time window, so it never mixes
     in another user or another product. Returns {volume, fills}."""
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    table = "trades_" + _nado_ledger_network(network, "get_session_turnover")
     if product_id is None or started_at is None:
         return {"volume": 0.0, "fills": 0}
     try:
@@ -1740,7 +1765,7 @@ def get_account_realized_pnl_windows(user_id: int, network: str, now=None) -> di
     Returns an empty dict on any error so the display path never raises."""
     from src.nadobro.quant.portfolio_calculator import realized_pnl_windows_from_rows
 
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    table = "trades_" + _nado_ledger_network(network, "get_account_realized_pnl_windows")
     try:
         rows = query_all(
             f"""
@@ -2081,7 +2106,7 @@ def get_analytics_fills(user_id: int, network: str) -> list[dict]:
     without a product, 1,700+ rows on one account) and excluding them
     under-counted Nado volume and fees on every window (2026-09-16).
     """
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    table = "trades_" + _nado_ledger_network(network, "get_analytics_fills")
     try:
         return query_all(
             f"""
@@ -2109,7 +2134,7 @@ def backfill_via_nadobro(network: str, limit: int = 5000) -> int:
     ``order_digest`` against ``order_intents`` (the registry every bot-placed
     order writes). Rows with no intent are stamped FALSE = traded on the Nado
     UI. Idempotent; returns the number of rows updated."""
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    table = "trades_" + _nado_ledger_network(network, "backfill_via_nadobro")
     try:
         row = execute_returning(
             f"""
@@ -2155,7 +2180,7 @@ def get_paired_trades(
     closed trades first, with any still-open position last. ``[]`` on any error."""
     from src.nadobro.quant.portfolio_calculator import pair_fills_into_trades
 
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    table = "trades_" + _nado_ledger_network(network, "get_paired_trades")
     # product_id 0 = product-less venue fills (this indexer's match feed carries no
     # product_id); excluded so per-product pairing never mixes BTC with ETH.
     where = ["user_id = %s", "submission_idx IS NOT NULL", "COALESCE(product_id, 0) <> 0"]
@@ -2195,7 +2220,7 @@ def get_session_recent_fills(
     /mm_fills for engine strategies. Scoped per ``user_id`` + ``strategy_session_id``
     (see _session_match_where); ``user_id`` auto-resolves from the session and an
     unresolvable owner yields [] rather than an account-wide query."""
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
+    table = "trades_" + _nado_ledger_network(network, "get_session_recent_fills")
     if user_id is None:
         user_id = _resolve_session_user_id(session_id)
         if user_id is None:
@@ -2327,8 +2352,9 @@ def rollup_engine_session_pnl_funding(session_id: int, network: str) -> dict:
 
     Returns the resolved ``{realized_pnl, total_funding_paid}`` (empty on error).
     """
-    table = "trades_testnet" if str(network).lower() == "testnet" else "trades_mainnet"
-    funding_table = "funding_payments_testnet" if str(network).lower() == "testnet" else "funding_payments_mainnet"
+    net = _nado_ledger_network(network, "rollup_engine_session_pnl_funding")
+    table = f"trades_{net}"
+    funding_table = f"funding_payments_{net}"
     try:
         sess = query_one(
             "SELECT user_id, product_id, started_at, stopped_at FROM strategy_sessions WHERE id = %s",
@@ -2885,7 +2911,7 @@ def get_session_net_base_by_product(session_id: int, network: str) -> dict[int, 
     ``BASE-USDT0`` / ``BASE-PERP`` while the fill rows carry venue product names
     (``KBTC``), so names do not join.
     """
-    table = f"trades_{'testnet' if str(network).lower() == 'testnet' else 'mainnet'}"
+    table = "trades_" + _nado_ledger_network(network, "get_session_net_base_by_product")
     rows = query_all(
         f"""
         SELECT product_id,

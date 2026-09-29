@@ -76,6 +76,7 @@ from src.nadobro.users.user_service import (
 from src.nadobro.core.async_utils import run_blocking, run_blocking_db, run_blocking_sdk
 from src.nadobro.core.perf import timed_metric, record_metric
 from src.nadobro.utils.env import env_bool, env_float, env_tristate
+from src.nadobro.utils.venue_scope import LOWER_ELSE_MAINNET, coerce_nado_network
 from src.nadobro.core.cadence import FAST_CADENCE_STRATEGIES, effective_interval_seconds
 from src.nadobro.trading.execution_queue import enqueue_strategy
 from src.nadobro.core.feature_flags import legacy_bro_autoloop_enabled
@@ -794,8 +795,9 @@ def _resolve_session_network(state: dict) -> str:
     for key in ("network", "network_mode", "selected_network", "active_network"):
         val = state.get(key) if isinstance(state, dict) else None
         if val:
-            text = str(val).lower()
-            return "testnet" if text == "testnet" else "mainnet"
+            return coerce_nado_network(
+                val, LOWER_ELSE_MAINNET, site="bot_runtime._resolve_session_network"
+            )
     return "mainnet"
 
 
@@ -1525,7 +1527,9 @@ def start_user_bot(
         )
     # Persist network on state so _finalize_session can rollup against the
     # correct trades_<network> table after stop.
-    state["network"] = "testnet" if str(network).lower() == "testnet" else "mainnet"
+    state["network"] = coerce_nado_network(
+        network, LOWER_ELSE_MAINNET, site="bot_runtime.start_user_bot"
+    )
     _save_state(telegram_id, network, state)
     _ensure_task(telegram_id, network)
 

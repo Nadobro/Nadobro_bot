@@ -9,6 +9,12 @@ import requests
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Optional
 from src.nadobro.utils.env import env_float, env_int
+from src.nadobro.utils.venue_scope import (
+    EXACT_ELSE_MAINNET,
+    EXACT_ELSE_TESTNET,
+    coerce_nado_network,
+    guard_nado_scope,
+)
 from src.nadobro.config import (
     NADO_TESTNET_REST, NADO_MAINNET_REST,
     NADO_TESTNET_ARCHIVE, NADO_MAINNET_ARCHIVE,
@@ -385,6 +391,7 @@ def get_or_create_signing_client(
     """Return a cached, already-initialized signing NadoClient. Rotation-safe:
     a different ``private_key`` for the same ``user_id``+``network`` evicts
     the previous entry before constructing the new one."""
+    guard_nado_scope(network, site="nado_client.get_or_create_signing_client")
     digest = _pk_digest(private_key)
     cache_key = ("signer", digest, str(network))
     with _NADO_CLIENT_CACHE_LOCK:
@@ -427,6 +434,7 @@ def get_or_create_readonly_client(
     """Return a cached read-only NadoClient (``NadoClient.from_address``).
     Read-only clients don't need ``.initialize()`` — the SDK contexts they
     use are pulled lazily on the first query."""
+    guard_nado_scope(network, site="nado_client.get_or_create_readonly_client")
     addr = str(address or "").strip().lower()
     cache_key = ("readonly", addr, str(network))
     with _NADO_CLIENT_CACHE_LOCK:
@@ -478,6 +486,7 @@ class NadoClient:
     acting_user_id: Optional[int] = None
 
     def __init__(self, private_key: str, network: str = "testnet", main_address: str = None):
+        guard_nado_scope(network, site="NadoClient.__init__")
         self.private_key = private_key
         self.network = network
         self.client = None
@@ -490,6 +499,8 @@ class NadoClient:
 
     @classmethod
     def from_address(cls, address: str, network: str = "testnet") -> "NadoClient":
+        # ``cls.__new__`` bypasses ``__init__``, so this needs its own guard.
+        guard_nado_scope(network, site="NadoClient.from_address")
         instance = cls.__new__(cls)
         instance.private_key = None
         instance.network = network
@@ -530,7 +541,13 @@ class NadoClient:
         try:
             from nado_protocol.client import create_nado_client, NadoClientMode
 
-            mode = NadoClientMode.TESTNET if self.network == "testnet" else NadoClientMode.MAINNET
+            # Legacy ``self.network == "testnet"`` → TESTNET SDK, else MAINNET
+            # (note: the opposite fallback from _rest_url/_archive_url below;
+            # both kept exactly).
+            sdk_network = coerce_nado_network(
+                self.network, EXACT_ELSE_MAINNET, site="NadoClient.initialize"
+            )
+            mode = {"testnet": NadoClientMode.TESTNET, "mainnet": NadoClientMode.MAINNET}[sdk_network]
             self.client = create_nado_client(mode, self.private_key)
             self._install_sdk_timeouts()
             signer = getattr(getattr(self.client, "context", None), "signer", None)
@@ -584,10 +601,13 @@ class NadoClient:
             )
 
     def _rest_url(self):
-        return NADO_MAINNET_REST if self.network == "mainnet" else NADO_TESTNET_REST
+        # Legacy ``self.network == "mainnet"`` → mainnet, else testnet (kept).
+        net = coerce_nado_network(self.network, EXACT_ELSE_TESTNET, site="NadoClient._rest_url")
+        return {"testnet": NADO_TESTNET_REST, "mainnet": NADO_MAINNET_REST}[net]
 
     def _archive_url(self):
-        return NADO_MAINNET_ARCHIVE if self.network == "mainnet" else NADO_TESTNET_ARCHIVE
+        net = coerce_nado_network(self.network, EXACT_ELSE_TESTNET, site="NadoClient._archive_url")
+        return {"testnet": NADO_TESTNET_ARCHIVE, "mainnet": NADO_MAINNET_ARCHIVE}[net]
 
     def _gateway_allowed(
         self,
@@ -4707,7 +4727,11 @@ class NadoClient:
                 return self._nlp_product_id
             except ValueError:
                 pass
-        default = 11 if self.network == "mainnet" else 1
+        default = {"testnet": 1, "mainnet": 11}[
+            coerce_nado_network(
+                self.network, EXACT_ELSE_TESTNET, site="NadoClient.resolve_nlp_product_id"
+            )
+        ]
 
         def _is_zero(cfg: dict, key: str) -> bool:
             try:

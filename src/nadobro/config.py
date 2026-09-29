@@ -3,6 +3,11 @@ import os
 from typing import Optional
 
 from src.nadobro.utils.env import clean_env_value, env_bool
+from src.nadobro.utils.venue_scope import (
+    STR_STRIP_LOWER_ELSE_MAINNET,
+    coerce_nado_network,
+    guard_nado_scope,
+)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -100,7 +105,9 @@ def _default_catalog_network() -> str:
 
 
 def get_product_id(name: str, network: str = None, client=None) -> Optional[int]:
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.get_product_id"
+    )
     try:
         from src.nadobro.venue.product_catalog import get_product_id as _catalog_product_id
 
@@ -112,7 +119,9 @@ def get_product_id(name: str, network: str = None, client=None) -> Optional[int]
     return PRODUCT_ALIASES.get((name or "").lower().strip())
 
 def get_product_name(product_id: int, network: str = None, client=None) -> str:
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.get_product_name"
+    )
     try:
         from src.nadobro.venue.product_catalog import get_product_name as _catalog_product_name
 
@@ -128,7 +137,9 @@ def get_product_name(product_id: int, network: str = None, client=None) -> str:
 
 
 def get_spot_product_id(name: str, network: str = None, client=None) -> Optional[int]:
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.get_spot_product_id"
+    )
     try:
         from src.nadobro.venue.product_catalog import get_spot_product_id as _catalog_spot_product_id
 
@@ -141,7 +152,9 @@ def get_spot_product_id(name: str, network: str = None, client=None) -> Optional
 
 
 def get_spot_metadata(name: str, network: str = None) -> dict:
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.get_spot_metadata"
+    )
     try:
         from src.nadobro.venue.product_catalog import get_spot_metadata as _catalog_spot_metadata
 
@@ -172,7 +185,9 @@ PRODUCT_MAX_LEVERAGE = {
 
 
 def get_product_max_leverage(product: str, network: str = None, client=None) -> int:
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.get_product_max_leverage"
+    )
     try:
         from src.nadobro.venue.product_catalog import get_product_max_leverage as _catalog_max_leverage
 
@@ -187,7 +202,9 @@ def get_product_max_leverage(product: str, network: str = None, client=None) -> 
 def get_product_initial_margin_fraction(product: str, network: str = None, client=None) -> float:
     """Initial-margin fraction (``1/max_leverage``). Mirrors
     ``get_product_max_leverage``: live catalog first, static table on failure."""
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.get_product_initial_margin_fraction"
+    )
     try:
         from src.nadobro.venue.product_catalog import (
             get_product_initial_margin_fraction as _catalog_imf,
@@ -202,7 +219,9 @@ def get_product_maintenance_margin_fraction(product: str, network: str = None, c
     """Maintenance-margin fraction — the liquidation buffer the strategy leverage
     guard checks. Live catalog first (venue maintenance weight when available,
     else a conservative fallback derived from imf); static fallback on failure."""
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.get_product_maintenance_margin_fraction"
+    )
     try:
         from src.nadobro.venue.product_catalog import (
             get_product_maintenance_margin_fraction as _catalog_mmf,
@@ -216,7 +235,9 @@ def get_product_maintenance_margin_fraction(product: str, network: str = None, c
 
 
 def get_perp_products(network: str = None, client=None) -> list[str]:
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.get_perp_products"
+    )
     try:
         from src.nadobro.venue.product_catalog import list_perp_names
 
@@ -229,7 +250,9 @@ def get_perp_products(network: str = None, client=None) -> list[str]:
 
 
 def get_dn_pair(product: str, network: str = None, client=None) -> dict:
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.get_dn_pair"
+    )
     try:
         from src.nadobro.venue.product_catalog import get_dn_pair as _catalog_dn_pair
 
@@ -295,7 +318,9 @@ def list_volume_spot_product_names(network: str = None, client=None) -> list[str
     resolve to a spot product id, so the menu still renders something if the
     archive endpoint is temporarily 403'd.
     """
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.list_volume_spot_product_names"
+    )
     try:
         from src.nadobro.venue.product_catalog import list_volume_spot_bases
 
@@ -312,7 +337,9 @@ def list_volume_spot_product_names(network: str = None, client=None) -> list[str
 
 
 def get_dn_products(network: str = None, client=None) -> list[str]:
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.get_dn_products"
+    )
     try:
         from src.nadobro.venue.product_catalog import list_dn_product_names as _catalog_dn_products
 
@@ -325,7 +352,9 @@ def get_dn_products(network: str = None, client=None) -> list[str]:
 
 
 def is_product_isolated_only(product: str, network: str = None, client=None) -> bool:
-    network_name = str(network or _default_catalog_network())
+    network_name = guard_nado_scope(
+        str(network or _default_catalog_network()), site="config.is_product_isolated_only"
+    )
     try:
         from src.nadobro.venue.product_catalog import is_product_isolated_only as _catalog_isolated_only
 
@@ -353,7 +382,11 @@ def get_nado_builder_routing_config(network: str | None = None) -> tuple[int, in
       ``error_code=2118 "Invalid builder"``.
     - Fee rate is locked to 1 bps (10 units) to avoid accidental fee changes.
     """
-    if isinstance(network, str) and network.strip().lower() == "testnet":
+    # Legacy ``isinstance(network, str) and network.strip().lower() == "testnet"``
+    # (a non-str is mainnet) kept exactly; an Arcus scope raises VenueScopeError.
+    if coerce_nado_network(
+        network, STR_STRIP_LOWER_ELSE_MAINNET, site="config.get_nado_builder_routing_config"
+    ) == "testnet":
         return 0, 0
 
     builder_id_raw = (os.environ.get(NADO_BUILDER_ID_ENV) or "").strip()

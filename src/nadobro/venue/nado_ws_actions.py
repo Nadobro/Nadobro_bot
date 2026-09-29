@@ -43,6 +43,7 @@ import json
 import logging
 
 from src.nadobro.utils.env import env_bool, env_float
+from src.nadobro.utils.venue_scope import STR_EXACT_ELSE_TESTNET, coerce_nado_network
 import threading
 from typing import Any, Optional
 
@@ -65,7 +66,10 @@ def actions_url_for_network(network: str) -> str:
     IMPORTANT: this is the executes/queries socket, NOT `/v1/subscribe` (live
     data) and NOT `/v1/ws` (the serial v1 action socket).
     """
-    env = "prod" if str(network) == "mainnet" else "test"
+    # Legacy ``str(network) == "mainnet"`` → prod, else test (kept exactly);
+    # an Arcus scope raises VenueScopeError.
+    net = coerce_nado_network(network, STR_EXACT_ELSE_TESTNET, site="nado_ws_actions.actions_url_for_network")
+    env = {"testnet": "test", "mainnet": "prod"}[net]
     return f"wss://gateway.{env}.nado.xyz/ws/v2"
 
 

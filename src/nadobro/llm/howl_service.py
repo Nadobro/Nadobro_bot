@@ -7,6 +7,7 @@ from src.nadobro.models.database import get_bot_state_raw, set_bot_state
 from src.nadobro.users.settings_service import get_strategy_settings, update_user_settings
 from src.nadobro.llm.bro_llm import analyze_for_howl
 from src.nadobro.db import query_all
+from src.nadobro.utils.venue_scope import EXACT_ELSE_MAINNET, coerce_nado_network
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,11 @@ def _pending_key(telegram_id: int, network: str) -> str:
 
 
 def get_recent_bro_trades(telegram_id: int, hours: int = 24, network: str = "mainnet") -> list[dict]:
-    table = f"trades_{network}" if network in ("testnet", "mainnet") else "trades_mainnet"
+    # Legacy: exact "testnet"/"mainnet" keep their table, anything else reads
+    # trades_mainnet (kept exactly); an Arcus scope raises VenueScopeError.
+    table = "trades_" + coerce_nado_network(
+        network, EXACT_ELSE_MAINNET, site="howl_service.get_recent_bro_trades"
+    )
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     rows = query_all(
         f"SELECT product_name, side, pnl, size, price, created_at, status "

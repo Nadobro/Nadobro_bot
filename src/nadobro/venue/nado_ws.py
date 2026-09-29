@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.nadobro.utils.env import env_float
+from src.nadobro.utils.venue_scope import STR_EXACT_ELSE_TESTNET, coerce_nado_network
 from src.nadobro.core.async_utils import run_blocking_sdk
 from src.nadobro.core.ipv4_egress import websocket_connect_kwargs
 from src.nadobro.venue.ws_health import mark_connected, mark_disconnected, touch
@@ -81,7 +82,10 @@ def subscribe_url_for_network(network: str) -> str:
     the portfolio WS never went healthy and every poll fell back to the full
     REST read storm. (Audit 2026-05-29.)
     """
-    env = "prod" if str(network) == "mainnet" else "test"
+    # Legacy ``str(network) == "mainnet"`` → prod, else test (kept exactly);
+    # an Arcus scope raises VenueScopeError.
+    net = coerce_nado_network(network, STR_EXACT_ELSE_TESTNET, site="nado_ws.subscribe_url_for_network")
+    env = {"testnet": "test", "mainnet": "prod"}[net]
     return f"wss://gateway.{env}.nado.xyz/v1/subscribe"
 
 

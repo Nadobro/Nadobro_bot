@@ -20,6 +20,7 @@ from src.nadobro.users.invite_service import (
     _hash_code,
     normalize_code,
 )
+from src.nadobro.utils.venue_scope import STRIP_LOWER_ELSE_MAINNET, coerce_nado_network
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +56,11 @@ VALID_REFERRAL_NETWORKS = frozenset({"mainnet", "testnet"})
 
 
 def normalize_network(network: str | None) -> str:
-    value = str(network or "mainnet").strip().lower()
-    return value if value in VALID_REFERRAL_NETWORKS else "mainnet"
+    # Legacy ``str(network or "mainnet").strip().lower()`` kept if it is a valid
+    # referral network, else mainnet; an Arcus scope token raises VenueScopeError.
+    return coerce_nado_network(
+        network, STRIP_LOWER_ELSE_MAINNET, site="referral_service.normalize_network"
+    )
 
 
 def normalize_referral_payload(payload: str) -> str:

@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from src.nadobro.utils.env import env_float, env_int
+from src.nadobro.utils.venue_scope import EXACT_ELSE_TESTNET, coerce_nado_network
 from src.nadobro.config import (
     NADO_TESTNET_ARCHIVE,
     NADO_MAINNET_ARCHIVE,
@@ -172,7 +173,10 @@ def _get_session() -> requests.Session:
 
 
 def archive_url_for_network(network: str) -> str:
-    return NADO_MAINNET_ARCHIVE if network == "mainnet" else NADO_TESTNET_ARCHIVE
+    # Legacy ``network == "mainnet"`` → mainnet, else testnet (kept exactly);
+    # an Arcus scope raises VenueScopeError.
+    net = coerce_nado_network(network, EXACT_ELSE_TESTNET, site="nado_archive.archive_url_for_network")
+    return {"testnet": NADO_TESTNET_ARCHIVE, "mainnet": NADO_MAINNET_ARCHIVE}[net]
 
 
 def archive_rewards_url_for_network(network: str) -> str:
@@ -180,7 +184,10 @@ def archive_rewards_url_for_network(network: str) -> str:
     (:func:`archive_url_for_network`). The ``ink_airdrop`` allocation query is
     served here; posting it to the indexer ``/v1`` returns HTTP 422 "unknown
     variant `ink_airdrop`" because the indexer's request enum has no such variant."""
-    return NADO_MAINNET_ARCHIVE_REWARDS if network == "mainnet" else NADO_TESTNET_ARCHIVE_REWARDS
+    net = coerce_nado_network(
+        network, EXACT_ELSE_TESTNET, site="nado_archive.archive_rewards_url_for_network"
+    )
+    return {"testnet": NADO_TESTNET_ARCHIVE_REWARDS, "mainnet": NADO_MAINNET_ARCHIVE_REWARDS}[net]
 
 
 def _from_x18(value) -> float:

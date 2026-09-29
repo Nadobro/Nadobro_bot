@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from src.nadobro.utils.env import env_float, env_int
+from src.nadobro.utils.venue_scope import EXACT_ELSE_TESTNET, coerce_nado_network
 from src.nadobro.models.database import (
     get_bot_state,
     get_vault_deposit_watch,
@@ -206,7 +207,12 @@ def get_user_vault_snapshot(telegram_id: int) -> dict:
     # this load-bearing query ran after nlp_locked_balances it landed on a
     # drained bucket, throttled, and the old code booked the failure as
     # "mintable = $0" → a depositable user saw 🔒 Margin in use (2026-07-18).
-    nlp_product_id = int(client.resolve_nlp_product_id() or (11 if network == "mainnet" else 1))
+    # Legacy ``network == "mainnet"`` → pid 11, else 1 (kept exactly); an
+    # Arcus scope raises VenueScopeError.
+    nlp_default_pid = {"testnet": 1, "mainnet": 11}[
+        coerce_nado_network(network, EXACT_ELSE_TESTNET, site="nlp_vault_service.get_user_vault_snapshot")
+    ]
+    nlp_product_id = int(client.resolve_nlp_product_id() or nlp_default_pid)
     mintable = client.get_max_nlp_mintable(spot_leverage=False, product_id=nlp_product_id) or {}
     mintable_ok = bool(mintable.get("ok"))
     max_mintable = float(mintable.get("max_mintable_usdt0") or 0.0) if mintable_ok else 0.0

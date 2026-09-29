@@ -27,6 +27,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from src.nadobro.db import query_one
+from src.nadobro.utils.venue_scope import LOWER_ELSE_MAINNET, coerce_nado_network
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,9 @@ def _net_funding_usd(session: dict, network: str) -> Decimal:
     user_id = session.get("user_id")
     if product_id is None or started_at is None or user_id is None:
         return Decimal(0)
-    table = "funding_payments_testnet" if str(network).lower() == "testnet" else "funding_payments_mainnet"
+    table = "funding_payments_" + coerce_nado_network(
+        network, LOWER_ELSE_MAINNET, site="pnl_card_builder._net_funding_usd"
+    )
     try:
         row = query_one(
             f"""

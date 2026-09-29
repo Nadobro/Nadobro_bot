@@ -4,6 +4,7 @@ from typing import Optional
 
 
 from src.nadobro.utils.env import env_float, env_int
+from src.nadobro.utils.venue_scope import LOWER_ELSE_TESTNET, coerce_nado_network, guard_nado_scope
 from src.nadobro.config import (
     PRODUCTS,
     PRODUCT_MAX_LEVERAGE,
@@ -56,11 +57,15 @@ def _as_bool(value) -> bool:
 
 
 def _rest_url(network: str) -> str:
-    return NADO_MAINNET_REST if str(network).lower() == "mainnet" else NADO_TESTNET_REST
+    # Legacy ``str(network).lower() == "mainnet"`` → mainnet, else testnet
+    # (kept exactly); an Arcus scope raises VenueScopeError.
+    net = coerce_nado_network(network, LOWER_ELSE_TESTNET, site="product_catalog._rest_url")
+    return {"testnet": NADO_TESTNET_REST, "mainnet": NADO_MAINNET_REST}[net]
 
 
 def _archive_v2_url(network: str) -> str:
-    base = NADO_MAINNET_ARCHIVE if str(network).lower() == "mainnet" else NADO_TESTNET_ARCHIVE
+    net = coerce_nado_network(network, LOWER_ELSE_TESTNET, site="product_catalog._archive_v2_url")
+    base = {"testnet": NADO_TESTNET_ARCHIVE, "mainnet": NADO_MAINNET_ARCHIVE}[net]
     return str(base).rstrip("/").replace("/v1", "/v2")
 
 
@@ -417,7 +422,8 @@ def _build_dynamic_spot_catalog(network: str) -> Optional[dict]:
 
 
 def get_spot_catalog(network: str = "mainnet", refresh: bool = False) -> dict:
-    key = str(network or "mainnet").lower()
+    # Catalog root: an Arcus scope must never key (or fetch) a Nado catalog.
+    key = guard_nado_scope(str(network or "mainnet").lower(), site="product_catalog.get_spot_catalog")
     cached = _spot_catalog_cache.get(key)
     if not refresh and cached and (time.time() - cached["ts"] < _CATALOG_TTL_SECONDS):
         return cached["data"]
@@ -899,7 +905,8 @@ def _build_dn_pair_catalog(network: str, client=None) -> Optional[dict]:
 
 
 def get_catalog(network: str = "mainnet", client=None, refresh: bool = False) -> dict:
-    key = str(network or "mainnet").lower()
+    # Catalog root: an Arcus scope must never key (or fetch) a Nado catalog.
+    key = guard_nado_scope(str(network or "mainnet").lower(), site="product_catalog.get_catalog")
     if not refresh:
         cached = _catalog_cache.get(key)
         if cached and (time.time() - cached["ts"] < _CATALOG_TTL_SECONDS):
@@ -920,7 +927,8 @@ def get_catalog(network: str = "mainnet", client=None, refresh: bool = False) ->
 
 
 def get_dn_pair_catalog(network: str = "mainnet", client=None, refresh: bool = False) -> dict:
-    key = str(network or "mainnet").lower()
+    # Catalog root: an Arcus scope must never key (or fetch) a Nado catalog.
+    key = guard_nado_scope(str(network or "mainnet").lower(), site="product_catalog.get_dn_pair_catalog")
     if not refresh:
         cached = _dn_pair_cache.get(key)
         if cached and (time.time() - cached["ts"] < _CATALOG_TTL_SECONDS):
@@ -1328,7 +1336,8 @@ def spot_min_notional_cached(base: str, network: str = "mainnet") -> Optional[fl
     render is what hung taps for 30-60s once already). Returns None on a cache
     miss so the caller can omit the figure rather than show a guess.
     """
-    key = str(network or "mainnet").lower()
+    # Catalog root: an Arcus scope must never key (or fetch) a Nado catalog.
+    key = guard_nado_scope(str(network or "mainnet").lower(), site="product_catalog.spot_min_notional_cached")
     cached = _spot_catalog_cache.get(key)
     if not cached:
         return None
