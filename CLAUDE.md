@@ -18,7 +18,7 @@ Engine-v2 cutover and the 2026-07 services/ decomposition). Trust code over it.
   `PYTHON=.venv/bin/python bash scripts/self_review.sh` (`--full` adds the whole engine suite).
   Loop, audit agents, and triage protocol: `.claude/skills/self-review/SKILL.md` and
   `docs/self_review/SELF_REVIEW_WORKFLOW.md`.
-- Type-check (BLOCKING in CI — ci.yml runs it as a required job): `.venv/bin/python -m mypy src/nadobro/engine`.
+- Type-check (BLOCKING in CI — ci.yml runs it as a required job): `.venv/bin/python -m mypy src/nadobro/engine src/nadobro/venue/arcus`.
   `scripts/self_review.sh` fails on it too, so a green local gate matches CI.
 
 ## Layout (`src/nadobro/`) — see docs/ARCHITECTURE.md for the full map
@@ -34,7 +34,10 @@ Layering (enforced by `tests/lint/test_architecture_layers.py` — domain packag
   pool, raw-SQL CRUD. Tables are split per network (`trades_testnet`/`trades_mainnet`, `alerts_*`);
   `bot_state` is a KV store for settings/strategy state.
 - Integration: `venue/` (Nado REST/WS clients, fill `nado_sync`, archive indexer, product catalog,
-  `gateway_budget`), `market_data/` (CMC/HL/X/news/scanners), `llm/` (`llm_gateway.py` — ALL LLM
+  `gateway_budget`; `venue/arcus/` = the Arcus (second venue, perps) library — signing, clock,
+  IP/pool budgets, fail-closed catalog, async REST client, hub; imports only utils/config/
+  core.feature_flags, unwired until later Arcus phases, lints `tests/lint/test_arcus_*.py`),
+  `market_data/` (CMC/HL/X/news/scanners), `llm/` (`llm_gateway.py` — ALL LLM
   reasoning routes through here; NanoGPT, per-task model env vars — plus AI chat, knowledge/vector,
   HOWL/edge/signals/briefs, managed agent), `connectors/` (+ `provider_config.py`, source registry).
 - Domain: `engine/` — Engine v2: `controllers/` (grid_trading, dynamic_grid, market_making,

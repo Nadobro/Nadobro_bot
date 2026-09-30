@@ -61,12 +61,12 @@ if [[ -n "$CI_VENV" && -x "$CI_VENV/bin/python" ]]; then
 fi
 
 echo
-echo "==> [2/3] Type-check engine (mypy — BLOCKING, mirrors CI ci.yml)"
+echo "==> [2/3] Type-check engine + Arcus venue (mypy — BLOCKING, mirrors CI ci.yml)"
 if $PY -m mypy --version >/dev/null 2>&1; then
   # CI's ci.yml runs this exact command as a REQUIRED job, so the local gate
   # must fail on it too — treating it as advisory here let a type error reach
   # a PR and block the merge (2026-07-11).
-  $PY -m mypy src/nadobro/engine || rc=1
+  $PY -m mypy src/nadobro/engine src/nadobro/venue/arcus || rc=1
 else
   echo "   mypy not installed; skipping (CI still enforces it)"
 fi

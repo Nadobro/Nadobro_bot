@@ -97,3 +97,47 @@ def test_only_engine_adapter_may_import_nado_client() -> None:
         "Engine modules other than adapter/nado.py import the venue client "
         "(services/nado_client):\n  " + "\n  ".join(violations)
     )
+
+
+# --- Arcus venue (02 §9.3) -----------------------------------------------------
+# Inside the engine, only adapter/arcus.py (lands in P6a) may import the Arcus
+# venue library; the Arcus adapter never touches the Nado paths; the Nado adapter
+# never touches Arcus. All three spellings (absolute, package-relative, bare).
+ARCUS_ADAPTER = ENGINE_ROOT / "adapter" / "arcus.py"
+NADO_ADAPTER = ALLOWED_IMPORTER  # engine/adapter/nado.py
+ARCUS_VENUE_PREFIXES = ("src.nadobro.venue.arcus", "nadobro.venue.arcus", "venue.arcus")
+
+
+def test_only_arcus_adapter_may_import_venue_arcus_in_engine() -> None:
+    violations: list[str] = []
+    for py in ENGINE_ROOT.rglob("*.py"):
+        if py.resolve() == ARCUS_ADAPTER.resolve():
+            continue
+        if _imports_any(py, ARCUS_VENUE_PREFIXES):
+            violations.append(str(py.relative_to(REPO_ROOT)))
+    assert not violations, (
+        "Engine modules other than adapter/arcus.py import the Arcus venue library:\n  "
+        + "\n  ".join(violations)
+    )
+
+
+def test_arcus_adapter_does_not_import_nado_paths() -> None:
+    # Vacuously green until P6a creates engine/adapter/arcus.py.
+    if not ARCUS_ADAPTER.exists():
+        return
+    forbidden = ENGINE_VENUE_FORBIDDEN + FORBIDDEN_PREFIXES + (
+        "src.nadobro.engine.order_tags",
+        "src.nadobro.engine.order_lifecycle",
+        "engine.order_tags",
+        "engine.order_lifecycle",
+    )
+    assert not _imports_any(ARCUS_ADAPTER, forbidden), (
+        "engine/adapter/arcus.py imports a Nado-only path (nado_client / connectors.nado / "
+        "order_tags / order_lifecycle)"
+    )
+
+
+def test_nado_adapter_does_not_import_venue_arcus() -> None:
+    assert not _imports_any(NADO_ADAPTER, ARCUS_VENUE_PREFIXES), (
+        "engine/adapter/nado.py must not import the Arcus venue library"
+    )

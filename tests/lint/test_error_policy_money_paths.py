@@ -38,6 +38,17 @@ SERVICES_BASELINE: dict[str, int] = {
     "src/nadobro/core/crypto.py": 0,
     "src/nadobro/trading/execution_queue.py": 0,
     "src/nadobro/strategy/strategy_scheduler.py": 0,
+    # Arcus venue library (P2, 02 §9.4 / D14): born clean — keep at zero. Later
+    # phases add their own files when they create them.
+    "src/nadobro/venue/arcus/types.py": 0,
+    "src/nadobro/venue/arcus/errors.py": 0,
+    "src/nadobro/venue/arcus/signing.py": 0,
+    "src/nadobro/venue/arcus/clock.py": 0,
+    "src/nadobro/venue/arcus/budget.py": 0,
+    "src/nadobro/venue/arcus/parse.py": 0,
+    "src/nadobro/venue/arcus/catalog.py": 0,
+    "src/nadobro/venue/arcus/client.py": 0,
+    "src/nadobro/venue/arcus/hub.py": 0,
 }
 
 DEGRADE_OK_MARKER = "policy: degrade-ok"

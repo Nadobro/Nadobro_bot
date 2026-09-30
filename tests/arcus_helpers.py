@@ -5,8 +5,9 @@ Golden-vector constants are the ones of 02 §5.1: the seed is
 independently (cryptography 50.0.0). ``tests/`` is on ``sys.path`` via
 ``tests/conftest.py``, so test files ``import arcus_helpers``.
 
-``mock_client(...)`` (an ``ArcusClient`` over ``httpx.MockTransport``) is added
-by the client stage together with ``client.py``.
+``mock_client(routes)`` builds an ``ArcusClient`` over ``httpx.MockTransport``
+(no network) with fake clocks; it returns the client and the list of captured
+``httpx.Request`` objects.
 """
 
 from __future__ import annotations
@@ -14,8 +15,14 @@ from __future__ import annotations
 import json
 import pathlib
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable, Union
 
+import httpx
+
+from src.nadobro.venue.arcus.budget import IpBudget
+from src.nadobro.venue.arcus.client import ArcusClient
+from src.nadobro.venue.arcus.clock import ArcusClock
+from src.nadobro.venue.arcus.signing import Ed25519Signer, make_auth
 from src.nadobro.venue.arcus.types import ArcusAccountRef
 
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "arcus"
@@ -120,3 +127,95 @@ class FakeTimeNs:
         if self.script:
             return self.script.pop(0)
         return self.now
+
+
+class FakeSleep:
+    """Injectable ``asyncio.sleep``: records each wait and advances a FakeMono."""
+
+    def __init__(self, mono: FakeMono) -> None:
+        self.mono = mono
+        self.calls: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        self.mono.advance(seconds)
+
+
+REST_BASE = "https://api.testnet.arcus.xyz"
+
+Route = Union[httpx.Response, Callable[[httpx.Request], httpx.Response], list]
+
+
+def resp(status: int, body: Any = None, *, headers: dict[str, str] | None = None, content: bytes | None = None) -> httpx.Response:
+    """A response template (copied per request by ``mock_client``)."""
+    if content is not None:
+        return httpx.Response(status, content=content, headers=headers)
+    if body is None:
+        return httpx.Response(status, headers=headers)
+    return httpx.Response(status, json=body, headers=headers)
+
+
+def fixture_resp(status: int, name: str, *, headers: dict[str, str] | None = None) -> httpx.Response:
+    """A response whose body is the raw bytes of a fixture file."""
+    raw = (FIXTURES / name).read_bytes()
+    merged = {"Content-Type": "application/json", **(headers or {})}
+    return httpx.Response(status, content=raw, headers=merged)
+
+
+def _fresh(template: httpx.Response) -> httpx.Response:
+    return httpx.Response(template.status_code, headers=template.headers, content=template.content)
+
+
+def mock_client(
+    routes: dict[tuple[str, str], Route],
+    *,
+    mono: FakeMono | None = None,
+    time_ns: FakeTimeNs | None = None,
+    clock: ArcusClock | None = None,
+    budget: IpBudget | None = None,
+    clock_max_age_s: Callable[[], float] | None = None,
+    network: str = "testnet",
+) -> tuple[ArcusClient, list[httpx.Request]]:
+    """An ``ArcusClient`` whose HTTP goes to ``routes`` (keyed by (METHOD, path)).
+
+    A route is a response template (copied per call), a callable
+    ``request -> Response`` (it may raise ``httpx`` errors), or a list of those
+    served in order (the last one repeats). An unknown route fails the test.
+    """
+    calls: list[httpx.Request] = []
+    queues: dict[tuple[str, str], Any] = {
+        key: (list(value) if isinstance(value, list) else value) for key, value in routes.items()
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        key = (request.method, request.url.path)
+        if key not in queues:
+            raise AssertionError(f"unexpected request {key}")
+        route = queues[key]
+        if isinstance(route, list):
+            if not route:
+                raise AssertionError(f"no response left for {key}")
+            route = route.pop(0) if len(route) > 1 else route[0]
+        if isinstance(route, httpx.Response):
+            return _fresh(route)
+        return route(request)
+
+    mono = mono or FakeMono()
+    clock = clock or ArcusClock(network, time_ns=time_ns or FakeTimeNs(), monotonic=mono)
+    budget = budget or IpBudget(network, clock=mono, sleep=FakeSleep(mono))
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=REST_BASE)
+    client = ArcusClient(
+        network,
+        clock=clock,
+        ip_budget=budget,
+        http=http,
+        clock_max_age_s=clock_max_age_s or (lambda: 900.0),
+        monotonic=mono,
+    )
+    return client, calls
+
+
+def golden_auth(ref: ArcusAccountRef = REF) -> Any:
+    """The golden-vector auth (seed ``bytes(range(32))``)."""
+    return make_auth(ref, Ed25519Signer.from_seed_hex(SEED))
