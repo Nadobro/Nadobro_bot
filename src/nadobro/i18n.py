@@ -4946,6 +4946,72 @@ _TEXTS = {
         "ru": "• Arcus в закрытой бете. Привяжите аккаунт Arcus в разделе 👛 Кошелёк Arcus на главной Arcus.",
         "ko": "• Arcus는 비공개 베타입니다. Arcus 홈의 👛 Arcus 지갑에서 Arcus 계정을 연결하세요.",
     },
+    # --- Arcus P3b review fixes: a paste whose message could NOT be deleted never claims a
+    # deletion (SEC-1); a flow that timed out mid-check / a too-late cancel (R2-2, SEC-2);
+    # the no-action key reminders when the user cannot renew in the bot (SEC-3 / R2-1). ---
+    "🔐 Key received. Checking it on Arcus — this can take up to a minute.": {
+        "zh": "🔐 已收到密钥。正在 Arcus 上检查 — 最多可能需要一分钟。",
+        "fr": "🔐 Clé reçue. Vérification sur Arcus — cela peut prendre jusqu'à une minute.",
+        "ar": "🔐 تم استلام المفتاح. جارٍ التحقق منه على Arcus — قد يستغرق ذلك حتى دقيقة.",
+        "ru": "🔐 Ключ получен. Проверяю его на Arcus — это может занять до минуты.",
+        "ko": "🔐 키를 받았습니다. Arcus에서 확인 중입니다 — 최대 1분 정도 걸릴 수 있습니다.",
+    },
+    "🔐 Key received. I'll check it as soon as the address check finishes.": {
+        "zh": "🔐 已收到密钥。地址检查完成后我会立即检查它。",
+        "fr": "🔐 Clé reçue. Je la vérifierai dès que la vérification de l'adresse sera terminée.",
+        "ar": "🔐 تم استلام المفتاح. سأتحقق منه فور انتهاء التحقق من العنوان.",
+        "ru": "🔐 Ключ получен. Я проверю его, как только завершится проверка адреса.",
+        "ko": "🔐 키를 받았습니다. 주소 확인이 끝나는 대로 확인하겠습니다.",
+    },
+    "🔐 Send your wallet address first, then paste the key again.": {
+        "zh": "🔐 请先发送您的钱包地址，然后再次粘贴密钥。",
+        "fr": "🔐 Envoyez d'abord l'adresse de votre portefeuille, puis collez à nouveau la clé.",
+        "ar": "🔐 أرسل عنوان محفظتك أولاً، ثم الصق المفتاح مرة أخرى.",
+        "ru": "🔐 Сначала отправьте адрес кошелька, затем вставьте ключ снова.",
+        "ko": "🔐 먼저 지갑 주소를 보낸 다음 키를 다시 붙여 넣으세요.",
+    },
+    "🔐 That message looked like a secret key. Only paste a key when linking asks for it.": {
+        "zh": "🔐 那条消息看起来像密钥。只有在关联流程要求时才粘贴密钥。",
+        "fr": "🔐 Ce message ressemblait à une clé secrète. Ne collez une clé que lorsque l'association le demande.",
+        "ar": "🔐 بدت تلك الرسالة كمفتاح سري. لا تلصق مفتاحاً إلا عندما تطلبه عملية الربط.",
+        "ru": "🔐 Это сообщение похоже на секретный ключ. Вставляйте ключ только тогда, когда его запрашивает привязка.",
+        "ko": "🔐 그 메시지는 비밀 키처럼 보입니다. 연결 과정에서 요청할 때만 키를 붙여 넣으세요.",
+    },
+    "I stored nothing. Nadobro needs the API Signing Key from the Arcus app, never your wallet key.": {
+        "zh": "我未保存任何内容。Nadobro 需要的是 Arcus 应用中的 API Signing Key，绝不是您的钱包私钥。",
+        "fr": "Je n'ai rien enregistré. Nadobro a besoin de l'API Signing Key de l'application Arcus, jamais de la clé de votre portefeuille.",
+        "ar": "لم أحفظ شيئاً. يحتاج Nadobro إلى API Signing Key من تطبيق Arcus، وليس مفتاح محفظتك أبداً.",
+        "ru": "Я ничего не сохранил. Nadobro нужен API Signing Key из приложения Arcus, а не ключ кошелька.",
+        "ko": "아무것도 저장하지 않았습니다. Nadobro에는 지갑 키가 아니라 Arcus 앱의 API Signing Key가 필요합니다.",
+    },
+    "This link request timed out before the check finished. Nothing was stored. Tap Start over.": {
+        "zh": "此关联请求在检查完成前已超时。未保存任何内容。请点击 重新开始。",
+        "fr": "Cette demande d'association a expiré avant la fin de la vérification. Rien n'a été enregistré. Touchez Recommencer.",
+        "ar": "انتهت مهلة طلب الربط هذا قبل انتهاء التحقق. لم يُحفظ أي شيء. اضغط البدء من جديد.",
+        "ru": "Время запроса на привязку истекло до завершения проверки. Ничего не сохранено. Нажмите «Начать заново».",
+        "ko": "확인이 끝나기 전에 이 연결 요청의 시간이 초과되었습니다. 아무것도 저장되지 않았습니다. 처음부터 다시를 누르세요.",
+    },
+    "Too late to cancel: your key had already passed the checks and was saved. Tap Unlink if you don't want Nadobro to use it.": {
+        "zh": "取消已来不及：您的密钥已通过检查并已保存。如果您不希望 Nadobro 使用它，请点击 解除关联。",
+        "fr": "Trop tard pour annuler : votre clé avait déjà passé les vérifications et a été enregistrée. Touchez Dissocier si vous ne voulez pas que Nadobro l'utilise.",
+        "ar": "فات أوان الإلغاء: اجتاز مفتاحك عمليات التحقق بالفعل وتم حفظه. اضغط إلغاء الربط إذا كنت لا تريد أن يستخدمه Nadobro.",
+        "ru": "Отменить уже нельзя: ваш ключ прошёл проверки и был сохранён. Нажмите «Отвязать», если не хотите, чтобы Nadobro его использовал.",
+        "ko": "취소하기에는 너무 늦었습니다: 키가 이미 확인을 통과해 저장되었습니다. Nadobro가 사용하지 않기를 원하면 연결 해제를 누르세요.",
+    },
+    "⏳ Your Arcus {network} key <code>{key_name}</code> expires on {until}. Renewing Arcus keys isn't available in Nadobro right now, so there is nothing to paste here. Arcus strategies stop {stop_hours} hours before a key expires and never restart on their own.": {
+        "zh": "⏳ 您的 Arcus {network} 密钥 <code>{key_name}</code> 将于 {until} 过期。Nadobro 目前无法续期 Arcus 密钥，因此这里无需粘贴任何内容。Arcus 策略会在密钥过期前 {stop_hours} 小时停止，且不会自动重新启动。",
+        "fr": "⏳ Votre clé Arcus {network} <code>{key_name}</code> expire le {until}. Le renouvellement des clés Arcus n'est pas disponible dans Nadobro pour le moment, il n'y a donc rien à coller ici. Les stratégies Arcus s'arrêtent {stop_hours} heures avant l'expiration d'une clé et ne redémarrent jamais d'elles-mêmes.",
+        "ar": "⏳ تنتهي صلاحية مفتاح Arcus {network} الخاص بك <code>{key_name}</code> في {until}. تجديد مفاتيح Arcus غير متاح في Nadobro حالياً، لذا لا حاجة للصق أي شيء هنا. تتوقف استراتيجيات Arcus قبل {stop_hours} ساعة من انتهاء صلاحية المفتاح ولا يُعاد تشغيلها تلقائياً أبداً.",
+        "ru": "⏳ Ваш ключ Arcus {network} <code>{key_name}</code> истекает {until}. Продление ключей Arcus сейчас недоступно в Nadobro, поэтому вставлять сюда ничего не нужно. Стратегии Arcus останавливаются за {stop_hours} ч до истечения ключа и никогда не перезапускаются сами.",
+        "ko": "⏳ Arcus {network} 키 <code>{key_name}</code>이(가) {until}에 만료됩니다. 지금은 Nadobro에서 Arcus 키를 갱신할 수 없으므로 여기에 붙여 넣을 것이 없습니다. Arcus 전략은 키 만료 {stop_hours}시간 전에 중지되며 절대 자동으로 다시 시작되지 않습니다.",
+    },
+    "⚠️ Your Arcus {network} key <code>{key_name}</code> has expired. Linking Arcus keys isn't available in Nadobro right now, so there is nothing to paste here.": {
+        "zh": "⚠️ 您的 Arcus {network} 密钥 <code>{key_name}</code> 已过期。Nadobro 目前无法关联 Arcus 密钥，因此这里无需粘贴任何内容。",
+        "fr": "⚠️ Votre clé Arcus {network} <code>{key_name}</code> a expiré. L'association de clés Arcus n'est pas disponible dans Nadobro pour le moment, il n'y a donc rien à coller ici.",
+        "ar": "⚠️ انتهت صلاحية مفتاح Arcus {network} الخاص بك <code>{key_name}</code>. ربط مفاتيح Arcus غير متاح في Nadobro حالياً، لذا لا حاجة للصق أي شيء هنا.",
+        "ru": "⚠️ Срок действия вашего ключа Arcus {network} <code>{key_name}</code> истёк. Привязка ключей Arcus сейчас недоступна в Nadobro, поэтому вставлять сюда ничего не нужно.",
+        "ko": "⚠️ Arcus {network} 키 <code>{key_name}</code>이(가) 만료되었습니다. 지금은 Nadobro에서 Arcus 키를 연결할 수 없으므로 여기에 붙여 넣을 것이 없습니다.",
+    },
 }
 
 

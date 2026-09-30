@@ -145,6 +145,19 @@ TEXT_KR_EXPIRED: Final = (
     "⚠️ Your Arcus {network} key <code>{key_name}</code> has expired. "
     "Paste a new key in 👛 Arcus wallet to trade on Arcus again."
 )
+# The same notices when the user CANNOT renew in the bot right now (Arcus flag off —
+# /venue and the ax: callbacks are then not registered — or the user is outside the
+# cohort, or the key is on a closed mainnet): no paste instruction, no buttons
+# (SEC-3 / R2-1). A button would fall through to Nado's catch-all router.
+TEXT_KR_PAUSED: Final = (
+    "⏳ Your Arcus {network} key <code>{key_name}</code> expires on {until}. Renewing Arcus keys "
+    "isn't available in Nadobro right now, so there is nothing to paste here. Arcus strategies stop "
+    "{stop_hours} hours before a key expires and never restart on their own."
+)
+TEXT_KR_EXPIRED_PAUSED: Final = (
+    "⚠️ Your Arcus {network} key <code>{key_name}</code> has expired. Linking Arcus keys isn't "
+    "available in Nadobro right now, so there is nothing to paste here."
+)
 
 LABEL_RENEW_KEY: Final = "🔄 Renew key"
 LABEL_VENUE_KEY: Final = "🔁 Venue"  # == handlers.venue_handler.LABEL_VENUE (P1; pinned by a test)
@@ -168,6 +181,8 @@ I18N_TEXT_KEYS: Final[tuple[str, ...]] = (
     TEXT_KR_DAYS,
     TEXT_KR_HOURS,
     TEXT_KR_EXPIRED,
+    TEXT_KR_PAUSED,
+    TEXT_KR_EXPIRED_PAUSED,
 )
 I18N_LABEL_KEYS: Final[tuple[str, ...]] = (LABEL_RENEW_KEY,)
 
@@ -343,6 +358,9 @@ _DIAG_CACHE: dict[tuple[int, str], tuple[float, KeyDiagnosis]] = {}
 _POSTURE: dict[str, EgressPosture] = {}
 _LISTENERS: list[Callable[[int, str, str], object]] = []
 _SHIELDED: set[asyncio.Task[Any]] = set()
+# The link generation whose key the last successful store saved, per (user, network)
+# (read by settle_cancelled_link; written under the store lock).
+_STORED_GEN: dict[tuple[int, str], int] = {}
 
 
 def _services(network: str) -> hub.ArcusServices:
@@ -376,6 +394,7 @@ def _reset_for_tests() -> None:
     _POSTURE.clear()
     _LISTENERS.clear()
     _SHIELDED.clear()
+    _STORED_GEN.clear()
 
 
 def _net(network: object) -> ArcusNet:
@@ -482,6 +501,17 @@ def cancel_link(user_id: int, network: str) -> None:
     drop the stash."""
     begin_generation(user_id, network)
     drop_stash(user_id, network)
+
+
+async def settle_cancelled_link(user_id: int, network: str, generation: int) -> bool:
+    """Call right AFTER :func:`cancel_link` for a flow at ``generation``. A store
+    that was already past its generation check holds the store lock and cannot
+    be stopped any more (its upsert thread has started); wait for it, then say
+    whether it stored THIS generation's key. True means the key WAS saved: the
+    caller must not claim "nothing was stored" (SEC-2)."""
+    k = _key(user_id, network)
+    async with _store_lock(k):
+        return _STORED_GEN.get(k) == generation
 
 
 # --- key names (03 §7.4) -------------------------------------------------------------------------
@@ -918,6 +948,7 @@ async def _store_and_announce(
                 return out(LinkResult.STORE_FAILED)  # stash kept
             _drop_if_current(k, stash)
             _DIAG_CACHE.pop(k, None)  # a cached diagnosis described the previous key
+            _STORED_GEN[k] = pending.generation
         renewed = prev is not None and prev.status in _ACTIVE_LIKE and prev.address == addr
         await _audit(
             user_id,
@@ -1086,17 +1117,24 @@ async def unlink(user_id: int, network: str) -> Literal["unlinked", "refused_run
     """Forget the stored key for (user, network): the ciphertext is wiped and the
     address released. Refused while Arcus automation (or its cleanup) runs, so
     nothing is stranded. Flags are not checked (reducing exposure must always
-    work). A DB error on the first read PROPAGATES."""
+    work). A DB error on the first read PROPAGATES.
+
+    Any link flow in progress ends FIRST, before any await (generation bumped,
+    stash dropped): a store that has not reached its check ends SUPERSEDED. A
+    store already past it holds the store lock, so the read and the wipe below
+    wait for it and then remove what it wrote — an explicit unlink can never be
+    undone by a renewal that was in flight (SEC-2 / R2-4)."""
     net = _net(network)
-    row = await run_blocking_db(_creds.get_credential, user_id, net)
-    if row is None or row.status == "unlinked":
-        cancel_link(user_id, net)
-        return "none"
-    if await automation_active(user_id):
-        return "refused_running"
-    changed = await run_blocking_db(_creds.mark_status, user_id, net, "unlinked", wipe_secret=True)
+    k = _key(user_id, net)
     cancel_link(user_id, net)
-    _DIAG_CACHE.pop(_key(user_id, net), None)
+    async with _store_lock(k):
+        row = await run_blocking_db(_creds.get_credential, user_id, net)
+        if row is None or row.status == "unlinked":
+            return "none"
+        if await automation_active(user_id):
+            return "refused_running"
+        changed = await run_blocking_db(_creds.mark_status, user_id, net, "unlinked", wipe_secret=True)
+        _DIAG_CACHE.pop(k, None)
     if not changed:
         return "none"
     await _audit(user_id, "arcus_unlinked", f"{net} {addr_short(row.address)}")
@@ -1138,13 +1176,23 @@ class KeyNoticeState:
     pub: str
     sent: frozenset[int]
     expired_notified: bool
+    # The validUntil these notices were for. Arcus lets the owner re-register the
+    # SAME public key with a new validUntil (docs create-api-key "Public-key
+    # ownership": "renew / rewrite validUntil is allowed"), so the pubkey alone
+    # cannot tell a renewed validity from the old one.
+    until: int = 0
 
     @classmethod
-    def load(cls, raw: object, pub: str) -> KeyNoticeState:
-        """The stored state for THIS key; a missing, malformed or other-key
-        (renewed) state is a fresh one."""
-        fresh = cls(pub=pub, sent=frozenset(), expired_notified=False)
+    def load(cls, raw: object, pub: str, valid_until_ms: int) -> KeyNoticeState:
+        """The stored state for THIS key AND validity; a missing, malformed,
+        other-key (renewed) or other-validity (validUntil rewritten) state is a
+        fresh one. A state without ``until`` is fresh too: more reminders, never
+        fewer."""
+        fresh = cls(pub=pub, sent=frozenset(), expired_notified=False, until=valid_until_ms)
         if not isinstance(raw, dict) or raw.get("pub") != pub:
+            return fresh
+        until = raw.get("until")
+        if isinstance(until, bool) or not isinstance(until, int) or until != valid_until_ms:
             return fresh
         sent = raw.get("sent")
         expired = raw.get("expired_notified")
@@ -1152,10 +1200,15 @@ class KeyNoticeState:
             return fresh
         if any(isinstance(d, bool) or not isinstance(d, int) for d in sent):
             return fresh
-        return cls(pub=pub, sent=frozenset(sent), expired_notified=expired)
+        return cls(pub=pub, sent=frozenset(sent), expired_notified=expired, until=valid_until_ms)
 
     def dump(self) -> dict[str, Any]:
-        return {"pub": self.pub, "sent": sorted(self.sent), "expired_notified": self.expired_notified}
+        return {
+            "pub": self.pub,
+            "until": self.until,
+            "sent": sorted(self.sent),
+            "expired_notified": self.expired_notified,
+        }
 
 
 @dataclass(frozen=True)
@@ -1211,7 +1264,7 @@ async def collect_key_notices(*, now_ms: int | None = None) -> list[KeyNotice]:
             continue
         try:
             raw = await run_blocking_db(_creds.get_key_notice_state, row.user_id, row.network)
-            state = KeyNoticeState.load(raw, row.api_public_key)
+            state = KeyNoticeState.load(raw, row.api_public_key, int(row.valid_until_ms))
             decision = decide_key_notices(
                 valid_until_ms=row.valid_until_ms, now_ms=now, state=state, reminder_days=days
             )
@@ -1248,17 +1301,32 @@ async def collect_key_notices(*, now_ms: int | None = None) -> list[KeyNotice]:
     return notices
 
 
+def renewal_reachable(user_id: int, network: str) -> bool:
+    """May this user start a (re)link on ``network`` in the bot right now: the
+    cohort flag, plus ``ARCUS_MAINNET_ENABLED`` for mainnet. The reminder sender
+    ALSO needs the venue UI (/venue + the ``venue:``/``ax:`` callbacks) to be
+    registered in this process before it tells the user to act."""
+    return _link_allowed(user_id, _net(network))
+
+
 def build_key_notice(
-    n: KeyNotice, *, now_ms: int, stop_hours: float
+    n: KeyNotice, *, now_ms: int, stop_hours: float, actionable: bool
 ) -> tuple[str, dict[str, str], tuple[tuple[str, str], ...]]:
     """Pure: (English text key, RAW format values, ((label, callback_data), …)).
-    The caller escapes the values, localizes the key and labels, builds the markup."""
+    The caller escapes the values, localizes the key and labels, builds the markup.
+
+    ``actionable``: the user can renew in the bot right now (the venue UI is
+    registered AND :func:`renewal_reachable`). Otherwise the notice still goes
+    out — an expiry must reach a stranded user — but with a text that asks for
+    nothing and NO buttons (SEC-3 / R2-1)."""
     fmt: dict[str, str] = {
         "network": parse_arcus_net(n.network).upper(),
         "key_name": n.key_name or "—",
         "until": _until_text(n.valid_until_ms),
         "stop_hours": f"{stop_hours:g}",
     }
+    if not actionable:
+        return (TEXT_KR_EXPIRED_PAUSED if n.expired_now else TEXT_KR_PAUSED), fmt, ()
     remaining = n.valid_until_ms - now_ms
     if n.expired_now:
         key = TEXT_KR_EXPIRED
@@ -1337,6 +1405,8 @@ __all__ = [
     "TEXT_KR_DAYS",
     "TEXT_KR_HOURS",
     "TEXT_KR_EXPIRED",
+    "TEXT_KR_PAUSED",
+    "TEXT_KR_EXPIRED_PAUSED",
     "LABEL_RENEW_KEY",
     "LABEL_VENUE_KEY",
     "I18N_TEXT_KEYS",
@@ -1357,6 +1427,7 @@ __all__ = [
     "begin_generation",
     "current_generation",
     "cancel_link",
+    "settle_cancelled_link",
     "has_stash",
     "drop_stash",
     "new_key_name",
@@ -1372,6 +1443,7 @@ __all__ = [
     "register_credential_listener",
     "decide_key_notices",
     "collect_key_notices",
+    "renewal_reachable",
     "build_key_notice",
     "note_egress_posture",
     "egress_posture",

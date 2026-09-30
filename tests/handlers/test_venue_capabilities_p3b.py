@@ -41,6 +41,7 @@ def test_the_nado_revoke_path_stays_never_gate():
 
 @pytest.mark.parametrize("data", [
     "ax:wallet", "ax:link:start", "ax:link:attest", "ax:link:same", "ax:link:check", "ax:link:cancel",
+    "ax:link:key",  # [✅ Check key] (R2-5)
     "ax:unlink", "ax:unlink:confirm:testnet", "ax:unlink:confirm:mainnet", "ax:mode", "ax:mode:testnet",
     "ax:mode:mainnet", "ax:refresh",
 ])
@@ -72,13 +73,13 @@ def test_the_venue_handler_routes_every_p3b_callback(monkeypatch):
     monkeypatch.setattr(vh, "read_active_venue", arcus_view)
     monkeypatch.setattr(awh, "handle", wallet)
     monkeypatch.setattr(apf, "handle", home)
-    for data in ("ax:wallet", "ax:link:start", "ax:unlink", "ax:unlink:confirm:testnet", "ax:mode",
+    for data in ("ax:wallet", "ax:link:start", "ax:link:key", "ax:unlink", "ax:unlink:confirm:testnet", "ax:mode",
                  "ax:mode:mainnet", "ax:refresh", "ax:bogus"):
         update = SimpleNamespace(callback_query=SimpleNamespace(data=data, message=None),
                                  effective_user=SimpleNamespace(id=UID))
         asyncio.run(vh.handle_venue_callback(update, SimpleNamespace(user_data={})))
     assert routed == [
-        ("wallet", "ax:wallet"), ("wallet", "ax:link:start"), ("wallet", "ax:unlink"),
+        ("wallet", "ax:wallet"), ("wallet", "ax:link:start"), ("wallet", "ax:link:key"), ("wallet", "ax:unlink"),
         ("wallet", "ax:unlink:confirm:testnet"), ("wallet", "ax:mode"), ("wallet", "ax:mode:mainnet"),
         ("home", "ax:refresh"),
     ]

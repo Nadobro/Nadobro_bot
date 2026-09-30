@@ -22,6 +22,12 @@ Shapes (build_decisions D-11 names hex and PEM shapes; 03 §5):
 A 40-hex address (with or without ``0x``) is never secret-shaped. A 64-hex
 transaction hash is (an accepted cost: the interceptor is Arcus-scoped only).
 
+Invisible Unicode format characters (category ``Cf``: zero-width space, the
+LRM / RLM / Arabic-letter bidi marks, word joiner, BOM, …) are dropped before
+any hex test: a paste from an RTL keyboard or a rich-text app can carry them
+around or inside a key, and they must neither hide a key from the interceptor
+nor turn a valid key into "not a key".
+
 :func:`is_wallet_private_key` tells a pasted 32-byte value apart from the
 secp256k1 WALLET key of the linked address. The address derivation is injected
 (``core.crypto.derive_address_from_private_key`` in the bot), which keeps this
@@ -31,6 +37,7 @@ module free of third-party imports.
 from __future__ import annotations
 
 import re
+import unicodedata
 from enum import Enum
 from typing import Callable, Final
 
@@ -60,13 +67,22 @@ _KEY_HEX_LEN: Final = 64
 _ADDRESS_RE: Final = re.compile(r"^0x[0-9a-f]{40}$")
 
 
+def _drop_format_chars(text: str) -> str:
+    """``text`` without Unicode format characters (category ``Cf``). ASCII has
+    none, so the common case costs one ``isascii`` check."""
+    if text.isascii():
+        return text
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+
+
 def collapse_secret_candidate(text: str) -> str:
-    """``text`` with ALL whitespace removed (keys wrapped across lines or split
-    into groups by a UI) and surrounding quote / backtick / angle-bracket
-    characters stripped. Non-str input gives ``""``."""
+    """``text`` with ALL whitespace and every invisible format character
+    (category ``Cf``) removed (keys wrapped across lines, split into groups by a
+    UI, or carrying bidi marks / zero-width spaces), and surrounding quote /
+    backtick / angle-bracket characters stripped. Non-str input gives ``""``."""
     if not isinstance(text, str):
         return ""
-    return "".join(text.split()).strip(_WRAP)
+    return _drop_format_chars("".join(text.split())).strip(_WRAP)
 
 
 def _hex_body(collapsed: str) -> str:
@@ -90,7 +106,8 @@ def classify_secret_text(text: object) -> SecretShape | None:
                 return SecretShape.HEX_KEY
             if len(body) > _KEY_HEX_LEN:
                 return SecretShape.HEX_OTHER
-    if _HEX_RUN_RE.search(scan):
+    # A zero-width character inside a key must not split its hex run.
+    if _HEX_RUN_RE.search(_drop_format_chars(scan)):
         return SecretShape.HEX_EMBEDDED
     return None
 

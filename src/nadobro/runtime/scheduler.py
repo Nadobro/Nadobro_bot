@@ -1230,8 +1230,15 @@ def get_scheduler_diagnostics() -> dict:
 # is P5's ArcusScheduler (run-state aware). Imports stay function-local and never
 # reach handlers/ or strategy/ (the reminder texts live in users.arcus_link_service).
 
+# Are /venue and the venue:/ax: callbacks registered in this process (main.py's boot
+# decision, handlers/venue_gate.should_register_venue_gate)? Without them a reminder's
+# [🔄 Renew key]/[🔁 Venue] would fall through to Nado's catch-all router and its
+# "paste it in 👛 Arcus wallet" could not be followed, so the notice goes out in its
+# no-action form (SEC-3 / R2-1). False until start_arcus_jobs says otherwise.
+_arcus_venue_ui = False
 
-def start_arcus_jobs(*, arcus_state_present: bool) -> bool:
+
+def start_arcus_jobs(*, arcus_state_present: bool, venue_ui: bool = False) -> bool:
     """Register the Arcus jobs on the (already started) scheduler.
 
     - key lifecycle (reminders T-14/7/2/1 d + active->expired), every
@@ -1239,10 +1246,16 @@ def start_arcus_jobs(*, arcus_state_present: bool) -> bool:
       credentials exist (expiry notices must reach a stranded user with the flag off);
     - egress compliance probe (boot + every 6 h): only when ``ARCUS_ENABLED``.
 
+    ``venue_ui``: the venue gate (with /venue and the ``venue:``/``ax:``
+    callbacks) was registered at boot. Only then may a reminder carry buttons
+    and a paste instruction.
+
     Returns True iff any job was added. Never resumes or starts anything.
     """
+    global _arcus_venue_ui
     from src.nadobro.core.feature_flags import arcus_enabled, arcus_key_lifecycle_interval_s
 
+    _arcus_venue_ui = bool(venue_ui)
     long_tick = {"misfire_grace_time": 120, "coalesce": True, "max_instances": 1}
     enabled = arcus_enabled()
     added: list[str] = []
@@ -1261,7 +1274,8 @@ def start_arcus_jobs(*, arcus_state_present: bool) -> bool:
         added += ["arcus_egress_boot", "arcus_egress_check"]
     if added:
         logger.info(
-            "Arcus jobs registered: %s (flag=%s, credentials=%s)", ", ".join(added), enabled, arcus_state_present
+            "Arcus jobs registered: %s (flag=%s, credentials=%s, venue_ui=%s)",
+            ", ".join(added), enabled, arcus_state_present, _arcus_venue_ui,
         )
     return bool(added)
 
@@ -1283,7 +1297,9 @@ async def tick_arcus_key_lifecycle() -> None:
 
 
 async def _send_arcus_key_notice(notice) -> None:
-    """One localized HTML reminder with [🔄 Renew key][🔁 Venue]. Never raises."""
+    """One localized HTML reminder with [🔄 Renew key][🔁 Venue] — or, when the
+    user cannot renew in the bot right now (venue UI not registered, outside the
+    cohort, closed mainnet), the no-action text without buttons. Never raises."""
     try:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         from telegram.constants import ParseMode
@@ -1303,16 +1319,24 @@ async def _send_arcus_key_notice(notice) -> None:
         except Exception as exc:  # the reminder still goes out, in English
             logger.warning("arcus key notice language read failed uid=%s (%s)", notice.user_id, type(exc).__name__)
             lang = "en"
+        actionable = _arcus_venue_ui and link_service.renewal_reachable(notice.user_id, notice.network)
         key, fmt, buttons = link_service.build_key_notice(
-            notice, now_ms=time.time_ns() // 1_000_000, stop_hours=arcus_key_expiry_stop_hours()
+            notice,
+            now_ms=time.time_ns() // 1_000_000,
+            stop_hours=arcus_key_expiry_stop_hours(),
+            actionable=actionable,
         )
         values = {name: esc(value) for name, value in fmt.items()}
         try:
             text = localize_text(key, lang).format(**values)
         except (KeyError, IndexError, ValueError):
             text = key.format(**values)
-        markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(localize_label(label, lang), callback_data=data) for label, data in buttons]]
+        markup = (
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton(localize_label(label, lang), callback_data=data) for label, data in buttons]]
+            )
+            if buttons
+            else None
         )
         try:
             await _bot_app.bot.send_message(

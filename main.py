@@ -490,6 +490,8 @@ async def run_bot():
     # Arcus P3b: key reminders + the active->expired transition (and, with
     # ARCUS_ENABLED, the egress compliance probe). With the flag off and no Arcus
     # credentials nothing is registered and no Arcus venue module is imported.
+    # venue_ui: a reminder may carry [Renew key]/[Venue] and a paste instruction
+    # only when the gate (with /venue and the venue:/ax: callbacks) is registered.
     # The boot check lives in users/venue_service (never users/arcus_credentials,
     # which imports the Arcus library). Nothing here starts or resumes anything.
     from src.nadobro.runtime.scheduler import start_arcus_jobs
@@ -502,7 +504,7 @@ async def run_bot():
         logger.warning("arcus credential check failed (%s); registering the Arcus key job anyway", type(exc).__name__)
         arcus_state = True  # reminders and the expired transition must not silently vanish
     try:
-        start_arcus_jobs(arcus_state_present=bool(arcus_state))
+        start_arcus_jobs(arcus_state_present=bool(arcus_state), venue_ui=bool(venue_gate_enabled))
     except Exception as exc:  # policy: degrade-ok(Arcus reminders only; Nado boot must never fail on them)
         logger.warning("Arcus jobs failed to register (%s)", type(exc).__name__)
     from src.nadobro.core.feature_flags import strategy_scheduler_enabled

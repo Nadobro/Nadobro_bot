@@ -91,15 +91,19 @@ from src.nadobro.handlers.arcus_ui import (
     TEXT_IN_TITLE,
     TEXT_IN_WARN,
     TEXT_K_ACK,
+    TEXT_K_ACK_KEPT,
     TEXT_K_ADDRESS_FIRST,
+    TEXT_K_ADDRESS_FIRST_KEPT,
     TEXT_K_ATTEST_FIRST,
     TEXT_K_CHECKING,
     TEXT_K_CHECKING_STORED,
     TEXT_K_GENERIC_DELETED,
     TEXT_K_GENERIC_EXPOSED,
+    TEXT_K_GENERIC_KEPT,
     TEXT_K_NOT_DELETED,
     TEXT_K_STILL_CHECKING,
     TEXT_K_WAIT_ADDRESS,
+    TEXT_K_WAIT_ADDRESS_KEPT,
     TEXT_K_WAIT_PASTE,
     TEXT_M_BODY,
     TEXT_M_LINE,
@@ -121,7 +125,9 @@ from src.nadobro.handlers.arcus_ui import (
     TEXT_PR_NOT_ELIGIBLE_MAINNET,
     TEXT_PR_OK,
     TEXT_PR_TAKEN,
+    TEXT_R_CANCEL_TOO_LATE,
     TEXT_R_CANCELLED,
+    TEXT_R_FLOW_EXPIRED,
     TEXT_R_INACTIVE,
     TEXT_R_INVALID,
     TEXT_R_LINKED,
@@ -137,6 +143,7 @@ from src.nadobro.handlers.arcus_ui import (
     TEXT_R_TOO_SOON,
     TEXT_R_WALLET_KEY,
     TEXT_R_WALLET_KEY_2,
+    TEXT_R_WALLET_KEY_2_KEPT,
     TEXT_R_WITHDRAW,
     TEXT_R_WRONG_SUB,
     TEXT_U_BODY,
@@ -200,6 +207,10 @@ CB_LINK_START = "ax:link:start"
 CB_LINK_ATTEST = "ax:link:attest"
 CB_LINK_SAME = "ax:link:same"
 CB_LINK_CHECK = "ax:link:check"
+# [✅ Check key]: always diagnoses the STORED key, also while a link / renewal flow is
+# pending ([🔗 Continue linking] is ax:link:check; R2-5). Under ax:link:, so P1's
+# venue_handler routing already reaches handle().
+CB_KEY_CHECK = "ax:link:key"
 CB_LINK_CANCEL = "ax:link:cancel"
 CB_UNLINK = "ax:unlink"
 CB_UNLINK_CONFIRM_PREFIX = "ax:unlink:confirm:"  # + the network the card showed
@@ -334,6 +345,27 @@ def _ttl_expiry() -> float:
     return _mono() + arcus_link_pending_ttl_s()
 
 
+def _raw_pending(context: Any) -> LinkPending | None:
+    """The stored flow entry as it is — expired or not, nothing popped."""
+    user_data = getattr(context, "user_data", None)
+    raw = user_data.get(PENDING_KEY) if user_data is not None else None
+    return raw if isinstance(raw, LinkPending) else None
+
+
+def _timed_out(context: Any, pending: LinkPending) -> bool:
+    """The flow ``pending`` belongs to is still the stored one, but its TTL ran
+    out while a background check was running: it timed out — it was not
+    superseded or cancelled. Read BEFORE :func:`link_pending` (which pops an
+    expired entry). A result for a timed-out flow is still reported (R2-2)."""
+    raw = _raw_pending(context)
+    return (
+        raw is not None
+        and raw.network == pending.network
+        and raw.generation == pending.generation
+        and _mono() >= raw.expires_mono
+    )
+
+
 # --- background tasks (off the per-user lock; 03 §9.3) ---------------------------------------
 
 class _Target:
@@ -342,14 +374,19 @@ class _Target:
     (a later tap elsewhere makes the result arrive as a NEW message instead of
     clobbering the newer screen). ``[🔄 Check again]`` on another card while a
     task runs re-points the target there, so "the result will appear here" is
-    true."""
+    true.
 
-    __slots__ = ("message", "chat_id", "seq")
+    ``not_deleted``: the pasted message this task reports on could NOT be
+    deleted. Every report on this target then ends with the "delete it yourself"
+    warning and no report claims a deletion (SEC-1); re-pointing keeps it."""
 
-    def __init__(self, message: Any, chat_id: int, seq: int | None) -> None:
+    __slots__ = ("message", "chat_id", "seq", "not_deleted")
+
+    def __init__(self, message: Any, chat_id: int, seq: int | None, *, not_deleted: bool = False) -> None:
         self.message = message
         self.chat_id = int(chat_id)
         self.seq = seq
+        self.not_deleted = bool(not_deleted)
 
 
 _TASKS: dict[tuple[int, str, str], asyncio.Task[Any]] = {}
@@ -414,6 +451,9 @@ async def _task_language(uid: int) -> str:
 
 
 async def _report(context: Any, target: _Target, text: str, markup: InlineKeyboardMarkup | None) -> None:
+    if target.not_deleted:
+        # The key is still visible in the chat: an edit must never drop the warning (SEC-1).
+        text = text + "\n\n" + tr(TEXT_K_NOT_DELETED)
     shown = await arcus_ui.edit_or_send(
         getattr(context, "bot", None), target.message, target.chat_id, text, markup, seq=target.seq,
     )
@@ -544,7 +584,7 @@ async def render_wallet(
         else:
             rows.append([(LABEL_RENEW if linked else LABEL_LINK, CB_LINK_START)])
     if linked:
-        rows.append([(LABEL_CHECK_KEY, CB_LINK_CHECK), (LABEL_UNLINK, CB_UNLINK)])
+        rows.append([(LABEL_CHECK_KEY, CB_KEY_CHECK), (LABEL_UNLINK, CB_UNLINK)])
     rows.append([(LABEL_NETWORK, CB_MODE), (LABEL_HOME, CB_HOME)])
     return "\n".join(lines), arcus_ui.kb(rows)
 
@@ -703,8 +743,22 @@ def _retry_markup() -> InlineKeyboardMarkup:
     return arcus_ui.kb([[(LABEL_CHECK_AGAIN, CB_LINK_CHECK), (LABEL_CANCEL, CB_LINK_CANCEL)]])
 
 
-def _terminal_markup() -> InlineKeyboardMarkup:
-    return arcus_ui.kb([[(LABEL_START_OVER, CB_LINK_START), (LABEL_HOME, CB_HOME)]])
+def _terminal_markup(*, mainnet_refusal: bool = False) -> InlineKeyboardMarkup:
+    rows = [[(LABEL_START_OVER, CB_LINK_START), (LABEL_HOME, CB_HOME)]]
+    if mainnet_refusal:
+        # TEXT_PR_NOT_ELIGIBLE_MAINNET sends the user to Arcus testnet via 🌐 Network (R2-6).
+        rows.append([(LABEL_NETWORK, CB_MODE)])
+    return arcus_ui.kb(rows)
+
+
+def _pending_expired_markup() -> InlineKeyboardMarkup:
+    """TEXT_R_PENDING_EXPIRED: "Paste the key again, or tap Link to start over" (R2-6)."""
+    return arcus_ui.kb([[(LABEL_LINK, CB_LINK_START), (LABEL_CANCEL, CB_LINK_CANCEL)]])
+
+
+def _no_pending_markup() -> InlineKeyboardMarkup:
+    """TEXT_R_NO_PENDING: "Tap Link Arcus account to start" (R2-6)."""
+    return arcus_ui.kb([[(LABEL_LINK, CB_LINK_START), (LABEL_HOME, CB_HOME)]])
 
 
 def _step_card(pending: LinkPending) -> tuple[str, InlineKeyboardMarkup]:
@@ -726,7 +780,8 @@ def _not_allowed_text(uid: int, network: str) -> str:
     return TEXT_ARCUS_NOT_ALLOWED
 
 
-def _outcome_lines(uid: int, out: LinkOutcome) -> list[str]:
+def _outcome_lines(uid: int, out: LinkOutcome, *, deleted: bool = True) -> list[str]:
+    """``deleted``: the pasted message was deleted (False: no line may claim it was)."""
     result = out.result
     if result in (LinkResult.LINKED, LinkResult.LINKED_NO_ACTIVITY):
         row = out.row
@@ -756,7 +811,7 @@ def _outcome_lines(uid: int, out: LinkOutcome) -> list[str]:
                 lines.append(tr(TEXT_R_SHORT_VALIDITY, days=esc(str(left))))
         return lines
     if result is LinkResult.WALLET_KEY_REFUSED:
-        return [tr(TEXT_R_WALLET_KEY), tr(TEXT_R_WALLET_KEY_2)]
+        return [tr(TEXT_R_WALLET_KEY), tr(TEXT_R_WALLET_KEY_2 if deleted else TEXT_R_WALLET_KEY_2_KEPT)]
     if result is LinkResult.KEY_NOT_FOUND:
         return [tr(TEXT_R_NOT_FOUND, network=esc(_net_or_dash(out.network)), address=esc(out.address or "—"))]
     if result is LinkResult.NOT_WHITELISTED:
@@ -769,17 +824,25 @@ def _outcome_lines(uid: int, out: LinkOutcome) -> list[str]:
     return [tr(_SIMPLE_RESULT_TEXT.get(result, TEXT_BUSY))]
 
 
-def _outcome_markup(kind: str, in_arcus: bool) -> InlineKeyboardMarkup:
+def _outcome_markup(kind: str, in_arcus: bool, out: LinkOutcome | None = None) -> InlineKeyboardMarkup:
+    """The result's buttons. With ``out``, a text that names a button gets that
+    button (R2-6)."""
     if not in_arcus:
         # A user who pasted from the Nado view: the gate would deny ax:* there.
         return arcus_ui.kb([[(LABEL_VENUE, CB_VENUE_VIEW)]])
+    result = out.result if out is not None else None
     if kind == _LINKED:
         return arcus_ui.kb([[(LABEL_WALLET, CB_WALLET), (LABEL_HOME, CB_HOME)]])
     if kind == _RETRY:
         return _retry_markup()
+    if result is LinkResult.PENDING_EXPIRED:
+        return _pending_expired_markup()
     if kind == _PASTE:
         return _cancel_only()
-    return _terminal_markup()
+    if result is LinkResult.NO_PENDING:
+        return _no_pending_markup()
+    mainnet_refusal = result is LinkResult.NOT_WHITELISTED and out is not None and _is_mainnet(out.network)
+    return _terminal_markup(mainnet_refusal=mainnet_refusal)
 
 
 def _apply_result(context: Any, uid: int, pending: LinkPending, kind: str) -> None:
@@ -795,8 +858,24 @@ def _apply_result(context: Any, uid: int, pending: LinkPending, kind: str) -> No
 
 async def _render_outcome(context: Any, uid: int, out: LinkOutcome, target: _Target, kind: str) -> None:
     in_arcus = await _viewing_arcus(uid)
-    text = "\n".join(_outcome_lines(uid, out))
-    await _report(context, target, text, _outcome_markup(kind, in_arcus))
+    text = "\n".join(_outcome_lines(uid, out, deleted=not target.not_deleted))
+    await _report(context, target, text, _outcome_markup(kind, in_arcus, out))
+
+
+async def _report_timed_out(context: Any, uid: int, out: LinkOutcome | None, target: _Target) -> None:
+    """The flow timed out while this check ran (R2-2): never silent. A key that
+    WAS stored is still announced as linked; anything else says the request
+    timed out (nothing was stored) with [🔗 Start over]."""
+    in_arcus = await _viewing_arcus(uid)
+    if out is not None and _RESULT_KIND.get(out.result) == _LINKED:
+        text = "\n".join(_outcome_lines(uid, out, deleted=not target.not_deleted))
+        markup = _outcome_markup(_LINKED, in_arcus, out)
+    else:
+        text, markup = tr(TEXT_R_FLOW_EXPIRED), _outcome_markup(_TERMINAL, in_arcus)
+    logger.info(
+        "arcus link flow timed out mid-check uid=%s -> %s", uid, out.result.value if out is not None else "-",
+    )
+    await _report(context, target, text, markup)
 
 
 async def _verify_body(context: Any, uid: int, pending: LinkPending, target: _Target) -> None:
@@ -810,10 +889,13 @@ async def _verify_body(context: Any, uid: int, pending: LinkPending, target: _Ta
     except Exception as exc:  # policy: degrade-ok(shown as busy with [Check again]; the stash is kept)
         logger.warning("arcus verify failed uid=%s (%s)", uid, type(exc).__name__)
         out = LinkOutcome(result=LinkResult.BUSY, network=pending.network, address=pending.address)
-    if out.result is LinkResult.SUPERSEDED:
+    timed_out = _timed_out(context, pending)  # before link_pending pops an expired entry
+    if out.result is LinkResult.SUPERSEDED and not timed_out:
         return
     current = link_pending(context, uid)
     if current is None or current.generation != pending.generation:
+        if timed_out:
+            await _report_timed_out(context, uid, out, target)
         return
     kind = _RESULT_KIND[out.result]
     _apply_result(context, uid, current, kind)
@@ -862,17 +944,33 @@ async def _after_intake(
 ) -> None:
     if intake.status == "superseded":
         return  # the flow moved on while sealing: like a generation mismatch
+    timed_out = _timed_out(context, pending)  # before link_pending pops an expired entry
     current = link_pending(context, uid)
-    if current is None or current.generation != pending.generation:
-        return
+    live = current is not None and current.generation == pending.generation
     status = intake.status
+    if status == "wallet_key":
+        # A WALLET private key was pasted: the "move your funds" warning is shown even
+        # when the flow ended meanwhile — it must never be dropped. The step stays.
+        in_arcus = await _viewing_arcus(uid)
+        out = LinkOutcome(result=LinkResult.WALLET_KEY_REFUSED, network=pending.network, address=pending.address)
+        logger.info("arcus key intake uid=%s net=%s -> %s", uid, pending.network, status)
+        text = "\n".join(_outcome_lines(uid, out, deleted=not target.not_deleted))
+        await _report(context, target, text, _outcome_markup(_PASTE if live else _TERMINAL, in_arcus, out))
+        return
+    if not live:
+        if timed_out:
+            await _report_timed_out(context, uid, None, target)
+        return
+    assert current is not None
     if status == "stashed":
         if current.step == "address_check":
             # The precheck task starts the verification when the address passes.
-            await _report(context, target, tr(TEXT_K_WAIT_ADDRESS), _cancel_only())
+            wait = TEXT_K_WAIT_ADDRESS_KEPT if target.not_deleted else TEXT_K_WAIT_ADDRESS
+            await _report(context, target, tr(wait), _cancel_only())
         elif current.step in ("key", "verifying"):
             # The precheck may have finished while intake ran (and found no stash).
-            current = replace(current, step="verifying")
+            # A paste is activity: a fresh TTL, so the flow cannot time out mid-check (R2-2).
+            current = replace(current, step="verifying", expires_mono=_ttl_expiry())
             set_link_pending(context, current)
             await _verify_body(context, uid, current, target)
         return
@@ -881,16 +979,14 @@ async def _after_intake(
     if status == "pem":
         await _report(context, target, tr(TEXT_R_PEM), _outcome_markup(_PASTE, in_arcus))
         return
-    if status == "wallet_key":
-        result = LinkResult.WALLET_KEY_REFUSED
-    elif status == "error":
+    if status == "error":
         result = LinkResult.STORE_FAILED
     else:  # invalid / no_address
         result = LinkResult.INVALID_KEY
     out = LinkOutcome(result=result, network=pending.network, address=pending.address)
     logger.info("arcus key intake uid=%s net=%s -> %s", uid, pending.network, status)
-    text = "\n".join(_outcome_lines(uid, out))
-    await _report(context, target, text, _outcome_markup(_RESULT_KIND[result], in_arcus))
+    text = "\n".join(_outcome_lines(uid, out, deleted=not target.not_deleted))
+    await _report(context, target, text, _outcome_markup(_RESULT_KIND[result], in_arcus, out))
 
 
 # --- address precheck -----------------------------------------------------------------------
@@ -951,8 +1047,11 @@ async def _precheck_body(context: Any, uid: int, pending: LinkPending, target: _
     except Exception as exc:  # policy: degrade-ok(an unknown answer is BUSY, never "not eligible")
         logger.warning("arcus precheck failed uid=%s (%s)", uid, type(exc).__name__)
         check = AddressCheck.BUSY
+    timed_out = _timed_out(context, pending)  # before link_pending pops an expired entry
     current = link_pending(context, uid)
     if current is None or current.generation != pending.generation:
+        if timed_out:
+            await _report(context, target, tr(TEXT_R_FLOW_EXPIRED), _terminal_markup())
         return
     # No await between the re-read above and the pending update below.
     if check in _ELIGIBLE and pre is not None:
@@ -991,9 +1090,10 @@ async def _precheck_body(context: Any, uid: int, pending: LinkPending, target: _
     if check is not AddressCheck.INVALID:
         await _audit(uid, "arcus_link_refused", f"{network} {check.value}")
     lines = [tr(_PRECHECK_REFUSAL_TEXT.get(check, TEXT_BUSY))]
-    if check is AddressCheck.NOT_WHITELISTED and _is_mainnet(network):
+    mainnet_refusal = check is AddressCheck.NOT_WHITELISTED and _is_mainnet(network)
+    if mainnet_refusal:
         lines.append(tr(TEXT_PR_NOT_ELIGIBLE_MAINNET))
-    await _report(context, target, "\n".join(lines), _terminal_markup())
+    await _report(context, target, "\n".join(lines), _terminal_markup(mainnet_refusal=mainnet_refusal))
 
 
 # --- stored-key diagnosis ([✅ Check key] with no link in progress) -------------------------
@@ -1036,9 +1136,10 @@ async def handle(query: Any, data: str, telegram_id: int, context: Any) -> None:
         await _link_same(query, uid, context)
     elif data == CB_LINK_CHECK:
         await _link_check(query, uid, context)
+    elif data == CB_KEY_CHECK:
+        await _key_check(query, uid, context)
     elif data == CB_LINK_CANCEL:
-        clear_link_pending(context, uid)
-        await _show(query, uid, *await render_wallet(uid, context=context, note=tr(TEXT_R_CANCELLED)))
+        await _link_cancel(query, uid, context)
     elif data == CB_UNLINK:
         await _show(query, uid, *await render_unlink(uid))
     elif data.startswith(CB_UNLINK_CONFIRM_PREFIX):
@@ -1150,7 +1251,8 @@ async def _still_checking(
 
 
 async def _link_check(query: Any, uid: int, context: Any) -> None:
-    """[🔄 Check again] / [🔗 Continue linking] / [✅ Check key] (03 §9.7)."""
+    """[🔄 Check again] / [🔗 Continue linking] (03 §9.7). With no flow in
+    progress (a stale card) it checks the stored key, like [✅ Check key]."""
     pending = link_pending(context, uid)
     chat_id = _chat_id(query, uid)
     if pending is not None:
@@ -1161,14 +1263,17 @@ async def _link_check(query: Any, uid: int, context: Any) -> None:
             return
         if pending.step == "address_check":
             # Re-run the precheck on the same address. The generation is NOT bumped,
-            # so a key pasted during the check keeps its stash.
+            # so a key pasted during the check keeps its stash. A tap is activity: a
+            # fresh TTL, so the flow cannot time out mid-check (R2-2).
+            pending = replace(pending, expires_mono=_ttl_expiry())
+            set_link_pending(context, pending)
             await _show(query, uid, *_checking_address_card(pending))
             target = _Target(getattr(query, "message", None), chat_id, arcus_ui.current_seq(chat_id))
             _start_task(uid, network, "precheck", _precheck_and_report(context, uid, pending, target), target)
             return
         if pending.step in ("key", "verifying"):
             if link_service.has_stash(uid, network, pending.generation):
-                current = replace(pending, step="verifying")
+                current = replace(pending, step="verifying", expires_mono=_ttl_expiry())
                 set_link_pending(context, current)
                 await _show(query, uid, tr(TEXT_K_CHECKING), _cancel_only())
                 target = _Target(getattr(query, "message", None), chat_id, arcus_ui.current_seq(chat_id))
@@ -1176,11 +1281,18 @@ async def _link_check(query: Any, uid: int, context: Any) -> None:
                 return
             if pending.step == "verifying":
                 set_link_pending(context, replace(pending, step="key"))
-                await _show(query, uid, tr(TEXT_R_PENDING_EXPIRED), _cancel_only())
+                await _show(query, uid, tr(TEXT_R_PENDING_EXPIRED), _pending_expired_markup())
                 return
         # attest / address / key without a pasted key: that step's card again.
         await _show(query, uid, *_step_card(pending))
         return
+    await _key_check(query, uid, context)
+
+
+async def _key_check(query: Any, uid: int, context: Any) -> None:
+    """[✅ Check key]: diagnose the STORED key in the background — also while a
+    link or renewal flow is pending (R2-5); the flow is left untouched."""
+    chat_id = _chat_id(query, uid)
     try:
         network = await run_blocking_db(venue_service.get_arcus_network_mode, uid)
         row = await run_blocking_db(creds.get_credential, uid, network)
@@ -1203,6 +1315,22 @@ def _wallet_only() -> InlineKeyboardMarkup:
     return arcus_ui.kb([[(LABEL_WALLET, CB_WALLET)]])
 
 
+async def _link_cancel(query: Any, uid: int, context: Any) -> None:
+    """[❌ Cancel]: end the flow. A store that was already past its checks when
+    the tap came cannot be stopped (its upsert has started): wait for it, and
+    never say "Nothing was stored" when it saved the key (SEC-2). With no flow
+    to cancel (a stale card), the wallet card claims nothing."""
+    raw = _raw_pending(context)  # also an expired entry: its store may still be finishing
+    clear_link_pending(context, uid)
+    note: str | None = None
+    if raw is not None:
+        stored = await link_service.settle_cancelled_link(uid, raw.network, raw.generation)
+        note = tr(TEXT_R_CANCEL_TOO_LATE if stored else TEXT_R_CANCELLED)
+        if stored:
+            logger.info("arcus link cancel came too late uid=%s net=%s: the key was stored", uid, raw.network)
+    await _show(query, uid, *await render_wallet(uid, context=context, note=note))
+
+
 async def _unlink_confirm(query: Any, uid: int, context: Any, suffix: str) -> None:
     try:
         card_net = parse_arcus_net(suffix)
@@ -1219,15 +1347,24 @@ async def _unlink_confirm(query: Any, uid: int, context: Any, suffix: str) -> No
         await _show(query, uid, *await render_unlink(uid))
         return
     try:
-        previous = await run_blocking_db(creds.get_credential, uid, network)
         outcome = await link_service.unlink(uid, network)
     except Exception as exc:  # policy: degrade-ok(the card says it could not check; nothing half-done is claimed)
         logger.warning("arcus unlink failed uid=%s (%s)", uid, type(exc).__name__)
+        # unlink() ended any link flow in progress before its read failed.
+        clear_link_pending(context, uid)
         await _show(query, uid, *await render_unlink(uid, note=tr(TEXT_DB_BUSY)))
         return
     clear_link_pending(context, uid)
     if outcome == "unlinked":
-        key_name = previous.api_wallet_name if previous is not None else None
+        # Read AFTER the unlink: a renewal that finished just before it replaced the
+        # key, and the note must name the key that was actually removed (the unlinked
+        # row keeps its name; only the ciphertext is wiped).
+        try:
+            wiped = await run_blocking_db(creds.get_credential, uid, network)
+        except Exception as exc:  # policy: degrade-ok(the unlink succeeded; the note names no key)
+            logger.warning("arcus unlink: key name unreadable uid=%s (%s)", uid, type(exc).__name__)
+            wiped = None
+        key_name = wiped.api_wallet_name if wiped is not None else None
         note = tr(TEXT_U_DONE, key_name=esc(key_name or "—"))
         await _show(query, uid, *await render_wallet(uid, context=context, note=note))
     elif outcome == "refused_running":
@@ -1330,14 +1467,24 @@ async def arcus_secret_interceptor(update: Any, context: Any, *, shape: SecretSh
     try:
         chat_id = int(getattr(message, "chat_id", None) or uid)
         bot = getattr(context, "bot", None)
+        # A message that could not be deleted (older than 48 h, API error, …) is still
+        # in the chat: no reply may claim it was deleted, every reply carries the
+        # "delete it yourself" warning, and so does every later result of this paste
+        # (the task's _Target, SEC-1).
         not_deleted = "" if deleted else "\n\n" + tr(TEXT_K_NOT_DELETED)
         pending = link_pending(context, uid)
         if pending is not None and pending.step in _PASTE_STEPS and shape is SecretShape.HEX_KEY:
+            # A paste is activity: the flow gets a fresh TTL before the (up to 90 s)
+            # check starts, so it cannot time out mid-check (R2-2). The stash inherits
+            # it. No await between the read above and this write.
+            pending = replace(pending, expires_mono=_ttl_expiry())
+            set_link_pending(context, pending)
             text = getattr(message, "text", None)
             if text is None:
                 text = getattr(message, "caption", None)
-            ack = await arcus_ui.send_html(bot, chat_id, tr(TEXT_K_ACK) + not_deleted, None)
-            target = _Target(ack, chat_id, None)
+            ack_text = tr(TEXT_K_ACK if deleted else TEXT_K_ACK_KEPT) + not_deleted
+            ack = await arcus_ui.send_html(bot, chat_id, ack_text, None)
+            target = _Target(ack, chat_id, None, not_deleted=not deleted)
             # One "verify" slot per (user, network): a newer paste cancels the older one.
             _start_task(uid, pending.network, "verify", _process_paste(context, uid, pending, text, target), target)
             text = None
@@ -1345,9 +1492,11 @@ async def arcus_secret_interceptor(update: Any, context: Any, *, shape: SecretSh
             key = TEXT_R_PEM if shape is SecretShape.PEM else TEXT_R_INVALID
             await arcus_ui.send_html(bot, chat_id, tr(key) + not_deleted, _cancel_only())
         elif pending is not None:  # attest / address
-            await arcus_ui.send_html(bot, chat_id, tr(TEXT_K_ADDRESS_FIRST) + not_deleted, None)
+            first = TEXT_K_ADDRESS_FIRST if deleted else TEXT_K_ADDRESS_FIRST_KEPT
+            await arcus_ui.send_html(bot, chat_id, tr(first) + not_deleted, None)
         else:  # the Arcus view (or an unreadable venue) with no link in progress
-            warning = tr(TEXT_K_GENERIC_DELETED) + "\n" + tr(TEXT_K_GENERIC_EXPOSED) + not_deleted
+            generic = TEXT_K_GENERIC_DELETED if deleted else TEXT_K_GENERIC_KEPT
+            warning = tr(generic) + "\n" + tr(TEXT_K_GENERIC_EXPOSED) + not_deleted
             await arcus_ui.send_html(bot, chat_id, warning, None)
     except Exception as exc:  # policy: degrade-ok(message already deleted; the gate stops the update)
         logger.warning("arcus interceptor error uid=%s (%s)", uid, type(exc).__name__)

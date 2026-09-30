@@ -553,7 +553,7 @@ def get_key_notice_state(user_id: int, network: ArcusNet) -> dict[str, Any] | No
 
 
 def save_key_notice_state(user_id: int, network: ArcusNet, state: dict[str, Any]) -> None:
-    """Persist the reminder state ``{"pub", "sent", "expired_notified"}``. The
+    """Persist the reminder state ``{"pub", "until", "sent", "expired_notified"}``. The
     public key is public (docs: "API keys are Ed25519 public keys and are not
     secret"); no secret is ever stored here."""
     if not isinstance(state, dict):

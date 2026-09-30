@@ -57,7 +57,11 @@ def test_both_allowed_updates_sites_use_the_helper():
 def test_arcus_jobs_start_after_the_scheduler_with_a_safe_boot_check():
     run_bot = _fn("run_bot")
     src = ast.unparse(run_bot)
-    assert src.index("start_scheduler()") < src.index("start_arcus_jobs(arcus_state_present=bool(arcus_state))")
+    # SEC-3 / R2-1: the reminder job learns whether the venue UI (gate + /venue +
+    # venue:/ax: callbacks) is registered, so a reminder never offers dead buttons.
+    call = "start_arcus_jobs(arcus_state_present=bool(arcus_state), venue_ui=bool(venue_gate_enabled))"
+    assert src.index("start_scheduler()") < src.index(call)
+    assert src.index("venue_gate_enabled = await run_blocking_db(should_register_venue_gate)") < src.index(call)
     assert "arcus_state = await run_blocking_db(has_live_arcus_credentials)" in src
     assert "arcus_state = True" in src  # a DB error still registers the reminder job
     imports = [

@@ -65,6 +65,50 @@ def test_embedded_hex_run():
     assert extract_hex_key(text) is None
 
 
+# SEC-4: invisible format characters (category Cf) around or inside a key. They are
+# not whitespace to str.split(), so without the fix a trailing ZWSP made the key
+# HEX_EMBEDDED ("not a key") and a mid-key one hid it from the interceptor (None).
+_CF = {
+    "zwsp": "\u200b",
+    "lrm": "\u200e",
+    "rlm": "\u200f",
+    "arabic_letter_mark": "\u061c",
+    "word_joiner": "\u2060",
+    "bom": "\ufeff",
+    "soft_hyphen": "\u00ad",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_CF))
+@pytest.mark.parametrize("where", ["leading", "trailing", "mid", "every_8", "around_0x"])
+def test_format_characters_never_hide_or_break_a_key(name, where):
+    cf = _CF[name]
+    text = {
+        "leading": cf + RFC_SEED,
+        "trailing": RFC_SEED + cf,
+        "mid": RFC_SEED[:31] + cf + RFC_SEED[31:],
+        "every_8": cf.join(_groups(RFC_SEED, 8)),
+        "around_0x": cf + "0x" + cf + RFC_SEED + cf,
+    }[where]
+    assert classify_secret_text(text) is SecretShape.HEX_KEY
+    assert extract_hex_key(text) == RFC_SEED
+    assert collapse_secret_candidate(text) in (RFC_SEED, "0x" + RFC_SEED)
+
+
+@pytest.mark.parametrize("name", sorted(_CF))
+def test_a_format_character_inside_an_embedded_key_is_still_seen(name):
+    cf = _CF[name]
+    text = f"my key is {RFC_SEED[:20]}{cf}{RFC_SEED[20:]} thanks"
+    assert classify_secret_text(text) is SecretShape.HEX_EMBEDDED
+    assert extract_hex_key(text) is None
+
+
+def test_format_characters_alone_or_in_plain_text_are_not_secrets():
+    assert classify_secret_text("\u200b\u200e\ufeff") is None
+    assert classify_secret_text("\u200fمرحبا long BTC 10x\u200e") is None
+    assert classify_secret_text("0x" + ADDR40 + "\u200e") is None  # still an address, never a secret
+
+
 def test_addresses_are_never_secret_shaped():
     assert classify_secret_text(ADDR40) is None
     assert classify_secret_text("0x" + ADDR40) is None
@@ -133,4 +177,4 @@ def test_module_is_a_stdlib_only_leaf():
             imported.add(node.module)
     nadobro = {m for m in imported if m.startswith("src.nadobro")}
     assert all(m.startswith("src.nadobro.utils") for m in nadobro), nadobro
-    assert imported <= {"__future__", "re", "enum", "typing"}, imported
+    assert imported <= {"__future__", "re", "enum", "typing", "unicodedata"}, imported

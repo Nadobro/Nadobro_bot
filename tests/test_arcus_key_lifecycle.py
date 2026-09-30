@@ -92,15 +92,56 @@ def test_no_expiry_key_never_notifies():
 
 
 def test_state_load_resets_on_renewal_and_garbage():
-    stored = {"pub": RFC_PUB, "sent": [14, 7], "expired_notified": False}
-    assert KeyNoticeState.load(stored, RFC_PUB).sent == {14, 7}
-    assert KeyNoticeState.load(stored, "ab" * 32) == _fresh("ab" * 32)  # a renewed key starts fresh
-    for garbage in (None, [], "x", {"pub": RFC_PUB, "sent": "14", "expired_notified": False},
-                    {"pub": RFC_PUB, "sent": [14], "expired_notified": "no"},
-                    {"pub": RFC_PUB, "sent": [True], "expired_notified": False}):
-        assert KeyNoticeState.load(garbage, RFC_PUB) == _fresh()
-    assert KeyNoticeState(RFC_PUB, frozenset({7, 14}), True).dump() == {
-        "pub": RFC_PUB, "sent": [7, 14], "expired_notified": True}
+    until = NOW_MS + 30 * DAY_MS
+    stored = {"pub": RFC_PUB, "until": until, "sent": [14, 7], "expired_notified": False}
+    assert KeyNoticeState.load(stored, RFC_PUB, until).sent == {14, 7}
+    fresh = KeyNoticeState("ab" * 32, frozenset(), False, until)
+    assert KeyNoticeState.load(stored, "ab" * 32, until) == fresh  # a renewed key starts fresh
+    for garbage in (None, [], "x", {"pub": RFC_PUB, "until": until, "sent": "14", "expired_notified": False},
+                    {"pub": RFC_PUB, "until": until, "sent": [14], "expired_notified": "no"},
+                    {"pub": RFC_PUB, "until": until, "sent": [True], "expired_notified": False},
+                    {"pub": RFC_PUB, "until": True, "sent": [14], "expired_notified": False},
+                    {"pub": RFC_PUB, "until": str(until), "sent": [14], "expired_notified": False},
+                    {"pub": RFC_PUB, "sent": [14], "expired_notified": False}):  # no "until": more, never fewer
+        assert KeyNoticeState.load(garbage, RFC_PUB, until) == KeyNoticeState(RFC_PUB, frozenset(), False, until)
+    assert KeyNoticeState(RFC_PUB, frozenset({7, 14}), True, until).dump() == {
+        "pub": RFC_PUB, "until": until, "sent": [7, 14], "expired_notified": True}
+
+
+def test_a_rewritten_valid_until_of_the_same_key_starts_fresh():
+    # R2-3: docs create-api-key "Public-key ownership": re-registering a key the caller
+    # already owns (renew / rewrite validUntil) is allowed — same pub, new validity.
+    first = NOW_MS + 10 * DAY_MS
+    state = KeyNoticeState.load(None, RFC_PUB, first)
+    for remaining in (13 * DAY_MS, 6 * DAY_MS, DAY_MS + HOUR_MS, 20 * HOUR_MS, -1):
+        now = first - remaining
+        state = decide_key_notices(valid_until_ms=first, now_ms=now, state=state, reminder_days=DAYS).new_state
+    assert state.sent == set(DAYS) and state.expired_notified
+    stored = state.dump()
+    renewed = first + 180 * DAY_MS
+    assert KeyNoticeState.load(stored, RFC_PUB, first) == state  # the old validity: nothing again
+    fresh = KeyNoticeState.load(stored, RFC_PUB, renewed)
+    assert fresh == KeyNoticeState(RFC_PUB, frozenset(), False, renewed)
+    got = []
+    for remaining in (13 * DAY_MS, 6 * DAY_MS, DAY_MS + HOUR_MS, 20 * HOUR_MS, -1):
+        d = decide_key_notices(valid_until_ms=renewed, now_ms=renewed - remaining, state=fresh, reminder_days=DAYS)
+        fresh = d.new_state
+        got.append((d.reminder_days, d.expired_now))
+    assert got == [(14, False), (7, False), (2, False), (1, False), (None, True)]
+
+
+def test_collect_sends_reminders_again_after_a_same_key_validity_rewrite(monkeypatch):
+    # R2-3 through collect_key_notices: the stored state from the first validity (all
+    # thresholds sent, expiry announced) must not silence the rewritten validity.
+    first = NOW_MS - DAY_MS
+    renewed = NOW_MS + 6 * DAY_MS
+    db = FakeDB(lifecycle=_rows(H.row(until=renewed)))
+    db.notice_states[(UID, "testnet")] = {
+        "pub": RFC_PUB, "until": first, "sent": [1, 2, 7, 14], "expired_notified": True}
+    H.install(monkeypatch, db=db)
+    notices = run(ls.collect_key_notices(now_ms=NOW_MS))
+    assert [(n.reminder_days, n.expired_now) for n in notices] == [(7, False)]
+    assert db.saves[-1][2] == {"pub": RFC_PUB, "until": renewed, "sent": [7, 14], "expired_notified": False}
 
 
 def test_decision_has_no_stand_down_output():
@@ -118,22 +159,49 @@ def _notice(remaining_ms, *, reminder=None, expired=False, name="nadobro-ab12", 
 def test_build_key_notice(monkeypatch):
     from src.nadobro.core.feature_flags import arcus_key_expiry_stop_hours
 
-    key, fmt, buttons = ls.build_key_notice(_notice(23 * HOUR_MS, reminder=1), now_ms=NOW_MS, stop_hours=24.0)
+    def build(notice, **kw):
+        return ls.build_key_notice(notice, now_ms=NOW_MS, actionable=True, **kw)
+
+    key, fmt, buttons = build(_notice(23 * HOUR_MS, reminder=1), stop_hours=24.0)
     assert key == ls.TEXT_KR_HOURS and fmt["hours"] == "23" and fmt["stop_hours"] == "24"
     assert fmt["network"] == "TESTNET" and fmt["key_name"] == "nadobro-ab12"
-    key, fmt, _ = ls.build_key_notice(_notice(5 * DAY_MS + 3 * HOUR_MS, reminder=7), now_ms=NOW_MS, stop_hours=24.0)
+    key, fmt, _ = build(_notice(5 * DAY_MS + 3 * HOUR_MS, reminder=7), stop_hours=24.0)
     assert key == ls.TEXT_KR_DAYS and fmt["days"] == "5" and fmt["until"].endswith("UTC")
-    key, fmt, _ = ls.build_key_notice(_notice(40 * HOUR_MS, reminder=2), now_ms=NOW_MS, stop_hours=24.0)
+    key, fmt, _ = build(_notice(40 * HOUR_MS, reminder=2), stop_hours=24.0)
     assert key == ls.TEXT_KR_HOURS and fmt["hours"] == "40"  # < 48 h reads in hours
-    key, fmt, _ = ls.build_key_notice(_notice(-5, expired=True, name=None, network="mainnet"), now_ms=NOW_MS, stop_hours=24.0)
+    key, fmt, _ = build(_notice(-5, expired=True, name=None, network="mainnet"), stop_hours=24.0)
     assert key == ls.TEXT_KR_EXPIRED and fmt["key_name"] == "—" and fmt["network"] == "MAINNET"
     monkeypatch.setenv("ARCUS_KEY_EXPIRY_STOP_HOURS", "48")
-    _, fmt, _ = ls.build_key_notice(_notice(3 * DAY_MS, reminder=7), now_ms=NOW_MS, stop_hours=arcus_key_expiry_stop_hours())
+    _, fmt, _ = build(_notice(3 * DAY_MS, reminder=7), stop_hours=arcus_key_expiry_stop_hours())
     assert fmt["stop_hours"] == "48"
     assert buttons == ((ls.LABEL_RENEW_KEY, "ax:link:start"), (ls.LABEL_VENUE_KEY, "venue:view"))
     for text_key in (ls.TEXT_KR_DAYS, ls.TEXT_KR_HOURS, ls.TEXT_KR_EXPIRED):
-        for key_, fmt_, _ in (ls.build_key_notice(_notice(3 * DAY_MS, reminder=7), now_ms=NOW_MS, stop_hours=24.0),):
+        for key_, fmt_, _ in (build(_notice(3 * DAY_MS, reminder=7), stop_hours=24.0),):
             key_.format(**fmt_)
+
+
+def test_build_key_notice_without_a_way_to_renew_asks_for_nothing():
+    # SEC-3 / R2-1: no paste instruction and NO buttons (they would reach Nado's
+    # catch-all router, which edits the reminder to "Unknown action.").
+    for notice, expected in ((_notice(3 * DAY_MS, reminder=7), ls.TEXT_KR_PAUSED),
+                             (_notice(20 * HOUR_MS, reminder=1), ls.TEXT_KR_PAUSED),
+                             (_notice(-5, expired=True), ls.TEXT_KR_EXPIRED_PAUSED)):
+        key, fmt, buttons = ls.build_key_notice(notice, now_ms=NOW_MS, stop_hours=24.0, actionable=False)
+        assert key == expected and buttons == ()
+        text = key.format(**fmt)
+        assert "paste it" not in text.lower() and "Paste a new key" not in text and "Arcus wallet" not in text
+        assert "nothing to paste" in text and "<code>nadobro-ab12</code>" in text
+
+
+def test_renewal_reachable_follows_the_cohort_and_the_mainnet_flag(monkeypatch):
+    assert ls.renewal_reachable(UID, "testnet") is False  # flag off
+    monkeypatch.setenv("ARCUS_ENABLED", "1")
+    monkeypatch.setenv("ARCUS_ALLOWED_USER_IDS", str(UID))
+    assert ls.renewal_reachable(UID, "testnet") is True
+    assert ls.renewal_reachable(UID + 1, "testnet") is False  # outside the cohort
+    assert ls.renewal_reachable(UID, "mainnet") is False  # mainnet closed
+    monkeypatch.setenv("ARCUS_MAINNET_ENABLED", "1")
+    assert ls.renewal_reachable(UID, "mainnet") is True
 
 
 def test_venue_label_matches_p1():
@@ -167,7 +235,8 @@ def test_reminder_state_is_saved_before_it_is_returned(monkeypatch):
     H.install(monkeypatch, db=db)
     notices = run(ls.collect_key_notices(now_ms=NOW_MS))
     assert [n.reminder_days for n in notices] == [7]
-    assert db.saves[-1][2] == {"pub": RFC_PUB, "sent": [7, 14], "expired_notified": False}
+    assert db.saves[-1][2] == {
+        "pub": RFC_PUB, "until": NOW_MS + 6 * DAY_MS, "sent": [7, 14], "expired_notified": False}
     assert not db.marks
 
 
@@ -227,9 +296,18 @@ def _lang(monkeypatch, lang="en"):
     monkeypatch.setattr(i18n, "get_user_language", fake)
 
 
+def _venue_ui(monkeypatch, on=True):
+    """The boot state where the reminder may carry buttons: gate registered + the user
+    may renew (SEC-3 / R2-1)."""
+    monkeypatch.setattr(sched, "_arcus_venue_ui", on)
+    monkeypatch.setenv("ARCUS_ENABLED", "1")
+    monkeypatch.setenv("ARCUS_ALLOWED_USER_IDS", str(UID))
+
+
 def test_tick_sends_the_expiry_notice(monkeypatch):
     db = FakeDB()
     H.install(monkeypatch, db=db)
+    _venue_ui(monkeypatch)
     now = _real_now(monkeypatch)
     db.lifecycle = _rows(H.row(until=now - 1))
     _lang(monkeypatch)
@@ -249,6 +327,7 @@ def test_tick_sends_the_expiry_notice(monkeypatch):
 def test_tick_localizes_and_escapes(monkeypatch):
     db = FakeDB()
     H.install(monkeypatch, db=db)
+    _venue_ui(monkeypatch)
     now = _real_now(monkeypatch)
     db.lifecycle = _rows(H.row(until=now + 5 * DAY_MS + 3 * HOUR_MS, name="<b>x</b>"))
     _lang(monkeypatch, "fr")
@@ -260,6 +339,86 @@ def test_tick_localizes_and_escapes(monkeypatch):
     assert "&lt;b&gt;x&lt;/b&gt;" in text and "<b>x</b>" not in text
     labels = [b.text for row in bot.sent[0]["reply_markup"].inline_keyboard for b in row]
     assert labels == ["🔄 Renouveler la clé", "🔁 Plateforme"]
+
+
+def _paused_setup(monkeypatch, *, until_offset, network="testnet", lang="en"):
+    db = FakeDB()
+    H.install(monkeypatch, db=db)
+    now = _real_now(monkeypatch)
+    db.lifecycle = _rows(H.row(until=now + until_offset, network=network))
+    _lang(monkeypatch, lang)
+    bot = _Bot()
+    monkeypatch.setattr(sched, "_bot_app", SimpleNamespace(bot=bot))
+    return db, bot
+
+
+def _boot(monkeypatch, *, venue_gate):
+    """start_arcus_jobs as main.py calls it (the scheduler itself is faked)."""
+    monkeypatch.setattr(sched, "scheduler", _Sched())
+    monkeypatch.setattr(sched, "_arcus_venue_ui", not venue_gate)  # prove start_arcus_jobs sets it
+    assert sched.start_arcus_jobs(arcus_state_present=True, venue_ui=venue_gate) is True
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_flag_off_rollback_sends_the_notice_without_buttons_or_paste_instructions(monkeypatch, expired):
+    # SEC-3 / R2-1 boot matrix: ARCUS_ENABLED off, an Arcus credential exists, nobody on
+    # the Arcus view -> the lifecycle job runs but the venue gate (and /venue, venue:/ax:
+    # callbacks) is NOT registered. The notice still reaches the user, asks for nothing
+    # and carries no button that Nado's catch-all router would turn into "Unknown action.".
+    db, bot = _paused_setup(monkeypatch, until_offset=-1 if expired else 5 * DAY_MS)
+    _boot(monkeypatch, venue_gate=False)
+    run(sched.tick_arcus_key_lifecycle())
+    [msg] = bot.sent
+    assert msg["reply_markup"] is None
+    assert "nothing to paste" in msg["text"] and "Arcus wallet" not in msg["text"]
+    assert ("has expired" in msg["text"]) is expired
+    assert db.saves  # at most once, as for the actionable notice
+    if expired:
+        assert db.marks and db.marks[0][2] == "expired"  # the transition still happens
+
+
+def test_gate_registered_but_user_outside_the_cohort_gets_no_buttons(monkeypatch):
+    _db, bot = _paused_setup(monkeypatch, until_offset=5 * DAY_MS)
+    monkeypatch.setenv("ARCUS_ENABLED", "1")
+    monkeypatch.setenv("ARCUS_ALLOWED_USER_IDS", str(UID + 1))
+    _boot(monkeypatch, venue_gate=True)
+    run(sched.tick_arcus_key_lifecycle())
+    [msg] = bot.sent
+    assert msg["reply_markup"] is None and "nothing to paste" in msg["text"]
+
+
+def test_a_closed_mainnet_key_gets_no_buttons(monkeypatch):
+    _db, bot = _paused_setup(monkeypatch, until_offset=5 * DAY_MS, network="mainnet")
+    _venue_ui(monkeypatch)
+    run(sched.tick_arcus_key_lifecycle())
+    [msg] = bot.sent
+    assert msg["reply_markup"] is None and "MAINNET" in msg["text"]
+
+
+def test_gate_registered_and_renewable_keeps_the_buttons(monkeypatch):
+    _db, bot = _paused_setup(monkeypatch, until_offset=5 * DAY_MS)
+    monkeypatch.setenv("ARCUS_ENABLED", "1")
+    monkeypatch.setenv("ARCUS_ALLOWED_USER_IDS", str(UID))
+    _boot(monkeypatch, venue_gate=True)
+    run(sched.tick_arcus_key_lifecycle())
+    [msg] = bot.sent
+    assert [b.callback_data for row in msg["reply_markup"].inline_keyboard for b in row] == [
+        "ax:link:start", "venue:view"]
+    assert "Arcus wallet" in msg["text"]
+
+
+def test_paused_notice_is_localized(monkeypatch):
+    _db, bot = _paused_setup(monkeypatch, until_offset=5 * DAY_MS, lang="ru")
+    _boot(monkeypatch, venue_gate=False)
+    run(sched.tick_arcus_key_lifecycle())
+    assert "вставлять сюда ничего не нужно" in bot.sent[0]["text"]
+
+
+def test_start_arcus_jobs_defaults_to_no_venue_ui(monkeypatch):
+    monkeypatch.setattr(sched, "scheduler", _Sched())
+    monkeypatch.setattr(sched, "_arcus_venue_ui", True)
+    sched.start_arcus_jobs(arcus_state_present=True)
+    assert sched._arcus_venue_ui is False  # fail-closed: no buttons unless told otherwise
 
 
 def test_state_saved_before_send_so_a_failed_send_is_not_repeated(monkeypatch):

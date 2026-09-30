@@ -311,6 +311,26 @@ def test_intake_stashes_only_ciphertext(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        "\u200e" + RFC_SEED,  # LRM from an RTL keyboard (Arabic is a UI language)
+        RFC_SEED + "\u200b",  # trailing zero-width space
+        "\ufeff0x" + RFC_SEED,  # BOM
+        RFC_SEED[:32] + "\u2060" + RFC_SEED[32:],  # word joiner inside the key
+        "\u061c" + RFC_SEED[:16] + "\u200f" + RFC_SEED[16:] + "\u200e",
+    ],
+)
+def test_intake_stashes_a_key_carrying_invisible_format_characters(monkeypatch, text):
+    # SEC-4: the key is the same 32 bytes; a Cf character must not refuse it at intake.
+    env = H.install(monkeypatch)
+    p = _pending(env)
+    assert run(ls.intake_key(user_id=UID, pending=p, pasted_text=text)).status == "stashed"
+    stash = ls._STASH[(UID, "testnet")]
+    assert stash.sealed.api_public_key == RFC_PUB
+    assert crypto.decrypt_with_server_key(stash.sealed.token) == bytes.fromhex(RFC_SEED)
+
+
+@pytest.mark.parametrize(
     "text, status",
     [
         ("-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEI\n-----END PRIVATE KEY-----", "pem"),
@@ -761,6 +781,144 @@ def test_unlink_db_error_propagates(monkeypatch):
     H.install(monkeypatch, db=FakeDB(credential=RuntimeError("db down")))
     with pytest.raises(RuntimeError):
         run(ls.unlink(UID, "testnet"))
+
+
+def test_unlink_db_error_still_ends_the_link_flow_first(monkeypatch):
+    # The generation moves on before the first await (SEC-2 / R2-4), so a store in
+    # flight can never land after an Unlink tap, even one that then fails its read.
+    env = H.install(monkeypatch, db=FakeDB(credential=RuntimeError("db down")))
+    p = _pending(env)
+    assert run(ls.intake_key(user_id=UID, pending=p, pasted_text=RFC_SEED)).status == "stashed"
+    with pytest.raises(RuntimeError):
+        run(ls.unlink(UID, "testnet"))
+    assert ls.current_generation(UID, "testnet") == p.generation + 1 and not ls._STASH
+
+
+def _renewal_store_blocked_in_upsert(monkeypatch):
+    """A renewal (an ACTIVE credential exists) whose store section is blocked INSIDE
+    its upsert thread — past the generation / stash check, holding the store lock."""
+    gate = threading.Event()
+    env = H.install(monkeypatch, db=FakeDB(credential=H.row(pub=PUB_B, name="nadobro-old1"), upsert_gate=gate))
+    env.client.api_keys = [ok([entry(RFC_PUB, name="nadobro-new2")])]
+    order = []
+    real_mark = env.db.mark_status
+    real_upsert = env.db.upsert_active_credential
+
+    def mark(*args, **kwargs):
+        order.append(("mark", args[2]))
+        return real_mark(*args, **kwargs)
+
+    def upsert(**kwargs):
+        order.append(("upsert-start", None))
+        stored = real_upsert(**kwargs)  # waits on the gate
+        order.append(("upsert-done", None))
+        env.db.credential = stored  # the row now holds the NEW key
+        return stored
+
+    monkeypatch.setattr(ls._creds, "mark_status", mark)
+    monkeypatch.setattr(ls._creds, "upsert_active_credential", upsert)
+    return env, gate, order
+
+
+def test_unlink_during_a_renewal_store_waits_and_then_wipes_the_new_key(monkeypatch):
+    # SEC-2 / R2-4: before the fix unlink() neither took the store lock nor moved the
+    # generation first, so its UPDATE ... 'unlinked' could land BEFORE the renewal's
+    # INSERT ... ON CONFLICT DO UPDATE SET status='active' — the row ended ACTIVE with
+    # the new key while the user was told "Unlinked".
+    events = []
+    env, gate, order = _renewal_store_blocked_in_upsert(monkeypatch)
+    ls.register_credential_listener(lambda uid, net, ev: events.append(ev))
+
+    async def body():
+        verify = asyncio.get_running_loop().create_task(
+            ls.verify_and_store(user_id=UID, pending=_pending(env), pasted_secret=RFC_SEED)
+        )
+        while ("upsert-start", None) not in order:
+            await asyncio.sleep(0.01)
+        unlink = asyncio.get_running_loop().create_task(ls.unlink(UID, "testnet"))
+        await asyncio.sleep(0.05)
+        assert not unlink.done()  # it waits for the store that cannot be stopped any more
+        assert ("mark", "unlinked") not in order
+        verify.cancel()  # the handler's clear_link_pending cancels the verify task
+        gate.set()
+        outcome = await unlink
+        for _ in range(200):
+            if "renewed" in events:
+                break
+            await asyncio.sleep(0.01)
+        return outcome
+
+    outcome = asyncio.run(body())
+    assert outcome == "unlinked"
+    assert order == [("upsert-start", None), ("upsert-done", None), ("mark", "unlinked")]
+    assert env.db.marks[-1][:4] == (UID, "testnet", "unlinked", {"wipe_secret": True})
+    assert sorted(events) == ["renewed", "unlinked"]
+    assert "arcus_unlinked" in [a[1] for a in env.db.audits]
+
+
+def test_unlink_before_the_store_check_makes_the_store_superseded(monkeypatch):
+    # The Unlink tap comes while the key is still being polled on Arcus: the store must
+    # end SUPERSEDED (nothing written), never re-activate the row afterwards.
+    env = H.install(monkeypatch, db=FakeDB(credential=H.row(pub=PUB_B, name="nadobro-old1")))
+    env.client.api_keys = [ok([entry(RFC_PUB, name="nadobro-new2")])]
+    gate = {}
+    real = env.client.get_api_keys
+
+    async def gated(address, **kw):
+        gate["polling"].set()
+        await gate["release"].wait()
+        return await real(address, **kw)
+
+    monkeypatch.setattr(env.client, "get_api_keys", gated)
+
+    async def body():
+        gate["polling"], gate["release"] = asyncio.Event(), asyncio.Event()
+        verify = asyncio.get_running_loop().create_task(
+            ls.verify_and_store(user_id=UID, pending=_pending(env), pasted_secret=RFC_SEED)
+        )
+        await asyncio.wait_for(gate["polling"].wait(), 5)
+        outcome = await ls.unlink(UID, "testnet")
+        gate["release"].set()
+        return outcome, await verify
+
+    outcome, out = asyncio.run(body())
+    assert outcome == "unlinked"
+    assert out.result in (LinkResult.SUPERSEDED, LinkResult.PENDING_EXPIRED)
+    assert env.db.upserts == []
+
+
+def test_settle_cancelled_link_reports_a_store_it_could_not_stop(monkeypatch):
+    env, gate, order = _renewal_store_blocked_in_upsert(monkeypatch)
+    p = _pending(env)
+
+    async def body():
+        verify = asyncio.get_running_loop().create_task(
+            ls.verify_and_store(user_id=UID, pending=p, pasted_secret=RFC_SEED)
+        )
+        while ("upsert-start", None) not in order:
+            await asyncio.sleep(0.01)
+        ls.cancel_link(UID, "testnet")  # [❌ Cancel]
+        settle = asyncio.get_running_loop().create_task(ls.settle_cancelled_link(UID, "testnet", p.generation))
+        await asyncio.sleep(0.05)
+        assert not settle.done()
+        gate.set()
+        stored = await settle
+        await verify
+        return stored
+
+    assert asyncio.run(body()) is True
+    assert len(env.db.upserts) == 1
+
+
+def test_settle_cancelled_link_without_a_store_is_false(monkeypatch):
+    env = H.install(monkeypatch)
+    p = _pending(env)
+    assert run(ls.intake_key(user_id=UID, pending=p, pasted_text=RFC_SEED)).status == "stashed"
+    ls.cancel_link(UID, "testnet")
+    assert run(ls.settle_cancelled_link(UID, "testnet", p.generation)) is False
+    # a later verification of the cancelled generation stores nothing either
+    assert run(ls.verify_and_store(user_id=UID, pending=p)).result is LinkResult.PENDING_EXPIRED
+    assert env.db.upserts == []
 
 
 # ============================================================================================

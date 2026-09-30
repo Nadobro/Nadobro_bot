@@ -47,6 +47,10 @@ from src.nadobro.users import arcus_link_service as ls  # noqa: E402
 from src.nadobro.users.arcus_link_service import AddressCheck, LinkPending, LinkResult  # noqa: E402
 
 GENERIC = arcus_ui.TEXT_K_GENERIC_DELETED + "\n" + arcus_ui.TEXT_K_GENERIC_EXPOSED
+# The same warning when the message could NOT be deleted: it never claims a deletion (SEC-1).
+GENERIC_KEPT = (
+    arcus_ui.TEXT_K_GENERIC_KEPT + "\n" + arcus_ui.TEXT_K_GENERIC_EXPOSED + "\n\n" + arcus_ui.TEXT_K_NOT_DELETED
+)
 PEM = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g\n-----END PRIVATE KEY-----"
 
 # Every group-0 step of messages._handle_message_inner that runs before the relay.
@@ -308,7 +312,9 @@ def test_a_failed_delete_still_warns_and_asks_the_user_to_delete(monkeypatch, er
     msg = FakeMessage(RFC_SEED, log=context.bot.log, delete_error=error)
     assert asyncio.run(_dispatch(nado, update_for(msg), context)) is False
     [text] = context.bot.texts()
-    assert text == GENERIC + "\n\n" + arcus_ui.TEXT_K_NOT_DELETED
+    # Updated for SEC-1: the not-deleted variant never says "I deleted".
+    assert text == GENERIC_KEPT
+    assert "I deleted" not in text
     assert nado.reached == 0
 
 
@@ -318,7 +324,7 @@ def test_a_message_without_delete_is_handled_by_the_catch_all(monkeypatch):
     context = ctx()
     msg = FakeMessage(RFC_SEED, log=context.bot.log, no_delete=True)
     assert asyncio.run(_dispatch(nado, update_for(msg), context)) is False
-    assert context.bot.texts() == [GENERIC + "\n\n" + arcus_ui.TEXT_K_NOT_DELETED]
+    assert context.bot.texts() == [GENERIC_KEPT]  # SEC-1: no deletion claimed
 
 
 @pytest.mark.parametrize("venue", ["arcus", "nado"])
@@ -579,3 +585,184 @@ def test_gate_imports_no_arcus_module_at_import_time():
     names = {getattr(n, "module", None) or n.names[0].name for n in top}
     assert not any("arcus" in (name or "") for name in names), names
     assert "src.nadobro.utils.secret_text" in names
+
+
+# ---------------------------------------------------------------------------
+# SEC-1: a paste that could NOT be deleted (Telegram refuses messages older than
+# 48 h — e.g. an edited old message — and API errors happen). Before the fix the
+# "delete it yourself" warning lived only in the ack, and the first result EDITED
+# it away; for a wallet key the result even said "I deleted it". Now every text
+# shown for that paste ends with the warning and none claims a deletion.
+# ---------------------------------------------------------------------------
+
+_DELETE_FAILED = BadRequest("Message can't be deleted")
+_DELETION_CLAIMS = ("I deleted", "removed from the chat")
+
+
+def _shown(log):
+    return [text for kind, text in log if kind in ("send", "edit")]
+
+
+def _assert_kept_and_warned(log):
+    """The last visible text (the ack's final edit) ends with the warning, and no
+    text ever shown claims the message was deleted."""
+    shown = _shown(log)
+    assert shown, log
+    assert shown[-1].endswith("\n\n" + arcus_ui.TEXT_K_NOT_DELETED), shown[-1]
+    for text in shown:
+        assert not any(claim in text for claim in _DELETION_CLAIMS), text
+    return shown[-1]
+
+
+def _paste_undeletable(monkeypatch, world, context, secret, *, kind="new"):
+    nado = Nado(monkeypatch)
+    msg = FakeMessage(secret, log=context.bot.log, delete_error=_DELETE_FAILED)
+    update = update_for(msg) if kind == "new" else update_for(None, edited=msg)
+
+    async def body():
+        reached = await _dispatch(nado, update, context)
+        await drain()
+        return reached
+
+    assert asyncio.run(body()) is False
+    assert msg.deleted == 0 and nado.reached == 0
+    return msg
+
+
+@pytest.mark.parametrize("kind", ["new", "edited"])
+def test_undeleted_wallet_key_result_never_says_i_deleted_it(monkeypatch, kind):
+    world = _world(monkeypatch, "arcus")
+    context = _with_pending(world, "key", address=H.WALLET_ADDR)
+    _paste_undeletable(monkeypatch, world, context, H.WALLET_SEED, kind=kind)
+    final = _assert_kept_and_warned(context.bot.log)
+    assert final.startswith(ls.TEXT_R_WALLET_KEY + "\n" + arcus_ui.TEXT_R_WALLET_KEY_2_KEPT)
+    assert _shown(context.bot.log)[0] == arcus_ui.TEXT_K_ACK_KEPT + "\n\n" + arcus_ui.TEXT_K_NOT_DELETED
+    assert world.db.upserts == []
+
+
+def test_undeleted_key_that_links_keeps_the_warning(monkeypatch):
+    world = _world(monkeypatch, "arcus")
+    world.client.api_keys = [ok([entry(RFC_PUB, until=NOW_MS + 179 * DAY_MS)])]
+    context = _with_pending(world, "key")
+    _paste_undeletable(monkeypatch, world, context, RFC_SEED)
+    final = _assert_kept_and_warned(context.bot.log)
+    assert final.startswith("✅ <b>Linked</b>")
+    assert len(world.db.upserts) == 1
+
+
+def test_undeleted_key_busy_result_keeps_the_warning(monkeypatch):
+    world = _world(monkeypatch, "arcus")
+    world.client.api_keys = [H.UNAVAILABLE]
+    context = _with_pending(world, "key")
+    _paste_undeletable(monkeypatch, world, context, RFC_SEED)
+    final = _assert_kept_and_warned(context.bot.log)
+    assert final == ls.TEXT_BUSY + "\n\n" + arcus_ui.TEXT_K_NOT_DELETED
+    assert context.user_data[awh.PENDING_KEY].step == "verifying"  # [Check again] still works
+
+
+def test_undeleted_key_waiting_for_the_address_check_keeps_the_warning(monkeypatch):
+    world = _world(monkeypatch, "arcus")
+    context = _with_pending(world, "address_check")
+    _paste_undeletable(monkeypatch, world, context, RFC_SEED)
+    final = _assert_kept_and_warned(context.bot.log)
+    assert final == arcus_ui.TEXT_K_WAIT_ADDRESS_KEPT + "\n\n" + arcus_ui.TEXT_K_NOT_DELETED
+    # ...and when the precheck then passes, its card shows the result; the ack (the
+    # message next to the key still in the chat) keeps the warning.
+    pending = context.user_data[awh.PENDING_KEY]
+    card = AH.SentMessage([], UID, "Checking…")
+    world.client.api_keys = [ok([]), ok([entry(RFC_PUB, until=NOW_MS + 179 * DAY_MS)])]
+    async def precheck():
+        await awh._precheck_and_report(context, UID, pending, awh._Target(card, UID, None))
+        await drain()  # the verification it starts runs in this loop
+
+    asyncio.run(precheck())
+    assert card.text.startswith("✅ <b>Linked</b>")
+    assert _shown(context.bot.log)[-1] == final
+
+
+@pytest.mark.parametrize("step", ["attest", "address"])
+def test_undeleted_key_before_the_address_never_says_i_deleted_your_key(monkeypatch, step):
+    world = _world(monkeypatch, "arcus")
+    context = _with_pending(world, step)
+    _paste_undeletable(monkeypatch, world, context, RFC_SEED)
+    assert context.bot.texts() == [arcus_ui.TEXT_K_ADDRESS_FIRST_KEPT + "\n\n" + arcus_ui.TEXT_K_NOT_DELETED]
+
+
+def test_undeleted_key_warning_follows_a_check_again_on_another_card(monkeypatch):
+    # [🔄 Check again] while the verification runs re-points the result to the tapped
+    # card: the warning goes with it.
+    world = _world(monkeypatch, "arcus")
+    nado = Nado(monkeypatch)
+    context = _with_pending(world, "key")
+    world.client.api_keys = [ok([entry(RFC_PUB, until=NOW_MS + 179 * DAY_MS)])]
+    gate = {}
+    real = world.client.get_api_keys
+
+    async def gated(address, **kw):
+        if not gate["release"].is_set():
+            gate["blocked"].set()
+            await gate["release"].wait()
+        return await real(address, **kw)
+
+    monkeypatch.setattr(world.client, "get_api_keys", gated)
+
+    async def body():
+        gate["blocked"], gate["release"] = asyncio.Event(), asyncio.Event()
+        msg = FakeMessage(RFC_SEED, log=context.bot.log, delete_error=_DELETE_FAILED)
+        assert await _dispatch(nado, update_for(msg), context) is False
+        await asyncio.wait_for(gate["blocked"].wait(), 5)
+        tapped = AH.FakeQuery("ax:link:check")
+        await awh.handle(tapped, "ax:link:check", UID, context)
+        gate["release"].set()
+        await drain()
+        return tapped
+
+    tapped = asyncio.run(body())
+    assert tapped.message.text.startswith("✅ <b>Linked</b>")
+    assert tapped.message.text.endswith("\n\n" + arcus_ui.TEXT_K_NOT_DELETED)
+
+
+# ---------------------------------------------------------------------------
+# R2-2: a paste is activity. Before the fix a key pasted with little TTL left was
+# STORED while the flow expired mid-poll, and the result was dropped silently.
+# ---------------------------------------------------------------------------
+
+def test_a_paste_near_the_end_of_the_ttl_still_gets_its_result(monkeypatch):
+    world = _world(monkeypatch, "arcus")
+    nado = Nado(monkeypatch)
+    context = _with_pending(world, "key", expires_in=20.0)  # 20 s of TTL left at paste time
+    # the new key becomes visible on the 5th read (offset 25 s): docs "takes a moment"
+    world.client.api_keys = [ok([]), ok([]), ok([]), ok([]), ok([entry(RFC_PUB, until=NOW_MS + 179 * DAY_MS)])]
+
+    async def body():
+        await _dispatch(nado, update_for(FakeMessage(RFC_SEED, log=context.bot.log)), context)
+        await drain()
+
+    asyncio.run(body())
+    assert len(world.db.upserts) == 1
+    edits = [text for kind, text in context.bot.log if kind == "edit"]
+    assert edits and edits[-1].startswith("✅ <b>Linked</b>")
+    assert awh.PENDING_KEY not in context.user_data  # linked: the flow ended normally
+
+
+def test_a_paste_refreshes_the_flow_ttl_and_the_stash_expiry(monkeypatch, caplog):
+    world = _world(monkeypatch, "arcus")
+    nado = Nado(monkeypatch)
+    world.client.api_keys = [ok([])]  # never listed: KEY_NOT_FOUND after the full poll, stash kept
+    context = _with_pending(world, "key", expires_in=5.0)
+    pasted_at = world.env.mono.now
+
+    async def body():
+        await _dispatch(nado, update_for(FakeMessage(RFC_SEED, log=context.bot.log)), context)
+        await drain()
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(body())
+    ttl = awh.arcus_link_pending_ttl_s()
+    assert world.env.mono.now >= pasted_at + 60.0  # the whole poll ran
+    current = context.user_data[awh.PENDING_KEY]
+    assert current.step == "verifying" and current.expires_mono == pasted_at + ttl
+    assert ls._STASH[(UID, "testnet")].expires_mono == pasted_at + ttl  # the stash inherits it
+    assert "timed out mid-check" not in caplog.text
+    edits = [text for kind, text in context.bot.log if kind == "edit"]
+    assert edits and "couldn't find that key" in edits[-1]

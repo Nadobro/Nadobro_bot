@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -176,7 +177,8 @@ def test_wallet_active_shows_address_key_expiry_and_soon(monkeypatch):
     assert arcus_ui.format_utc_ms(NOW_MS + 10 * DAY_MS + 3_600_000) in text
     assert "expires in 10 days" in text and "stop 24 hours before" in text
     assert "Last checked: 2026-09-21 14:13 UTC" in text
-    assert callback_data(markup) == ["ax:link:start", "ax:link:check", "ax:unlink", "ax:mode", "ax:home"]
+    # R2-5: [✅ Check key] has its own callback (ax:link:check is [Continue linking]).
+    assert callback_data(markup) == ["ax:link:start", "ax:link:key", "ax:unlink", "ax:mode", "ax:home"]
     assert buttons(markup)[0][0] == arcus_ui.LABEL_RENEW
     assert not _HEX64.search(text)  # neither the pubkey nor anything key-like
 
@@ -213,7 +215,7 @@ def test_wallet_expired_and_invalid(monkeypatch, status, needle):
     world.db.credential = H.row(status=status, until=NOW_MS - DAY_MS)
     text, markup = _card(tap("ax:wallet", ctx()))
     assert needle in text and f"<code>{ADDR}</code>" in text
-    assert callback_data(markup)[:3] == ["ax:link:start", "ax:link:check", "ax:unlink"]
+    assert callback_data(markup)[:3] == ["ax:link:start", "ax:link:key", "ax:unlink"]  # R2-5
 
 
 def test_wallet_active_but_past_valid_until_is_shown_expired(monkeypatch):
@@ -454,7 +456,9 @@ def test_not_whitelisted_on_mainnet_ends_the_flow_with_both_lines(monkeypatch):
     text, markup = _REPLY_EDITS[-1]
     assert ls.TEXT_PR_NOT_ELIGIBLE in text and arcus_ui.TEXT_PR_NOT_ELIGIBLE_MAINNET in text
     assert awh.PENDING_KEY not in context.user_data
-    assert callback_data(markup) == ["ax:link:start", "ax:home"]
+    # R2-6: TEXT_PR_NOT_ELIGIBLE_MAINNET points at 🌐 Network, so the card carries it.
+    assert callback_data(markup) == ["ax:link:start", "ax:home", "ax:mode"]
+    assert buttons(markup)[2][0] == arcus_ui.LABEL_NETWORK
     assert ("arcus_link_refused" in [a[1] for a in world.db.audits])
     assert world.db.upserts == []
 
@@ -616,7 +620,9 @@ def test_check_verifying_without_a_stash_says_timed_out(monkeypatch):
     text, markup = _card(tap("ax:link:check", context))
     assert text == arcus_ui.TEXT_R_PENDING_EXPIRED
     assert context.user_data[awh.PENDING_KEY].step == "key"
-    assert callback_data(markup) == ["ax:link:cancel"]
+    # R2-6: "…or tap Link to start over" — the card carries [🔗 Link Arcus account].
+    assert callback_data(markup) == ["ax:link:start", "ax:link:cancel"]
+    assert buttons(markup)[0][0] == arcus_ui.LABEL_LINK
 
 
 def test_check_at_the_key_step_without_a_paste_shows_the_instructions_again(monkeypatch):
@@ -724,7 +730,7 @@ def _outcome(result, **kw):
     (LinkResult.KEY_WRONG_SUBACCOUNT, "paste", "key"),
     (LinkResult.KEY_HAS_WITHDRAW, "paste", "key"),
     (LinkResult.WALLET_KEY_REFUSED, "paste", "key"),
-    (LinkResult.PENDING_EXPIRED, "paste", "key"),
+    (LinkResult.PENDING_EXPIRED, "paste_expired", "key"),
     (LinkResult.NOT_WHITELISTED, "terminal", None),
     (LinkResult.BLOCKED, "terminal", None),
     (LinkResult.GEO_RESTRICTED, "terminal", None),
@@ -740,6 +746,7 @@ def test_result_moves_the_flow_and_picks_the_buttons(monkeypatch, result, kind, 
     expected = {
         "retry": ["ax:link:check", "ax:link:cancel"],
         "paste": ["ax:link:cancel"],
+        "paste_expired": ["ax:link:start", "ax:link:cancel"],  # R2-6: [🔗 Link Arcus account][Cancel]
         "terminal": ["ax:link:start", "ax:home"],
     }[kind]
     assert callback_data(markup) == expected
@@ -1171,6 +1178,7 @@ def test_every_callback_and_label_is_accounted_for(monkeypatch):
     for kind in ("linked", "retry", "paste", "terminal"):
         markups += [awh._outcome_markup(kind, True), awh._outcome_markup(kind, False)]
     markups += [awh._retry_markup(), awh._cancel_only(), awh._wallet_only(), awh._terminal_markup()]
+    markups += [awh._terminal_markup(mainnet_refusal=True), awh._pending_expired_markup(), awh._no_pending_markup()]
     allowed_foreign = {"venue:view", "wallet:revoke_steps"}
     labels_ok = set(arcus_ui.ARCUS_P3B_LABEL_KEYS) | _REUSED_LABELS
     seen = set()
@@ -1201,3 +1209,284 @@ def test_no_card_contains_a_secret_or_pubkey(monkeypatch):
     for data in ("ax:wallet", "ax:unlink", "ax:mode"):
         text, _ = _card(tap(data, context))
         assert RFC_PUB not in text and not _HEX64.search(text)
+
+
+# ---------------------------------------------------------------------------
+# R2-5: [✅ Check key] always checks the STORED key, also while a flow is pending
+# ---------------------------------------------------------------------------
+
+def test_wallet_with_a_pending_renewal_offers_continue_and_a_distinct_check_key(monkeypatch):
+    world = World(monkeypatch)
+    world.db.credential = H.row(until=NOW_MS + 100 * DAY_MS)
+    context = ctx()
+    context.user_data[awh.PENDING_KEY] = _pending(world, "key", previous=ADDR)
+    text, markup = _card(tap("ax:wallet", context))
+    assert arcus_ui.TEXT_W_LINKING in text
+    pairs = [(label, data) for label, data, _url in buttons(markup)]
+    assert (arcus_ui.LABEL_CONTINUE, "ax:link:check") in pairs
+    assert (arcus_ui.LABEL_CHECK_KEY, "ax:link:key") in pairs
+    assert len({data for _label, data in pairs}) == len(pairs)  # no two buttons share a callback
+
+
+def test_check_key_during_a_pending_flow_diagnoses_the_stored_key(monkeypatch):
+    world = World(monkeypatch)
+    world.db.credential = H.row(until=NOW_MS + 100 * DAY_MS)
+    world.client.api_keys = [ok([entry(RFC_PUB, until=NOW_MS + 100 * DAY_MS)])]
+    context = ctx()
+    pending = _pending(world, "key", previous=ADDR)
+    context.user_data[awh.PENDING_KEY] = pending
+    query = tap("ax:link:key", context)
+    assert query.edits[0][0] == arcus_ui.TEXT_K_CHECKING_STORED  # not the instructions card
+    assert "Key active on Arcus" in query.message.text
+    assert world.db.touches  # KEY_OK -> touch_verified
+    assert context.user_data[awh.PENDING_KEY] == pending  # the flow is left untouched
+
+
+def test_check_key_without_a_flow_diagnoses_too(monkeypatch):
+    world = World(monkeypatch)
+    world.db.credential = H.row(until=NOW_MS + 100 * DAY_MS)
+    world.client.api_keys = [ok([])]
+    query = tap("ax:link:key", ctx())
+    assert ls.TEXT_D_REVOKED in query.message.text
+
+
+# ---------------------------------------------------------------------------
+# R2-6: a text that names a button is shown with that button
+# ---------------------------------------------------------------------------
+
+def test_pending_expired_result_offers_the_link_button(monkeypatch):
+    _world, context, card = _verify_with(monkeypatch, _outcome(LinkResult.PENDING_EXPIRED))
+    text, kw = card.edits[-1]
+    assert text == arcus_ui.TEXT_R_PENDING_EXPIRED  # "…or tap Link to start over"
+    assert [(label, data) for label, data, _u in buttons(kw["reply_markup"])] == [
+        (arcus_ui.LABEL_LINK, "ax:link:start"), ("❌ Cancel", "ax:link:cancel")]
+
+
+def test_no_pending_result_offers_link_arcus_account(monkeypatch):
+    _world, context, card = _verify_with(monkeypatch, _outcome(LinkResult.NO_PENDING))
+    text, kw = card.edits[-1]
+    assert text == arcus_ui.TEXT_R_NO_PENDING  # "Tap Link Arcus account to start."
+    assert buttons(kw["reply_markup"])[0][:2] == (arcus_ui.LABEL_LINK, "ax:link:start")
+
+
+def test_a_mainnet_not_whitelisted_result_offers_the_network_button(monkeypatch):
+    world = World(monkeypatch, network="mainnet")
+    monkeypatch.setenv("ARCUS_MAINNET_ENABLED", "1")
+    context = ctx()
+    pending = _pending(world, "key")
+    context.user_data[awh.PENDING_KEY] = pending
+
+    async def fake(*, user_id, pending, pasted_secret=None):
+        return LinkOutcome(result=LinkResult.NOT_WHITELISTED, network="mainnet", address=ADDR)
+
+    monkeypatch.setattr(ls, "verify_and_store", fake)
+    card = SentMessage([], UID, "ack")
+    asyncio.run(awh._verify_and_report(context, UID, pending, awh._Target(card, UID, None)))
+    text, kw = card.edits[-1]
+    assert arcus_ui.TEXT_PR_NOT_ELIGIBLE_MAINNET in text  # "…(🌐 Network)."
+    assert ("🌐 Network", "ax:mode") in [(label, data) for label, data, _u in buttons(kw["reply_markup"])]
+    # testnet: no Network line and no Network button
+    _world, _context, card = _verify_with(monkeypatch, _outcome(LinkResult.NOT_WHITELISTED))
+    assert callback_data(card.edits[-1][1]["reply_markup"]) == ["ax:link:start", "ax:home"]
+
+
+# ---------------------------------------------------------------------------
+# R2-2: a flow that times out while a check runs is reported, never silent
+# ---------------------------------------------------------------------------
+
+def _timed_out_verify(monkeypatch, outcome_for):
+    world = World(monkeypatch)
+    context = ctx()
+    pending = replace(_pending(world, "verifying"), expires_mono=world.env.mono.now + 20.0)
+    context.user_data[awh.PENDING_KEY] = pending
+
+    async def slow(*, user_id, pending, pasted_secret=None):
+        world.env.mono.now += 60.0  # the 60 s apiKeys poll outlives the TTL
+        return outcome_for(pending)
+
+    monkeypatch.setattr(ls, "verify_and_store", slow)
+    card = SentMessage([], UID, "ack")
+    asyncio.run(awh._verify_and_report(context, UID, pending, awh._Target(card, UID, None)))
+    return world, context, card
+
+
+def test_a_key_stored_after_the_flow_timed_out_is_still_announced(monkeypatch):
+    linked_row = H.row(until=NOW_MS + 179 * DAY_MS)
+    _world, context, card = _timed_out_verify(
+        monkeypatch, lambda p: _outcome(LinkResult.LINKED, row=linked_row, valid_until_ms=linked_row.valid_until_ms)
+    )
+    text, kw = card.edits[-1]
+    assert text.startswith("✅ <b>Linked</b>")
+    assert callback_data(kw["reply_markup"]) == ["ax:wallet", "ax:home"]
+    assert awh.PENDING_KEY not in context.user_data
+
+
+@pytest.mark.parametrize("result", [LinkResult.KEY_NOT_FOUND, LinkResult.BUSY, LinkResult.SUPERSEDED,
+                                    LinkResult.KEY_INACTIVE, LinkResult.PENDING_EXPIRED])
+def test_any_other_result_after_a_timeout_says_it_timed_out(monkeypatch, result):
+    _world, context, card = _timed_out_verify(monkeypatch, lambda p: _outcome(result))
+    text, kw = card.edits[-1]
+    assert text == arcus_ui.TEXT_R_FLOW_EXPIRED
+    assert callback_data(kw["reply_markup"]) == ["ax:link:start", "ax:home"]  # "Tap Start over"
+    assert awh.PENDING_KEY not in context.user_data
+
+
+def test_a_timed_out_precheck_is_reported(monkeypatch):
+    world = World(monkeypatch)
+    context = ctx()
+    pending = replace(_pending(world, "address_check"), expires_mono=world.env.mono.now + 5.0)
+    context.user_data[awh.PENDING_KEY] = pending
+
+    async def slow(network, address, *, user_id):
+        world.env.mono.now += 30.0
+        return ls.AddressPrecheck(AddressCheck.ELIGIBLE, frozenset(), True, world.env.mono.now, None)
+
+    monkeypatch.setattr(ls, "precheck_address", slow)
+    card = SentMessage([], UID, "Checking…")
+    asyncio.run(awh._precheck_and_report(context, UID, pending, awh._Target(card, UID, None)))
+    assert card.edits[-1][0] == arcus_ui.TEXT_R_FLOW_EXPIRED
+    assert awh.PENDING_KEY not in context.user_data
+
+
+def test_check_again_refreshes_the_ttl_before_a_long_check(monkeypatch, caplog):
+    world = World(monkeypatch)
+    world.client.api_keys = [ok([]), ok([]), ok([]), ok([]), ok([entry(RFC_PUB, until=NOW_MS + 100 * DAY_MS)])]
+    context = ctx()
+    pending = replace(_pending(world, "verifying"), expires_mono=world.env.mono.now + 10.0)
+    context.user_data[awh.PENDING_KEY] = pending
+    _stash(world, replace(pending, expires_mono=world.env.mono.now + 1800))
+    with caplog.at_level(logging.INFO):
+        query = tap("ax:link:check", context)
+    assert "<b>Linked</b>" in query.message.text
+    assert len(world.db.upserts) == 1
+    assert "timed out mid-check" not in caplog.text  # the 25 s poll did not outlive the flow
+
+
+def test_check_again_at_the_address_check_refreshes_the_ttl(monkeypatch):
+    world = World(monkeypatch)
+    context = ctx()
+    pending = replace(_pending(world, "address_check"), expires_mono=world.env.mono.now + 3.0)
+    context.user_data[awh.PENDING_KEY] = pending
+
+    async def slow(network, address, *, user_id):
+        world.env.mono.now += 20.0
+        return ls.AddressPrecheck(AddressCheck.BUSY, frozenset(), None, world.env.mono.now, None)
+
+    monkeypatch.setattr(ls, "precheck_address", slow)
+    query = FakeQuery("ax:link:check")
+
+    async def body():
+        await awh.handle(query, "ax:link:check", UID, context)
+        await drain()
+
+    asyncio.run(body())
+    assert query.message.text == ls.TEXT_BUSY  # a result, not silence
+    assert context.user_data[awh.PENDING_KEY].step == "address_check"
+
+
+def test_a_wallet_key_warning_survives_a_flow_that_ended_meanwhile(monkeypatch):
+    # The "treat it as exposed, move your funds" warning must never be dropped, even
+    # when the flow was cancelled while the key was being checked.
+    world = World(monkeypatch)
+    context = ctx()
+    pending = _pending(world, "key", address=H.WALLET_ADDR)
+    context.user_data[awh.PENDING_KEY] = pending
+    card = SentMessage([], UID, "ack")
+    awh.clear_link_pending(context, UID)  # e.g. [❌ Cancel] tapped during intake
+    asyncio.run(awh._after_intake(context, UID, pending, ls.KeyIntake("wallet_key"), awh._Target(card, UID, None)))
+    text, kw = card.edits[-1]
+    assert text.startswith(ls.TEXT_R_WALLET_KEY)
+    assert callback_data(kw["reply_markup"]) == ["ax:link:start", "ax:home"]
+
+
+# ---------------------------------------------------------------------------
+# SEC-2: [❌ Cancel] / Unlink while a store is already saving the key
+# ---------------------------------------------------------------------------
+
+def _store_in_flight(monkeypatch, world, context):
+    """Start a verification whose store is blocked INSIDE its upsert (past every check)."""
+    world.client.api_keys = [ok([entry(RFC_PUB, until=NOW_MS + 100 * DAY_MS)])]
+    pending = _pending(world, "key")
+    context.user_data[awh.PENDING_KEY] = pending
+    _stash(world, pending)
+    world.db.upsert_gate = threading.Event()
+    return pending
+
+
+async def _wait_for_upsert(world):
+    for _ in range(500):
+        if any(a[0] == "upsert" for a in world.db.all_args):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the store never reached its upsert")
+
+
+def test_cancel_during_a_store_says_too_late_not_nothing_stored(monkeypatch):
+    world = World(monkeypatch)
+    context = ctx()
+    _store_in_flight(monkeypatch, world, context)
+
+    async def body():
+        check = FakeQuery("ax:link:check")
+        await awh.handle(check, "ax:link:check", UID, context)  # starts the verification
+        await _wait_for_upsert(world)
+        cancel = FakeQuery("ax:link:cancel")
+        tap_task = asyncio.ensure_future(awh.handle(cancel, "ax:link:cancel", UID, context))
+        await asyncio.sleep(0.05)
+        assert not tap_task.done()  # waits for the save that cannot be stopped any more
+        world.db.upsert_gate.set()
+        await tap_task
+        await drain()
+        return cancel
+
+    cancel = asyncio.run(body())
+    text, _ = _card(cancel)
+    assert arcus_ui.TEXT_R_CANCEL_TOO_LATE in text and arcus_ui.TEXT_R_CANCELLED not in text
+    assert len(world.db.upserts) == 1
+    assert awh.PENDING_KEY not in context.user_data
+
+
+def test_cancel_before_the_store_stores_nothing_and_says_so(monkeypatch):
+    world = World(monkeypatch)
+    world.client.api_keys = [ok([entry(RFC_PUB, until=NOW_MS + 100 * DAY_MS)])]
+    context = ctx()
+    pending = _pending(world, "key")
+    context.user_data[awh.PENDING_KEY] = pending
+    _stash(world, pending)
+    text, _ = _card(tap("ax:link:cancel", context))
+    assert arcus_ui.TEXT_R_CANCELLED in text and arcus_ui.TEXT_R_CANCEL_TOO_LATE not in text
+    assert world.db.upserts == []
+
+
+def test_cancel_with_no_flow_claims_nothing(monkeypatch):
+    World(monkeypatch)
+    text, _ = _card(tap("ax:link:cancel", ctx()))
+    assert arcus_ui.TEXT_R_CANCELLED not in text and arcus_ui.TEXT_R_CANCEL_TOO_LATE not in text
+    assert arcus_ui.TEXT_W_NOT_LINKED in text
+
+
+def test_unlink_note_names_the_key_actually_removed(monkeypatch):
+    # A renewal saved nadobro-new2 just before the unlink: the note must name THAT key.
+    world = World(monkeypatch)
+    world.db.credential = H.row(name="nadobro-old1")
+
+    async def unlink(uid, network):
+        world.db.credential = H.row(name="nadobro-new2", status="unlinked")  # the row the unlink wiped
+        return "unlinked"
+
+    monkeypatch.setattr(ls, "unlink", unlink)
+    query = FakeQuery("ax:unlink:confirm:testnet")
+    asyncio.run(awh.handle(query, "ax:unlink:confirm:testnet", UID, ctx()))
+    text, _ = _card(query)
+    assert "Revoke <code>nadobro-new2</code>" in text and "nadobro-old1" not in text
+
+
+def test_unlink_db_error_also_ends_the_link_flow(monkeypatch):
+    world = World(monkeypatch)
+    world.db.credential = H.row()
+    _unlink_spy(monkeypatch, RuntimeError("db down"))
+    context = ctx()
+    context.user_data[awh.PENDING_KEY] = _pending(world, "key")
+    text, _ = _card(tap("ax:unlink:confirm:testnet", context))
+    assert arcus_ui.TEXT_DB_BUSY in text
+    assert awh.PENDING_KEY not in context.user_data

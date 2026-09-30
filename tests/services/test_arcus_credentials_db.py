@@ -341,3 +341,73 @@ def test_arcus_network_mode_cas_and_gates(monkeypatch):
     # a user without a row
     assert vs.get_arcus_network_mode(990_033_019) == "testnet"
     assert vs.set_arcus_network_mode(990_033_019, "testnet") == "unchanged"
+
+
+def test_unlink_racing_a_renewal_store_leaves_the_row_unlinked_and_wiped(monkeypatch):
+    """SEC-2 / R2-4 on real Postgres: an explicit Unlink that lands while a renewal's
+    store is already inside its upsert must END unlinked with the ciphertext wiped.
+    Before the fix unlink() did not wait for the store lock, its UPDATE could commit
+    first and the renewal's INSERT … ON CONFLICT DO UPDATE SET status='active' then
+    re-activated the row with the new key."""
+    import asyncio
+    import sys
+    import threading
+    from types import SimpleNamespace
+
+    import arcus_link_helpers as H
+    from src.nadobro.users import arcus_credentials as creds
+    from src.nadobro.users import arcus_link_service as ls
+    from src.nadobro.users.arcus_link_service import AddressCheck, LinkPending
+    from src.nadobro.venue.arcus.signing import derive_public_key_hex
+
+    monkeypatch.setenv("ARCUS_ENABLED", "1")
+    monkeypatch.setenv("ARCUS_ALLOWED_USER_IDS", str(_U1))
+    monkeypatch.delitem(sys.modules, "src.nadobro.strategy.arcus_runtime", raising=False)
+    ls._reset_for_tests()
+    _upsert(_U1, seed=_SEED_A, name="nadobro-old1")  # the key a renewal replaces
+    pub_b = derive_public_key_hex(_SEED_B)
+    client = H.FakeClient()  # keyless reads only: scripted, no network
+    client.api_keys = [H.ok([H.entry(pub_b, address=_ADDR, name="nadobro-new2")])]
+    mono = H.FakeMono()
+    monkeypatch.setattr(ls, "_services", lambda net: SimpleNamespace(client=client, clock=H.FakeClock()))
+    monkeypatch.setattr(ls, "_now_ms", lambda: H.NOW_MS)
+    monkeypatch.setattr(ls, "_mono", mono)
+    entered, release = threading.Event(), threading.Event()
+    real_upsert = creds.upsert_active_credential
+
+    def gated_upsert(**kwargs):
+        entered.set()
+        assert release.wait(10)
+        return real_upsert(**kwargs)
+
+    monkeypatch.setattr(ls._creds, "upsert_active_credential", gated_upsert)
+    generation = ls.begin_generation(_U1, "testnet")
+    pending = LinkPending(
+        network="testnet", step="key", expires_mono=mono.now + 1800, generation=generation, attested_at=_NOW,
+        renewal=True, previous_address=_ADDR, address=_ADDR, key_name="nadobro-new2",
+        address_check=AddressCheck.ELIGIBLE, address_checked_mono=mono.now, has_activity=True,
+    )
+
+    async def body():
+        loop = asyncio.get_running_loop()
+        verify = loop.create_task(ls.verify_and_store(user_id=_U1, pending=pending, pasted_secret=_SEED_B))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        unlink = loop.create_task(ls.unlink(_U1, "testnet"))  # the user's explicit Unlink
+        await asyncio.sleep(0.1)
+        assert not unlink.done()
+        verify.cancel()  # the handler's clear_link_pending cancels the verify task
+        release.set()
+        outcome = await unlink
+        await asyncio.gather(verify, *list(ls._SHIELDED), return_exceptions=True)
+        return outcome
+
+    try:
+        outcome = asyncio.run(body())
+    finally:
+        release.set()
+        ls._reset_for_tests()
+    raw = _raw(_U1)
+    assert outcome == "unlinked"
+    assert raw["status"] == "unlinked" and raw["encrypted_signing_key"] == ""
+    assert raw["api_public_key"] == pub_b  # the wipe removed the key the store had just written

@@ -51,7 +51,9 @@ from src.nadobro.users.arcus_link_service import (
     TEXT_D_WRONG_SCOPE,
     TEXT_KR_DAYS,
     TEXT_KR_EXPIRED,
+    TEXT_KR_EXPIRED_PAUSED,
     TEXT_KR_HOURS,
+    TEXT_KR_PAUSED,
     TEXT_PR_NOT_ELIGIBLE,
     TEXT_R_WALLET_KEY,
 )
@@ -183,6 +185,14 @@ TEXT_K_GENERIC_DELETED = (
     "🔐 I deleted a message that looked like a secret key. Only paste a key when linking asks for it."
 )
 TEXT_K_GENERIC_EXPOSED = "If that was a wallet private key or seed phrase, treat it as exposed and move your funds."
+# The same messages when the pasted message could NOT be deleted (Telegram refuses
+# messages older than 48 h, e.g. an edited old message; API errors): they never
+# claim a deletion, and TEXT_K_NOT_DELETED is appended to them and to every later
+# result shown for that paste (SEC-1).
+TEXT_K_ACK_KEPT = "🔐 Key received. Checking it on Arcus — this can take up to a minute."
+TEXT_K_WAIT_ADDRESS_KEPT = "🔐 Key received. I'll check it as soon as the address check finishes."
+TEXT_K_ADDRESS_FIRST_KEPT = "🔐 Send your wallet address first, then paste the key again."
+TEXT_K_GENERIC_KEPT = "🔐 That message looked like a secret key. Only paste a key when linking asks for it."
 
 # Link results.
 TEXT_R_LINKED = "✅ <b>Linked</b> · <code>{address}</code> · subaccount 0 · key valid until {until}"
@@ -199,6 +209,9 @@ TEXT_R_SHORT_VALIDITY = "This key expires in {days} days. Use Days Valid 180 nex
 TEXT_R_WALLET_KEY_2 = (
     "I deleted it and stored nothing. Nadobro needs the API Signing Key from the Arcus app, never "
     "your wallet key."
+)
+TEXT_R_WALLET_KEY_2_KEPT = (
+    "I stored nothing. Nadobro needs the API Signing Key from the Arcus app, never your wallet key."
 )
 TEXT_R_INVALID = "That isn't an Arcus API Signing Key. Paste only the key: 64 characters, 0-9 and a-f."
 TEXT_R_PEM = "That looks like a key file. Arcus API Signing Keys are 64 characters, 0-9 and a-f."
@@ -217,6 +230,13 @@ TEXT_R_PENDING_EXPIRED = "This linking step timed out. Paste the key again, or t
 TEXT_R_STORE_FAILED = "Couldn't save the link right now. Nothing changed. Tap Check again."
 TEXT_R_NO_PENDING = "No link in progress. Tap Link Arcus account to start."
 TEXT_R_CANCELLED = "Linking cancelled. Nothing was stored."
+# The flow timed out while a check was still running (R2-2).
+TEXT_R_FLOW_EXPIRED = "This link request timed out before the check finished. Nothing was stored. Tap Start over."
+# Cancel tapped while the key was already being saved: the save cannot be stopped (SEC-2).
+TEXT_R_CANCEL_TOO_LATE = (
+    "Too late to cancel: your key had already passed the checks and was saved. Tap Unlink if you "
+    "don't want Nadobro to use it."
+)
 
 # Unlink card.
 TEXT_U_TITLE = "🔌 <b>Unlink Arcus</b> · {network}"
@@ -298,10 +318,11 @@ _HANDLER_TEXT_KEYS: tuple[str, ...] = (
     TEXT_K_ACK, TEXT_K_CHECKING, TEXT_K_CHECKING_STORED, TEXT_K_WAIT_ADDRESS, TEXT_K_NOT_DELETED,
     TEXT_K_WAIT_PASTE, TEXT_K_ATTEST_FIRST, TEXT_K_ADDRESS_FIRST, TEXT_K_STILL_CHECKING,
     TEXT_K_GENERIC_DELETED, TEXT_K_GENERIC_EXPOSED,
+    TEXT_K_ACK_KEPT, TEXT_K_WAIT_ADDRESS_KEPT, TEXT_K_ADDRESS_FIRST_KEPT, TEXT_K_GENERIC_KEPT,
     TEXT_R_LINKED, TEXT_R_RENEWED, TEXT_R_OLD_KEY, TEXT_R_NO_ACTIVITY, TEXT_R_SHORT_VALIDITY,
     TEXT_R_WALLET_KEY_2, TEXT_R_INVALID, TEXT_R_PEM, TEXT_R_NOT_FOUND, TEXT_R_INACTIVE,
     TEXT_R_TOO_SOON, TEXT_R_WRONG_SUB, TEXT_R_WITHDRAW, TEXT_R_PENDING_EXPIRED, TEXT_R_STORE_FAILED,
-    TEXT_R_NO_PENDING, TEXT_R_CANCELLED,
+    TEXT_R_NO_PENDING, TEXT_R_CANCELLED, TEXT_R_WALLET_KEY_2_KEPT, TEXT_R_FLOW_EXPIRED, TEXT_R_CANCEL_TOO_LATE,
     TEXT_U_TITLE, TEXT_U_BODY, TEXT_U_RUNNING_NOTE, TEXT_U_NADO_NOTE, TEXT_U_NONE, TEXT_U_DONE,
     TEXT_U_REFUSED,
     TEXT_M_TITLE, TEXT_M_VIEWING, TEXT_M_LINE, TEXT_M_STATUS_LINKED, TEXT_M_STATUS_NOT_LINKED,
@@ -324,7 +345,7 @@ DOMAIN_TEXT_KEYS = (
     TEXT_BUSY, TEXT_PR_NOT_ELIGIBLE, TEXT_R_WALLET_KEY,
     TEXT_D_OK, TEXT_D_OK_NO_EXPIRY, TEXT_D_SKEW, TEXT_D_EXPIRED, TEXT_D_REVOKED, TEXT_D_NAME_REUSE,
     TEXT_D_WRONG_SCOPE, TEXT_D_UNKNOWN_401, TEXT_D_NO_CREDENTIAL,
-    TEXT_KR_DAYS, TEXT_KR_HOURS, TEXT_KR_EXPIRED,
+    TEXT_KR_DAYS, TEXT_KR_HOURS, TEXT_KR_EXPIRED, TEXT_KR_PAUSED, TEXT_KR_EXPIRED_PAUSED,
 )
 
 
