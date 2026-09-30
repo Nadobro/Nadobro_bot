@@ -7,9 +7,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.nadobro.utils.visual import b, divider, esc, money
 from src.nadobro.handlers import ui
+from src.nadobro.handlers.network_guard import bind_cb, normalize_network
 
 
-def cancel_callback_for(order, fallback_index: int) -> str:
+def cancel_callback_for(order, fallback_index: int, *, network: str) -> str:
     """Cancel callback that identifies the order by DIGEST, not list position.
 
     A positional index re-resolved against a fresh snapshot can point at a
@@ -18,12 +19,16 @@ def cancel_callback_for(order, fallback_index: int) -> str:
     (16 hex chars, unique per user in practice) survives list reordering;
     the numeric form remains only for orders that carry no digest and for
     buttons rendered before this upgrade.
+
+    Both forms are bound to ``network``, the network the order list was read
+    from (PREVIEW-NETWORK-BIND): an index re-resolved on the OTHER network
+    would cancel an unrelated order there.
     """
     digest = str(order.get("digest") or order.get("order_digest") or "")
     short = digest.lower().removeprefix("0x")[:16]
     if short:
-        return f"portfolio:cancel_order:d:{short}"
-    return f"portfolio:cancel_order:{fallback_index}"
+        return bind_cb(f"portfolio:cancel_order:d:{short}", network)
+    return bind_cb(f"portfolio:cancel_order:{fallback_index}", network)
 
 
 def order_kind_label(order: dict[str, Any]) -> str:
@@ -43,6 +48,9 @@ def sorted_orders(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def render_orders_view(snapshot: dict[str, Any], page: int = 0, page_size: int = 6) -> tuple[str, InlineKeyboardMarkup]:
+    # Buttons are bound to the network the snapshot was read from; when it is
+    # unknown, none is rendered (never bound to a guessed network).
+    snapshot_network = normalize_network(snapshot.get("network"))
     network = str(snapshot.get("network") or "mainnet").upper()
     orders = sorted_orders(snapshot)
     total_pages = max(1, (len(orders) + page_size - 1) // page_size)
@@ -62,7 +70,10 @@ def render_orders_view(snapshot: dict[str, Any], page: int = 0, page_size: int =
             f" · {esc(str(order.get('created_at') or '—'))}",
             "",
         ])
-        rows.append([InlineKeyboardButton(f"🗑 Cancel {idx}", callback_data=cancel_callback_for(order, idx - 1))])
+        if snapshot_network is not None:
+            rows.append([InlineKeyboardButton(
+                f"🗑 Cancel {idx}", callback_data=cancel_callback_for(order, idx - 1, network=snapshot_network),
+            )])
     if not visible:
         lines.append("No open orders")
 
@@ -73,18 +84,22 @@ def render_orders_view(snapshot: dict[str, Any], page: int = 0, page_size: int =
         nav.append(InlineKeyboardButton(ui.NAV_OLDER, callback_data=f"portfolio:orders:{page + 1}"))
     if nav:
         rows.insert(0, nav)
-    if orders:
-        rows.append([InlineKeyboardButton("🗑 Cancel All", callback_data="portfolio:cancel_all_confirm")])
+    if orders and snapshot_network is not None:
+        # The opener carries this view's network; the confirm it opens is bound to it.
+        rows.append([InlineKeyboardButton(
+            "🗑 Cancel All", callback_data=bind_cb("portfolio:cancel_all_confirm", snapshot_network),
+        )])
     rows.append([InlineKeyboardButton(ui.nav_back_to("Portfolio"), callback_data="portfolio:view")])
     return "\n".join(lines)[:3500], InlineKeyboardMarkup(rows)
 
 
-def render_cancel_all_confirm() -> tuple[str, InlineKeyboardMarkup]:
+def render_cancel_all_confirm(*, network: str) -> tuple[str, InlineKeyboardMarkup]:
+    """"Yes, cancel all" is bound to the network this confirm was rendered on."""
     return (
         "🗑 Cancel all open orders?\n\nThis will cancel known open plain orders, then refresh Portfolio from Nado.",
         InlineKeyboardMarkup([
             [InlineKeyboardButton("◀ Keep orders", callback_data="portfolio:positions")],
-            [InlineKeyboardButton("🗑 Yes, cancel all", callback_data="portfolio:cancel_all_yes")],
+            [InlineKeyboardButton("🗑 Yes, cancel all", callback_data=bind_cb("portfolio:cancel_all_yes", network))],
         ]),
     )
 

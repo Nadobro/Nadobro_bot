@@ -271,7 +271,8 @@ def toast_for(data: str) -> str | None:
         return "Placing your order…"
     if pre("pos:close:"):
         return "Closing position…"
-    if data == "pos:confirm_close_all":
+    if data == "pos:confirm_close_all" or data.startswith("pos:confirm_close_all:"):
+        # The confirm is network-tagged (``pos:confirm_close_all:<network>``).
         return "Closing everything…"
     if pre("strategy:startok:", "strategy:start:"):
         return "Starting strategy…"

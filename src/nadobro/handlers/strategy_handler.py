@@ -17,6 +17,13 @@ from src.nadobro.handlers.formatters import escape_md, fmt_price
 from src.nadobro.utils.visual import money
 from src.nadobro.handlers.keyboards import back_kb, dn_funding_rates_kb, strategy_action_kb, strategy_product_picker_kb
 from src.nadobro.core.async_utils import run_blocking
+from src.nadobro.handlers.network_guard import (
+    active_network,
+    bind_cb,
+    refuse_query,
+    same_network,
+    unbind_cb,
+)
 from src.nadobro.strategy.bot_runtime import stop_user_bot, get_user_bot_status
 from src.nadobro.users.onboarding_service import is_new_onboarding_complete
 from src.nadobro.core.perf import timed_metric
@@ -283,13 +290,16 @@ def _vol_fee_estimate(telegram_id: int, product: str, network: str):
     )
 
 
-def _vol_fee_quote_key(est, sl_pct: float) -> tuple:
+def _vol_fee_quote_key(est, sl_pct: float, *, network: str) -> tuple:
     """Identity of the charges a fee card quoted.
 
     Compared at ack time so consent can only start a run on the numbers the
-    user actually saw. Every field here is one the user is agreeing to.
+    user actually saw. Every field here is one the user is agreeing to —
+    including the network: consent given for testnet charges is not consent
+    for a mainnet run with the same numbers (PREVIEW-NETWORK-BIND).
     """
     return (
+        str(network),
         str(est.margin_usd),
         str(est.target_volume_usd),
         str(est.total_rate),
@@ -534,7 +544,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 query,
                 body,
                 parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=strategy_action_kb("vol", "BTC", ["BTC"], vol_market=vm),
+                reply_markup=strategy_action_kb("vol", "BTC", ["BTC"], vol_market=vm, network=network),
             )
             return
         selected_product = str(context.user_data.get(f"strategy_pair:{strategy_id}", available_pairs[0]) or available_pairs[0]).upper()
@@ -566,6 +576,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 is_running=is_running,
                 vol_market=vkb,
                 mid_bias=mid_bias,
+                network=network,
             ),
         )
     elif action == "custom" and len(parts) >= 4:
@@ -634,6 +645,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 is_running=is_running,
                 vol_market=vkb,
                 mid_bias=mid_bias,
+                network=network,
             ),
         )
     elif action == "bias" and len(parts) >= 4:
@@ -1259,6 +1271,13 @@ async def _handle_strategy(query, data, context, telegram_id):
             parse_mode=ParseMode.MARKDOWN_V2,
         )
     elif action in ("start", "startok") and len(parts) >= 4:
+        # PREVIEW-NETWORK-BIND: Start / "Agree & Start" carry the network their
+        # card was rendered on (settings are per network, so a card from the
+        # other network showed settings this run would not use).
+        start_data, card_network = unbind_cb(data)
+        parts = start_data.split(":")
+        if len(parts) < 4:
+            return  # malformed: no product once the network tag is removed
         strategy_id = parts[2]
         product = str(parts[3] or "").upper()
         # VOL-FEE-AGREEMENT (2026-07-31): "startok" is the same start path,
@@ -1271,8 +1290,25 @@ async def _handle_strategy(query, data, context, telegram_id):
             start_direction = "short" if str(parts[4]).lower() == "short" else "long"
         if strategy_id not in supported:
             return
-        user = get_user(telegram_id)
-        network = user.network_mode.value if user else "mainnet"
+        current_network = await active_network(telegram_id)
+        # The retired Alpha Agent ("bro") has nothing to bind: start_user_bot
+        # refuses "bro" unconditionally, so this branch can never start a run
+        # on any network. Its dashboard (bro_action_kb) still renders an
+        # untagged "strategy:start:bro:MULTI"; answer it as before, on the
+        # current network, rather than with an "out of date" refusal that a
+        # re-tap of the same dashboard could never clear.
+        bro_retired = strategy_id == "bro" and current_network is not None
+        if not bro_retired and not same_network(card_network, current_network):
+            await refuse_query(
+                query,
+                kind=f"strategy_{action}",
+                built=card_network,
+                current=current_network,
+                telegram_id=telegram_id,
+                reply_markup=back_kb(f"strategy:preview:{strategy_id}"),
+            )
+            return
+        network = current_network if bro_retired else card_network
         vm = _vol_market_pref(context) if strategy_id == "vol" else None
         available_pairs = _strategy_available_products(strategy_id, network, vm)
         allowed_pairs = set(available_pairs)
@@ -1287,6 +1323,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                     available_pairs[0],
                     list(available_pairs),
                     vol_market=vkb_err,
+                    network=network,
                 ),
             )
             return
@@ -1362,6 +1399,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                     product,
                     list(available_pairs),
                     vol_market=vkb_block,
+                    network=network,
                 ),
             )
             return
@@ -1382,7 +1420,7 @@ async def _handle_strategy(query, data, context, telegram_id):
             # change between rendering and tapping would start the run on
             # numbers the user never saw — and the ack record would rewrite
             # itself to match, destroying the audit trail too.
-            context.user_data["vol_fee_quote"] = _vol_fee_quote_key(vol_est, _vol_sl)
+            context.user_data["vol_fee_quote"] = _vol_fee_quote_key(vol_est, _vol_sl, network=network)
             await _edit_loc(
                 query,
                 _vol_fee_agreement_text(vol_est, product, network, sl_pct=_vol_sl),
@@ -1390,7 +1428,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(
                         "✅ Agree & Start",
-                        callback_data=f"strategy:startok:vol:{product}",
+                        callback_data=bind_cb(f"strategy:startok:vol:{product}", network),
                     )],
                     [InlineKeyboardButton(
                         "◀ Back", callback_data="strategy:preview:vol",
@@ -1407,7 +1445,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 _vol_fee_estimate, telegram_id, product, network
             )
             _live_sl = float((strategy_conf or {}).get("sl_pct") or 0.0)
-            _live_key = _vol_fee_quote_key(_live_est, _live_sl)
+            _live_key = _vol_fee_quote_key(_live_est, _live_sl, network=network)
             if context.user_data.get("vol_fee_quote") != _live_key:
                 context.user_data["vol_fee_quote"] = _live_key
                 await _edit_loc(
@@ -1420,7 +1458,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton(
                             "✅ Agree & Start",
-                            callback_data=f"strategy:startok:vol:{product}",
+                            callback_data=bind_cb(f"strategy:startok:vol:{product}", network),
                         )],
                         [InlineKeyboardButton(
                             "◀ Back", callback_data="strategy:preview:vol",

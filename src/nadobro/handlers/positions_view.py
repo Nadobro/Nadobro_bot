@@ -6,6 +6,7 @@ from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.nadobro.handlers.orders_view import cancel_callback_for, order_kind_label, sorted_orders
+from src.nadobro.handlers.network_guard import bind_cb, normalize_network
 from src.nadobro.utils.visual import b, divider, esc, money, pct, pnl_dot, signed_money
 from src.nadobro.handlers import ui
 
@@ -25,6 +26,10 @@ def render_positions_view(
     pos_page: int | None = None,
     ord_page: int | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
+    # The network the snapshot was read from binds every executing button and
+    # every bulk opener on this view (PREVIEW-NETWORK-BIND). Unknown: the view
+    # still renders, but with no button that could act on a guessed network.
+    snapshot_network = normalize_network(snapshot.get("network"))
     network = str(snapshot.get("network") or "mainnet").upper()
     positions = sorted(
         list(snapshot.get("positions") or []),
@@ -94,9 +99,12 @@ def render_positions_view(
             f"size {abs(_dec(order.get('amount') or order.get('size')))} @ "
             f"{money(_dec(order.get('price') or order.get('limit_price')))}"
         )
-        order_action_rows.append(
-            [InlineKeyboardButton(f"🗑 Cancel {idx}", callback_data=cancel_callback_for(order, idx - 1))]
-        )
+        if snapshot_network is not None:
+            order_action_rows.append(
+                [InlineKeyboardButton(
+                    f"🗑 Cancel {idx}", callback_data=cancel_callback_for(order, idx - 1, network=snapshot_network),
+                )]
+            )
     if not orders:
         lines.append("No open orders")
 
@@ -119,11 +127,18 @@ def render_positions_view(
 
     rows.extend(order_action_rows)
 
+    # The bulk openers carry the view's network: the confirm they open is bound
+    # to it, so this (possibly stale) view can never open a close-all or
+    # cancel-all on the network the user has switched to since.
     bulk_row: list[InlineKeyboardButton] = []
-    if positions:
-        bulk_row.append(InlineKeyboardButton("❌ Close All", callback_data="portfolio:close_all_confirm"))
-    if orders:
-        bulk_row.append(InlineKeyboardButton("🗑 Cancel All", callback_data="portfolio:cancel_all_confirm"))
+    if positions and snapshot_network is not None:
+        bulk_row.append(InlineKeyboardButton(
+            "❌ Close All", callback_data=bind_cb("portfolio:close_all_confirm", snapshot_network),
+        ))
+    if orders and snapshot_network is not None:
+        bulk_row.append(InlineKeyboardButton(
+            "🗑 Cancel All", callback_data=bind_cb("portfolio:cancel_all_confirm", snapshot_network),
+        ))
     if bulk_row:
         rows.append(bulk_row)
     rows.append([InlineKeyboardButton(ui.nav_back_to("Portfolio"), callback_data="portfolio:view")])

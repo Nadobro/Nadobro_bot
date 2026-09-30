@@ -32,11 +32,20 @@ from src.nadobro.handlers.keyboards import (
     trade_card_confirm_kb,
 )
 from src.nadobro.handlers.home_card import build_home_card_text_async
+from src.nadobro.handlers.network_guard import (
+    active_network,
+    network_unknown_message,
+    network_unknown_query,
+    normalize_network,
+    refuse_query,
+    same_network,
+    stale_preview_text,
+)
 from src.nadobro.users.admin_service import is_trading_paused
 from src.nadobro.users.onboarding_service import get_resume_step, is_new_onboarding_complete
 from src.nadobro.users.settings_service import get_user_settings
 from src.nadobro.trading.trade_service import execute_market_order, execute_limit_order
-from src.nadobro.users.user_service import ensure_active_wallet_ready, get_user_readonly_client, get_user
+from src.nadobro.users.user_service import ensure_active_wallet_ready, get_user_readonly_client
 
 logger = logging.getLogger(__name__)
 
@@ -210,15 +219,16 @@ async def _load_preview_fields(session: dict, telegram_id: int) -> None:
     size = float(session.get("size", 0) or 0)
     leverage = int(session.get("leverage", 1) or 1)
     order_type = session.get("order_type", "market")
+    # Priced on the network the card was built on (PREVIEW-NETWORK-BIND); the
+    # caller has already verified that is still the user's network.
+    network = session.get("network") or "mainnet"
     price = 0.0
     try:
         if order_type == "limit":
             price = float(session.get("limit_price", 0) or 0)
         else:
-            client = get_user_readonly_client(telegram_id)
+            client = get_user_readonly_client(telegram_id, network=network)
             if client:
-                user = get_user(telegram_id)
-                network = user.network_mode.value if user else "mainnet"
                 pid = get_product_id(product, network=network, client=client)
                 if pid is not None:
                     mp = client.get_market_price(pid)
@@ -335,10 +345,17 @@ async def open_trade_card_from_message(
         return False
     session = _get_trade_card_session(context, touch=True)
     chat_id = update.effective_chat.id
+    # A new card is bound to the network it is built on (PREVIEW-NETWORK-BIND).
+    # When that cannot be read right now, no card is built: never one bound to
+    # a guessed network.
+    network = await active_network(telegram_id)
+    if network is None:
+        await network_unknown_message(
+            update.message, kind="trade_card_open", telegram_id=telegram_id, reply_markup=home_card_kb(),
+        )
+        return True
 
     if prefer_reply_to_message:
-        user = get_user(telegram_id)
-        network = user.network_mode.value if user else "mainnet"
         session = {
             "session_id": _new_session_id(),
             "state": "direction",
@@ -364,7 +381,12 @@ async def open_trade_card_from_message(
         _set_trade_card_session(context, session)
         return True
 
-    if session and session.get("origin_chat_id") == chat_id and session.get("origin_message_id"):
+    if (
+        session
+        and session.get("origin_chat_id") == chat_id
+        and session.get("origin_message_id")
+        and same_network(session.get("network"), network)
+    ):
         await _edit_or_send_trade_card(
             context,
             telegram_id,
@@ -374,8 +396,6 @@ async def open_trade_card_from_message(
         )
         return True
 
-    user = get_user(telegram_id)
-    network = user.network_mode.value if user else "mainnet"
     session = {
         "session_id": _new_session_id(),
         "state": "direction",
@@ -391,8 +411,15 @@ async def open_trade_card_from_message(
 async def open_trade_card_from_callback(query, context: CallbackContext, telegram_id: int) -> bool:
     if not is_trade_card_mode_enabled():
         return False
-    user = get_user(telegram_id)
-    network = user.network_mode.value if user else "mainnet"
+    # A new card is bound to the network it is built on (PREVIEW-NETWORK-BIND).
+    # When that cannot be read right now, no card is built: never one bound to
+    # a guessed network.
+    network = await active_network(telegram_id)
+    if network is None:
+        await network_unknown_query(
+            query, kind="trade_card_open", telegram_id=telegram_id, reply_markup=home_card_kb(),
+        )
+        return True
     session = {
         "session_id": _new_session_id(),
         "state": "direction",
@@ -420,7 +447,9 @@ def _session_matches_query(session: dict, query, session_id: str) -> bool:
     return True
 
 
-async def _execute_card_trade(query, context: CallbackContext, telegram_id: int, session: dict):
+async def _execute_card_trade(query, context: CallbackContext, telegram_id: int, session: dict, *, network: str):
+    """Place the card's order on ``network`` — the network the card was built on,
+    already verified by the caller to still be the user's network."""
     direction = session.get("direction", "long")
     order_type = session.get("order_type", "market")
     product = session.get("product", "BTC")
@@ -452,6 +481,7 @@ async def _execute_card_trade(query, context: CallbackContext, telegram_id: int,
             "limit_price": session.get("limit_price", session.get("price", 0)),
             "tp": session.get("tp"),
             "sl": session.get("sl"),
+            "network": network,
         },
     })
 
@@ -501,16 +531,31 @@ async def handle_trade_card_callback(update: Update, context: CallbackContext, t
         )
         return True
 
-    user = get_user(telegram_id)
-    session["network"] = user.network_mode.value if user else session.get("network", "mainnet")
-
-    session.pop("error", None)
-    state = session.get("state", "direction")
-
     if action in ("home", "cancel"):
         _clear_trade_card_session(context)
         await _render_home_on_card(query, telegram_id)
         return True
+
+    # PREVIEW-NETWORK-BIND: the card (product list, leverage cap, price) was
+    # built on session["network"]. It is never re-stamped: once the user is on
+    # another network, every further tap expires the card and nothing is sent.
+    card_network = session.get("network")
+    current_network = await active_network(telegram_id)
+    if not same_network(card_network, current_network):
+        _clear_trade_card_session(context)
+        await refuse_query(
+            query,
+            kind="trade_card",
+            notice="trade",
+            built=card_network,
+            current=current_network,
+            telegram_id=telegram_id,
+            reply_markup=home_card_kb(),
+        )
+        return True
+
+    session.pop("error", None)
+    state = session.get("state", "direction")
 
     if action == "back":
         session["state"] = _back_state(state)
@@ -540,9 +585,7 @@ async def handle_trade_card_callback(update: Update, context: CallbackContext, t
         session["product"] = value
         session["state"] = "leverage"
     elif action == "lev":
-        user = get_user(telegram_id)
-        network = user.network_mode.value if user else "mainnet"
-        max_leverage = get_product_max_leverage(session.get("product", "BTC"), network=network)
+        max_leverage = get_product_max_leverage(session.get("product", "BTC"), network=card_network)
         try:
             selected = int(value)
         except (TypeError, ValueError):
@@ -584,7 +627,7 @@ async def handle_trade_card_callback(update: Update, context: CallbackContext, t
         await _edit_message_safely(query, _build_confirm_preview(session), trade_card_confirm_kb(session["session_id"]))
         return True
     elif action == "confirm":
-        await _execute_card_trade(query, context, telegram_id, session)
+        await _execute_card_trade(query, context, telegram_id, session, network=card_network)
         return True
     else:
         return False
@@ -592,6 +635,31 @@ async def handle_trade_card_callback(update: Update, context: CallbackContext, t
     _set_trade_card_session(context, session)
     await _edit_message_safely(query, _build_trade_card_text(session), _card_keyboard(session))
     return True
+
+
+async def _refuse_card_text_input(update, context, session: dict, telegram_id: int, built, current) -> None:
+    """Replace the stale card with the refusal (so its buttons are gone too);
+    fall back to a reply when the card message can no longer be edited."""
+    lang = get_active_language()
+    text = stale_preview_text(built, current, notice="trade")
+    logger.info(
+        "network_bound_preview_refused kind=trade_card_text built=%s current=%s user=%s",
+        normalize_network(built) or "unknown",
+        normalize_network(current) or "unknown",
+        telegram_id,
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=session["origin_chat_id"],
+            message_id=session["origin_message_id"],
+            text=text,
+            reply_markup=localize_markup(home_card_kb(), lang),
+        )
+        return
+    except Exception:  # policy: degrade-ok(card not editable; the notice is sent as a reply below)
+        logger.info("trade_card: stale card not editable, replying instead user=%s", telegram_id)
+    if update.message:
+        await update.message.reply_text(text, reply_markup=localize_markup(home_card_kb(), lang))
 
 
 async def handle_trade_card_text_input(update: Update, context: CallbackContext, telegram_id: int, text: str) -> bool:
@@ -604,6 +672,13 @@ async def handle_trade_card_text_input(update: Update, context: CallbackContext,
     state = session.get("state")
     if state not in ("size_custom_input", "limit_price", "tp_input", "sl_input"):
         return False
+
+    card_network = session.get("network")
+    current_network = await active_network(telegram_id)
+    if not same_network(card_network, current_network):
+        _clear_trade_card_session(context)
+        await _refuse_card_text_input(update, context, session, telegram_id, card_network, current_network)
+        return True
 
     try:
         value = float(text.strip())

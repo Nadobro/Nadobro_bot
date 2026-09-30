@@ -155,6 +155,9 @@ class HandlePendingTextTradeConfirmationHydrationTest(unittest.TestCase):
             "direction": "short", "product": "BTC", "order_type": "limit",
             "size": 0.05, "leverage": 49, "limit_price": 81239.0,
             "price": 81239.0, "est_margin": 82.90, "slippage_pct": 1.0,
+            # Every preview is stamped with the network it was built on
+            # (PREVIEW-NETWORK-BIND); an unstamped one is refused.
+            "network": "mainnet",
         }
         # Simulate a prior preview that persisted state, then the worker
         # handling the user's `confirm` reply starts with empty user_data.
@@ -172,8 +175,12 @@ class HandlePendingTextTradeConfirmationHydrationTest(unittest.TestCase):
         sys.modules["src.nadobro.handlers.messages"] = fake_messages
 
         try:
+            async def _active_network(_telegram_id):
+                return "mainnet"
+
             with patch.object(intent_handlers, "is_trading_paused", return_value=False), \
-                 patch.object(intent_handlers, "ensure_active_wallet_ready", return_value=(True, "")):
+                 patch.object(intent_handlers, "ensure_active_wallet_ready", return_value=(True, "")), \
+                 patch.object(intent_handlers, "active_network", _active_network):
 
                 update = _FakeUpdate()
                 ctx = _FakeContext()

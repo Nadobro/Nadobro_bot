@@ -94,18 +94,19 @@ class TelegramUiFormatterTests(unittest.TestCase):
         self.assertIn("🚀 *Getting Started*", formatters.fmt_getting_started())
 
     def test_empty_positions_offers_next_step_and_back(self):
-        cbs = [b.callback_data for b in self._buttons(keyboards.positions_kb([]))]
+        cbs = [b.callback_data for b in self._buttons(keyboards.positions_kb([], network="mainnet"))]
         self.assertIn("card:trade:start", cbs)
         self.assertIn("nav:strategy_hub", cbs)
         self.assertIn("portfolio:view", cbs)  # Back to Portfolio
         # With a position, show Close All instead of the empty CTA.
         cbs2 = [b.callback_data for b in self._buttons(
-            keyboards.positions_kb([{"product_name": "BTC-PERP"}]))]
-        self.assertIn("pos:close_all", cbs2)
+            keyboards.positions_kb([{"product_name": "BTC-PERP"}], network="mainnet"))]
+        # The opener carries the network the positions were read from.
+        self.assertIn("pos:close_all:mainnet", cbs2)
         self.assertNotIn("nav:strategy_hub", cbs2)
 
     def test_trade_confirm_puts_cancel_left_of_confirm(self):
-        first_row = keyboards.trade_confirm_kb().inline_keyboard[0]
+        first_row = keyboards.trade_confirm_kb(network="mainnet").inline_keyboard[0]
         self.assertEqual(len(first_row), 2)
         self.assertIn("Cancel", first_row[0].text)
         self.assertIn("Confirm", first_row[1].text)

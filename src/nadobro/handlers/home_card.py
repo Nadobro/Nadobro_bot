@@ -148,7 +148,7 @@ def build_positions_view(telegram_id: int):
         prices = client.get_all_market_prices()
     except Exception as e:
         logger.debug("positions_prices_failed user=%s err=%s", telegram_id, e)
-    return fmt_positions(positions, prices), positions_kb(positions or [])
+    return fmt_positions(positions, prices), positions_kb(positions or [], network=network)
 
 
 # NOTE: ``build_portfolio_view`` was retired during the Portfolio workflow

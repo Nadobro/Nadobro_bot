@@ -104,7 +104,7 @@ def _flat_buttons(kb):
 
 
 def test_mid_start_card_carries_bias_row():
-    kb = strategy_action_kb("mid", "BTC", ["BTC", "ETH", "SOL"], mid_bias=0.0)
+    kb = strategy_action_kb("mid", "BTC", ["BTC", "ETH", "SOL"], mid_bias=0.0, network="mainnet")
     callbacks = [btn.callback_data for btn in _flat_buttons(kb)]
     assert "strategy:bias:mid:-0.5" in callbacks
     assert "strategy:bias:mid:0" in callbacks
@@ -112,20 +112,20 @@ def test_mid_start_card_carries_bias_row():
 
 
 def test_mid_bias_row_marks_the_active_lean():
-    kb = strategy_action_kb("mid", "BTC", ["BTC"], mid_bias=0.5)
+    kb = strategy_action_kb("mid", "BTC", ["BTC"], mid_bias=0.5, network="mainnet")
     by_cb = {btn.callback_data: btn.text for btn in _flat_buttons(kb)}
     assert by_cb["strategy:bias:mid:0.5"].startswith("✅")
     assert not by_cb["strategy:bias:mid:0"].startswith("✅")
     assert not by_cb["strategy:bias:mid:-0.5"].startswith("✅")
 
-    kb_short = strategy_action_kb("mid", "BTC", ["BTC"], mid_bias=-1.0)
+    kb_short = strategy_action_kb("mid", "BTC", ["BTC"], mid_bias=-1.0, network="mainnet")
     by_cb_short = {btn.callback_data: btn.text for btn in _flat_buttons(kb_short)}
     assert by_cb_short["strategy:bias:mid:-0.5"].startswith("✅")
 
 
 def test_other_strategies_have_no_bias_row():
     for sid in ("grid", "rgrid", "dgrid", "vol", "dn"):
-        kb = strategy_action_kb(sid, "BTC", ["BTC"])
+        kb = strategy_action_kb(sid, "BTC", ["BTC"], network="mainnet")
         callbacks = [btn.callback_data for btn in _flat_buttons(kb)]
         assert not any(cb.startswith("strategy:bias:") for cb in callbacks), sid
 

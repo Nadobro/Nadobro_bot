@@ -236,12 +236,12 @@ def test_mid_start_card_uses_setup_label_without_changing_other_cards():
 
     mid_labels = [
         button.text
-        for row in strategy_action_kb("mid", "BTC", ["BTC"]).inline_keyboard
+        for row in strategy_action_kb("mid", "BTC", ["BTC"], network="mainnet").inline_keyboard
         for button in row
     ]
     grid_labels = [
         button.text
-        for row in strategy_action_kb("grid", "BTC", ["BTC"]).inline_keyboard
+        for row in strategy_action_kb("grid", "BTC", ["BTC"], network="mainnet").inline_keyboard
         for button in row
     ]
     assert "⚙️ Setup" in mid_labels

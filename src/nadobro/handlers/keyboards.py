@@ -1,5 +1,6 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from src.nadobro.config import PRODUCTS, DUAL_MODE_CARD_FLOW, get_product_max_leverage, get_perp_products
+from src.nadobro.handlers.network_guard import bind_cb
 
 PERP_PRODUCTS = [name for name, info in PRODUCTS.items() if info["type"] == "perp"]
 
@@ -587,16 +588,22 @@ def trade_leverage_kb(product, action, size):
     return InlineKeyboardMarkup(rows)
 
 
-def trade_confirm_kb(trade_id="pending"):
+def trade_confirm_kb(trade_id="pending", *, network: str):
+    """``network``: the network the ``pending_trade`` preview was priced on.
+    Confirm carries it (PREVIEW-NETWORK-BIND): the slot is single, so a newer
+    preview on another network may have replaced the one this card showed."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("❌ Cancel", callback_data="cancel_trade"),
-            InlineKeyboardButton("✅ Confirm Trade", callback_data=f"exec_trade:{trade_id}"),
+            InlineKeyboardButton("✅ Confirm Trade", callback_data=bind_cb(f"exec_trade:{trade_id}", network)),
         ],
     ])
 
 
-def positions_kb(positions):
+def positions_kb(positions, *, network: str):
+    """``network``: the network ``positions`` were read from. Each one-tap close,
+    and the "Close All" opener (whose confirm inherits it), is bound to it
+    (PREVIEW-NETWORK-BIND); there is deliberately no default."""
     rows = [
         [InlineKeyboardButton("📌 Reload positions", callback_data="pos:view")],
     ]
@@ -605,9 +612,13 @@ def positions_kb(positions):
         pname = p.get("product_name", "").replace("-PERP", "")
         if pname and pname not in seen:
             seen.add(pname)
-            rows.append([InlineKeyboardButton(f"❌ Close {pname}-PERP", callback_data=f"pos:close:{pname}")])
+            rows.append([InlineKeyboardButton(
+                f"❌ Close {pname}-PERP", callback_data=bind_cb(f"pos:close:{pname}", network),
+            )])
     if positions:
-        rows.append([InlineKeyboardButton("❌ Close All Positions", callback_data="pos:close_all")])
+        rows.append([InlineKeyboardButton(
+            "❌ Close All Positions", callback_data=bind_cb("pos:close_all", network),
+        )])
     else:
         # Nothing open yet: point the user at the next move instead of a dead end.
         rows.append([
@@ -844,6 +855,8 @@ def strategy_action_kb(
     is_running: bool = False,
     vol_market: str = "spot",  # retained for signature compatibility; volume is spot-only.
     mid_bias: float | None = None,  # Mid Mode: current directional bias for the ✅ marker
+    *,
+    network: str,  # the network this card was rendered on; Start is bound to it
 ):
     if strategy_id == "dn":
         products = [p.upper() for p in (available_products or ["BTC", "ETH"])]
@@ -869,7 +882,7 @@ def strategy_action_kb(
         start_row = [
             InlineKeyboardButton(
                 f"▶ Start {strategy_id.upper()} (Spot)",
-                callback_data=f"strategy:start:{strategy_id}:{selected}",
+                callback_data=bind_cb(f"strategy:start:{strategy_id}:{selected}", network),
             ),
         ]
         rows = [
@@ -885,7 +898,7 @@ def strategy_action_kb(
             [
                 InlineKeyboardButton(
                     f"▶ Start {strategy_id.upper()}",
-                    callback_data=f"strategy:start:{strategy_id}:{selected}",
+                    callback_data=bind_cb(f"strategy:start:{strategy_id}:{selected}", network),
                 ),
             ],
             [
@@ -1096,11 +1109,13 @@ def bro_config_section_kb(section: str):
 
 
 
-def close_product_kb(network: str = "mainnet"):
+def close_product_kb(*, network: str):
+    """One-tap closes, bound to ``network`` (PREVIEW-NETWORK-BIND). No default:
+    a ``"mainnet"`` default is exactly how a testnet card closed mainnet."""
     rows = []
     row = []
     for name in _perp_products(network=network):
-        row.append(InlineKeyboardButton(name, callback_data=f"pos:close:{name}"))
+        row.append(InlineKeyboardButton(name, callback_data=bind_cb(f"pos:close:{name}", network)))
         if len(row) == 4:
             rows.append(row)
             row = []
@@ -1110,10 +1125,11 @@ def close_product_kb(network: str = "mainnet"):
     return InlineKeyboardMarkup(rows)
 
 
-def confirm_close_all_kb():
+def confirm_close_all_kb(*, network: str):
+    """"Yes, Close All" bound to the network the prompt was shown on."""
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Yes, Close All", callback_data="pos:confirm_close_all"),
+            InlineKeyboardButton("✅ Yes, Close All", callback_data=bind_cb("pos:confirm_close_all", network)),
             InlineKeyboardButton("❌ Cancel", callback_data="nav:main"),
         ],
     ])
@@ -1295,9 +1311,12 @@ def copy_cumulative_tp_kb():
     ])
 
 
-def copy_confirm_kb():
+def copy_confirm_kb(*, network: str):
+    """``network``: the network the ``copy_setup`` wizard was run on. Confirm
+    carries it (PREVIEW-NETWORK-BIND): the slot is single, so a newer wizard on
+    another network may have replaced the one this card showed."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirm & Start", callback_data="copy:confirm")],
+        [InlineKeyboardButton("✅ Confirm & Start", callback_data=bind_cb("copy:confirm", network))],
         [InlineKeyboardButton("❌ Cancel", callback_data="copy:hub")],
     ])
 

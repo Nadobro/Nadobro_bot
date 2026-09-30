@@ -107,6 +107,7 @@ def test_action_taps_get_a_present_tense_toast():
     """The Phase 2 win: a tap that does real work says so, instantly."""
     assert _ack_and_capture("exec_trade:abc") == "Placing your order…"
     assert _ack_and_capture("pos:close:BTC") == "Closing position…"
+    assert _ack_and_capture("pos:close:BTC:mainnet") == "Closing position…"  # network-tagged
     assert _ack_and_capture("strategy:stop") == "Stopping strategy…"
     assert _ack_and_capture("portfolio:view") == "Loading portfolio…"
 
@@ -121,7 +122,11 @@ def test_unmapped_tap_keeps_the_silent_bare_ack():
 def test_confirm_screen_is_not_mislabelled_as_the_action():
     """pos:close_all only OPENS a confirm dialog; it must not say 'Closing…'."""
     assert _ack_and_capture("pos:close_all") is None
+    # PREVIEW-NETWORK-BIND: the opener now carries the card's network; still no toast.
+    assert _ack_and_capture("pos:close_all:testnet") is None
     assert _ack_and_capture("pos:confirm_close_all") == "Closing everything…"
+    # PREVIEW-NETWORK-BIND: the confirm now carries the network it was rendered on.
+    assert _ack_and_capture("pos:confirm_close_all:testnet") == "Closing everything…"
 
 
 def test_toast_resolution_does_no_io():

@@ -211,14 +211,17 @@ def test_consent_is_bound_to_the_quoted_numbers():
     destroying the audit trail too."""
     from src.nadobro.handlers.strategy_handler import _vol_fee_quote_key
 
-    shown = _vol_fee_quote_key(_est(), sl_pct=5.0)
-    assert _vol_fee_quote_key(_est(), sl_pct=5.0) == shown, "stable when nothing moved"
+    shown = _vol_fee_quote_key(_est(), sl_pct=5.0, network="mainnet")
+    assert _vol_fee_quote_key(_est(), sl_pct=5.0, network="mainnet") == shown, "stable when nothing moved"
 
     # Each user-agreed dimension must invalidate the consent.
-    assert _vol_fee_quote_key(_est(margin_usd=250), sl_pct=5.0) != shown
-    assert _vol_fee_quote_key(_est(target_volume_usd=50_000), sl_pct=5.0) != shown
-    assert _vol_fee_quote_key(_est(taker_fee_rate=Decimal("0.0009")), sl_pct=5.0) != shown
-    assert _vol_fee_quote_key(_est(), sl_pct=10.0) != shown, "the stop is agreed to as well"
+    assert _vol_fee_quote_key(_est(margin_usd=250), sl_pct=5.0, network="mainnet") != shown
+    assert _vol_fee_quote_key(_est(target_volume_usd=50_000), sl_pct=5.0, network="mainnet") != shown
+    assert _vol_fee_quote_key(_est(taker_fee_rate=Decimal("0.0009")), sl_pct=5.0, network="mainnet") != shown
+    assert _vol_fee_quote_key(_est(), sl_pct=10.0, network="mainnet") != shown, "the stop is agreed to as well"
+    # PREVIEW-NETWORK-BIND: consent to testnet charges is not consent to the
+    # same numbers on mainnet.
+    assert _vol_fee_quote_key(_est(), sl_pct=5.0, network="testnet") != shown, "the network is agreed to as well"
 
 
 def test_ack_path_rechecks_the_quote_before_starting():

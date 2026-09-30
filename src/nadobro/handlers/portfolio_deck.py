@@ -7,6 +7,7 @@ from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.nadobro.handlers.orders_view import order_kind_label
+from src.nadobro.handlers.network_guard import bind_cb, normalize_network
 from src.nadobro.core.feature_flags import portfolio_sync_enabled, portfolio_sync_interval_seconds
 from src.nadobro.venue.nado_sync import sync_user
 from src.nadobro.users.user_service import get_user
@@ -33,8 +34,12 @@ def portfolio_deck_kb(
     has_orders: bool = False,
     *,
     window: str = _DEFAULT_WINDOW,
+    network: str | None,
 ) -> InlineKeyboardMarkup:
+    """``network``: the network the deck's snapshot was read from. "Close All"
+    carries it (PREVIEW-NETWORK-BIND) and is left out when it is unknown."""
     window = _normalize_window(window)
+    network = normalize_network(network)
     # Single shared 24h/7d/30d/All toggle — flips both Volume and PnL windows.
     toggle_row = [
         InlineKeyboardButton(
@@ -52,7 +57,10 @@ def portfolio_deck_kb(
         [InlineKeyboardButton("📊 Refresh portfolio", callback_data=f"portfolio:refresh:{window}")],
     ]
     if has_positions:
-        rows.append([InlineKeyboardButton("❌ Close All", callback_data="portfolio:close_all_confirm")])
+        if network is not None:
+            rows.append([InlineKeyboardButton(
+                "❌ Close All", callback_data=bind_cb("portfolio:close_all_confirm", network),
+            )])
     elif not has_orders:
         # Empty book: hand the user a next step instead of a dead end.
         rows.append([
@@ -218,7 +226,7 @@ def render_portfolio_deck(
     if not orders:
         lines.append("No open orders")
     return "\n".join(lines)[:3500], portfolio_deck_kb(
-        bool(positions), bool(orders), window=window
+        bool(positions), bool(orders), window=window, network=snapshot.get("network"),
     )
 
 
@@ -243,12 +251,13 @@ def render_loading() -> str:
     return "⏳ Loading portfolio…"
 
 
-def render_close_all_confirm() -> tuple[str, InlineKeyboardMarkup]:
+def render_close_all_confirm(*, network: str) -> tuple[str, InlineKeyboardMarkup]:
+    """"Yes, close all" is bound to the network this confirm was rendered on."""
     return (
         "❌ Close all open positions?\n\nThis will submit reduce-only market closes, then refresh Portfolio from Nado.",
         InlineKeyboardMarkup([
             [InlineKeyboardButton("◀ Keep positions", callback_data="portfolio:view")],
-            [InlineKeyboardButton("❌ Yes, close all", callback_data="portfolio:close_all_yes")],
+            [InlineKeyboardButton("❌ Yes, close all", callback_data=bind_cb("portfolio:close_all_yes", network))],
         ]),
     )
 
