@@ -35,7 +35,7 @@ from src.nadobro.handlers.keyboards import (
     trade_tpsl_edit_kb, trade_confirm_reply_kb, SIZE_PRESETS,
     mode_kb, strategy_hub_kb, wallet_kb, positions_kb,
     alerts_kb, settings_kb, close_product_kb, confirm_close_all_kb,
-    bro_answer_kb, referral_kb,
+    bro_answer_kb, referral_kb, back_kb,
 )
 from src.nadobro.users.points_ui import points_scope_kb
 from src.nadobro.handlers.trade_card import (
@@ -49,6 +49,7 @@ from src.nadobro.handlers.home_card import (
 )
 from src.nadobro.handlers.render_utils import plain_text_fallback
 from src.nadobro.handlers.state_reset import clear_pending_user_state
+from src.nadobro.handlers.network_guard import active_network, refuse_message, same_network
 from src.nadobro.handlers.wallet_view import build_wallet_view_payload, hydrate_wallet_flow_context
 from src.nadobro.handlers.formatters import fmt_points_dashboard
 from src.nadobro.users.points_service import (
@@ -184,6 +185,8 @@ async def _execute_authorized_action(message, context, telegram_id: int, action_
         leverage = flow.get("leverage", 1)
         slippage_pct = flow.get("slippage_pct", 1)
 
+        # The network the flow was built and verified on (PREVIEW-NETWORK-BIND).
+        network = flow.get("network")
         if order_type == "limit":
             price = flow.get("limit_price", flow.get("price", 0))
             is_long = direction == "long"
@@ -191,6 +194,7 @@ async def _execute_authorized_action(message, context, telegram_id: int, action_
                 execute_limit_order, telegram_id, product, size, price,
                 is_long=is_long, leverage=leverage,
                 tp_price=flow.get("tp"), sl_price=flow.get("sl"),
+                network=network,
             )
         else:
             is_long = direction == "long"
@@ -198,6 +202,7 @@ async def _execute_authorized_action(message, context, telegram_id: int, action_
                 execute_market_order, telegram_id, product, size,
                 is_long=is_long, leverage=leverage, slippage_pct=slippage_pct,
                 tp_price=flow.get("tp"), sl_price=flow.get("sl"),
+                network=network,
             )
         await _reply_loc(message, 
             fmt_trade_result(result),
@@ -214,18 +219,20 @@ async def _execute_authorized_action(message, context, telegram_id: int, action_
         leverage = pending.get("leverage", 1)
         slippage_pct = pending.get("slippage_pct", 1)
 
+        network = pending.get("network")
         if action in ("limit_long", "limit_short"):
             price = pending.get("price", 0)
             is_long = action == "limit_long"
             result = await run_blocking(
                 execute_limit_order, telegram_id, product, size, price,
-                is_long=is_long, leverage=leverage,
+                is_long=is_long, leverage=leverage, network=network,
             )
         else:
             is_long = action == "long"
             result = await run_blocking(
                 execute_market_order, telegram_id, product, size,
                 is_long=is_long, leverage=leverage, slippage_pct=slippage_pct,
+                network=network,
             )
         await _reply_loc(message, 
             fmt_trade_result(result),
@@ -238,7 +245,9 @@ async def _execute_authorized_action(message, context, telegram_id: int, action_
         product = action_data.get("product")
         # Off the 8-thread misc pool (which the click/card-render path shares) so
         # a throttled venue close can't starve unrelated taps. SDK pool = 24.
-        result = await run_blocking_sdk(close_position, telegram_id, product)
+        result = await run_blocking_sdk(
+            close_position, telegram_id, product, network=action_data.get("network"),
+        )
         if result.get("success"):
             msg = f"✅ Closed {escape_md(str(result.get('cancelled', 0)))} {escape_md(result.get('product', product))} position size\\."
         else:
@@ -248,7 +257,9 @@ async def _execute_authorized_action(message, context, telegram_id: int, action_
 
     if action_type == "close_all":
         # SDK pool, not the misc pool the click path renders cards on.
-        result = await run_blocking_sdk(close_all_positions, telegram_id)
+        result = await run_blocking_sdk(
+            close_all_positions, telegram_id, network=action_data.get("network"),
+        )
         if result.get("success"):
             products = ", ".join(result.get("products", []))
             msg = f"✅ Closed total size {escape_md(str(result.get('cancelled', 0)))} across {escape_md(products)}\\."
@@ -266,18 +277,21 @@ async def _execute_authorized_action(message, context, telegram_id: int, action_
         leverage = flow.get("leverage", 1)
         slippage_pct = flow.get("slippage_pct", 1)
 
+        network = flow.get("network")
         if order_type == "limit":
             price = float(flow.get("limit_price", flow.get("price", 0)) or 0)
             result = await run_blocking(
                 execute_limit_order, telegram_id, product, size, price,
                 is_long=(direction == "long"), leverage=leverage,
                 tp_price=flow.get("tp"), sl_price=flow.get("sl"),
+                network=network,
             )
         else:
             result = await run_blocking(
                 execute_market_order, telegram_id, product, size,
                 is_long=(direction == "long"), leverage=leverage, slippage_pct=slippage_pct,
                 tp_price=flow.get("tp"), sl_price=flow.get("sl"),
+                network=network,
             )
         result_msg = fmt_trade_result(result)
         await _reply_loc(message, 
@@ -299,8 +313,11 @@ async def _execute_authorized_action(message, context, telegram_id: int, action_
             MIN_MARGIN_PER_TRADE,
             start_copy,
         )
-        user = get_user(telegram_id)
-        network = user.network_mode.value if user else "mainnet"
+        # The copy wizard's own network (PREVIEW-NETWORK-BIND), verified at confirm.
+        network = action_data.get("network")
+        if not network:
+            user = get_user(telegram_id)
+            network = user.network_mode.value if user else "mainnet"
         if budget_usd < MIN_MARGIN_PER_TRADE:
             reply = (
                 f"⚠️ Copy trading needs a margin of at least "
@@ -658,7 +675,8 @@ async def _dispatch_reply_button(update, context, telegram_id, callback_data, te
             reply_markup=localize_markup(trade_direction_kb(), lang),
         )
         _clear_trade_flow(context)
-        _set_trade_flow(context, {"state": "direction"})
+        # PREVIEW-NETWORK-BIND: the flow is bound to the network it starts on.
+        _set_trade_flow(context, {"state": "direction", "network": await active_network(telegram_id)})
         return
 
     if callback_data.startswith("trade_flow:"):
@@ -871,7 +889,11 @@ async def _handle_trade_flow_button(update, context, telegram_id, callback_data)
 
         direction = value
         direction_label = "🟢 LONG" if direction == "long" else "🔴 SHORT"
-        _set_trade_flow(context, {"state": "order_type", "direction": direction})
+        _set_trade_flow(context, {
+            "state": "order_type",
+            "direction": direction,
+            "network": (flow or {}).get("network"),
+        })
         await _reply_loc(update.message, 
             f"{direction_label} → Select order type:",
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -1075,7 +1097,28 @@ async def _go_back(update, context, flow, state, telegram_id):
         )
 
 
+async def _refuse_stale_trade_flow(update, context, telegram_id, built, current) -> None:
+    _clear_trade_flow(context)
+    await refuse_message(
+        update.message,
+        kind="trade_flow",
+        notice="trade",
+        built=built,
+        current=current,
+        telegram_id=telegram_id,
+        reply_markup=persistent_menu_kb(),
+    )
+
+
 async def _move_to_confirm(update, context, telegram_id, flow):
+    # PREVIEW-NETWORK-BIND: only preview (and later confirm) on the network the
+    # flow started on.
+    network = flow.get("network")
+    current_network = await active_network(telegram_id)
+    if not same_network(network, current_network):
+        await _refuse_stale_trade_flow(update, context, telegram_id, network, current_network)
+        return
+
     product = flow.get("product", "BTC")
     size = flow.get("size", 0)
     leverage = flow.get("leverage", 1)
@@ -1092,10 +1135,8 @@ async def _move_to_confirm(update, context, telegram_id, flow):
         if order_type == "limit":
             price = flow.get("limit_price", 0)
         else:
-            client = get_user_readonly_client(telegram_id)
+            client = get_user_readonly_client(telegram_id, network=network)
             if client:
-                user = get_user(telegram_id)
-                network = user.network_mode.value if user else "mainnet"
                 pid = get_product_id(product, network=network, client=client)
                 if pid is not None:
                     mp = client.get_market_price(pid)
@@ -1142,6 +1183,13 @@ async def _execute_trade_flow(update, context, telegram_id, flow):
     leverage = flow.get("leverage", 1)
     slippage_pct = _get_user_settings(telegram_id, context).get("slippage", 1)
 
+    # PREVIEW-NETWORK-BIND: confirm only on the network the preview was built on.
+    network = flow.get("network")
+    current_network = await active_network(telegram_id)
+    if not same_network(network, current_network):
+        await _refuse_stale_trade_flow(update, context, telegram_id, network, current_network)
+        return
+
     _clear_trade_flow(context)
 
     if is_trading_paused():
@@ -1173,6 +1221,7 @@ async def _execute_trade_flow(update, context, telegram_id, flow):
             "limit_price": flow.get("limit_price", flow.get("price", 0)),
             "tp": flow.get("tp"),
             "sl": flow.get("sl"),
+            "network": network,
         },
     })
 
@@ -1296,6 +1345,25 @@ async def _handle_pending_trade(update, context, telegram_id, text):
         return False
 
     step = pending.get("step", "")
+    if step not in ("custom_size", "limit_input"):
+        return False
+
+    # PREVIEW-NETWORK-BIND: the product was picked on the network stamped into
+    # the pending trade; a typed size/price is only priced on that network.
+    network = pending.get("network")
+    current_network = await active_network(telegram_id)
+    if not same_network(network, current_network):
+        context.user_data.pop("pending_trade", None)
+        await refuse_message(
+            update.message,
+            kind="trade_legacy_text",
+            notice="trade",
+            built=network,
+            current=current_network,
+            telegram_id=telegram_id,
+            reply_markup=back_kb(),
+        )
+        return True
 
     if step == "custom_size":
         try:
@@ -1316,8 +1384,6 @@ async def _handle_pending_trade(update, context, telegram_id, text):
 
         action = pending["action"]
         product = pending["product"]
-        user = get_user(telegram_id)
-        network = user.network_mode.value if user else "mainnet"
         max_leverage = get_product_max_leverage(product, network=network)
         if leverage > max_leverage:
             if explicit_leverage:
@@ -1330,7 +1396,7 @@ async def _handle_pending_trade(update, context, telegram_id, text):
 
         price = 0
         try:
-            client = get_user_readonly_client(telegram_id)
+            client = get_user_readonly_client(telegram_id, network=network)
             if client:
                 pid = get_product_id(product, network=network, client=client)
                 if pid is not None:
@@ -1354,6 +1420,7 @@ async def _handle_pending_trade(update, context, telegram_id, text):
             "price": price,
             "est_margin": est_margin,
             "slippage_pct": _get_user_settings(telegram_id, context).get("slippage", 1),
+            "network": network,
         }
 
         preview = fmt_trade_preview(action, product, size, price, leverage, est_margin)
@@ -1379,8 +1446,6 @@ async def _handle_pending_trade(update, context, telegram_id, text):
         action = pending["action"]
         product = pending["product"]
         leverage = _get_user_settings(telegram_id, context).get("default_leverage", 3)
-        user = get_user(telegram_id)
-        network = user.network_mode.value if user else "mainnet"
         max_leverage = get_product_max_leverage(product, network=network)
         if leverage > max_leverage:
             leverage = max_leverage
@@ -1392,6 +1457,7 @@ async def _handle_pending_trade(update, context, telegram_id, text):
             "leverage": leverage,
             "price": price,
             "slippage_pct": _get_user_settings(telegram_id, context).get("slippage", 1),
+            "network": network,
         }
 
         preview = fmt_trade_preview(
@@ -2115,7 +2181,8 @@ async def _handle_managed_agent_message(update, context, telegram_id, username, 
 
 
 async def _handle_pending_text_close_all_confirmation(update, context, telegram_id, text):
-    if not context.user_data.get(PENDING_TEXT_CLOSE_ALL_KEY):
+    pending = context.user_data.get(PENDING_TEXT_CLOSE_ALL_KEY)
+    if not pending:
         return False
 
     normalized = (text or "").strip().lower()
@@ -2128,16 +2195,32 @@ async def _handle_pending_text_close_all_confirmation(update, context, telegram_
         )
         return True
 
+    # PREVIEW-NETWORK-BIND: the prompt is bound to the network it was shown on.
+    # A legacy flag (``True``, no stamp) or another network now: fail closed.
+    built = pending.get("network") if isinstance(pending, dict) else None
+    current = await active_network(telegram_id)
+    if not same_network(built, current):
+        context.user_data.pop(PENDING_TEXT_CLOSE_ALL_KEY, None)
+        await refuse_message(
+            update.message,
+            kind="text_close_all",
+            built=built,
+            current=current,
+            telegram_id=telegram_id,
+            reply_markup=persistent_menu_kb(),
+        )
+        return True
+
     if normalized not in ("confirm", "yes", "y", "execute", "close all"):
         await _reply_loc(update.message, 
             "Type `confirm` to close all positions or `cancel` to discard\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=confirm_close_all_kb(),
+            reply_markup=confirm_close_all_kb(network=built),
         )
         return True
 
     context.user_data.pop(PENDING_TEXT_CLOSE_ALL_KEY, None)
-    await execute_action_directly(update, context, telegram_id, {"type": "close_all"})
+    await execute_action_directly(update, context, telegram_id, {"type": "close_all", "network": built})
     return True
 
 
@@ -2165,11 +2248,12 @@ async def _handle_interaction_intent_message(update, context, telegram_id, text)
         return True
 
     if action == "close_all":
-        context.user_data[PENDING_TEXT_CLOSE_ALL_KEY] = True
+        # Bound to the network this prompt was built on (PREVIEW-NETWORK-BIND).
+        context.user_data[PENDING_TEXT_CLOSE_ALL_KEY] = {"network": network}
         await _reply_loc(update.message, 
             fmt_close_all_confirm() + "\n\nType `confirm` to execute or `cancel` to discard\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=confirm_close_all_kb(),
+            reply_markup=confirm_close_all_kb(network=network),
         )
         return True
 

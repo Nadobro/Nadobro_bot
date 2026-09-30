@@ -25,7 +25,8 @@ def render_positions_view(
     pos_page: int | None = None,
     ord_page: int | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    network = str(snapshot.get("network") or "mainnet").upper()
+    snapshot_network = str(snapshot.get("network") or "mainnet").lower()
+    network = snapshot_network.upper()
     positions = sorted(
         list(snapshot.get("positions") or []),
         key=lambda p: (
@@ -95,7 +96,9 @@ def render_positions_view(
             f"{money(_dec(order.get('price') or order.get('limit_price')))}"
         )
         order_action_rows.append(
-            [InlineKeyboardButton(f"🗑 Cancel {idx}", callback_data=cancel_callback_for(order, idx - 1))]
+            [InlineKeyboardButton(
+                f"🗑 Cancel {idx}", callback_data=cancel_callback_for(order, idx - 1, network=snapshot_network),
+            )]
         )
     if not orders:
         lines.append("No open orders")

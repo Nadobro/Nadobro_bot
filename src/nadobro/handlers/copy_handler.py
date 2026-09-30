@@ -13,6 +13,7 @@ from src.nadobro.handlers.keyboards import back_kb, copy_hub_kb, copy_trader_pre
 from src.nadobro.i18n import localize_text, get_active_language
 from src.nadobro.users.admin_service import is_admin
 from src.nadobro.core.async_utils import run_blocking
+from src.nadobro.handlers.network_guard import active_network, refuse_query, same_network
 from src.nadobro.users.onboarding_service import is_new_onboarding_complete
 from src.nadobro.users.user_service import get_user, ensure_active_wallet_ready
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -238,7 +239,10 @@ async def _handle_copy(query, data, context, telegram_id):
             await _edit_loc(query, "⚠️ {msg}", parse_mode=ParseMode.MARKDOWN_V2,
                             reply_markup=back_kb(), msg=escape_md(msg))
             return
-        context.user_data["copy_setup"] = {"trader_id": trader_id, "step": "budget"}
+        # PREVIEW-NETWORK-BIND: the wizard is bound to the network it starts on.
+        context.user_data["copy_setup"] = {
+            "trader_id": trader_id, "step": "budget", "network": await active_network(telegram_id),
+        }
         await _edit_loc(query,
             "💰 *Set Copy Margin*\n\nHow much USD to allocate for copying this "
             "trader? \\(minimum \\$100\\)",
@@ -342,7 +346,10 @@ async def _handle_copy(query, data, context, telegram_id):
 
     elif action == "start" and len(parts) >= 3:
         trader_id = int(parts[2])
-        context.user_data["copy_setup"] = {"trader_id": trader_id, "step": "budget"}
+        # PREVIEW-NETWORK-BIND: the wizard is bound to the network it starts on.
+        context.user_data["copy_setup"] = {
+            "trader_id": trader_id, "step": "budget", "network": await active_network(telegram_id),
+        }
         await _edit_loc(query,
             "💰 *Set Copy Budget*\n\nHow much USD to allocate for copy trading this trader?",
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -447,6 +454,21 @@ async def _handle_copy(query, data, context, telegram_id):
         if not setup:
             await _edit_loc(query, "⚠️ No setup to confirm\\.", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=back_kb())
             return
+        # PREVIEW-NETWORK-BIND: start the copy only on the network the wizard
+        # was run on (a missing stamp fails closed).
+        setup_network = setup.get("network")
+        current_network = await active_network(telegram_id)
+        if not same_network(setup_network, current_network):
+            context.user_data.pop("copy_setup", None)
+            await refuse_query(
+                query,
+                kind="copy_confirm",
+                built=setup_network,
+                current=current_network,
+                telegram_id=telegram_id,
+                reply_markup=back_kb("copy:hub"),
+            )
+            return
         if not is_new_onboarding_complete(telegram_id):
             await _edit_loc(query,
                 "⚠️ Complete setup first \\(language \\+ accept terms\\)\\.",
@@ -475,6 +497,7 @@ async def _handle_copy(query, data, context, telegram_id):
             "budget_usd": setup["budget_usd"],
             "risk_factor": setup["risk_factor"],
             "max_leverage": setup["max_leverage"],
+            "network": setup_network,
         }
         if setup.get("cumulative_stop_loss_pct"):
             action_data["cumulative_stop_loss_pct"] = setup["cumulative_stop_loss_pct"]

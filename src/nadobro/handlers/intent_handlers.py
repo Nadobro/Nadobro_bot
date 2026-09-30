@@ -8,6 +8,7 @@ from telegram.error import BadRequest
 
 from src.nadobro.i18n import localize_text, get_active_language
 from src.nadobro.handlers.render_utils import plain_text_fallback
+from src.nadobro.handlers.network_guard import active_network, refuse_message, same_network
 from src.nadobro.handlers.formatters import (
     escape_md,
     build_trade_preview_text,
@@ -131,6 +132,8 @@ def _execute_trade_payload(telegram_id: int, payload: dict, **kwargs) -> dict:
     leverage = int(payload.get("leverage") or 1)
     slippage_pct = float(payload.get("slippage_pct") or 1)
 
+    # Execute on the network the preview was built on (PREVIEW-NETWORK-BIND).
+    network = payload.get("network")
     if order_type == "limit":
         return execute_limit_order(
             telegram_id,
@@ -141,6 +144,7 @@ def _execute_trade_payload(telegram_id: int, payload: dict, **kwargs) -> dict:
             leverage=leverage,
             tp_price=payload.get("tp"),
             sl_price=payload.get("sl"),
+            network=network,
         )
     return execute_market_order(
         telegram_id,
@@ -151,6 +155,7 @@ def _execute_trade_payload(telegram_id: int, payload: dict, **kwargs) -> dict:
         slippage_pct=slippage_pct,
         tp_price=payload.get("tp"),
         sl_price=payload.get("sl"),
+        network=network,
     )
 
 
@@ -178,6 +183,26 @@ async def handle_pending_text_trade_confirmation(update, context: CallbackContex
         )
         return True
 
+    # PREVIEW-NETWORK-BIND: the preview was priced and validated on the network
+    # stamped into it. If the user is on another network now (or the stamp is
+    # missing: fail closed), discard it. Never execute a testnet preview as a
+    # real mainnet order, or the other way round. The payload may have been
+    # hydrated from bot_state in a process the switch's clean-up never reached.
+    pending_network = pending.get("network")
+    current_network = await active_network(telegram_id)
+    if not same_network(pending_network, current_network):
+        context.user_data.pop(PENDING_TEXT_TRADE_KEY, None)
+        await run_blocking(clear_text_trade_pending, int(telegram_id))
+        await refuse_message(
+            update.message,
+            kind="text_trade",
+            notice="trade",
+            built=pending_network,
+            current=current_network,
+            telegram_id=telegram_id,
+        )
+        return True
+
     if is_trading_paused():
         await _reply_md_safe(update.message, localize_text("⏸ Trading is temporarily paused by admin\\.", lang))
         return True
@@ -185,26 +210,6 @@ async def handle_pending_text_trade_confirmation(update, context: CallbackContex
     if not wallet_ready:
         await _reply_md_safe(update.message, f"⚠️ {escape_md(wallet_msg)}")
         return True
-
-    # Network guard: the preview was priced/validated against the network it
-    # was built on. If the user switched testnet<->mainnet since, discard it —
-    # never execute a testnet preview as a real mainnet order (or vice versa).
-    pending_network = str(pending.get("network") or "").strip().lower()
-    if pending_network:
-        user = get_user(telegram_id)
-        current_network = user.network_mode.value if user else "mainnet"
-        if pending_network != str(current_network).lower():
-            context.user_data.pop(PENDING_TEXT_TRADE_KEY, None)
-            await run_blocking(clear_text_trade_pending, int(telegram_id))
-            await _reply_md_safe(
-                update.message,
-                localize_text(
-                    "⚠️ This trade was previewed on *{prev}* but you are now on *{cur}*\\. "
-                    "Discarded — please request the trade again\\.",
-                    lang,
-                ).format(prev=escape_md(pending_network.upper()), cur=escape_md(str(current_network).upper())),
-            )
-            return True
 
     context.user_data.pop(PENDING_TEXT_TRADE_KEY, None)
     await run_blocking(clear_text_trade_pending, int(telegram_id))
@@ -340,7 +345,9 @@ async def handle_position_management_intent(update, context: CallbackContext, te
         if is_trading_paused():
             await _reply_md_safe(update.message, localize_text("⏸ Trading is temporarily paused by admin\\.", lang))
             return True
-        context.user_data["pending_text_close_all"] = True
+        # Bound to the network this prompt was built on (PREVIEW-NETWORK-BIND):
+        # both the typed "confirm" and the button check it before closing.
+        context.user_data["pending_text_close_all"] = {"network": network}
         try:
             await run_blocking(persist_text_close_all_pending, int(telegram_id))
         except Exception:
@@ -349,12 +356,12 @@ async def handle_position_management_intent(update, context: CallbackContext, te
             await update.message.reply_text(
                 fmt_close_all_confirm() + "\n\nType `confirm` to execute or `cancel` to discard\\.",
                 parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=confirm_close_all_kb(),
+                reply_markup=confirm_close_all_kb(network=network),
             )
         except BadRequest:
             await update.message.reply_text(
                 "⚠️ Close all positions? Type confirm or cancel.",
-                reply_markup=confirm_close_all_kb(),
+                reply_markup=confirm_close_all_kb(network=network),
             )
         return True
 

@@ -44,9 +44,13 @@ PARAMETERISED: list[tuple[str, str, tuple, dict]] = [
     ("alert_condition_kb__btc", "alert_condition_kb", ("BTC",), {}),
     ("alert_delete_kb__two", "alert_delete_kb", (ALERTS,), {}),
     ("alert_delete_kb__empty", "alert_delete_kb", ([],), {}),
-    ("positions_kb__two", "positions_kb", ([POSITION_LONG, POSITION_SHORT],), {}),
-    ("positions_kb__empty", "positions_kb", ([],), {}),
-    ("strategy_action_kb__grid", "strategy_action_kb", ("grid",), {}),
+    # PREVIEW-NETWORK-BIND: executing buttons are bound to the network their
+    # card was rendered on, so these builders take a required ``network``.
+    ("positions_kb__two", "positions_kb", ([POSITION_LONG, POSITION_SHORT],), {"network": "mainnet"}),
+    ("positions_kb__empty", "positions_kb", ([],), {"network": "mainnet"}),
+    ("strategy_action_kb__grid", "strategy_action_kb", ("grid",), {"network": "mainnet"}),
+    ("close_product_kb__mainnet", "close_product_kb", (), {"network": "mainnet"}),
+    ("confirm_close_all_kb__mainnet", "confirm_close_all_kb", (), {"network": "mainnet"}),
     ("trade_card_direction_kb", "trade_card_direction_kb", ("sess-1",), {}),
     ("trade_card_order_type_kb", "trade_card_order_type_kb", ("sess-1",), {}),
     ("trade_card_leverage_kb", "trade_card_leverage_kb", ("sess-1",), {}),

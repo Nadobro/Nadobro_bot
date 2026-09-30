@@ -21,7 +21,14 @@ import asyncio
 import logging
 import time
 
-from src.nadobro.handlers.keyboards import portfolio_analytics_kb
+from src.nadobro.handlers.keyboards import back_kb, portfolio_analytics_kb
+from src.nadobro.handlers.network_guard import (
+    active_network,
+    network_of,
+    refuse_query,
+    same_network,
+    unbind_cb,
+)
 from src.nadobro.core.async_utils import run_blocking, run_blocking_sdk
 from src.nadobro.core.perf import timed_metric
 from src.nadobro.trading.trade_service import close_all_positions
@@ -144,7 +151,21 @@ def _spawn_background_refresh(query, telegram_id: int, view_key: str, render_fre
     _BG_REFRESH[key] = asyncio.create_task(_job())
 
 
+async def _refuse_stale_portfolio_action(query, telegram_id, *, kind: str, built, current) -> None:
+    await refuse_query(
+        query,
+        kind=kind,
+        built=built,
+        current=current,
+        telegram_id=telegram_id,
+        reply_markup=back_kb("portfolio:view"),
+    )
+
+
 async def _handle_portfolio(query, data, telegram_id):
+    # Executing buttons (close all / cancel all / cancel one) carry the network
+    # they were rendered on (PREVIEW-NETWORK-BIND, network_guard.bind_cb).
+    data, built_network = unbind_cb(data)
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else "view"
     try:
@@ -160,11 +181,19 @@ async def _handle_portfolio(query, data, telegram_id):
 
         # Portfolio is the HTML domain: declare it even for plain confirm
         # text so the whole domain is uniform (and statically checkable).
-        text, kb = render_close_all_confirm()
+        text, kb = render_close_all_confirm(network=network_of(user) or "mainnet")
         await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
     if action == "close_all_yes":
+        # Refused BEFORE the progress edit: nothing may run on a network the
+        # confirm was not rendered on (an untagged legacy button fails closed).
+        current_network = await active_network(telegram_id)
+        if not same_network(built_network, current_network):
+            await _refuse_stale_portfolio_action(
+                query, telegram_id, kind="portfolio_close_all", built=built_network, current=current_network,
+            )
+            return
         # Keep a way out on the progress card. An edit without reply_markup
         # STRIPS the keyboard, so if the close chain dies mid-flight (deploy,
         # venue stall) the user is left staring at "Closing all positions…"
@@ -177,12 +206,11 @@ async def _handle_portfolio(query, data, telegram_id):
                 [InlineKeyboardButton("🔄 Refresh Portfolio", callback_data="portfolio:view")],
             ]),
         )
-        network = user.network_mode.value if user else "mainnet"
         # SDK pool, NOT the 8-worker misc pool that renders every card: a venue
         # close holds its worker for the whole cancel/flatten/verify chain, so
         # running it here queued unrelated taps behind it (the callback.total
         # SLO breach). Matches the /status stop and text close-all paths.
-        result = await run_blocking_sdk(close_all_positions, telegram_id, network=network)
+        result = await run_blocking_sdk(close_all_positions, telegram_id, network=built_network)
         if isinstance(result, dict) and not result.get("success", False):
             await _edit_loc(
                 query,
@@ -227,17 +255,32 @@ async def _handle_portfolio(query, data, telegram_id):
     if action == "cancel_all_confirm":
         from src.nadobro.handlers.orders_view import render_cancel_all_confirm
 
-        text, kb = render_cancel_all_confirm()
+        text, kb = render_cancel_all_confirm(network=network_of(user) or "mainnet")
         await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
     if action == "cancel_all_yes":
+        # Refused before the book is even read: a stale "Yes, cancel all" would
+        # otherwise wipe the OTHER network's book, including a running
+        # strategy's quotes, trigger rungs and reduce-only stop backstops.
+        current_network = await active_network(telegram_id)
+        if not same_network(built_network, current_network):
+            await _refuse_stale_portfolio_action(
+                query, telegram_id, kind="portfolio_cancel_all", built=built_network, current=current_network,
+            )
+            return
         await _edit_loc(query, "⏳ Cancelling open orders…")
         from src.nadobro.handlers.portfolio_deck import snapshot_for_user
         from src.nadobro.handlers.positions_view import render_positions_view
 
         snapshot = await snapshot_for_user(telegram_id, force=True)
-        client = await run_blocking(get_user_nado_client, telegram_id, snapshot.get("network"))
+        if not same_network(built_network, snapshot.get("network")):
+            # The network moved under us (another process): cancel nothing.
+            await _refuse_stale_portfolio_action(
+                query, telegram_id, kind="portfolio_cancel_all", built=built_network, current=snapshot.get("network"),
+            )
+            return
+        client = await run_blocking(get_user_nado_client, telegram_id, built_network)
         if not client:
             await _edit_loc(query, "⚠ Cannot cancel orders: Nado client unavailable.")
             return
@@ -278,15 +321,33 @@ async def _handle_portfolio(query, data, telegram_id):
         return
 
     if action == "cancel_order":
+        digest_form = len(parts) > 3 and parts[2] == "d"
+        # A tagged button must match the current network. An untagged legacy
+        # POSITIONAL button fails closed: its index would be re-resolved
+        # against whatever network the user is on now. An untagged DIGEST
+        # button stays accepted: a digest is chain-specific, so it can only
+        # ever match an order on the network it was read from.
+        if built_network is not None or not digest_form:
+            current_network = await active_network(telegram_id)
+            if not same_network(built_network, current_network):
+                await _refuse_stale_portfolio_action(
+                    query, telegram_id, kind="portfolio_cancel_order", built=built_network, current=current_network,
+                )
+                return
         await _edit_loc(query, "⏳ Cancelling order…")
         from src.nadobro.handlers.orders_view import sorted_orders
         from src.nadobro.handlers.portfolio_deck import snapshot_for_user
         from src.nadobro.handlers.positions_view import render_positions_view
 
         snapshot = await snapshot_for_user(telegram_id, force=True)
+        if built_network is not None and not same_network(built_network, snapshot.get("network")):
+            await _refuse_stale_portfolio_action(
+                query, telegram_id, kind="portfolio_cancel_order", built=built_network, current=snapshot.get("network"),
+            )
+            return
         orders = sorted_orders(snapshot)
         order = None
-        if len(parts) > 3 and parts[2] == "d":
+        if digest_form:
             # Digest-addressed cancel: immune to list reordering between
             # render and tap (a positional index re-resolved against a fresh
             # snapshot could cancel the WRONG order).

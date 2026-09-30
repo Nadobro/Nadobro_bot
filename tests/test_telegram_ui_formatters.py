@@ -94,13 +94,13 @@ class TelegramUiFormatterTests(unittest.TestCase):
         self.assertIn("🚀 *Getting Started*", formatters.fmt_getting_started())
 
     def test_empty_positions_offers_next_step_and_back(self):
-        cbs = [b.callback_data for b in self._buttons(keyboards.positions_kb([]))]
+        cbs = [b.callback_data for b in self._buttons(keyboards.positions_kb([], network="mainnet"))]
         self.assertIn("card:trade:start", cbs)
         self.assertIn("nav:strategy_hub", cbs)
         self.assertIn("portfolio:view", cbs)  # Back to Portfolio
         # With a position, show Close All instead of the empty CTA.
         cbs2 = [b.callback_data for b in self._buttons(
-            keyboards.positions_kb([{"product_name": "BTC-PERP"}]))]
+            keyboards.positions_kb([{"product_name": "BTC-PERP"}], network="mainnet"))]
         self.assertIn("pos:close_all", cbs2)
         self.assertNotIn("nav:strategy_hub", cbs2)
 

@@ -159,7 +159,8 @@ def test_order_cancel_indices_follow_sorted_order():
 
     assert text.index("NEW") < text.index("OLD")
     # Digest-addressed cancel: immune to list reordering between render and tap.
-    assert kb.inline_keyboard[0][0].callback_data == "portfolio:cancel_order:d:new"
+    # Bound to the network the list was read from (the snapshot's).
+    assert kb.inline_keyboard[0][0].callback_data == "portfolio:cancel_order:d:new:testnet"
 
 
 def test_positions_cancel_indices_paginate_correctly():
@@ -183,11 +184,12 @@ def test_positions_cancel_indices_paginate_correctly():
         if btn.callback_data and btn.callback_data.startswith("portfolio:cancel_order:")
     ]
     # Sorted newest-first: ORD7..ORD1; ord page 1 (size 4) shows ORD3, ORD2,
-    # ORD1 — addressed by digest, not list position.
+    # ORD1 — addressed by digest, not list position, and bound to the
+    # snapshot's network.
     assert cancel_callbacks == [
-        "portfolio:cancel_order:d:3",
-        "portfolio:cancel_order:d:2",
-        "portfolio:cancel_order:d:1",
+        "portfolio:cancel_order:d:3:testnet",
+        "portfolio:cancel_order:d:2:testnet",
+        "portfolio:cancel_order:d:1:testnet",
     ]
 
 
@@ -335,8 +337,8 @@ def test_unrealized_pnl_pct_cross_falls_back_to_margin_used():
 def test_cancel_callback_falls_back_to_index_without_digest():
     from src.nadobro.handlers.orders_view import cancel_callback_for
 
-    assert cancel_callback_for({"digest": "0xABCDEF1234567890ffff"}, 3) == (
-        "portfolio:cancel_order:d:abcdef1234567890"
+    assert cancel_callback_for({"digest": "0xABCDEF1234567890ffff"}, 3, network="mainnet") == (
+        "portfolio:cancel_order:d:abcdef1234567890:mainnet"
     )
-    assert cancel_callback_for({"order_digest": "0x99"}, 3) == "portfolio:cancel_order:d:99"
-    assert cancel_callback_for({}, 3) == "portfolio:cancel_order:3"
+    assert cancel_callback_for({"order_digest": "0x99"}, 3, network="mainnet") == "portfolio:cancel_order:d:99:mainnet"
+    assert cancel_callback_for({}, 3, network="testnet") == "portfolio:cancel_order:3:testnet"

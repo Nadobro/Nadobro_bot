@@ -82,20 +82,20 @@ Each cell is `[label] → callback_data`.
 [◀ Back] → strategy:preview:bro  |  [🏠 Home] → nav:main
 ```
 
-## close_product_kb
+## close_product_kb__mainnet
 `close_product_kb`
 
 ```
-[BTC] → pos:close:BTC  |  [ETH] → pos:close:ETH  |  [SOL] → pos:close:SOL  |  [XRP] → pos:close:XRP
-[BNB] → pos:close:BNB  |  [LINK] → pos:close:LINK  |  [DOGE] → pos:close:DOGE
+[BTC] → pos:close:BTC:mainnet  |  [ETH] → pos:close:ETH:mainnet  |  [SOL] → pos:close:SOL:mainnet  |  [XRP] → pos:close:XRP:mainnet
+[BNB] → pos:close:BNB:mainnet  |  [LINK] → pos:close:LINK:mainnet  |  [DOGE] → pos:close:DOGE:mainnet
 [◀ Back] → nav:main
 ```
 
-## confirm_close_all_kb
+## confirm_close_all_kb__mainnet
 `confirm_close_all_kb`
 
 ```
-[✅ Yes, Close All] → pos:confirm_close_all  |  [❌ Cancel] → nav:main
+[✅ Yes, Close All] → pos:confirm_close_all:mainnet  |  [❌ Cancel] → nav:main
 ```
 
 ## copy_budget_kb
@@ -243,8 +243,8 @@ Each cell is `[label] → callback_data`.
 
 ```
 [📌 Reload positions] → pos:view
-[❌ Close BTC-PERP] → pos:close:BTC
-[❌ Close ETH-PERP] → pos:close:ETH
+[❌ Close BTC-PERP] → pos:close:BTC:mainnet
+[❌ Close ETH-PERP] → pos:close:ETH:mainnet
 [❌ Close All Positions] → pos:close_all
 [📁 Back to Portfolio] → portfolio:view  |  [🏠 Home] → nav:main
 ```
@@ -344,7 +344,7 @@ Each cell is `[label] → callback_data`.
 `strategy_action_kb`
 
 ```
-[▶ Start GRID] → strategy:start:grid:BTC
+[▶ Start GRID] → strategy:start:grid:BTC:mainnet
 [🎯 Choose Asset] → strategy:custom:grid:0  |  [⚙️ Advanced] → strategy:config:grid
 [✅ BTC] → strategy:pair:grid:BTC  |  [ETH] → strategy:pair:grid:ETH  |  [SOL] → strategy:pair:grid:SOL
 [◀ Back] → nav:strategy_hub  |  [🏠 Home] → nav:main

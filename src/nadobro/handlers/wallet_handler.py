@@ -140,12 +140,11 @@ async def _handle_wallet(query, data, telegram_id, context):
         result_msg = fmt_network_switch_result(result)
 
         if result.switched:
-            # Mode switch invalidates in-flight confirmation flows (pending
-            # text trade / close-all) so a later "confirm" can't execute a
-            # preview built against the other network.
-            from src.nadobro.handlers.state_reset import clear_pending_user_state
+            # Mode switch invalidates every in-flight preview. Hygiene only:
+            # each confirm is also bound to its network (network_guard.py).
+            from src.nadobro.handlers.state_reset import clear_state_after_network_switch
 
-            clear_pending_user_state(context, telegram_id)
+            await clear_state_after_network_switch(context, telegram_id)
             info = get_user_wallet_info(telegram_id)
             msg = fmt_wallet_info(info)
             await _edit_loc(query, 

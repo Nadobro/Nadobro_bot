@@ -7,6 +7,7 @@ from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.nadobro.handlers.orders_view import order_kind_label
+from src.nadobro.handlers.network_guard import bind_cb
 from src.nadobro.core.feature_flags import portfolio_sync_enabled, portfolio_sync_interval_seconds
 from src.nadobro.venue.nado_sync import sync_user
 from src.nadobro.users.user_service import get_user
@@ -243,12 +244,13 @@ def render_loading() -> str:
     return "⏳ Loading portfolio…"
 
 
-def render_close_all_confirm() -> tuple[str, InlineKeyboardMarkup]:
+def render_close_all_confirm(*, network: str) -> tuple[str, InlineKeyboardMarkup]:
+    """"Yes, close all" is bound to the network this confirm was rendered on."""
     return (
         "❌ Close all open positions?\n\nThis will submit reduce-only market closes, then refresh Portfolio from Nado.",
         InlineKeyboardMarkup([
             [InlineKeyboardButton("◀ Keep positions", callback_data="portfolio:view")],
-            [InlineKeyboardButton("❌ Yes, close all", callback_data="portfolio:close_all_yes")],
+            [InlineKeyboardButton("❌ Yes, close all", callback_data=bind_cb("portfolio:close_all_yes", network))],
         ]),
     )
 

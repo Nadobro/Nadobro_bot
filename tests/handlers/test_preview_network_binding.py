@@ -22,12 +22,12 @@ Every function that moves money is a spy, so nothing reaches Nado.
 
 Most scenarios run twice:
 
-* ``same_network`` is a control and must pass both today and after the fix.
-  The preview is built and confirmed on TESTNET, and the action runs exactly
-  once. This keeps the spies honest, so a guardrail can never pass vacuously.
-* ``cross_network`` is a strict xfail. The preview is built on TESTNET, the
-  user's network becomes MAINNET, and then the preview is confirmed. Nothing
-  may run, and the user must be told the preview expired ("Nothing was sent").
+* ``same_network`` is a control: the preview is built and confirmed on
+  TESTNET, and the action runs exactly once. This keeps the spies honest, so a
+  guardrail can never pass vacuously.
+* ``cross_network``: the preview is built on TESTNET, the user's network
+  becomes MAINNET, and then the preview is confirmed. Nothing may run, and the
+  user must be told the preview expired ("Nothing was sent").
 
 The network changes in one of two ways:
 
@@ -42,8 +42,9 @@ The network changes in one of two ways:
   fix binds them to their network, so correctness no longer depends on that
   clean-up.
 
-Each xfail turns into an XPASS once the fix lands. Delete its marker in the
-same PR.
+PREVIEW-NETWORK-BIND — fixed: every cross-network scenario here was a strict
+xfail until previews were bound to the network they were built on
+(handlers/network_guard.py). They are plain regression tests now.
 """
 from __future__ import annotations
 
@@ -105,9 +106,9 @@ class HarnessError(RuntimeError):
     """The scenario itself broke: a handler raised or swallowed an error, or a
     button the scenario needs was never rendered.
 
-    This is deliberately NOT an AssertionError. The xfail markers accept only
-    AssertionError, so a broken harness fails loudly instead of passing itself
-    off as the expected bug."""
+    This is deliberately NOT an AssertionError: a broken harness must fail
+    loudly as a harness failure, never pass itself off as a refused confirm
+    (or, while these were strict xfails, as the expected bug)."""
 
 
 # --------------------------------------------------------------------------- #
@@ -537,18 +538,12 @@ def h(monkeypatch):
 # --------------------------------------------------------------------------- #
 # Verdicts                                                                     #
 # --------------------------------------------------------------------------- #
-def _xfail(path: str):
-    return pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=f"PREVIEW-NETWORK-BIND: {path} executes on the new network",
-    )
-
-
 def _same_and_cross(path: str):
+    """``path``: the confirm under test (documentation only)."""
+    del path
     return [
         pytest.param(False, id="same_network"),
-        pytest.param(True, id="cross_network", marks=_xfail(path)),
+        pytest.param(True, id="cross_network"),
     ]
 
 
@@ -652,7 +647,6 @@ def test_trade_card_confirm_is_bound_to_the_network_it_was_built_on(h, order_typ
         assert trade_card.TRADE_CARD_SESSION_KEY not in h.ctx.user_data, "the stale card must be cleared"
 
 
-@_xfail("trade card confirmed after the Execution Mode switch (the switch leaves trade_card_session)")
 def test_trade_card_built_on_testnet_cannot_confirm_after_execution_mode_switch(h):
     """The reported bug, end to end: card on TESTNET -> Execution Mode ->
     MAINNET -> Confirm on the old card places a REAL mainnet order."""
@@ -670,7 +664,6 @@ def test_trade_card_built_on_testnet_cannot_confirm_after_execution_mode_switch(
     _assert_nothing_executed(h)
 
 
-@_xfail("a half-built trade card continued after the network changed")
 @pytest.mark.parametrize("step", ["tap", "text"])
 def test_trade_card_half_built_on_testnet_cannot_continue_on_mainnet(h, step):
     """The card is half built on TESTNET and the network changes to MAINNET. The
@@ -839,6 +832,47 @@ def test_positional_order_cancel_is_bound_to_the_network_it_was_rendered_on(h, c
     _verdict(h, mark, cross_network, "cancel_orders")
 
 
+def _count_book_reads(h: Harness, monkeypatch, *, move_to: str | None = None) -> list:
+    """Wrap the fresh-snapshot read. With ``move_to``, the user's network
+    changes DURING the read (a switch served by another process)."""
+    reads: list = []
+
+    async def _snapshot_for_user(_uid, **_k):
+        reads.append(h.network)
+        if move_to is not None:
+            h.network = move_to
+        return h.snapshot(h.network)
+
+    monkeypatch.setattr(portfolio_deck, "snapshot_for_user", _snapshot_for_user)
+    return reads
+
+
+@pytest.mark.parametrize("build", [_build_cancel_all, _build_positional_cancel], ids=["cancel_all", "cancel_one"])
+def test_stale_cancel_is_refused_before_the_book_is_even_read(h, monkeypatch, build):
+    reads = _count_book_reads(h, monkeypatch)
+    mark = _drive(h, build, cross_network=True, change="elsewhere")
+    assert reads == [], "a stale cancel read the other network's book"
+    _assert_nothing_executed(h)
+    _assert_expired_notice(h, mark)
+
+
+@pytest.mark.parametrize("build", [_build_cancel_all, _build_positional_cancel], ids=["cancel_all", "cancel_one"])
+def test_cancel_refuses_when_the_network_moves_during_the_book_read(h, monkeypatch, build):
+    """Second layer: the confirm matched when tapped, but the snapshot came
+    back for the other network. Nothing may be cancelled on it."""
+
+    async def scenario() -> int:
+        confirm = await build(h)
+        _count_book_reads(h, monkeypatch, move_to=MAINNET)
+        mark = h.screen.mark()
+        await confirm()
+        return mark
+
+    mark = asyncio.run(scenario())
+    _assert_nothing_executed(h)
+    _assert_expired_notice(h, mark)
+
+
 # --------------------------------------------------------------------------- #
 # H6 - vault deposit / withdraw confirms                                       #
 # --------------------------------------------------------------------------- #
@@ -940,7 +974,6 @@ def test_in_memory_preview_is_bound_to_its_network_not_to_the_switch_clear(h, mo
     _verdict(h, mark, cross_network, executed)
 
 
-@_xfail("a pending text trade with no network stamp (the guard fails open)")
 def test_pending_text_trade_without_a_network_stamp_is_refused(h):
     """``handle_pending_text_trade_confirmation`` checks the network only
     ``if pending_network:``. A payload hydrated from bot_state without a
@@ -1001,16 +1034,8 @@ _SWITCH_CLEARS = [
     "trade_flow",
     "copy_setup",
     "vault_pending_amount",
-    pytest.param(
-        trade_card.TRADE_CARD_SESSION_KEY,
-        marks=pytest.mark.xfail(strict=True, raises=AssertionError,
-                                reason="PREVIEW-NETWORK-BIND: the switch leaves the trade card session behind"),
-    ),
-    pytest.param(
-        "vol_fee_quote",
-        marks=pytest.mark.xfail(strict=True, raises=AssertionError,
-                                reason="PREVIEW-NETWORK-BIND: the switch leaves the Volume fee consent behind"),
-    ),
+    trade_card.TRADE_CARD_SESSION_KEY,
+    "vol_fee_quote",
 ]
 
 
@@ -1037,14 +1062,167 @@ def test_network_switch_keeps_the_vault_in_flight_guard(h):
     assert h.ctx.user_data.get("vault_op_inflight") == "deposit"
 
 
+def _refuse_switches(h: Harness, monkeypatch, *, error: str) -> None:
+    """The fail-closed switch refuses: the user stays on the old network."""
+
+    def _refused(_tid, target):
+        items = ()
+        if error == network_switch.ERR_NOT_CONFIRMED:
+            items = (network_switch.SwitchItem(
+                kind=network_switch.STRATEGY, outcome=network_switch.FAILED,
+                label="grid", product="BTC", error="rate limited",
+            ),)
+        return network_switch.NetworkSwitchResult(
+            switched=False, from_network=h.network, to_network=target, items=items, error=error,
+        )
+
+    _swap(monkeypatch, network_switch, "switch_network", _refused)
+
+
+@pytest.mark.parametrize("error", [network_switch.ERR_NOT_CONFIRMED, network_switch.ERR_FLIP_FAILED])
+@pytest.mark.parametrize("key", _SWITCH_CLEARS)
+def test_refused_network_switch_keeps_every_preview(h, monkeypatch, key, error):
+    """A refused switch leaves the user on the network their previews were
+    built on, so they are still valid: nothing may be cleared, in memory or
+    in bot_state."""
+    _refuse_switches(h, monkeypatch, error=error)
+    h.ctx.user_data[key] = {"network": TESTNET, "sentinel": True}
+    h.bot_state[f"text_trade_pending:{UID}"] = {"network": TESTNET, "product": "BTC"}
+    asyncio.run(h.tap(f"mode:{MAINNET}", message_id=MODE_MSG))
+    assert h.network == TESTNET, "the refused switch must not change the network"
+    assert h.ctx.user_data.get(key) == {"network": TESTNET, "sentinel": True}, f"{key} was cleared by a refused switch"
+    assert f"text_trade_pending:{UID}" in h.bot_state, "a refused switch cleared a persisted preview"
+
+
+def test_switch_to_the_already_active_network_keeps_previews(h):
+    h.ctx.user_data[trade_card.TRADE_CARD_SESSION_KEY] = {"network": TESTNET, "sentinel": True}
+    h.bot_state[f"text_trade_pending:{UID}"] = {"network": TESTNET, "product": "BTC"}
+    asyncio.run(h.tap(f"mode:{TESTNET}", message_id=MODE_MSG))
+    assert h.ctx.user_data.get(trade_card.TRADE_CARD_SESSION_KEY) == {"network": TESTNET, "sentinel": True}
+    assert f"text_trade_pending:{UID}" in h.bot_state
+
+
+def test_trade_card_still_confirms_on_its_network_after_a_refused_switch(h, monkeypatch):
+    """No over-blocking: the switch was refused, so the card's network is still
+    the user's network and Confirm places the order there, exactly once."""
+    _refuse_switches(h, monkeypatch, error=network_switch.ERR_NOT_CONFIRMED)
+
+    async def scenario() -> None:
+        sid = await _card_to(h, order_type="market")
+        confirm = h.button(trade_card_cb(sid, "confirm"))
+        await h.tap(f"mode:{MAINNET}", message_id=MODE_MSG)
+        await h.tap(confirm)
+
+    asyncio.run(scenario())
+    _assert_executed_on_testnet(h, "execute_market_order")
+
+
+@pytest.mark.parametrize("switched", [True, False], ids=["switched", "refused"])
+def test_wallet_network_switch_clears_previews_only_when_it_switches(h, monkeypatch, switched):
+    """The stale ``wallet:network:*`` path runs the same switch and the same
+    clean-up as Execution Mode."""
+    if not switched:
+        _refuse_switches(h, monkeypatch, error=network_switch.ERR_NOT_CONFIRMED)
+    for key in (trade_card.TRADE_CARD_SESSION_KEY, "vol_fee_quote", "pending_text_trade"):
+        h.ctx.user_data[key] = {"network": TESTNET}
+    h.bot_state[f"text_trade_pending:{UID}"] = {"network": TESTNET, "product": "BTC"}
+    asyncio.run(h.tap(f"wallet:network:{MAINNET}", message_id=MODE_MSG))
+    assert h.network == (MAINNET if switched else TESTNET)
+    for key in (trade_card.TRADE_CARD_SESSION_KEY, "vol_fee_quote", "pending_text_trade"):
+        assert (key in h.ctx.user_data) is (not switched), key
+    assert (f"text_trade_pending:{UID}" in h.bot_state) is (not switched)
+
+
+# --------------------------------------------------------------------------- #
+# Same network: exactly the old behaviour, with the network now explicit       #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("order_type", ["market", "limit"])
+def test_same_network_trade_card_places_exactly_what_the_card_showed(h, order_type):
+    """The binding adds a check, nothing else: the order carries the card's
+    own fields, and the network it was built on is now passed explicitly."""
+
+    async def scenario() -> None:
+        sid = await _card_to(h, order_type=order_type)
+        await h.tap(h.button(trade_card_cb(sid, "confirm")))
+
+    asyncio.run(scenario())
+    size = float(SIZE_PRESETS["BTC"][2])
+    if order_type == "market":
+        assert h.venue.calls == [(
+            "execute_market_order",
+            (UID, "BTC", size),
+            {"is_long": True, "leverage": 5, "slippage_pct": 1, "tp_price": None, "sl_price": None,
+             "network": TESTNET},
+        )]
+    else:
+        assert h.venue.calls == [(
+            "execute_limit_order",
+            (UID, "BTC", size, 95_000.0),
+            {"is_long": True, "leverage": 5, "tp_price": None, "sl_price": None, "network": TESTNET},
+        )]
+
+
+def test_a_card_built_after_the_switch_trades_on_the_new_network(h):
+    """No over-blocking: a card opened AFTER the switch belongs to the new
+    network and confirms there."""
+
+    async def scenario() -> None:
+        await h.switch(MAINNET)
+        sid = await _card_to(h, order_type="market")
+        await h.tap(h.button(trade_card_cb(sid, "confirm")))
+
+    asyncio.run(scenario())
+    assert [(c[0], c[2].get("network")) for c in h.venue.calls] == [("execute_market_order", MAINNET)]
+
+
+# --------------------------------------------------------------------------- #
+# Buttons rendered before the binding existed carry no network: fail closed    #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "data",
+    [
+        "pos:confirm_close_all",
+        "portfolio:close_all_yes",
+        "portfolio:cancel_all_yes",
+        "pos:close:BTC",
+        "portfolio:cancel_order:0",
+        "strategy:start:grid:BTC",
+        "strategy:startok:vol:KBTC",
+        "vault:deposit:confirm:100.0",
+        "vault:withdraw:confirm:10.0",
+    ],
+)
+def test_untagged_legacy_confirm_button_is_refused_even_on_the_same_network(h, data):
+    """An untagged button cannot say which network it was rendered on, so it
+    is refused (fail closed) rather than executed on whatever network the user
+    is on now. One stale message costs the user a re-tap; the other way round
+    costs a real order."""
+    _orders_on_both_networks(h)
+    mark = h.screen.mark()
+    asyncio.run(h.tap(data))
+    _assert_nothing_executed(h)
+    _assert_expired_notice(h, mark, names=False)
+
+
+def test_untagged_digest_cancel_is_still_honoured_on_its_own_network(h):
+    """The digest form is chain-specific (safe by construction), so a legacy
+    untagged digest button keeps working on the network it was read from..."""
+    _orders_on_both_networks(h)
+    asyncio.run(h.tap("portfolio:cancel_order:d:" + "1a" * 8))
+    _assert_executed_on_testnet(h, "cancel_orders")
+
+
+def test_untagged_digest_cancel_never_matches_on_the_other_network(h):
+    """...and can never match an order on the other network."""
+    _orders_on_both_networks(h)
+    h.flip_elsewhere(MAINNET)
+    asyncio.run(h.tap("portfolio:cancel_order:d:" + "1a" * 8))
+    _assert_nothing_executed(h)
+
+
 # --------------------------------------------------------------------------- #
 # Adjacent money-path bug in the same confirm family                           #
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="PREVIEW-NETWORK-BIND (adjacent): the close-all button leaves the typed confirm armed; a later 'yes' closes everything again",
-)
 def test_close_all_button_disarms_the_typed_close_all_confirm(h):
     """The user types "close all positions", then taps the prompt's
     "Yes, Close All" button: everything closes. Their next "yes" (to anything

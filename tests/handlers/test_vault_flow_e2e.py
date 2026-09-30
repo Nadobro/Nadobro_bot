@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
+from src.nadobro.handlers import network_guard
 from src.nadobro.handlers import vault_handler as vh
 from src.nadobro.vault import nlp_vault_service as svc
 
@@ -177,8 +178,10 @@ def env(monkeypatch):
     """Patch the process boundaries; everything between them runs for real."""
     client = FakeVaultClient()
     holder = {"client": client}
-    for mod in (svc, vh):
-        monkeypatch.setattr(mod, "get_user", lambda *_a, **_k: FakeUser(), raising=False)
+    # The service resolves the user itself; the handler reads the user's active
+    # network through network_guard (confirms are bound to it).
+    for mod in (svc, network_guard):
+        monkeypatch.setattr(mod, "get_user", lambda *_a, **_k: FakeUser())
     monkeypatch.setattr(svc, "get_user_nado_client", lambda *_a, **_k: holder["client"])
     monkeypatch.setattr(svc, "get_pool_metrics", lambda *_a, **_k: {
         "tvl_usdt0": 9_099_631.40, "apr_pct": 7.59, "apr_source": "snapshots",
@@ -225,9 +228,10 @@ def test_deposit_happy_path_home_to_mint(env):
     # (100 - 1) / 1.04 NAV = 95.192307...
     assert "95.192308" in confirm["text"]
     assert "4 days" in confirm["text"]
-    assert "vault:deposit:confirm:100.0" in _callbacks(confirm)
+    # PREVIEW-NETWORK-BIND: Confirm is bound to the network it was quoted on.
+    assert "vault:deposit:confirm:100.0:mainnet" in _callbacks(confirm)
 
-    q = FakeQuery("vault:deposit:confirm:100.0")
+    q = FakeQuery("vault:deposit:confirm:100.0:mainnet")
     _drive(vh.handle_vault_callback(q, ctx))
     assert env["client"].mints == [(100.0, False)]  # exactly one, never borrows
     done = q.edits[-1]
@@ -266,14 +270,14 @@ def test_deposit_unknown_capacity_reaches_picker_and_mints(env):
     _drive(vh.handle_vault_callback(q, ctx))
     assert "Max you can deposit now" in q.edits[-1]["text"]
 
-    q = FakeQuery("vault:deposit:confirm:100.0")
+    q = FakeQuery("vault:deposit:confirm:100.0:mainnet")
     _drive(vh.handle_vault_callback(q, ctx))
     assert env["client"].mints == [(100.0, False)]
 
 
 def test_deposit_over_70pct_rejected_end_to_end(env):
     ctx = FakeContext()
-    q = FakeQuery("vault:deposit:confirm:120.0")  # > 101.45 ceiling
+    q = FakeQuery("vault:deposit:confirm:120.0:mainnet")  # > 101.45 ceiling
     _drive(vh.handle_vault_callback(q, ctx))
     assert env["client"].mints == []
     assert "70%" in q.edits[-1]["text"]
@@ -282,13 +286,13 @@ def test_deposit_over_70pct_rejected_end_to_end(env):
 def test_deposit_double_tap_mints_once(env):
     ctx = FakeContext()
     ctx.user_data[vh._OP_INFLIGHT_KEY] = "deposit"  # first tap still in flight
-    q = FakeQuery("vault:deposit:confirm:100.0")
+    q = FakeQuery("vault:deposit:confirm:100.0:mainnet")
     _drive(vh.handle_vault_callback(q, ctx))
     assert env["client"].mints == []
     assert any("processing" in (a or "") for a in q.answers)
     # guard clears with the first operation, later taps work again
     ctx.user_data.pop(vh._OP_INFLIGHT_KEY)
-    q2 = FakeQuery("vault:deposit:confirm:100.0")
+    q2 = FakeQuery("vault:deposit:confirm:100.0:mainnet")
     _drive(vh.handle_vault_callback(q2, ctx))
     assert env["client"].mints == [(100.0, False)]
 
@@ -296,10 +300,31 @@ def test_deposit_double_tap_mints_once(env):
 def test_deposit_venue_rejection_surfaces_error(env):
     env["client"] = FakeVaultClient(reject_mint="Mint would cause a borrow on the subaccount")
     ctx = FakeContext()
-    q = FakeQuery("vault:deposit:confirm:100.0")
+    q = FakeQuery("vault:deposit:confirm:100.0:mainnet")
     _drive(vh.handle_vault_callback(q, ctx))
     assert "borrow" in q.edits[-1]["text"]
     assert env["client"].mints == []
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        "vault:deposit:confirm:100.0:testnet",   # quoted on the other network
+        "vault:deposit:confirm:100.0",           # legacy button with no network
+        "vault:withdraw:confirm:50.0:testnet",
+        "vault:withdraw:confirm:50.0",
+    ],
+)
+def test_confirm_from_another_network_or_untagged_mints_and_burns_nothing(env, data):
+    """PREVIEW-NETWORK-BIND: the user is on MAINNET. A confirm quoted on testnet,
+    or a legacy untagged one, must neither mint/burn nor take the in-flight lock."""
+    env["client"] = FakeVaultClient(lp_balance=100.0, nav=1.04)
+    ctx = FakeContext()
+    q = FakeQuery(data)
+    _drive(vh.handle_vault_callback(q, ctx))
+    assert env["client"].mints == [] and env["client"].burns == []
+    assert vh._OP_INFLIGHT_KEY not in ctx.user_data
+    assert "Nothing was sent" in q.edits[-1]["text"]
 
 
 def test_deposit_custom_amount_text_flow(env):
@@ -315,6 +340,7 @@ def test_deposit_custom_amount_text_flow(env):
     good = FakeUpdate("$1,00")  # "$1,00" -> "100"
     assert _drive(vh.handle_vault_text(good, ctx)) is True
     assert "Confirm Deposit" in good.message.replies[-1]["text"]
+    assert "vault:deposit:confirm:100.0:mainnet" in _callbacks({"kb": good.message.replies[-1]["kb"]})
     assert vh._DEPOSIT_PENDING_KEY not in ctx.user_data
 
 
@@ -350,7 +376,9 @@ def test_withdraw_happy_path_pct_to_burn(env):
     assert "Estimated USDT0 out (pre-fees): `$52.00`" in confirm["text"]
     assert "Estimated fees: `$2.00`" in confirm["text"]
 
-    q = FakeQuery("vault:withdraw:confirm:50.0")
+    assert "vault:withdraw:confirm:50.0:mainnet" in _callbacks(confirm)
+
+    q = FakeQuery("vault:withdraw:confirm:50.0:mainnet")
     _drive(vh.handle_vault_callback(q, ctx))
     assert env["client"].burns == [50.0]
     assert "Burned 50.000000 NLP" in q.edits[-1]["text"]
@@ -371,7 +399,7 @@ def test_withdraw_lockup_blocks_even_from_stale_keyboard(env):
     assert not any(cb.startswith("vault:withdraw:pct:") for cb in _callbacks(picker))
 
     # A stale confirm button (pre-lockup keyboard) must still be rejected
-    q = FakeQuery("vault:withdraw:confirm:50.0")
+    q = FakeQuery("vault:withdraw:confirm:50.0:mainnet")
     _drive(vh.handle_vault_callback(q, ctx))
     assert env["client"].burns == []
     assert "Lockup active" in q.edits[-1]["text"]
@@ -380,7 +408,7 @@ def test_withdraw_lockup_blocks_even_from_stale_keyboard(env):
 def test_withdraw_over_balance_rejected(env):
     env["client"] = FakeVaultClient(lp_balance=10.0)
     ctx = FakeContext()
-    q = FakeQuery("vault:withdraw:confirm:11.0")
+    q = FakeQuery("vault:withdraw:confirm:11.0:mainnet")
     _drive(vh.handle_vault_callback(q, ctx))
     assert env["client"].burns == []
     assert "only have" in q.edits[-1]["text"]
@@ -455,6 +483,6 @@ def test_withdraw_100pct_burns_only_the_unlocked_tranche(env):
     assert not any(cb.startswith("vault:withdraw:pct:") for cb in _callbacks(picker))
     assert "locked" in picker["text"].lower()
     # And a stale-keyboard confirm cannot sneak a burn through.
-    q = FakeQuery("vault:withdraw:confirm:2.0")
+    q = FakeQuery("vault:withdraw:confirm:2.0:mainnet")
     _drive(vh.handle_vault_callback(q, ctx))
     assert client.burns == []

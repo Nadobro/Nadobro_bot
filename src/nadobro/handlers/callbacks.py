@@ -38,7 +38,8 @@ from src.nadobro.handlers.home_card import (
     build_positions_view,
 )
 from src.nadobro.handlers.commands import build_status_dashboard_parts
-from src.nadobro.handlers.state_reset import clear_pending_user_state
+from src.nadobro.handlers.state_reset import clear_pending_user_state, clear_state_after_network_switch
+from src.nadobro.handlers.network_guard import active_network, refuse_query, same_network, unbind_cb
 from src.nadobro.users.user_service import (
     get_or_create_user, get_user_nado_client, get_user_readonly_client, get_user_wallet_info,
     get_user, remove_user_private_key, ensure_active_wallet_ready, update_user_language,
@@ -415,10 +416,10 @@ async def _handle_mode(query, data, telegram_id, context=None):
     result = await run_blocking(switch_network, telegram_id, target_network)
     result_msg = fmt_network_switch_result(result)
     if result.switched:
-        # A mode switch invalidates any in-flight confirmation flow (pending
-        # text trade / close-all / trade card) — a "confirm" typed after the
-        # switch must never execute a preview built against the other network.
-        clear_pending_user_state(context, telegram_id)
+        # A mode switch invalidates every in-flight preview (trade card, text
+        # trade / close-all, fee consent, ...). Hygiene only: each confirm is
+        # also bound to its network at confirm time (network_guard.py).
+        await clear_state_after_network_switch(context, telegram_id)
         network_label = "🧪 TESTNET" if target_network == "testnet" else "🌐 MAINNET"
         await _edit_loc(query,
             "✅ *Switched to {label}*\n\n{msg}",
@@ -605,7 +606,7 @@ async def _handle_trade(query, data, telegram_id, context):
             select_product=localize_text("Select a product:", get_active_language()),
         )
     elif action in ("limit_long", "limit_short"):
-        context.user_data["pending_trade"] = {"action": action, "step": "product_select"}
+        context.user_data["pending_trade"] = {"action": action, "step": "product_select", "network": network}
         action_label = "LIMIT LONG" if action == "limit_long" else "LIMIT SHORT"
         await _edit_loc(query, 
             "*{label}*\n\n{select_product}",
@@ -624,7 +625,7 @@ async def _handle_trade(query, data, telegram_id, context):
         await _edit_loc(query, 
             "⚠️ *Close All Positions*\n\nAre you sure you want to close ALL open orders?",
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=confirm_close_all_kb(),
+            reply_markup=confirm_close_all_kb(network=network),
         )
 
 
@@ -642,6 +643,8 @@ async def _handle_product(query, data, telegram_id, context):
             "action": action,
             "product": product,
             "step": "limit_input",
+            # PREVIEW-NETWORK-BIND: checked before the typed size/price is priced.
+            "network": await active_network(telegram_id),
         }
         _lang = get_active_language()
         await _edit_loc(query, 
@@ -680,6 +683,8 @@ async def _handle_size(query, data, telegram_id, context):
             "action": action,
             "product": product,
             "step": "custom_size",
+            # PREVIEW-NETWORK-BIND: checked before the typed size is priced.
+            "network": await active_network(telegram_id),
         }
         _lang = get_active_language()
         await _edit_loc(query, 
@@ -729,10 +734,8 @@ async def _handle_leverage(query, data, telegram_id, context):
 
     price = 0
     try:
-        client = await run_blocking(get_user_readonly_client, telegram_id)
+        client = await run_blocking(get_user_readonly_client, telegram_id, network=network)
         if client:
-            user = await run_blocking(get_user, telegram_id)
-            network = user.network_mode.value if user else "mainnet"
             pid = await run_blocking(get_product_id, product, network=network, client=client)
             if pid is not None:
                 mp = await run_blocking(client.get_market_price, pid)
@@ -750,6 +753,8 @@ async def _handle_leverage(query, data, telegram_id, context):
         "price": price,
         "est_margin": est_margin,
         "slippage_pct": _get_user_settings(telegram_id, context).get("slippage", 1),
+        # PREVIEW-NETWORK-BIND: the network this preview was priced on.
+        "network": network,
     }
 
     preview = fmt_trade_preview(action, product, size, price, leverage, est_margin)
@@ -766,6 +771,22 @@ async def _handle_exec_trade(query, data, telegram_id, context):
         await _edit_loc(query, 
             "⚠️ No pending trade found\\. Please start again\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=back_kb(),
+        )
+        return
+    # PREVIEW-NETWORK-BIND: never confirm a preview on a network it was not
+    # priced on (a missing stamp fails closed).
+    built_network = pending.get("network")
+    current_network = await active_network(telegram_id)
+    if not same_network(built_network, current_network):
+        context.user_data.pop("pending_trade", None)
+        await refuse_query(
+            query,
+            kind="exec_trade",
+            notice="trade",
+            built=built_network,
+            current=current_network,
+            telegram_id=telegram_id,
             reply_markup=back_kb(),
         )
         return
@@ -792,11 +813,14 @@ async def _handle_exec_trade(query, data, telegram_id, context):
             "leverage": leverage,
             "slippage_pct": slippage_pct,
             "price": pending.get("price", 0),
+            "network": built_network,
         },
     })
 
 
 async def _handle_positions(query, data, telegram_id, context):
+    # Executing buttons carry the network they were rendered on (bind_cb).
+    data, built_network = unbind_cb(data)
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else "view"
 
@@ -820,19 +844,51 @@ async def _handle_positions(query, data, telegram_id, context):
 
     elif action == "close" and len(parts) >= 3:
         product = parts[2]
+        # PREVIEW-NETWORK-BIND: a one-tap close only acts on the network its
+        # button was rendered on; an untagged (legacy) button fails closed.
+        current_network = await active_network(telegram_id)
+        if not same_network(built_network, current_network):
+            await refuse_query(
+                query,
+                kind="close_position",
+                built=built_network,
+                current=current_network,
+                telegram_id=telegram_id,
+                reply_markup=back_kb(),
+            )
+            return
         from src.nadobro.handlers.messages import execute_action_directly
-        await execute_action_directly(query, context, telegram_id, {"type": "close_position", "product": product})
+        await execute_action_directly(query, context, telegram_id, {
+            "type": "close_position", "product": product, "network": built_network,
+        })
 
     elif action == "close_all":
+        network = await active_network(telegram_id) or "mainnet"
         await _edit_loc(query, 
             fmt_close_all_confirm(),
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=confirm_close_all_kb(),
+            reply_markup=confirm_close_all_kb(network=network),
         )
 
     elif action == "confirm_close_all":
-        from src.nadobro.handlers.messages import execute_action_directly
-        await execute_action_directly(query, context, telegram_id, {"type": "close_all"})
+        # Whatever happens next, this prompt is answered: disarm the typed
+        # "confirm" armed by the same close-all prompt, so a later "yes" can't
+        # close the account a second time.
+        from src.nadobro.handlers.messages import PENDING_TEXT_CLOSE_ALL_KEY, execute_action_directly
+
+        context.user_data.pop(PENDING_TEXT_CLOSE_ALL_KEY, None)
+        current_network = await active_network(telegram_id)
+        if not same_network(built_network, current_network):
+            await refuse_query(
+                query,
+                kind="close_all",
+                built=built_network,
+                current=current_network,
+                telegram_id=telegram_id,
+                reply_markup=back_kb(),
+            )
+            return
+        await execute_action_directly(query, context, telegram_id, {"type": "close_all", "network": built_network})
 
 
 async def _handle_portfolio(query, data, telegram_id):

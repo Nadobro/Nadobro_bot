@@ -1870,6 +1870,29 @@ _TEXTS = {
         "ru": "⌛ Карточка сделки истекла\\. Начните новую пошаговую сделку\\.",
         "ko": "⌛ 트레이드 카드가 만료되었습니다\\. 새 가이드 거래를 시작하세요\\.",
     },
+    # PREVIEW-NETWORK-BIND refusals (handlers/network_guard.py). Plain text, no
+    # parse mode; {built}/{current} are TESTNET / MAINNET.
+    "⚠️ This trade was prepared on {built}; you're now on {current}. Nothing was sent. Start again.": {
+        "zh": "⚠️ 这笔交易是在 {built} 上准备的；您现在在 {current}。未发送任何内容。请重新开始。",
+        "fr": "⚠️ Ce trade a été préparé sur {built} ; vous êtes maintenant sur {current}. Rien n'a été envoyé. Recommencez.",
+        "ar": "⚠️ تم إعداد هذه الصفقة على {built}؛ أنت الآن على {current}. لم يتم إرسال أي شيء. ابدأ من جديد.",
+        "ru": "⚠️ Эта сделка была подготовлена в {built}, а сейчас вы в {current}. Ничего не отправлено. Начните заново.",
+        "ko": "⚠️ 이 거래는 {built}에서 준비되었지만 현재 {current}에 있습니다. 아무것도 전송되지 않았습니다. 다시 시작하세요.",
+    },
+    "⚠️ This was prepared on {built}; you're now on {current}. Nothing was sent. Start again.": {
+        "zh": "⚠️ 此操作是在 {built} 上准备的；您现在在 {current}。未发送任何内容。请重新开始。",
+        "fr": "⚠️ Ceci a été préparé sur {built} ; vous êtes maintenant sur {current}. Rien n'a été envoyé. Recommencez.",
+        "ar": "⚠️ تم إعداد هذا على {built}؛ أنت الآن على {current}. لم يتم إرسال أي شيء. ابدأ من جديد.",
+        "ru": "⚠️ Это было подготовлено в {built}, а сейчас вы в {current}. Ничего не отправлено. Начните заново.",
+        "ko": "⚠️ 이 작업은 {built}에서 준비되었지만 현재 {current}에 있습니다. 아무것도 전송되지 않았습니다. 다시 시작하세요.",
+    },
+    "⚠️ This confirmation is out of date. Nothing was sent. Start again.": {
+        "zh": "⚠️ 此确认已过期。未发送任何内容。请重新开始。",
+        "fr": "⚠️ Cette confirmation n'est plus valide. Rien n'a été envoyé. Recommencez.",
+        "ar": "⚠️ هذا التأكيد لم يعد صالحًا. لم يتم إرسال أي شيء. ابدأ من جديد.",
+        "ru": "⚠️ Это подтверждение устарело. Ничего не отправлено. Начните заново.",
+        "ko": "⚠️ 이 확인은 만료되었습니다. 아무것도 전송되지 않았습니다. 다시 시작하세요.",
+    },
     "Setup incomplete. Resume onboarding at ": {
         "zh": "设置未完成。请从以下步骤继续引导：",
         "fr": "Configuration incomplète. Reprenez l'onboarding à l'étape ",
