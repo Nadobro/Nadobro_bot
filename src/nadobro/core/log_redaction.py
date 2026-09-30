@@ -98,17 +98,35 @@ _TG_BOT_TOKEN_BARE_RE = re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b")
 # across that space or the one inside ``-----END <LABEL>``, so nothing outside
 # the block changes. The labelled rule runs LAST, on the old chain's output.
 _E6_PEM_PLACEHOLDER = "-----BEGIN <REDACTED_PEM>"
+# Linear-time (LR-LINEAR): the plain ``BEGIN….*?END`` form rescanned to the end of
+# the text from EVERY header when no END follows (many headers, no END =
+# quadratic). A header whose lazy scan finds no END now takes the ``.*+`` branch,
+# which swallows the rest of the text in one pass, and ``_e6_pem_repl`` writes it
+# back unchanged: no later header can have an END either, so the old pattern
+# matched nothing there. Output is identical to the old pattern.
 _E6_PEM_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 ]{3,64}-----.*?-----END [A-Z0-9 ]{3,64}-----", re.DOTALL
+    r"-----BEGIN [A-Z0-9 ]{3,64}-----(?:(.*?-----END [A-Z0-9 ]{3,64}-----)|.*+)",
+    re.DOTALL,
 )
 _E6_PEM_OPEN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]{3,64}-----.*\Z", re.DOTALL)
+# Linear-time (LR-LINEAR): the separator's adjacent ``\s*`` quantifiers are
+# possessive. The old ``\s*["']?\s*`` could split one whitespace run between two
+# quantifiers in every way before failing (a long run = quadratic). Neither the
+# quote nor the value class contains whitespace, so no split can change the match.
 _E6_LABELLED_SECRET_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])"
     r"((?:[A-Za-z0-9]+[_-]){0,6}(?:api[_-]?secret|secret|signing[_-]?(?:key|seed)|private[_-]?key|seed[_-]?hex|x-signature))"
     r"(?![A-Za-z0-9])"
-    r"(\s*[\"']?\s*[:=]\s*[\"']?)"
+    r"(\s*+[\"']?\s*+[:=]\s*+[\"']?)"
     r"([A-Za-z0-9_\-./+=]{8,})"
 )
+
+
+def _e6_pem_repl(match: "re.Match[str]") -> str:
+    """Replace a closed PEM block; write an unterminated tail back unchanged."""
+    if match.group(1) is None:
+        return match.group(0)
+    return _E6_PEM_PLACEHOLDER
 
 
 def _base_chain(text: str) -> str:
@@ -141,7 +159,7 @@ def redact_sensitive_text(value: Any) -> Any:
     if not isinstance(value, str):
         return value
 
-    text = _E6_PEM_RE.sub(_E6_PEM_PLACEHOLDER, value)
+    text = _E6_PEM_RE.sub(_e6_pem_repl, value)
     text = _E6_PEM_OPEN_RE.sub(_E6_PEM_PLACEHOLDER, text)
     text = _base_chain(text)
     text = _E6_LABELLED_SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<REDACTED>", text)
