@@ -30,6 +30,25 @@ Fix applied (search for AUDIT-FIX):
                   were sliding through unredacted in ``user=380277661``
                   style operational logs. The structured key=value rule
                   catches them regardless of digit count.
+  LR-LINEAR:      this chain runs on EVERY log record, on the event loop, so
+                  every stage must be linear in the line length or one long
+                  line stalls the bot. The URL-credential, Pinecone-URL and
+                  Supabase-host patterns were quadratic (16k plain letters
+                  took 4.6 s) and are rewritten to produce BYTE-IDENTICAL
+                  output; tests/test_log_redaction_linear.py keeps the old
+                  patterns as an oracle, differential-fuzzes against them,
+                  and times every pattern in this module (10k/100k chars)
+                  and the whole chain (up to 1M chars).
+                  The rewritten patterns only redact correctly through their
+                  ``_redact_*`` helpers (extra groups, a callable replacement,
+                  pre-checks), so they deliberately do NOT keep the old names
+                  ``_URL_CREDENTIALS_RE`` / ``_PINECONE_URL_RE`` /
+                  ``_SUPABASE_HOST_RE``: code written against the old module
+                  (e.g. a ``_base_chain`` on an unmerged branch) that calls
+                  ``OLD_NAME.sub(old_replacement, text)`` fails with NameError
+                  instead of silently mis-redacting. When merging such code,
+                  call ``_redact_url_credentials`` / ``_redact_pinecone_urls``
+                  / ``_redact_supabase_hosts`` in place of those three subs.
 """
 import logging
 import re
@@ -69,10 +88,50 @@ _IPV6_RE = re.compile(
     r"|::(?:[a-fA-F0-9]{1,4})(?::[a-fA-F0-9]{1,4}){0,7}"
     r")\b"
 )
-_SUPABASE_HOST_RE = re.compile(r"\b[a-z0-9-]+\.pooler\.supabase\.com\b", re.IGNORECASE)
+# LR-LINEAR: the old ``\b[a-z0-9-]+\.pooler\.supabase\.com\b`` was tried at
+# EVERY word boundary and each try rescanned to the end of the host-char run,
+# and ``a-a-a-...`` has a boundary at every char: O(n^2). '.' is not a host
+# char, so the literal can only follow the END of a maximal run, and every
+# start inside one run shares that continuation: the run's FIRST boundary
+# decides for the whole run. So start only where a run starts -- or right
+# after a previous match, the one place re.sub resumes inside a run
+# (``...supabase.com`` then ``-``) -- and let group 1 consume, and the
+# replacement write back, the run's chars before its first boundary.
+_SUPABASE_HOST_SCAN_RE = re.compile(
+    r"(?:(?<![a-z0-9-])|(?<=\.pooler\.supabase\.com))"
+    r"((?:(?!\b)[a-z0-9-])*+)"
+    r"\b[a-z0-9-]++\.pooler\.supabase\.com\b",
+    re.IGNORECASE,
+)
+# Exact pre-check (every match contains this literal, same flags), so a line
+# without it skips the lookbehind-per-position scan above.
+_SUPABASE_LITERAL_RE = re.compile(r"\.pooler\.supabase\.com", re.IGNORECASE)
 _FLY_INTERNAL_RE = re.compile(r"\bfdaa:[a-fA-F0-9:]+\b")
-_PINECONE_URL_RE = re.compile(r'https?://[^\s"\'<>]+pinecone\.io[^\s"\'<>]*', re.IGNORECASE)
-_URL_CREDENTIALS_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^@\s/]+)@", re.IGNORECASE)
+# LR-LINEAR: the old ``https?://[^\s"'<>]+pinecone\.io[^\s"'<>]*`` scanned to
+# the end of the separator-free run from EVERY ``http(s)://``, so
+# ``http://http://...`` was O(n^2). A match always extends to that run's end,
+# and a later scheme in the same run sees a subset of the ``pinecone.io``
+# occurrences the first one saw: if the first fails, every later one fails.
+# The second alternative consumes such a run (group 1 unset) and
+# ``_pinecone_repl`` writes it back unchanged.
+_PINECONE_RUN_RE = re.compile(
+    r'https?://(?:([^\s"\'<>]+pinecone\.io[^\s"\'<>]*)|[^\s"\'<>]*+)',
+    re.IGNORECASE,
+)
+# LR-LINEAR: the old ``([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^@\s/]+)@`` was
+# tried at EVERY letter and each try rescanned the rest of the scheme-char run
+# for ``://``: O(run^2). ':' is not a scheme char, so ``://`` can only follow
+# the END of a maximal run, and every start inside one run shares that
+# continuation: the run's first letter decides for the whole run. So start
+# only where a run starts (re.sub never resumes inside one: a match ends in
+# '@') and let group 1 consume, and the replacement write back, the run's
+# non-letter lead-in. The possessive quantifiers only drop backtracking that
+# can never succeed (a shorter run is always followed by a char of the same
+# class, never by the literal that must come next).
+_URL_CREDENTIALS_SCAN_RE = re.compile(
+    r"(?<![a-z0-9+.-])([0-9+.-]*+)([a-z][a-z0-9+.-]*+://)([^/\s:@]++):([^@\s/]++)@",
+    re.IGNORECASE,
+)
 _PRIVATE_KEY_FIELD_RE = re.compile(
     r"(?i)\b(private[_-]?key|secret|api[_-]?key|authorization|bearer|token)\b"
     r"(\s*[:=]\s*)"
@@ -83,14 +142,37 @@ _PRIVATE_KEY_FIELD_RE = re.compile(
 _TG_BOT_TOKEN_BARE_RE = re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b")
 
 
+def _redact_url_credentials(text: str) -> str:
+    # Exact pre-check: every match contains "://" and "@" (caseless chars).
+    if "://" not in text or "@" not in text:
+        return text
+    return _URL_CREDENTIALS_SCAN_RE.sub(r"\1\2<REDACTED>:<REDACTED>@", text)
+
+
+def _pinecone_repl(match: "re.Match[str]") -> str:
+    if match.group(1) is None:  # a run with no pinecone host: keep it as-is
+        return match.group(0)
+    return "<REDACTED_PINECONE_URL>"
+
+
+def _redact_pinecone_urls(text: str) -> str:
+    return _PINECONE_RUN_RE.sub(_pinecone_repl, text)
+
+
+def _redact_supabase_hosts(text: str) -> str:
+    if _SUPABASE_LITERAL_RE.search(text) is None:
+        return text
+    return _SUPABASE_HOST_SCAN_RE.sub(r"\1<REDACTED_DB_HOST>", text)
+
+
 def redact_sensitive_text(value: Any) -> Any:
     """Redact secrets and account identifiers from text while preserving non-string
     values so %-style logging keeps numeric formatting semantics."""
     if not isinstance(value, str):
         return value
 
-    text = _URL_CREDENTIALS_RE.sub(r"\1<REDACTED>:<REDACTED>@", value)
-    text = _PINECONE_URL_RE.sub("<REDACTED_PINECONE_URL>", text)
+    text = _redact_url_credentials(value)
+    text = _redact_pinecone_urls(text)
     text = _BOT_TOKEN_RE.sub("/bot<REDACTED>", text)
     text = _TG_BOT_TOKEN_BARE_RE.sub("<REDACTED_BOT_TOKEN>", text)
     text = _BEARER_RE.sub("Bearer <REDACTED>", text)
@@ -102,7 +184,7 @@ def redact_sensitive_text(value: Any) -> Any:
         lambda m: f"{m.group(1)}{m.group(2)}<REDACTED_ID>", text
     )
     text = _PRIVATE_KEY_FIELD_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<REDACTED>", text)
-    text = _SUPABASE_HOST_RE.sub("<REDACTED_DB_HOST>", text)
+    text = _redact_supabase_hosts(text)
     text = _FLY_INTERNAL_RE.sub("<REDACTED_IPV6>", text)
     text = _IPV4_RE.sub("<REDACTED_IP>", text)
     text = _IPV6_RE.sub("<REDACTED_IPV6>", text)
