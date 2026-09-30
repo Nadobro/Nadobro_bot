@@ -72,7 +72,8 @@ async def read(uid):
     return STATE["venue"]
 
 
-async def render(target, uid, *, query=None, message=None):
+# context=: Arcus P3b (03 §11.2/§20) — the gate passes the context to the renderer.
+async def render(target, uid, *, query=None, message=None, context=None):
     events.append(["render", target, "query" if query is not None else "message"])
 
 
@@ -263,7 +264,9 @@ def test_real_ptb_routing_with_the_gate_registered():
     assert c["nado|cb|ax:home"] == [["private"], ["language"], ["answer", TEXT_ARCUS_BUTTON_ON_NADO, True]]
     assert _names(c["nado|msg|long BTC 10x"]) == pre + ["handle_message"]
     assert _names(c["nado|msg|/desk"]) == pre + ["cmd_desk"]
-    assert _names(c["nado|edited|long BTC 10x"]) == pre + ["handle_message"]
+    # Arcus P3b (03 D-13/§20): with the gate registered every edited message stops at
+    # the gate (edits are only delivered once the gate widens allowed_updates).
+    assert c["nado|edited|long BTC 10x"] == [["private"], ["language"]]
     # Arcus view.
     assert c["arcus|cb|strategy:start:grid:BTC"] == [["private"], ["language"], ["answer", TEXT_DENIED_ON_ARCUS, True]]
     assert _names(c["arcus|cb|strategy:stop"]) == pre + ["handle_callback"]  # NEVER_GATE reaches Nado

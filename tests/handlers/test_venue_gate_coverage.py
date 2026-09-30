@@ -28,8 +28,11 @@ from src.nadobro.utils import venue_capabilities as vc  # noqa: E402
 from src.nadobro.utils.venue_capabilities import (  # noqa: E402
     ARCUS_ONLY,
     AX_HOME,
+    AX_MODE,
     AX_SETTINGS,
     AX_UNAVAILABLE,
+    AX_UNLINK,
+    AX_WALLET,
     DISPATCH,
     NADO_ONLY,
     NEUTRAL,
@@ -270,7 +273,8 @@ def test_router_prefixes_match_the_table():
     )
     assert exact == {"cancel_trade", "home:mode"}
     assert _cls("cancel_trade") == NEVER_GATE
-    assert classify_callback("home:mode") == (DISPATCH, AX_UNAVAILABLE)
+    # Arcus P3b (03 §11.3/§20): the Nado mode card dispatches to the Arcus network card.
+    assert classify_callback("home:mode") == (DISPATCH, AX_MODE)
 
 
 def test_callback_aliases_match_handle_callback():
@@ -448,10 +452,15 @@ def test_registered_commands_match_the_table():
 
 
 def test_command_classes_are_pinned():
-    assert {n for n, (c, _) in vc.COMMANDS.items() if c == NEVER_GATE} == {"stop_all", "revoke", "agent_off", "desk"}
+    # Updated deliberately for Arcus P3b (03 D-11/§19.11): /revoke moves from NEVER_GATE to
+    # DISPATCH -> the Arcus unlink card, which carries the NEVER_GATE wallet:revoke_steps
+    # button (the Nado 1CT revoke path stays reachable from the Arcus view). Nado-view users
+    # pass DISPATCH untouched.
+    assert {n for n, (c, _) in vc.COMMANDS.items() if c == NEVER_GATE} == {"stop_all", "agent_off", "desk"}
     assert {n for n, (c, _) in vc.COMMANDS.items() if c == NEUTRAL} == {"help", "ops", "venue"}
     assert {n: t for n, (c, t) in vc.COMMANDS.items() if c == DISPATCH} == {
         "start": AX_HOME, "status": AX_HOME, "mm_status": AX_UNAVAILABLE, "mm_fills": AX_UNAVAILABLE,
+        "revoke": AX_UNLINK,
     }
     assert classify_command("STOP_ALL") == (NEVER_GATE, None)
     assert classify_command("not_a_command") == (UNKNOWN, None)
@@ -468,8 +477,8 @@ def test_every_reply_button_target_is_classified():
         "settings:view": AX_SETTINGS,
         "portfolio:view": AX_UNAVAILABLE,
         "pos:view": AX_UNAVAILABLE,
-        "wallet:view": AX_UNAVAILABLE,
-        "nav:mode": AX_UNAVAILABLE,
+        "wallet:view": AX_WALLET,  # Arcus P3b (03 §11.3/§20)
+        "nav:mode": AX_MODE,  # Arcus P3b (03 §11.3/§20)
         "nav:strategy_hub": AX_UNAVAILABLE,
     }
     # Everything else on the reply keyboard (trade flow, products, points,
@@ -594,7 +603,8 @@ def test_render_targets_only_for_dispatch():
     targets = set(vc.DISPATCH_EXACT.values()) | {t for _, t in vc.DISPATCH_PATTERNS}
     targets |= {t for c, t in vc.NAV_EXACT.values() if c == DISPATCH}
     targets |= {t for c, t in vc.COMMANDS.values() if c == DISPATCH}
-    assert targets == {AX_HOME, AX_SETTINGS, AX_UNAVAILABLE}
+    # + the Arcus wallet / network / unlink cards (Arcus P3b, 03 §11.3/§20).
+    assert targets == {AX_HOME, AX_SETTINGS, AX_UNAVAILABLE, AX_WALLET, AX_MODE, AX_UNLINK}
 
 
 @pytest.mark.parametrize("raw", [None, "", " ", 0, 123, b"nav:main", object(), "::::", "nav:" * 50, "\x00"])
@@ -605,6 +615,8 @@ def test_classification_is_total(raw):
     assert cls in vc.CLASSES
 
 
-def test_arcus_capabilities_are_empty_in_phase_1():
-    assert vc.VENUE_CAPABILITIES["arcus"] == {"strategies": frozenset(), "features": frozenset()}
+def test_arcus_capabilities_are_wallet_only_in_p3b():
+    # Renamed + updated deliberately for Arcus P3b (03 §11.3/§20): the Arcus wallet
+    # (paste-key linking) is the only Arcus feature; no strategies yet. Later phases UNION.
+    assert vc.VENUE_CAPABILITIES["arcus"] == {"strategies": frozenset(), "features": frozenset({"wallet"})}
     assert set(vc.VENUE_CAPABILITIES) == {"nado", "arcus"}

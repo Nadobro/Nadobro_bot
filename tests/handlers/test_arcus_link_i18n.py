@@ -102,10 +102,15 @@ def test_each_key_appears_exactly_once_in_the_dict_literals():
 
 
 def test_labels_are_appended_after_the_p1_block():
+    # The link service's label opens the P3b block; the UI half's labels follow it
+    # (handlers/arcus_ui.ARCUS_P3B_LABEL_KEYS lists the whole block in order).
+    from src.nadobro.handlers import arcus_ui
     from src.nadobro.handlers import venue_handler as vh
 
-    tail = list(i18n._LABELS)[-(len(vh.I18N_LABEL_KEYS) + len(ls.I18N_LABEL_KEYS)):]
-    assert tail == list(vh.I18N_LABEL_KEYS) + list(ls.I18N_LABEL_KEYS)
+    block = list(arcus_ui.ARCUS_P3B_LABEL_KEYS)
+    assert block[: len(ls.I18N_LABEL_KEYS)] == list(ls.I18N_LABEL_KEYS)
+    tail = list(i18n._LABELS)[-(len(vh.I18N_LABEL_KEYS) + len(block)):]
+    assert tail == list(vh.I18N_LABEL_KEYS) + block
 
 
 def _nado_string_constants() -> set[str]:

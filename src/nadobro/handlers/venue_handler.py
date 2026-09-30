@@ -20,6 +20,13 @@ persisted ``bot_state`` twins — a text-trade preview reloads from Postgres, so
 in-memory-only clear would let a "yes" typed after switching back execute a
 preview built before the switch). It never touches anything live.
 
+Arcus P3b: ``ax:home`` renders the Arcus home shell
+(``handlers/arcus_portfolio_handler.render_home``: link status from Postgres
+only, plus the Nado banner below), and the wallet / network / unlink cards and
+the ``ax:link:*`` flow live in ``handlers/arcus_wallet_handler``. Both are
+imported function-locally, so importing this module never imports the Arcus
+venue library.
+
 Wiring: ``handlers/venue_gate.register_venue_handlers`` adds ``/venue`` and the
 ``venue:`` / ``ax:`` callbacks only when ARCUS_ENABLED is on or a user is already
 on the Arcus view. Keyboards and renderers live HERE, not in keyboards.py /
@@ -58,7 +65,15 @@ from src.nadobro.users.venue_service import (
     set_active_venue,
 )
 from src.nadobro.users.wallet_pending_flow import clear_wallet_pending_flow
-from src.nadobro.utils.venue_capabilities import AX_HELP, AX_HOME, AX_SETTINGS, AX_UNAVAILABLE
+from src.nadobro.utils.venue_capabilities import (
+    AX_HELP,
+    AX_HOME,
+    AX_MODE,
+    AX_SETTINGS,
+    AX_UNAVAILABLE,
+    AX_UNLINK,
+    AX_WALLET,
+)
 from src.nadobro.utils.venue_scope import ARCUS_NETWORK_TESTNET, NADO_NETWORKS, VENUE_ARCUS, VENUE_NADO
 from src.nadobro.utils.visual import esc
 
@@ -71,6 +86,12 @@ CB_SET_ARCUS = "venue:set:arcus"
 VENUE_CALLBACK_PATTERN = r"^(?:venue|ax):"
 # ax:* screens reachable by callback (ax:unavailable is render-only).
 AX_CALLBACK_SCREENS = frozenset({AX_HOME, AX_HELP, AX_SETTINGS})
+# Arcus P3b (03 §11.2): the wallet / network / unlink cards and the link flow
+# (handlers/arcus_wallet_handler.handle), and the home refresh
+# (handlers/arcus_portfolio_handler.handle).
+AX_REFRESH = "ax:refresh"
+_WALLET_EXACT = frozenset({AX_WALLET, AX_UNLINK, AX_MODE})
+_WALLET_PREFIXES = ("ax:link:", "ax:unlink:", "ax:mode:")
 # Nado stop entries on the Arcus home — all NEVER_GATE (they pass the gate on the
 # Arcus view). They cover what /stop_all (strategies + copy trades) and
 # /agent_off do not: the desk list (its only actions are Stop and Refresh) and
@@ -127,6 +148,9 @@ TEXT_UNAVAILABLE_BODY = (
 # Arcus help.
 TEXT_HELP_TITLE = "❓ <b>Arcus (beta)</b>"
 TEXT_HELP_BETA = "• Arcus is in closed beta. Linking your Arcus account is coming soon."
+# Arcus P3b (03 §11.2 item 5): replaces TEXT_HELP_BETA on the help card. Listed in
+# handlers/arcus_ui.ARCUS_P3B_TEXT_KEYS (NOT in I18N_TEXT_KEYS, which pins P1's set).
+TEXT_HELP_LINK = "• Arcus is in closed beta. Link your Arcus account from 👛 Arcus wallet on the Arcus home."
 TEXT_HELP_VENUE = "• /venue switches between Nado and Arcus. Switching never stops, closes or starts anything."
 TEXT_HELP_AUTOMATION = (
     "• Your Nado automation keeps running in the background. /stop_all stops Nado strategies and copy trades."
@@ -381,8 +405,18 @@ def nado_automation_snapshot(telegram_id: int) -> tuple[str, list[tuple[str, dic
     return arcus_network, items, failed
 
 
-def arcus_home_text(arcus_network: str, items: list[tuple[str, dict[str, str]]], failed: bool) -> str:
-    lines = [tr(TEXT_HOME_TITLE, network=esc(str(arcus_network).upper())), "", tr(TEXT_HOME_LINK_SOON)]
+def arcus_home_text(
+    arcus_network: str,
+    items: list[tuple[str, dict[str, str]]],
+    failed: bool,
+    *,
+    link_lines: list[str] | None = None,
+) -> str:
+    """The Arcus home. ``link_lines=None`` keeps the P1 output byte-identical
+    (the "coming soon" line); a list (already translated + escaped, P3b's link
+    status) replaces that single line."""
+    lines = [tr(TEXT_HOME_TITLE, network=esc(str(arcus_network).upper())), ""]
+    lines += [tr(TEXT_HOME_LINK_SOON)] if link_lines is None else list(link_lines)
     if items:
         rendered = ", ".join(
             tr(key, **{name: esc(value) for name, value in fmt.items()}) for key, fmt in items
@@ -395,7 +429,7 @@ def arcus_home_text(arcus_network: str, items: list[tuple[str, dict[str, str]]],
 
 def arcus_help_text() -> str:
     return "\n".join(
-        [tr(TEXT_HELP_TITLE), "", tr(TEXT_HELP_BETA), tr(TEXT_HELP_VENUE), tr(TEXT_HELP_AUTOMATION)]
+        [tr(TEXT_HELP_TITLE), "", tr(TEXT_HELP_LINK), tr(TEXT_HELP_VENUE), tr(TEXT_HELP_AUTOMATION)]
     )
 
 
@@ -407,29 +441,47 @@ def arcus_unavailable_text() -> str:
     return "\n\n".join([tr(TEXT_UNAVAILABLE_TITLE), tr(TEXT_UNAVAILABLE_BODY)])
 
 
-async def build_arcus_screen(target: str, telegram_id: int) -> tuple[str, InlineKeyboardMarkup]:
+async def build_arcus_screen(
+    target: str, telegram_id: int, context: Any = None,
+) -> tuple[str, InlineKeyboardMarkup]:
     """Text + keyboard for an Arcus render target. Unknown targets get the
-    "Not on Arcus yet" card (never a Nado screen)."""
+    "Not on Arcus yet" card (never a Nado screen). ``context`` lets the home and
+    the wallet card show a link flow in progress (Arcus P3b).
+
+    The Arcus handler modules are imported function-locally: importing this
+    module (every boot with the gate registered) never imports the Arcus venue
+    library."""
     if target == AX_HOME:
-        try:
-            arcus_network, items, failed = await run_blocking_db(nado_automation_snapshot, telegram_id)
-        except Exception:  # policy: degrade-ok(banner says it could not check — never "nothing running")
-            logger.warning("arcus home: automation snapshot failed uid=%s", telegram_id)
-            arcus_network, items, failed = ARCUS_NETWORK_TESTNET, [], True
-        return arcus_home_text(arcus_network, items, failed), arcus_home_kb(items, failed)
+        from src.nadobro.handlers import arcus_portfolio_handler
+
+        return await arcus_portfolio_handler.render_home(telegram_id, context=context)
     if target == AX_HELP:
         return arcus_help_text(), arcus_help_kb()
     if target == AX_SETTINGS:
         return arcus_settings_text(), arcus_settings_kb()
+    if target == AX_WALLET:
+        from src.nadobro.handlers import arcus_wallet_handler
+
+        return await arcus_wallet_handler.render_wallet(telegram_id, context=context)
+    if target == AX_MODE:
+        from src.nadobro.handlers import arcus_wallet_handler
+
+        return await arcus_wallet_handler.render_mode(telegram_id)
+    if target == AX_UNLINK:
+        from src.nadobro.handlers import arcus_wallet_handler
+
+        return await arcus_wallet_handler.render_unlink(telegram_id)
     return arcus_unavailable_text(), arcus_unavailable_kb()
 
 
-async def render_arcus_target(target: str, telegram_id: int, *, query: Any = None, message: Any = None) -> None:
+async def render_arcus_target(
+    target: str, telegram_id: int, *, query: Any = None, message: Any = None, context: Any = None,
+) -> None:
     """Render an Arcus screen: edit the tapped message in place, or reply to a
     command / text message. The caller has checked the user is on Arcus."""
     if query is not None:
         _bump_seq(query, telegram_id)
-    text, kb = await build_arcus_screen(target, telegram_id)
+    text, kb = await build_arcus_screen(target, telegram_id, context)
     if query is not None:
         await edit_html(query, text, kb)
     elif message is not None:
@@ -582,7 +634,21 @@ async def handle_venue_callback(update: Update, context: CallbackContext) -> Non
             logger.warning("ax screen: venue unreadable uid=%s (%s)", uid, type(exc).__name__)
             return
         if venue == VENUE_ARCUS:
-            await render_arcus_target(data, uid, query=query)
+            await render_arcus_target(data, uid, query=query, context=context)
+    elif data in _WALLET_EXACT or data.startswith(_WALLET_PREFIXES) or data == AX_REFRESH:
+        # Arcus P3b: the wallet / network / unlink cards, the link flow and the
+        # home refresh. Re-checked under the lock exactly like the screens above.
+        try:
+            venue = await read_active_venue(uid)
+        except Exception as exc:  # policy: degrade-ok(nothing renders; the tap was acked)
+            logger.warning("ax wallet: venue unreadable uid=%s (%s)", uid, type(exc).__name__)
+            return
+        if venue == VENUE_ARCUS:
+            if data == AX_REFRESH:
+                from src.nadobro.handlers.arcus_portfolio_handler import handle as arcus_handle
+            else:
+                from src.nadobro.handlers.arcus_wallet_handler import handle as arcus_handle
+            await arcus_handle(query, data, uid, context)
     # Any other venue:/ax: value was acked by venue_callback_ack; nothing renders.
 
 
@@ -615,7 +681,7 @@ async def _switch_to_arcus(query: Any, context: CallbackContext, uid: int) -> No
         return
     if current == VENUE_ARCUS:
         await _answer_self(query)
-        await render_arcus_target(AX_HOME, uid, query=query)
+        await render_arcus_target(AX_HOME, uid, query=query, context=context)
         return
     if not arcus_enabled_for(uid):
         await _refuse(query, TEXT_ARCUS_NOT_ALLOWED)
@@ -644,7 +710,7 @@ async def _switch_to_arcus(query: Any, context: CallbackContext, uid: int) -> No
         return
     await clear_nado_pending_flows(context, uid)
     await _answer_self(query, tr(TEXT_SWITCHED_TO_ARCUS))
-    await render_arcus_target(AX_HOME, uid, query=query)
+    await render_arcus_target(AX_HOME, uid, query=query, context=context)
 
 
 async def _switch_to_nado(query: Any, context: CallbackContext, uid: int) -> None:

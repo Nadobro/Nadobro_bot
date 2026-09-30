@@ -13,16 +13,36 @@ Classification lives in ``utils/venue_capabilities.py``. Per update:
   buttons (denied with a hint).
 * Arcus-view users:
   - NEVER_GATE (every Nado stop / close / cancel / remove path, /stop_all,
-    /agent_off, /revoke, the /desk list) and NEUTRAL (/venue, help, language,
-    terms) pass;
-  - DISPATCH views render the Arcus target instead (ax:home, ax:settings or
-    the "Not on Arcus yet" card), inside the per-user lock, then stop;
+    /agent_off, the /desk list) and NEUTRAL (/venue, help, language, terms)
+    pass;
+  - DISPATCH views render the Arcus target instead (ax:home, ax:settings, the
+    Arcus wallet / network / unlink cards — /revoke shows the unlink card, which
+    carries the NEVER_GATE Nado 1CT revoke button — or the "Not on Arcus yet"
+    card), inside the per-user lock, then stop;
   - NADO_ONLY and UNKNOWN are denied with a localized hint (fail-closed);
   - free text never reaches Nado trade parsing, the LOWIQPTS relay or the LLM
-    chat: a reply-keyboard view button renders its Arcus screen, anything
+    chat: a reply-keyboard view button renders its Arcus screen, an Arcus link
+    flow in progress takes the address step (``arcus_text_router``), anything
     else gets a short hint. Message text is NEVER logged (a user may paste a
     secret);
-  - non-text messages and edited messages stop silently.
+  - non-text messages stop silently.
+
+The Arcus secret interceptor runs FIRST, for new AND edited messages (Arcus P3b,
+build_decisions D-11): a text or caption shaped like a secret key (64 hex, 0x +
+64 hex, longer hex, hex embedded in text, PEM — ``utils/secret_text.py``, pure,
+no IO) from a user on the Arcus view, with an unreadable venue (fail-closed for
+secrets only), or with an Arcus link pending, is DELETED and answered by
+``handlers/arcus_wallet_handler.arcus_secret_interceptor`` — before the LOWIQPTS
+relay and every LLM fall-through — and the update always stops. A crash while
+handling one also stops it (``probe.secret``). Nado-view users with nothing
+pending keep today's routing for new messages (a pasted 64-hex tx hash is not
+deleted).
+
+Edited messages (delivered only once main.py widens ``allowed_updates`` with the
+gate registered): after the interceptor, EVERY edited message stops — for both
+views — so an edited ``/stop_all`` or trade text never re-runs a handler
+(PTB's CommandHandler matches edited messages too). Nado users' edited messages
+are never deleted unless they are secret-shaped and an Arcus link is pending.
 
 NEVER_GATE / NEUTRAL taps pass without even reading the venue, and the gate
 never answers a callback query it lets through (group 0's ``with_callback_ack``
@@ -77,6 +97,7 @@ from src.nadobro.handlers.venue_handler import (
 from src.nadobro.i18n import get_active_language, localize_markup, resolve_reply_button_text
 from src.nadobro.users.user_service import get_or_create_user
 from src.nadobro.users.venue_service import count_users_on_venue, last_known_venue
+from src.nadobro.utils.secret_text import classify_secret_text
 from src.nadobro.utils.venue_capabilities import (
     ARCUS_ONLY,
     COMMANDS,
@@ -95,18 +116,26 @@ VENUE_GATE_GROUP = -1
 
 _ALWAYS_PASS = frozenset({NEVER_GATE, NEUTRAL})
 
+# ``context.user_data`` key of an Arcus link flow in progress
+# (``handlers/arcus_wallet_handler.PENDING_KEY``; pinned equal by a test). Read
+# here by name so the gate never imports the Arcus handlers at module level.
+_ARCUS_LINK_PENDING_KEY = "arcus_link_pending"
+
 Handler = Callable[[Update, CallbackContext], Awaitable[Any]]
 
 
 class _Probe:
-    """What the gate learned before a crash: the venue (for fail-closed) and a
-    log-safe tag (a callback PREFIX or a command name — never message text)."""
+    """What the gate learned before a crash: the venue (for fail-closed), a
+    log-safe tag (a callback PREFIX or a command name — never message text) and
+    whether the message is secret-shaped (a crash then stops it, whatever the
+    venue: it must never reach group 0's relay / LLM)."""
 
-    __slots__ = ("venue", "tag")
+    __slots__ = ("venue", "tag", "secret")
 
     def __init__(self) -> None:
         self.venue: str | None = None
         self.tag = "?"
+        self.secret = False
 
 
 def command_name(message: Any) -> str | None:
@@ -138,6 +167,22 @@ async def _venue_or_last_known(telegram_id: int, probe: _Probe | None = None) ->
     return venue
 
 
+async def _venue_or_none(telegram_id: int, probe: _Probe) -> str | None:
+    """Like ``_venue_or_last_known``, but an unreadable venue is None, not a
+    guess: a secret-shaped message is then intercepted (fail-closed for
+    secrets only; every other update keeps the last-known policy)."""
+    try:
+        venue: str | None = await read_active_venue(telegram_id)
+    except Exception as exc:  # policy: degrade-ok(unreadable venue -> None: fail-closed for secrets only)
+        venue = None
+        logger.warning(
+            "venue gate: venue unreadable uid=%s (%s); secret-shaped text is intercepted",
+            telegram_id, type(exc).__name__,
+        )
+    probe.venue = venue
+    return venue
+
+
 async def _touch_user(update: Update) -> None:
     """The last_active / username refresh handle_message and /start would have
     done — the Arcus view answers these updates itself. Fail-soft."""
@@ -155,7 +200,7 @@ def _render_callback(target: str) -> Handler:
         # to Nado renders nothing instead of an Arcus screen.
         if await _venue_or_last_known(uid) != VENUE_ARCUS:
             return
-        await render_arcus_target(target, uid, query=update.callback_query)
+        await render_arcus_target(target, uid, query=update.callback_query, context=context)
 
     return _render
 
@@ -166,15 +211,16 @@ def _render_reply(target: str) -> Handler:
         await _touch_user(update)
         if await _venue_or_last_known(uid) != VENUE_ARCUS:
             return
-        await render_arcus_target(target, uid, message=update.message)
+        await render_arcus_target(target, uid, message=update.message, context=context)
 
     return _render
 
 
 async def _arcus_free_text(update: Update, context: CallbackContext) -> None:
     """Free text on the Arcus view. A reply-keyboard label for a view renders
-    that view's Arcus screen; anything else gets the hint. The text itself is
-    never logged and never forwarded anywhere."""
+    that view's Arcus screen; an Arcus link flow in progress takes the address
+    step; anything else gets the hint. The text itself is never logged and never
+    forwarded anywhere."""
     uid = int(update.effective_user.id)
     message = update.message
     await _touch_user(update)
@@ -185,8 +231,14 @@ async def _arcus_free_text(update: Update, context: CallbackContext) -> None:
     if button_target is not None:
         cls, target = classify_callback(button_target)
         if cls == DISPATCH and target:
-            await render_arcus_target(target, uid, message=message)
+            await render_arcus_target(target, uid, message=message, context=context)
             return
+    # Arcus P3b: the link flow's address step (imported here: an Arcus-less boot
+    # never imports the Arcus venue library).
+    from src.nadobro.handlers.arcus_wallet_handler import arcus_text_router
+
+    if await arcus_text_router(update, context, (message.text or "")):
+        return
     await message.reply_text(
         tr(TEXT_ARCUS_FREE_TEXT_HINT),
         reply_markup=localize_markup(arcus_free_text_kb(), get_active_language()),
@@ -239,6 +291,31 @@ async def _gate(
         raise ApplicationHandlerStop()
 
     message = getattr(update, "message", None)
+    edited = getattr(update, "edited_message", None)
+    msg = message if message is not None else edited
+    if msg is not None:
+        # The Arcus secret interceptor: FIRST, for new AND edited messages.
+        raw = getattr(msg, "text", None)
+        if raw is None:
+            raw = getattr(msg, "caption", None)
+        shape = classify_secret_text(raw)  # pure; no IO; never logs
+        if shape is not None:
+            probe.tag, probe.secret = "secret", True
+            user_data = getattr(context, "user_data", None) or {}
+            # In-memory, deliberately WITHOUT a TTL check (fail-closed): an expired
+            # entry still intercepts once; the interceptor pops it.
+            pending = _ARCUS_LINK_PENDING_KEY in user_data
+            venue = await _venue_or_none(uid, probe)
+            if pending or venue != VENUE_NADO:  # Arcus view, unreadable, or a link pending
+                from src.nadobro.handlers.arcus_wallet_handler import arcus_secret_interceptor
+
+                await arcus_secret_interceptor(update, context, shape=shape, venue=venue)
+                raise ApplicationHandlerStop()
+            probe.secret = False  # Nado view, nothing pending: routing unchanged (D-11)
+        if message is None:
+            # An edited message: stopped for both views (never re-runs a handler).
+            probe.tag = "edited"
+            raise ApplicationHandlerStop()
     if message is not None:
         name = command_name(message)
         if name is not None:
@@ -263,8 +340,8 @@ async def _gate(
             await _serialized(_arcus_free_text, update, context, locked)
         raise ApplicationHandlerStop()
 
-    # Edited messages — and any other update type, should allowed_updates ever
-    # widen: Nado passes, Arcus stops silently (fail-closed).
+    # Any other update type, should allowed_updates ever widen: Nado passes,
+    # Arcus stops silently (fail-closed).
     probe.tag = "other"
     if await _venue_or_last_known(uid, probe) == VENUE_ARCUS:
         raise ApplicationHandlerStop()
@@ -288,7 +365,9 @@ async def venue_gate(update: Update, context: CallbackContext) -> None:
         logger.warning(
             "venue gate error uid=%s %s venue=%s (%s)", uid, probe.tag, probe.venue, type(exc).__name__,
         )
-        if probe.venue == VENUE_ARCUS:
+        # A crash while handling a secret-shaped message never lets it through to
+        # group 0 (LOWIQPTS relay / LLM), whatever the venue.
+        if probe.venue == VENUE_ARCUS or probe.secret:
             raise ApplicationHandlerStop() from None
 
 
@@ -315,7 +394,7 @@ def venue_recheck(handler: Handler) -> Handler:
             logger.warning(
                 "venue re-check error uid=%s %s venue=%s (%s)", uid, probe.tag, probe.venue, type(exc).__name__,
             )
-            if probe.venue == VENUE_ARCUS:
+            if probe.venue == VENUE_ARCUS or probe.secret:
                 return None
         return await handler(update, context)
 

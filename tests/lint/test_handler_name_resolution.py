@@ -35,6 +35,10 @@ HANDLER_MODULES = [
     "src/nadobro/handlers/desk_handler.py",
     "src/nadobro/handlers/venue_gate.py",
     "src/nadobro/handlers/venue_handler.py",
+    # Arcus P3b (03 §19.13)
+    "src/nadobro/handlers/arcus_ui.py",
+    "src/nadobro/handlers/arcus_wallet_handler.py",
+    "src/nadobro/handlers/arcus_portfolio_handler.py",
 ]
 
 _BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}

@@ -56,7 +56,7 @@ Package responsibilities:
 | `vault/` | NLP vault metrics, deposit watcher | venue, users |
 | `notify/` | rate-limited `telegram_sender`, alert evaluation/dispatch | users, models |
 | `runtime/` | `scheduler` (APScheduler jobs), `runtime_supervisor` | everything except handlers |
-| `handlers/` | Telegram UI: commands, single callback router (`callbacks.handle_callback`), free-text flow (`messages`), keyboards, cards/views; `venue_gate` (group -1 per-venue gate, registered only when ARCUS_ENABLED or a user is on the Arcus view) + `venue_handler` (/venue view switch, Arcus placeholder screens) | anything |
+| `handlers/` | Telegram UI: commands, single callback router (`callbacks.handle_callback`), free-text flow (`messages`), keyboards, cards/views; `venue_gate` (group -1 per-venue gate, registered only when ARCUS_ENABLED or a user is on the Arcus view; runs the Arcus secret interceptor FIRST for new and edited messages and stops every edited message) + `venue_handler` (/venue view switch, Arcus screens) + `arcus_wallet_handler` (Arcus paste-key link flow, wallet / network / unlink cards, the secret interceptor; background verification off the per-user lock) + `arcus_portfolio_handler` (Arcus home shell: link status from Postgres only) + `arcus_ui` (their texts, keyboards, message helpers) | anything |
 
 Domain-owned UI fragments: keyboards a domain service must send itself live in that
 domain (`users/points_ui.py`, `llm/howl_ui.py`), not in `handlers/keyboards.py` —

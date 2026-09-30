@@ -119,6 +119,11 @@ class Row:
         monkeypatch.setattr(vh, "run_blocking_db", rb)
         monkeypatch.setattr(vh, "is_new_onboarding_complete", lambda _uid: self.onboarded)
         monkeypatch.setattr(vh, "nado_automation_snapshot", lambda _uid: ("testnet", [], False))
+        # Arcus P3b (03 §10): the Arcus home reads the link status from Postgres;
+        # keep these unit tests hermetic (no credential row = "Not linked").
+        from src.nadobro.users import arcus_credentials
+
+        monkeypatch.setattr(arcus_credentials, "get_credential", lambda _uid, _net: None)
         for name in ("clear_strategy_pending_input", "clear_text_trade_pending",
                      "clear_text_close_all_pending", "clear_wallet_pending_flow"):
             monkeypatch.setattr(vh, name, (lambda n: (lambda uid: self.cleared.append(n)))(name))
@@ -276,7 +281,8 @@ def test_switch_to_arcus_compare_and_sets_and_renders_the_arcus_home(monkeypatch
     assert "ARCUS · beta" in text and "TESTNET" in text and "coming soon" in text
     assert kw["parse_mode"] == "HTML" or str(kw["parse_mode"]).endswith("HTML")
     buttons = [b.callback_data for row_ in kw["reply_markup"].inline_keyboard for b in row_]
-    assert buttons == ["venue:view", "ax:help"]
+    # Arcus P3b (03 §10/§20): the home shell adds [👛 Arcus wallet][🌐 Network] above P1's row.
+    assert buttons == ["ax:wallet", "ax:mode", "venue:view", "ax:help"]
 
 
 def test_switch_back_to_nado_renders_exactly_todays_nado_home(monkeypatch, nado_home):
@@ -472,7 +478,8 @@ def test_venue_view_edits_only_for_the_cohort_or_arcus(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("data,needle,buttons", [
-    ("ax:home", "ARCUS · beta", ["venue:view", "ax:help"]),
+    # ax:home buttons: Arcus P3b home shell (03 §10/§20).
+    ("ax:home", "ARCUS · beta", ["ax:wallet", "ax:mode", "venue:view", "ax:help"]),
     ("ax:help", "closed beta", ["ax:home", "venue:view"]),
     ("ax:settings", "Settings · Arcus", ["settings:language_menu", "venue:view", "ax:home"]),
 ])
@@ -651,7 +658,9 @@ def test_arcus_home_offers_the_nado_stop_entries_while_the_banner_shows(monkeypa
     from src.nadobro.utils.venue_capabilities import NEVER_GATE, classify_callback
 
     buttons = _home_buttons(monkeypatch, snapshot)
-    assert buttons == ["venue:view", "ax:help"] + expected
+    # Arcus P3b (03 §10/§20): [👛 Arcus wallet][🌐 Network] first; P1's rows (incl. the
+    # NEVER_GATE Nado stop entries) are kept below, unchanged.
+    assert buttons == ["ax:wallet", "ax:mode", "venue:view", "ax:help"] + expected
     for data in expected:
         assert classify_callback(data)[0] == NEVER_GATE, data
 

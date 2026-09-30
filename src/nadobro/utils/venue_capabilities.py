@@ -13,7 +13,7 @@ to decide, per update, what a user on the Arcus view may reach:
   and terms). Always passes.
 * ``DISPATCH`` — a view. Nado users get today's Nado screen; Arcus users get the
   Arcus render target instead (``ax:home`` / ``ax:settings`` / the "Not on Arcus
-  yet" card).
+  yet" card; since P3b also ``ax:wallet`` / ``ax:mode`` / ``ax:unlink``).
 * ``NADO_ONLY`` — opens Nado exposure or is a Nado-only feature. Denied on the
   Arcus view.
 * ``ARCUS_ONLY`` — ``ax:*``. Denied on the Nado view.
@@ -54,8 +54,15 @@ AX_HOME = "ax:home"
 AX_HELP = "ax:help"
 AX_SETTINGS = "ax:settings"
 AX_UNAVAILABLE = "ax:unavailable"
+# Arcus P3b (03 §11.3): the Arcus wallet (link status / link / renew), the
+# Arcus network card and the unlink card. Also callback_data (ARCUS_ONLY).
+AX_WALLET = "ax:wallet"
+AX_MODE = "ax:mode"
+AX_UNLINK = "ax:unlink"
 
-# Per-venue capabilities. Phase 1: Arcus has none (no client, no trading).
+# Per-venue capabilities. Arcus P3b: the Arcus wallet (paste-key linking) only —
+# no trading yet. A later phase UNIONs its features into this set (P4b adds
+# "portfolio"; 03 §11.3), never replaces it.
 VENUE_CAPABILITIES: dict[str, dict[str, frozenset[str]]] = {
     VENUE_NADO: {
         "strategies": frozenset({"grid", "rgrid", "dgrid", "mid", "dn", "vol", "bro"}),
@@ -65,7 +72,7 @@ VENUE_CAPABILITIES: dict[str, dict[str, frozenset[str]]] = {
             "mm_dashboard",
         }),
     },
-    VENUE_ARCUS: {"strategies": frozenset(), "features": frozenset()},
+    VENUE_ARCUS: {"strategies": frozenset(), "features": frozenset({"wallet"})},
 }
 
 # handlers/callbacks.py::handle_callback maps these BEFORE any routing (and so do
@@ -129,9 +136,9 @@ DISPATCH_EXACT: dict[str, str] = {
     "onboarding:resume": AX_HOME,    # callbacks._handle_onboarding: onboarded -> home
     "status:refresh": AX_HOME,       # callbacks._handle_status_callback: status card
     "strategy:status": AX_HOME,      # strategy_handler: status card
-    "home:mode": AX_UNAVAILABLE,     # callbacks: Nado execution-mode card
+    "home:mode": AX_MODE,            # callbacks: Nado execution-mode card -> the Arcus network card
     "settings:view": AX_SETTINGS,    # settings_handler: settings card
-    "wallet:view": AX_UNAVAILABLE,   # wallet_handler (would mint a Nado 1CT key when unlinked)
+    "wallet:view": AX_WALLET,        # wallet_handler (would mint a Nado 1CT key when unlinked) -> Arcus wallet
     "pos:view": AX_UNAVAILABLE,      # callbacks._handle_positions: positions
     "portfolio:view": AX_UNAVAILABLE,
     "portfolio:refresh": AX_UNAVAILABLE,
@@ -177,7 +184,7 @@ NAV_EXACT: dict[str, tuple[str, str | None]] = {
     "refresh": (DISPATCH, AX_HOME),
     "help": (NEUTRAL, None),
     "quick_start": (DISPATCH, AX_HOME),       # -> onboarding:resume (onboarded -> home)
-    "mode": (DISPATCH, AX_UNAVAILABLE),
+    "mode": (DISPATCH, AX_MODE),
     "trade": (NADO_ONLY, None),
     "ask_nado": (NADO_ONLY, None),            # arms pending_question -> LLM chat
     "strategy_hub": (DISPATCH, AX_UNAVAILABLE),
@@ -193,7 +200,11 @@ COMMANDS: dict[str, tuple[str, str | None]] = {
     "status": (DISPATCH, AX_HOME),
     "ops": (NEUTRAL, None),
     "stop_all": (NEVER_GATE, None),
-    "revoke": (NEVER_GATE, None),            # 1CT revoke steps (a remove path)
+    # Arcus P3b (03 D-11): /revoke on the Arcus view renders the Arcus unlink card.
+    # The Nado 1CT revoke path stays reachable from it: the card carries the
+    # NEVER_GATE wallet:revoke_steps button (-> wallet:revoke_confirm). Nado-view
+    # users pass DISPATCH untouched, so their /revoke is unchanged.
+    "revoke": (DISPATCH, AX_UNLINK),
     "agent_on": (NADO_ONLY, None),
     "agent_off": (NEVER_GATE, None),
     "agent_status": (NADO_ONLY, None),

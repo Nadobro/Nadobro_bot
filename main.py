@@ -198,6 +198,16 @@ def _runtime_health_payload() -> dict:
     return payload
 
 
+def _allowed_updates(venue_gate: bool) -> list[str]:
+    """The update types Telegram delivers. ``edited_message`` joins ONLY when the
+    Arcus venue gate is registered: the gate runs the Arcus secret interceptor on
+    edited messages (a key pasted by editing an old message is deleted too) and
+    stops every edited message after it, so an edited command never re-runs a
+    handler. Gate not registered (flag off, nobody on Arcus): exactly today's
+    list — production byte-identical."""
+    return ["message", "callback_query"] + (["edited_message"] if venue_gate else [])
+
+
 def setup_bot(venue_gate: bool = False):
     from telegram.ext import (
         Application,
@@ -477,6 +487,24 @@ async def run_bot():
         logger.warning(f"Alert price-check client failed to initialize: {e}")
 
     start_scheduler()
+    # Arcus P3b: key reminders + the active->expired transition (and, with
+    # ARCUS_ENABLED, the egress compliance probe). With the flag off and no Arcus
+    # credentials nothing is registered and no Arcus venue module is imported.
+    # The boot check lives in users/venue_service (never users/arcus_credentials,
+    # which imports the Arcus library). Nothing here starts or resumes anything.
+    from src.nadobro.runtime.scheduler import start_arcus_jobs
+
+    try:
+        from src.nadobro.users.venue_service import has_live_arcus_credentials
+
+        arcus_state = await run_blocking_db(has_live_arcus_credentials)
+    except Exception as exc:  # policy: degrade-ok(register the reminder job anyway; it no-ops without rows)
+        logger.warning("arcus credential check failed (%s); registering the Arcus key job anyway", type(exc).__name__)
+        arcus_state = True  # reminders and the expired transition must not silently vanish
+    try:
+        start_arcus_jobs(arcus_state_present=bool(arcus_state))
+    except Exception as exc:  # policy: degrade-ok(Arcus reminders only; Nado boot must never fail on them)
+        logger.warning("Arcus jobs failed to register (%s)", type(exc).__name__)
     from src.nadobro.core.feature_flags import strategy_scheduler_enabled
     from src.nadobro.strategy.strategy_scheduler import get_scheduler
     from src.nadobro.strategy.bot_runtime import _load_state
@@ -526,7 +554,7 @@ async def run_bot():
             logger.warning("Could not delete existing webhook before polling fallback: %s", e)
         await bot_app.updater.start_polling(
             drop_pending_updates=True,
-            allowed_updates=["message", "callback_query"],
+            allowed_updates=_allowed_updates(venue_gate_enabled),
         )
         logger.info("Nadobro is live in polling mode.")
 
@@ -646,7 +674,7 @@ async def run_bot():
                 url_path=webhook_path.lstrip("/"),
                 webhook_url=webhook_url,
                 drop_pending_updates=True,
-                allowed_updates=["message", "callback_query"],
+                allowed_updates=_allowed_updates(venue_gate_enabled),
                 secret_token=webhook_secret or None,
             )
             logger.info("Nadobro is live in webhook mode.")

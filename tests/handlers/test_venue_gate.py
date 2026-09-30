@@ -112,7 +112,9 @@ class World:
                 return self.venue()
             return self.venue
 
-        async def render(target, uid, *, query=None, message=None):
+        # context=: Arcus P3b (03 §11.2/§20) — the gate passes the context so the
+        # Arcus home / wallet can show a link flow in progress.
+        async def render(target, uid, *, query=None, message=None, context=None):
             assert uid == UID
             self.rendered.append((target, "query" if query is not None else "message"))
 
@@ -174,8 +176,9 @@ DISPATCH_SAMPLES = {
     "nav:main": vc.AX_HOME, "nav:refresh": vc.AX_HOME, "onboarding:resume": vc.AX_HOME,
     "status:refresh": vc.AX_HOME, "strategy:status": vc.AX_HOME, "nav:quick_start": vc.AX_HOME,
     "settings:view": vc.AX_SETTINGS, "nav:settings:view": vc.AX_SETTINGS,
-    "portfolio:view": vc.AX_UNAVAILABLE, "pos:view": vc.AX_UNAVAILABLE, "wallet:view": vc.AX_UNAVAILABLE,
-    "home:mode": vc.AX_UNAVAILABLE, "nav:mode": vc.AX_UNAVAILABLE, "nav:strategy_hub": vc.AX_UNAVAILABLE,
+    # Arcus P3b (03 §11.3): wallet:view -> the Arcus wallet, home:mode / nav:mode -> the Arcus network card.
+    "portfolio:view": vc.AX_UNAVAILABLE, "pos:view": vc.AX_UNAVAILABLE, "wallet:view": vc.AX_WALLET,
+    "home:mode": vc.AX_MODE, "nav:mode": vc.AX_MODE, "nav:strategy_hub": vc.AX_UNAVAILABLE,
     "portfolio:history:2": vc.AX_UNAVAILABLE, "mm:status:refresh": vc.AX_UNAVAILABLE,
 }
 
@@ -213,7 +216,11 @@ def test_nado_user_commands_pass(monkeypatch, text):
     assert update.message.replies == []
 
 
-@pytest.mark.parametrize("factory", [lambda: txt("long BTC 10x"), photo, lambda: edited("hi")])
+# Arcus P3b (03 D-13/§20): the edited("hi") case moved to the test below — with the
+# gate registered, main.py now asks Telegram for edited messages, and the gate stops
+# every one of them (PTB's CommandHandler matches edits, so an edited /stop_all would
+# re-run). Before P3b edits were never delivered, so this is byte-identical for Nado.
+@pytest.mark.parametrize("factory", [lambda: txt("long BTC 10x"), photo])
 def test_nado_user_messages_pass(monkeypatch, factory):
     world = World(monkeypatch, NADO)
     update = factory()
@@ -221,12 +228,22 @@ def test_nado_user_messages_pass(monkeypatch, factory):
     assert world.touched == 0
 
 
+@pytest.mark.parametrize("text", ["hi", "long BTC 10x", "/stop_all", "0x" + "ab" * 20])
+def test_nado_user_edited_messages_stop_silently(monkeypatch, text):
+    world = World(monkeypatch, NADO)
+    update = edited(text)
+    assert run(update) is False  # never reaches group 0
+    assert update.edited_message.replies == []
+    assert world.rendered == [] and world.touched == 0
+
+
 # ---------------------------------------------------------------------------
 # no venue read at all for NEVER_GATE / NEUTRAL
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("factory", [lambda d=d: cb(d) for d in NEVER_GATE_SAMPLES + NEUTRAL_SAMPLES]
-                         + [lambda: cmd("/stop_all"), lambda: cmd("/agent_off"), lambda: cmd("/revoke"),
+                         # /revoke dropped (Arcus P3b, 03 D-11/§20): it is DISPATCH now (reads the venue).
+                         + [lambda: cmd("/stop_all"), lambda: cmd("/agent_off"),
                             lambda: cmd("/desk"), lambda: cmd("/venue"), lambda: cmd("/help"),
                             lambda: cmd("/ops")])
 def test_never_gate_and_neutral_pass_without_reading_the_venue(monkeypatch, factory):
@@ -302,6 +319,7 @@ def test_dispatch_rechecks_the_venue_under_the_lock(monkeypatch):
 @pytest.mark.parametrize("text,target", [
     ("/start", vc.AX_HOME), ("/start ref_ABC123", vc.AX_HOME), ("/status", vc.AX_HOME),
     ("/Status@nadobro_bot", vc.AX_HOME), ("/mm_status", vc.AX_UNAVAILABLE), ("/mm_fills", vc.AX_UNAVAILABLE),
+    ("/revoke", vc.AX_UNLINK),  # Arcus P3b (03 D-11): the Arcus unlink card (carries the Nado 1CT revoke button)
 ])
 def test_arcus_user_dispatch_commands_reply_with_the_arcus_screen(monkeypatch, text, target):
     world = World(monkeypatch, ARCUS)
@@ -321,7 +339,8 @@ def test_arcus_user_nado_only_commands_are_denied(monkeypatch, text):
     assert world.rendered == []
 
 
-@pytest.mark.parametrize("text", ["/stop_all", "/agent_off", "/revoke", "/desk", "/venue", "/help", "/ops"])
+# /revoke moved to the DISPATCH test above (Arcus P3b, 03 D-11/§20).
+@pytest.mark.parametrize("text", ["/stop_all", "/agent_off", "/desk", "/venue", "/help", "/ops"])
 def test_arcus_user_stop_and_neutral_commands_pass(monkeypatch, text):
     world = World(monkeypatch, ARCUS)
     update = cmd(text)
@@ -334,9 +353,11 @@ def test_arcus_user_stop_and_neutral_commands_pass(monkeypatch, text):
 # free text on the Arcus view never reaches Nado trade parsing / relay / LLM
 # ---------------------------------------------------------------------------
 
+# The "0x" + "ab" * 32 case is secret-shaped (HEX_KEY) since Arcus P3b: it is now
+# intercepted (deleted + a warning) — covered by test_arcus_secret_interceptor.py (03 §20).
 @pytest.mark.parametrize("text", [
     "long BTC 10x", "BTC", "yes", "confirm", "0", "1,2", "what is unified margin?",
-    "close all", "ref_ABC123", "0x" + "ab" * 32,
+    "close all", "ref_ABC123", "0x" + "ab" * 20,
 ])
 def test_arcus_free_text_gets_the_hint_and_goes_nowhere(monkeypatch, text):
     world = World(monkeypatch, ARCUS)
