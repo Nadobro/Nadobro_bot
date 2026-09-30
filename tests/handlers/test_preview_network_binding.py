@@ -1308,6 +1308,104 @@ def test_text_trade_preview_is_bound_to_its_network(h, change):
         _assert_executed_on_testnet(h, "execute_market_order")
 
 
+class _FlakyUserReads:
+    """``intent_handlers.get_user`` while ``armed``: the read the intent is
+    parsed on succeeds, and every later read raises, as a DB blip would.
+    Disarmed, every read succeeds (the rest of the scenario is healthy)."""
+
+    def __init__(self, h: Harness) -> None:
+        self._h = h
+        self.armed = True
+        self.reads = 0
+
+    def __call__(self, _tid):
+        if not self.armed:
+            return self._h.user()
+        self.reads += 1
+        if self.reads > 1:
+            raise RuntimeError("guardrail: users read failed")
+        return self._h.user()
+
+
+def _text_trade_update(h: Harness, text: str):
+    message = _Message(h.screen, message_id=h.screen.next_message_id(), text=text)
+    return SimpleNamespace(message=message, effective_user=SimpleNamespace(id=UID), effective_chat=_Chat(UID))
+
+
+def test_text_trade_auto_execute_never_runs_on_a_guessed_network(h, monkeypatch):
+    """A TESTNET user types "... now". The intent is parsed on TESTNET; a
+    later re-read of the user failing must not stamp the payload with a guessed
+    "mainnet", which the executor is handed explicitly: that placed a REAL
+    mainnet order for a testnet user without any switch."""
+    monkeypatch.setattr(intent_handlers, "get_user", _FlakyUserReads(h))
+    text = "long 0.01 BTC 5x market now"
+    handled = asyncio.run(intent_handlers.handle_trade_intent_message(_text_trade_update(h, text), h.ctx, UID, text))
+    assert handled, "the auto-execute text trade was not handled"
+    _assert_executed_on_testnet(h, "execute_market_order")
+
+
+def test_text_trade_preview_stamp_is_the_parsed_network_not_a_guess(h, monkeypatch):
+    """Same failing re-read, typed-confirm flavour: the preview is stamped with
+    the network it was parsed and shown on (TESTNET). Once the user is on
+    MAINNET (switched elsewhere, so only the stamp can refuse it), "confirm"
+    is refused instead of matching a guessed "mainnet" stamp and executing."""
+    reads = _FlakyUserReads(h)
+    monkeypatch.setattr(intent_handlers, "get_user", reads)
+    text = "long 0.01 BTC 5x market"
+
+    async def scenario() -> int:
+        handled = await intent_handlers.handle_trade_intent_message(_text_trade_update(h, text), h.ctx, UID, text)
+        pending = h.ctx.user_data.get(intent_handlers.PENDING_TEXT_TRADE_KEY)
+        if not handled or not pending:
+            raise HarnessError(f"the text trade preview was not built: {h.screen.texts()[-2:]!r}")
+        assert pending.get("network") == TESTNET, (
+            f"the preview was stamped {pending.get('network')!r}, not the network it was parsed on"
+        )
+        reads.armed = False
+        h.flip_elsewhere(MAINNET)
+        mark = h.screen.mark()
+        await h.say("confirm")
+        return mark
+
+    mark = asyncio.run(scenario())
+    _assert_nothing_executed(h)
+    _assert_expired_notice(h, mark)
+    assert intent_handlers.PENDING_TEXT_TRADE_KEY not in h.ctx.user_data
+    assert f"text_trade_pending:{UID}" not in h.bot_state
+
+
+def test_enrich_never_fabricates_a_network_stamp(monkeypatch):
+    """Called without the caller's network and unable to read it, the payload
+    carries no stamp (a typed confirm then fails closed), never "mainnet"."""
+
+    def _boom(_tid):
+        raise RuntimeError("guardrail: users read failed")
+
+    monkeypatch.setattr(intent_handlers, "get_user", _boom)
+    monkeypatch.setattr(intent_handlers, "get_user_readonly_client", lambda *_a, **_k: None)
+    payload = {"direction": "long", "order_type": "market", "product": "BTC", "size": 0.01, "leverage": 5}
+    enriched = intent_handlers._enrich_trade_payload(UID, payload, {"default_leverage": 3, "slippage": 1})
+    assert enriched.get("network") is None, f"a guessed network was stamped: {enriched.get('network')!r}"
+    assert enriched["leverage"] >= 1
+
+
+@pytest.mark.parametrize("text", ["long 0.01 BTC 5x market", "long 0.01 BTC 5x market now"],
+                         ids=["preview", "auto_execute"])
+def test_text_trade_with_no_readable_network_is_neither_previewed_nor_executed(h, monkeypatch, text):
+    """No network can be read for the user: nothing is executed, no preview is
+    armed (it could only be bound to a guess), and the user is told so."""
+    monkeypatch.setattr(intent_handlers, "get_user", lambda _tid: None)
+    update = _text_trade_update(h, text)
+    mark = h.screen.mark()
+    handled = asyncio.run(intent_handlers.handle_trade_intent_message(update, h.ctx, UID, text))
+    assert handled
+    _assert_nothing_executed(h)
+    assert intent_handlers.PENDING_TEXT_TRADE_KEY not in h.ctx.user_data
+    assert f"text_trade_pending:{UID}" not in h.bot_state
+    shown = h.screen.texts(mark)
+    assert any(network_guard.network_unknown_text() == t for t in shown), shown
+
+
 # --------------------------------------------------------------------------- #
 # The switch's own clean-up of in-memory previews                              #
 # --------------------------------------------------------------------------- #

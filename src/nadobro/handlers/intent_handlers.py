@@ -8,7 +8,14 @@ from telegram.error import BadRequest
 
 from src.nadobro.i18n import localize_text, get_active_language
 from src.nadobro.handlers.render_utils import plain_text_fallback
-from src.nadobro.handlers.network_guard import active_network, refuse_message, same_network
+from src.nadobro.handlers.network_guard import (
+    active_network,
+    network_of,
+    network_unknown_message,
+    normalize_network,
+    refuse_message,
+    same_network,
+)
 from src.nadobro.handlers.formatters import (
     escape_md,
     build_trade_preview_text,
@@ -63,13 +70,25 @@ def _settings_for_user(telegram_id: int) -> dict:
     return settings
 
 
-def _enrich_trade_payload(telegram_id: int, payload: dict, settings: dict) -> dict:
+def _enrich_trade_payload(
+    telegram_id: int, payload: dict, settings: dict, *, network: str | None = None,
+) -> dict:
+    """Price and clamp a parsed trade, and stamp the network it is built on.
+
+    ``network``: the network the caller parsed the intent on. The stamp is
+    never a guess (PREVIEW-NETWORK-BIND): without a caller network it is read
+    here, and when that read fails the payload carries no stamp, so a typed
+    "confirm" fails closed. It used to fall back to "mainnet", and since the
+    executor is handed the stamp explicitly, one failed re-read placed a
+    TESTNET user's auto-executed ("... now") trade on MAINNET."""
     result = dict(payload)
-    try:
-        user = get_user(telegram_id)
-        network = user.network_mode.value if user else "mainnet"
-    except Exception:
-        network = "mainnet"
+    network = normalize_network(network)
+    if network is None:
+        try:
+            network = network_of(get_user(telegram_id))
+        except Exception:  # policy: degrade-ok(unstamped: a typed confirm fails closed; lookups use the catalog default)
+            logger.warning("text trade: could not read the network for uid=%s; leaving the preview unstamped", telegram_id)
+            network = None
     requested_leverage = int(payload.get("leverage") or settings.get("default_leverage", 3))
     product = str(result.get("product") or "BTC")
     max_leverage = get_product_max_leverage(product, network=network)
@@ -81,7 +100,7 @@ def _enrich_trade_payload(telegram_id: int, payload: dict, settings: dict) -> di
         if result.get("order_type") == "limit":
             price = float(result.get("limit_price") or 0)
         else:
-            client = get_user_readonly_client(telegram_id)
+            client = get_user_readonly_client(telegram_id, network=network)
             if client:
                 pid = get_product_id(result.get("product", "BTC"), network=network, client=client)
                 if pid is not None:
@@ -288,7 +307,14 @@ async def handle_trade_intent_message(update, context: CallbackContext, telegram
         return True
 
     settings = _settings_for_user(telegram_id)
-    payload = _enrich_trade_payload(telegram_id, intent, settings)
+    # Stamped with the network the intent was parsed on (one read for the whole
+    # preview), never re-read and never guessed (PREVIEW-NETWORK-BIND).
+    payload = _enrich_trade_payload(telegram_id, intent, settings, network=network_of(user))
+    if payload.get("network") is None:
+        # No network could be read: neither preview nor auto-execute a trade
+        # that would have to be bound to a guess.
+        await network_unknown_message(update.message, kind="text_trade", telegram_id=telegram_id)
+        return True
     preview = _preview_text(payload)
 
     if _auto_execute_requested(text):
