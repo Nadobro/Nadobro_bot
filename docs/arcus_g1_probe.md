@@ -145,7 +145,7 @@ Each report is `$OUT/<subcommand>_<YYYYmmddTHHMMSSZ>.json`. Values sit under
 | `cancel-race` | `summary` per delay | A6: `CANCELED` = a cancel that beat its placement was buffered; `OPEN_AFTER_NOT_FOUND` = it was not buffered. Ignore when `confounded` is true. |
 | `ct-order` | `older_ct_after_newer`, `replayed_ct` | A16: does P6a need a per-key send lock? A rejected older `ct` means yes. |
 | `oracle-band` (BTC, ETH, SOL) | `threshold_bp.buy` / `.sell`, `sides.*.result` | `ARCUS_ORACLE_DEVIATION_BP` per ticker (A4). Use the smaller side. `bracketed` = measured; `above_upper` = more than 2000 bp; `below_lower` / `inconclusive` / `n/a` = not measured, so re-run later. |
-| `open-order-cap` | `cap`, `baseline_open`, `stop` | `ARCUS_OPEN_ORDER_CAP` (A4). `cap` counts every open order on the account, including your own. `>N` = the cap was not reached. |
+| `open-order-cap` | `cap`, `baseline_open`, `stop` | `ARCUS_OPEN_ORDER_CAP` (A4). `cap` counts every resting (OPEN) order on the account, including your own. Untriggered TP/SL orders are not counted, so if the venue counts them the real cap is higher (the safe side). `>N` = the cap was not reached. |
 | `min-size` | `below_min_size`, `below_min_notional`, `reduce_only_dust` | Reduce-only dust policy (A5). Each case runs on the market where it is unconfounded: BTC-USD for size, the first market whose minimum size is under $5 for notional. |
 | `charged-400` | `order_used_delta` (after 3 rejected placements) | Are gateway 400s charged to the order pool? (A1 / D-17) |
 | `default-leverage` | per ticker `leverage`, `margin_mode` | Default leverage and margin mode |
@@ -191,8 +191,9 @@ stay unverified until the canary.
   placements per second, `--max` per subcommand (default 60), 300 per process.
   A reduce-only safety close is never blocked by these caps.
 - Cleanup always runs, including on Ctrl-C. It batch-cancels probe clientIds
-  by id (never cancel-all, never modify), then re-reads open orders by the run
-  prefix, up to 3 rounds. After a trading run it flattens only the
+  by id (never cancel-all, never modify), then re-reads the resting (OPEN)
+  orders by the run prefix, up to 3 rounds. The probe never places a TP/SL, so
+  your own untriggered TP/SLs are never read or touched. After a trading run it flattens only the
   probe-created position delta with reduce-only orders.
 - DENIED ≠ EMPTY: a denied read is never treated as "no orders" or "flat". The
   run then reports `unknown` and exits 3.

@@ -367,8 +367,8 @@ def testnet_guard(net: str) -> None:
     try:
         rest_host = _host(arcus_rest_url(net))
         ws_host = _host(arcus_ws_url(net))
-    except ValueError:
-        raise Refused("invalid Arcus testnet URL override") from None
+    except ValueError as exc:  # config's fixed messages never echo the URL
+        raise Refused(f"invalid Arcus testnet URL override: {exc}") from None
     mainnet_hosts = {_host(ARCUS_MAINNET_REST_DEFAULT), _host(ARCUS_MAINNET_WS_DEFAULT)}
     for resolve in (arcus_rest_url, arcus_ws_url):
         try:
@@ -1910,7 +1910,10 @@ async def sub_open_order_cap(ctx: ProbeCtx) -> dict[str, Any]:
     rungs: list[ProbeOrder] = []
     result: dict[str, Any] = {"cap": None, "probe_open": 0}
     try:
-        base = await ctx.client.get_open_orders(ctx.ref, market=None, status=("OPEN", "UNTRIGGERED"), lane=Lane.L1_ENGINE, max_wait_s=READ_WAIT_S)
+        # Resting (OPEN) orders only: whether untriggered TP/SLs count toward the
+        # cap is unknown, and leaving them out can only UNDER-state the cap (the
+        # safe side for ARCUS_OPEN_ORDER_CAP) (P2R1-01).
+        base = await ctx.client.get_open_orders(ctx.ref, market=None, status=("OPEN",), lane=Lane.L1_ENGINE, max_wait_s=READ_WAIT_S)
         if not isinstance(base, Ok):
             return {"skipped": "open-orders read denied (cannot count the baseline)"}
         baseline = len(base.value)
@@ -2512,7 +2515,9 @@ async def cleanup(ctx: ProbeCtx) -> dict[str, Any]:
         since = None if ctx.last_place_mono is None else ctx.mono() - ctx.last_place_mono
         wait = max(CLEANUP_SETTLE_S, CLEANUP_GRACE_S - (since or 0.0))
         await ctx.sleep(wait)
-        read = await ctx.client.get_open_orders(ctx.ref, market=None, status=("OPEN", "UNTRIGGERED"), lane=Lane.L0_BRAKE, max_wait_s=READ_WAIT_S)
+        # The probe never places a TP/SL, so its orders can only rest on the OPEN
+        # book; the user's own untriggered TP/SLs are not read at all (P2R1-01).
+        read = await ctx.client.get_open_orders(ctx.ref, market=None, status=("OPEN",), lane=Lane.L0_BRAKE, max_wait_s=READ_WAIT_S)
         if not isinstance(read, Ok):
             entry["open_orders"] = "denied: " + type(read).__name__
             remaining = None

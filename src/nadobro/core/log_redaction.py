@@ -88,6 +88,16 @@ _TG_BOT_TOKEN_BARE_RE = re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b")
 # ``ARCUS_PROBE_SIGNING_KEY=…`` slip past it, and its value class has no ``=``
 # (base64 padding). Bare 64-hex seeds / 128-hex signatures are already masked by
 # ``_LONG_HEX_RE``. Plain ``signature`` is deliberately NOT a label here.
+#
+# E6 is strictly ADDITIVE (R2-4): the pre-E6 chain (``_base_chain``) runs
+# byte-identical, so it redacts at least everything it redacted before. The PEM
+# pre-pass keeps the literal ``-----BEGIN `` prefix: every earlier value rule
+# whose class takes ``-`` (``token=``, ``Bearer``, ``/bot…``, bare bot tokens)
+# consumed ``-----BEGIN`` and stopped at the space after it, so a value glued to
+# a PEM header keeps its old length and is still redacted. No old rule can match
+# across that space or the one inside ``-----END <LABEL>``, so nothing outside
+# the block changes. The labelled rule runs LAST, on the old chain's output.
+_E6_PEM_PLACEHOLDER = "-----BEGIN <REDACTED_PEM>"
 _E6_PEM_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]{3,64}-----.*?-----END [A-Z0-9 ]{3,64}-----", re.DOTALL
 )
@@ -101,14 +111,8 @@ _E6_LABELLED_SECRET_RE = re.compile(
 )
 
 
-def redact_sensitive_text(value: Any) -> Any:
-    """Redact secrets and account identifiers from text while preserving non-string
-    values so %-style logging keeps numeric formatting semantics."""
-    if not isinstance(value, str):
-        return value
-
-    text = _E6_PEM_RE.sub("<REDACTED_PEM>", value)
-    text = _E6_PEM_OPEN_RE.sub("<REDACTED_PEM>", text)
+def _base_chain(text: str) -> str:
+    """The pre-E6 redaction chain, byte-identical (E6 only wraps it)."""
     text = _URL_CREDENTIALS_RE.sub(r"\1<REDACTED>:<REDACTED>@", text)
     text = _PINECONE_URL_RE.sub("<REDACTED_PINECONE_URL>", text)
     text = _BOT_TOKEN_RE.sub("/bot<REDACTED>", text)
@@ -122,13 +126,25 @@ def redact_sensitive_text(value: Any) -> Any:
         lambda m: f"{m.group(1)}{m.group(2)}<REDACTED_ID>", text
     )
     text = _PRIVATE_KEY_FIELD_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<REDACTED>", text)
-    text = _E6_LABELLED_SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<REDACTED>", text)
     text = _SUPABASE_HOST_RE.sub("<REDACTED_DB_HOST>", text)
     text = _FLY_INTERNAL_RE.sub("<REDACTED_IPV6>", text)
     text = _IPV4_RE.sub("<REDACTED_IP>", text)
     text = _IPV6_RE.sub("<REDACTED_IPV6>", text)
     text = _LONG_HEX_RE.sub("<REDACTED_HEX>", text)
     text = _BARE_LONG_ID_RE.sub("<REDACTED_ID>", text)
+    return text
+
+
+def redact_sensitive_text(value: Any) -> Any:
+    """Redact secrets and account identifiers from text while preserving non-string
+    values so %-style logging keeps numeric formatting semantics."""
+    if not isinstance(value, str):
+        return value
+
+    text = _E6_PEM_RE.sub(_E6_PEM_PLACEHOLDER, value)
+    text = _E6_PEM_OPEN_RE.sub(_E6_PEM_PLACEHOLDER, text)
+    text = _base_chain(text)
+    text = _E6_LABELLED_SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<REDACTED>", text)
     return text
 
 

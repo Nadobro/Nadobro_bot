@@ -183,7 +183,9 @@ class LogRedactionTests(unittest.TestCase):
             redacted = redact_sensitive_text(text)
             self.assertNotIn(value, redacted, text)
             self.assertIn(label, redacted, text)
-            self.assertIn("<REDACTED>", redacted, text)
+            # "<REDACTED>" from the labelled rule, or "<REDACTED_HEX>" when the
+            # (unchanged, earlier) long-hex rule already masked the value.
+            self.assertIn("<REDACTED", redacted, text)
 
     def test_e6_does_not_eat_neighbours(self):
         for text in (
@@ -201,6 +203,54 @@ class LogRedactionTests(unittest.TestCase):
         redacted = redact_sensitive_text(f"seed {seed} and api_key={pub}")
         self.assertNotIn(seed, redacted)
         self.assertNotIn(pub, redacted)
+
+    def test_e6_value_glued_to_a_pem_header_stays_redacted(self):
+        """R2-4: the pre-E6 chain redacted ``token=hunter2abcd-----BEGIN …``
+        because the value rule consumed ``-----BEGIN`` (12+ chars). E6 must not
+        shorten that value: both the value and the PEM body stay hidden."""
+        body = "MC4CAQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8Q"
+        for text, value in (
+            (f"token=hunter2abcd-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----", "hunter2abcd"),
+            ("api_key=abcDEF12345-----BEGIN CERTIFICATE-----", "abcDEF12345"),
+            (f"Bearer abc-----BEGIN PRIVATE KEY-----{body}", "abc-"),
+            (f"GET /bot123:abcdef-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY----- ok", "abcdef"),
+        ):
+            redacted = redact_sensitive_text(text)
+            self.assertNotIn(value, redacted, text)
+            self.assertNotIn(body, redacted, text)
+            self.assertNotIn("MC4CAQAw", redacted, text)
+
+    def test_e6_is_strictly_additive_over_the_pre_e6_chain(self):
+        """R2-4 differential: no token survives the full chain that the pre-E6
+        chain (``_base_chain``, byte-identical) redacted. Corpus: seeded random
+        concatenations of secrets, labels, PEM markers and glue characters."""
+        import random
+        import re
+
+        from src.nadobro.core import log_redaction as lr
+
+        pieces = [
+            "private_key", "secret", "api_secret", "signing_key", "x-signature", "token", "password",
+            "=", ": ", '"', "'", " ", "\n", "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----",
+            "-----BEGIN ", "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----", "-----", "BEGIN",
+            "postgres://user:pass@db.supabase.co/x", "https://u:p@host.com/", "0x" + "ab" * 20, "deadbeef" * 8,
+            "1234567890", "1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "10.1.2.3", "fdaa::1", "fdaa:1234:5678",
+            "abcDEF123xyz", "QUJDREVGR0hJSktMTU5PUA==", "MC4CAQAwBQYDK2VwBCIEI", "_", "-", "/", ".", ":",
+            "/bot123:ABC", "sk-abcdef1234567890", "user=", "12345678", "id=987654321012", "Bearer abcdefghijklmnop",
+            "Bearer ", "api_key=", "hunter2abcd", "subaccount=", "abcdef0123456789abcd", "account_id=",
+            "123456789012", "x.pooler.supabase.com", "https://a.pinecone.io/x",
+        ]
+        token_re = re.compile(r"[A-Za-z0-9]{4,}")
+        placeholder_re = re.compile(r"<REDACTED[A-Z_]*>")
+
+        def tokens(text: str) -> set[str]:
+            return set(token_re.findall(placeholder_re.sub(" ", text)))
+
+        rng = random.Random(20260930)
+        for _ in range(20_000):
+            text = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 12)))
+            revealed = tokens(redact_sensitive_text(text)) - tokens(lr._base_chain(text))
+            self.assertEqual(revealed, set(), text)
 
 
 if __name__ == "__main__":

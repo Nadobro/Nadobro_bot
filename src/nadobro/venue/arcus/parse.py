@@ -190,6 +190,9 @@ _POSITION_SIDES: Final = frozenset({"LONG", "SHORT"})
 _MARGIN_MODES: Final = frozenset({"CROSS", "ISOLATED"})
 _API_KEY_STATUSES: Final = frozenset({"ACTIVE", "PENDING_DELETE", "DELETED"})
 _COMPLIANCE_STATUSES: Final = frozenset({"COMPLIANT", "BLOCKED"})
+# order-status values of a TP/SL (trigger) order: "`UNTRIGGERED` is a TPSL parked
+# on the untriggered book" (get-open-orders) + the TPSL_* lifecycle values.
+_TRIGGER_ORDER_STATUSES: Final = frozenset({"UNTRIGGERED", "TPSL_PLACED", "TPSL_TRIGGERED", "TPSL_CANCELED"})
 # TimeInForceResponse: "Resting orders (submitted as GTT) are currently reported
 # as `GTC` for backward compatibility".
 _TIF_BY_WIRE: Final[Mapping[str, Tif]] = MappingProxyType(
@@ -457,9 +460,25 @@ def parse_markets_payload(obj: object) -> list[Mapping[str, object]]:
 
 
 def parse_order_row(obj: object, *, where: str = "order") -> OrderRow:
-    """One ``order`` (openOrders row / ``GET /v1/order``)."""
+    """One ``order`` (openOrders row / ``GET /v1/order``).
+
+    ``originalSize`` must be > 0, except on a trigger (TP/SL) row: a
+    position-level TP/SL is placed with ``quantity: "0"`` ("Use ``quantity:
+    "0"`` on each leg; the engine replaces it at trigger", place-batch-orders
+    positionTpsl), so its untriggered row may list ``originalSize: "0"``. One
+    such row (the user's own, on the shared subaccount 0) must not deny the
+    whole page (P2R1-01). A trigger row carries ``tpslType`` /
+    ``isPositionTPSL`` or a trigger status; it is never a bot order.
+    """
     row = _obj(obj, where)
-    original = _dec(row.get("originalSize"), f"{where}.originalSize", gt=0)
+    status = _str(row.get("status"), f"{where}.status").upper()
+    tpsl_type = _str_opt(row.get("tpslType"), f"{where}.tpslType")
+    position_tpsl_raw = row.get("isPositionTPSL")
+    position_tpsl = False if position_tpsl_raw is None else _bool(position_tpsl_raw, f"{where}.isPositionTPSL")
+    if tpsl_type is not None or position_tpsl or status in _TRIGGER_ORDER_STATUSES:
+        original = _dec(row.get("originalSize"), f"{where}.originalSize", ge=0)
+    else:
+        original = _dec(row.get("originalSize"), f"{where}.originalSize", gt=0)
     remaining = _dec(row.get("remainingSize"), f"{where}.remainingSize", ge=0)
     filled = _dec_opt(row.get("filledSize"), f"{where}.filledSize", ge=0)
     if filled is not None and filled != original - remaining:
@@ -472,7 +491,7 @@ def parse_order_row(obj: object, *, where: str = "order") -> OrderRow:
         market_id=_market_id(row.get("marketId"), f"{where}.marketId"),
         ticker=_str(row.get("marketDisplayName"), f"{where}.marketDisplayName"),
         side=_side(row.get("side"), f"{where}.side"),
-        status=_str(row.get("status"), f"{where}.status").upper(),
+        status=status,
         state=_str_opt(row.get("state"), f"{where}.state"),
         price=_dec(row.get("price"), f"{where}.price", ge=0),
         original_size=original,
@@ -724,9 +743,20 @@ def parse_api_keys(obj: object) -> list[ApiKeyEntry]:
     return [_api_key_entry(r) for r in _list_container(obj, "apiKeys", "apiKeys")]
 
 
-def parse_compliance(obj: object) -> ComplianceView:
+def parse_compliance(obj: object, *, requested_address: str | None = None) -> ComplianceView:
     """``ComplianceResponse``; the ``address`` section is present only when the
-    request carried ``?address=``."""
+    request carried ``?address=``.
+
+    ``requested_address`` (the ``?address=`` sent; compared after
+    :func:`normalize_address`) is the address the verdict is for. The section
+    is then REQUIRED and its echo must match ("The address screened (echoes
+    the ``?address=`` param …)", required ``[address, status]``): a missing
+    section or a foreign echo is drift -> DENIED, never a verdict applied to
+    the wrong user (P2R1-02). Without a requested address there is no per-user
+    verdict (``address_status`` None): a section there screens no user
+    ("empty if none").
+    """
+    wanted = None if requested_address is None else normalize_address(requested_address)
     body = _obj(obj, "compliance")
     geo = _obj(body.get("geo"), "compliance.geo")
     country = geo.get("country")
@@ -737,9 +767,14 @@ def parse_compliance(obj: object) -> ComplianceView:
     bypassed = _bool(geo.get("bypassed"), "compliance.geo.bypassed")
     address_status: Literal["COMPLIANT", "BLOCKED"] | None = None
     reason: str | None = None
-    section = body.get("address")
-    if section is not None:
-        addr = _obj(section, "compliance.address")
+    if wanted is not None:
+        addr = _obj(body.get("address"), "compliance.address")
+        try:
+            echoed = normalize_address(addr.get("address"))
+        except ValueError:
+            _fail("compliance.address")
+        if echoed != wanted:
+            _fail("compliance.address")
         status = _enum(addr.get("status"), "compliance.address.status", _COMPLIANCE_STATUSES)
         address_status = "BLOCKED" if status == "BLOCKED" else "COMPLIANT"
         reason = _str_opt(addr.get("reason"), "compliance.address.reason")

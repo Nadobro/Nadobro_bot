@@ -190,7 +190,11 @@ class FakeVenue:
         rate_used: list[int] | None = None,
         reject_market: bool = False,
         reject_reduce_only: bool = False,
+        user_tpsl: bool = False,
     ) -> None:
+        # the user's own untriggered position TP/SL (originalSize "0", no clientId),
+        # served only when a read asks for status UNTRIGGERED (P2R1-01)
+        self.user_tpsl = user_tpsl
         self.reject_market = reject_market  # every MARKET order -> 400 (tests the LIMIT IOC fallback)
         self.reject_reduce_only = reject_reduce_only  # every reduce-only order -> 400 (a stuck position)
         self.pos: dict[int, D] = {}
@@ -326,6 +330,8 @@ class FakeVenue:
             return httpx.Response(200, json={"positions": pmap, "total": len(pmap)})
         if path == "/v1/openOrders":
             rows = [self._row(o) for o in self.orders.values() if o["state"] == "OPEN"]
+            if self.user_tpsl and "UNTRIGGERED" in q.get("status", "OPEN").split(","):
+                rows.append(load_fixture("open_orders_position_tpsl.json")["orders"][1])
             if "market" in q:
                 rows = [r for r in rows if r["marketDisplayName"] == q["market"]]
             return httpx.Response(200, json={"orders": rows, "total": len(rows)})
@@ -828,6 +834,15 @@ def test_testnet_guard_refuses_non_testnet_urls(monkeypatch, env):
         probe.testnet_guard("testnet")
 
 
+def test_testnet_guard_names_the_cross_network_typo(monkeypatch):
+    """R2-5: config refuses a testnet URL on the mainnet host; the probe says why
+    (config's fixed message, never the URL itself)."""
+    monkeypatch.setenv("ARCUS_TESTNET_REST_URL", "https://api.arcus.xyz  # typo")
+    with pytest.raises(probe.Refused) as exc:
+        probe.testnet_guard("testnet")
+    assert "other Arcus network" in str(exc.value) and "arcus.xyz" not in str(exc.value)
+
+
 def test_testnet_guard_refuses_mainnet_and_accepts_documented_testnet():
     with pytest.raises(probe.Refused):
         probe.testnet_guard("mainnet")
@@ -979,6 +994,22 @@ def test_cleanup_incomplete_exits_3_and_lists_orders(monkeypatch, tmp_path, caps
     assert isinstance(left, list) and len(left) == 4 and all(o["client_id"].startswith("nb0_") for o in left)
     assert len(report["cleanup"]["rounds"]) == probe.CLEANUP_ROUNDS
     assert not any(r.url.path == "/v1/cancelAllOrders" for r in venue.requests)
+
+
+@pytest.mark.parametrize("sub", ["sign-check", "open-order-cap"])
+def test_probe_reads_only_resting_orders_next_to_a_user_tpsl(monkeypatch, tmp_path, sub):
+    """P2R1-01: the probe never places a TP/SL, so cleanup and the open-order-cap
+    baseline read status=OPEN only; the user's own untriggered position TP/SL
+    (originalSize "0") on subaccount 0 can never turn cleanup into "unknown"."""
+    venue = FakeVenue(user_tpsl=True)
+    argv = [sub] if sub == "sign-check" else [sub, "--max", "3"]
+    code, _ = run_probe(monkeypatch, tmp_path, argv, venue)
+    _, report = _report(tmp_path, sub)
+    assert code == 0 and report["cleanup"]["complete"] is True
+    reads = [r for r in venue.requests if r.url.path == "/v1/openOrders"]
+    assert reads and all(r.url.params["status"] == "OPEN" for r in reads)
+    if sub == "open-order-cap":
+        assert report["results"]["baseline_open"] == 0  # the user TP/SL is not counted
 
 
 def test_pool_watch_is_keyless(monkeypatch, tmp_path, capsys):

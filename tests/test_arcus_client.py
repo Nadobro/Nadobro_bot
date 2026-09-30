@@ -32,7 +32,9 @@ from arcus_helpers import (
     V5_SIG,
     V6_SIG,
     V7_SIG,
+    REST_BASE,
     FakeMono,
+    FakeSleep,
     FakeTimeNs,
     fixture_resp,
     golden_auth,
@@ -667,9 +669,10 @@ def test_opening_requires_recent_sync():
         )
         assert await client.place_order(golden_auth(), v1_spec()) == LocalDenied("clock_unsynced")
         assert [(c.method, c.url.path) for c in calls] == [T_TIME]  # one inline sync, no POST
-        # The /v1/time 429 means the SERVER bucket is empty: writes wait it out (Retry-After 2 s).
-        assert client.ip_budget.write_blocked()
-        mono.advance(2.0)
+        # The /v1/time 429 is a READ 429: the bucket cannot cover that read's weight,
+        # but a write is free, so writes are not blocked (R2-3); reads wait it out.
+        assert not client.ip_budget.write_blocked()
+        assert client.ip_budget.snapshot()["reads_blocked_for_s"] == 2.0
         assert isinstance(await client.place_order(golden_auth(), v1_spec(reduce_only=True)), Accepted)  # D2
         assert isinstance(await client.cancel_order(golden_auth(), CancelSpec(1, order_id="a1b2c3d4e5f67890")), Accepted)
         assert [(c.method, c.url.path) for c in calls] == [T_TIME, T_PLACE, T_CANCEL]
@@ -872,6 +875,19 @@ def test_get_open_orders_paging():
     asyncio.run(body())
 
 
+def test_get_open_orders_with_a_position_tpsl_row_is_ok():
+    """P2R1-01: an untriggered position TP/SL ("quantity: "0"") next to a bot
+    order is an Ok page with both rows, never Unavailable(200, "schema")."""
+    async def body():
+        client, _, _ = _client({("GET", "/v1/openOrders"): fixture_resp(200, "open_orders_position_tpsl.json")})
+        r = await client.get_open_orders(REF, market=None, status=("OPEN", "UNTRIGGERED"), lane=Lane.L0_BRAKE)
+        assert isinstance(r, Ok), r
+        assert [(o.client_id, o.status) for o in r.value] == [("nb7ps_2s-1", "OPEN"), (None, "UNTRIGGERED")]
+        assert schema_error_counts() == {}
+
+    asyncio.run(body())
+
+
 def test_get_open_orders_truncated():
     async def body():
         base = 1_790_000_000_000_000
@@ -1026,6 +1042,25 @@ def test_get_mids_prices_compliance():
     asyncio.run(body())
 
 
+def test_get_compliance_foreign_or_missing_echo_denied():
+    """P2R1-02: GET /v1/compliance?address=A answered for another address (or
+    without the address section) is DENIED, never a verdict for A."""
+    async def body():
+        foreign = load_fixture("compliance_blocked.json")
+        foreign["address"] = {"address": "0x" + "11" * 20, "status": "COMPLIANT"}
+        client, calls, _ = _client({("GET", "/v1/compliance"): resp(200, foreign)})
+        assert await client.get_compliance(ADDR_MIXED, lane=Lane.L2_INTERACTIVE) == Unavailable(200, "schema")
+        assert calls[-1].url.params["address"] == ADDR
+        client, _, _ = _client({("GET", "/v1/compliance"): fixture_resp(200, "compliance_geo_only.json")})
+        assert await client.get_compliance(ADDR, lane=Lane.L2_INTERACTIVE) == Unavailable(200, "schema")
+        assert schema_error_counts().get("compliance.address") == 2
+        # without ?address= the geo-only body is a normal Ok with no per-user verdict
+        r = await client.get_compliance(None, lane=Lane.L2_INTERACTIVE)
+        assert isinstance(r, Ok) and r.value.address_status is None
+
+    asyncio.run(body())
+
+
 def test_get_rate_limit_echo_mismatch_denied():
     async def body():
         b = load_fixture("rate_limit_testnet.json")
@@ -1065,12 +1100,42 @@ def test_get_api_keys_foreign_entry_denied():
     asyncio.run(body())
 
 
-def test_read_429_notes_server_block():
+def test_read_429_blocks_reads_but_never_brake_writes():
+    """R2-3: a READ 429 (no `reason`: "Per-IP weight, on a read endpoint") only
+    says the bucket cannot cover that read's weight. It blocks the weighted
+    reads (every lane) for Retry-After, but a brake batch cancel (weight 0,
+    "the write itself is free") is still SENT; a write the venue really
+    IP-rejects comes back as its own Throttled(ip) and only then blocks writes."""
     async def body():
-        client, _, _ = _client({T_TIME: fixture_resp(429, "err_429_read.json", headers={"Retry-After": "2"})})
-        r = await client.get_time(lane=Lane.L1_ENGINE)
+        client, calls, mono = _client(
+            {
+                ("GET", "/v1/candles"): fixture_resp(429, "err_429_read.json", headers={"Retry-After": "2"}),
+                T_TIME: fixture_resp(200, "time.json"),
+                T_BATCH: [fixture_resp(202, "batch_cancel_202.json"),
+                          fixture_resp(429, "err_429_ip_write.json", headers={"Retry-After": "3"})],
+            }
+        )
+        r = await client.get_candles("BTC-USD", "1m", to_us=1_790_000_000_000_000, lane=Lane.L3_BACKGROUND)
         assert r == Throttled("read_ip", 2000, ())
+        assert not client.ip_budget.write_blocked()
+        assert client.ip_budget.level() <= 0
+        # every weighted read waits the block out (L0 included), sending nothing
+        assert await client.get_time(lane=Lane.L0_BRAKE, max_wait_s=0) == LocalDenied("ip_budget:L0_BRAKE")
+        assert len(calls) == 1
+        # ... but the brake cancel goes out
+        specs = [CancelSpec(1, client_id="nb7ps_2s-2"), CancelSpec(3, order_id="00000000000000ff")]
+        res = await client.batch_cancel(golden_auth(), specs)
+        assert isinstance(res.outcome, Accepted)
+        assert [(c.method, c.url.path) for c in calls] == [("GET", "/v1/candles"), T_BATCH]
+        # a WRITE 429 with reason ip does block writes (and reads) precisely
+        res = await client.batch_cancel(golden_auth(), specs)
+        assert res.outcome == Throttled("ip", 2000, ())
         assert client.ip_budget.write_blocked()
+        assert (await client.batch_cancel(golden_auth(), specs)).outcome == LocalDenied("ip_blocked")
+        assert len(calls) == 3
+        mono.advance(2.0)
+        assert not client.ip_budget.write_blocked()
+        assert isinstance(await client.get_time(lane=Lane.L0_BRAKE, max_wait_s=2), Ok)
 
     asyncio.run(body())
 
@@ -1110,6 +1175,92 @@ def test_list_addon_charged_after():
         r = await client.get_fills(REF, market=None, from_us=None, to_us=None, lane=Lane.L3_BACKGROUND)
         assert r == Unavailable(200, "schema")
         assert before - client.ip_budget.level() == 70
+
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize(
+    "lane,n,floor",
+    [(Lane.L3_BACKGROUND, 40, 700), (Lane.L2_INTERACTIVE, 40, 400), (Lane.L1_ENGINE, 60, 300)],
+)
+def test_concurrent_list_reads_never_overdraw_the_l0_reserve(lane, n, floor):
+    """R2-1: the list add-on lands only after the response, so N concurrent
+    L1-L3 reads that each passed the floor check could together drive the
+    bucket far below the L0 reserve (and below zero, where the venue rejects
+    writes with reason ip). Each reserves its worst-case add-on at admission
+    instead: the mirrored level never drops below the lane floor, and a brake
+    read is admitted at once afterwards."""
+    async def body():
+        gate = asyncio.Event()
+        in_flight: list[int] = []
+        rows = [_fill_row(i) for i in range(1000)]
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            in_flight.append(1)
+            await gate.wait()
+            return httpx.Response(200, json={"fills": rows})
+
+        mono = FakeMono()  # no refill: the bound is the admission rule alone
+        budget = IpBudget("testnet", clock=mono, sleep=FakeSleep(mono))
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=REST_BASE)
+        client = ArcusClient("testnet", clock=ArcusClock("testnet", monotonic=mono), ip_budget=budget,
+                             http=http, monotonic=mono)
+        tasks = [
+            asyncio.ensure_future(
+                client.get_fills(REF, market=None, from_us=None, to_us=None, lane=lane, max_wait_s=0)
+            )
+            for _ in range(n)
+        ]
+        for _ in range(50):  # let every task reach admission (and the admitted ones the transport)
+            await asyncio.sleep(0)
+        admitted = len(in_flight)
+        assert 0 < admitted < n
+        assert budget.level() >= floor  # worst point: every admitted read in flight
+        gate.set()
+        outs = await asyncio.gather(*tasks)
+        ok = [o for o in outs if isinstance(o, Ok)]
+        assert len(ok) == admitted and all(o.weight_charged == 70 for o in ok)  # "20 + 50 = 70"
+        assert all(o == LocalDenied(f"ip_budget:{lane.name}") for o in outs if not isinstance(o, Ok))
+        assert budget.level() >= floor
+        assert budget.try_take(20, Lane.L0_BRAKE)  # the brake reserve is intact
+        await http.aclose()
+
+    asyncio.run(body())
+
+
+def test_list_read_reservation_is_refunded():
+    """R2-1: the worst-case add-on reserved at admission is refunded to the
+    rows actually returned (and fully on a denied or failed read); L0 reserves
+    nothing and pays the add-on after, as before."""
+    async def body():
+        client, _, _ = _client(
+            {
+                ("GET", "/v1/fills"): [resp(200, {"fills": [_fill_row(i) for i in range(45)]}),
+                                       fixture_resp(503, "err_503.json"),
+                                       resp(200, {"fills": [_fill_row(i) for i in range(45)]})],
+                ("GET", "/v1/openOrders"): resp(200, {"orders": []}),
+                ("GET", "/v1/candles"): fixture_resp(429, "err_429_read.json", headers={"Retry-After": "1"}),
+            }
+        )
+        budget = client.ip_budget
+        taken: list[int] = []
+        real = budget.try_take
+        budget.try_take = lambda w, lane: (taken.append(w), real(w, lane))[1]  # type: ignore[method-assign]
+        r = await client.get_fills(REF, market=None, from_us=None, to_us=None, limit=200, lane=Lane.L1_ENGINE)
+        assert isinstance(r, Ok) and r.weight_charged == 20 + 2 and taken[-1] == 20 + 10  # floor(200/20) held
+        assert budget.level() == 1500 - 22
+        r = await client.get_fills(REF, market=None, from_us=None, to_us=None, lane=Lane.L2_INTERACTIVE)
+        assert isinstance(r, Unavailable) and r.http_status == 503 and taken[-1] == 20 + 50
+        assert budget.level() == 1500 - 22 - 20  # base weight only; the reservation came back
+        r = await client.get_fills(REF, market=None, from_us=None, to_us=None, lane=Lane.L0_BRAKE)
+        assert isinstance(r, Ok) and taken[-1] == 20  # L0 reserves nothing
+        assert budget.level() == 1500 - 22 - 20 - 22
+        await client.get_open_orders(REF, market=None, limit=100, lane=Lane.L3_BACKGROUND)
+        assert taken[-1] == 20 + 2  # floor(100/50)
+        before = budget.level()
+        r = await client.get_candles("BTC-USD", "1m", to_us=1_790_000_000_000_000, lane=Lane.L3_BACKGROUND)
+        assert isinstance(r, Throttled) and taken[-1] == 20 + 25  # no countback: 1,500-bar cap
+        assert budget.level() == 0  # the 429 zeroes the level after the refund
 
     asyncio.run(body())
 
@@ -1279,6 +1430,22 @@ def test_client_construction_validation():
             ArcusClient("testnet", clock=clock, ip_budget=budget, http=httpx.AsyncClient(), base_url=bad)
     ok = ArcusClient("testnet", clock=clock, ip_budget=budget, http=httpx.AsyncClient(), base_url="http://127.0.0.1:8080/")
     assert ok._base == "http://127.0.0.1:8080"
+
+
+def test_explicit_base_url_of_the_other_network_is_refused(monkeypatch):
+    """R2-5: an explicit base_url gets the cross-network host check too."""
+    for name in ("ARCUS_TESTNET_REST_URL", "ARCUS_MAINNET_REST_URL", "ARCUS_TESTNET_WS_URL", "ARCUS_MAINNET_WS_URL"):
+        monkeypatch.delenv(name, raising=False)
+    mono = FakeMono()
+    for net, bad in (("testnet", "https://api.arcus.xyz"), ("mainnet", "https://api.testnet.arcus.xyz/")):
+        clock = ArcusClock(net, monotonic=mono)
+        budget = IpBudget(net, clock=mono)
+        with pytest.raises(ValueError):
+            ArcusClient(net, clock=clock, ip_budget=budget, http=httpx.AsyncClient(), base_url=bad)
+    monkeypatch.setenv("ARCUS_TESTNET_REST_URL", "https://api.arcus.xyz")  # typo'd env: the default path refuses too
+    with pytest.raises(ValueError):
+        ArcusClient("testnet", clock=ArcusClock("testnet", monotonic=mono), ip_budget=IpBudget("testnet", clock=mono),
+                    http=httpx.AsyncClient())
 
 
 def test_get_raw_weights():

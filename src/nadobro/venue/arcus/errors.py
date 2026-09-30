@@ -301,8 +301,11 @@ def pool_reading_of(
     Absent/null -> None ("Omitted when rate limiting is not configured").
     Malformed -> schema count + None. A pool other than ``expect_pool`` ->
     ``record_schema_error("rateLimit.pool")`` + None. ``remaining == -1`` ->
-    ``remaining=None`` (not enforced); other values verbatim (may be <= 0 on
-    the drip: "Can be 0 or negative while the request still succeeds").
+    ``remaining=None``: AMBIGUOUS — the documented "not enforced" sentinel, but
+    also ``floor(cap - consumed)`` on the first drip action — so the pool
+    governor reads it as UNKNOWN, never unlimited (R2-2). Other values
+    verbatim (may be <= 0 on the drip: "Can be 0 or negative while the request
+    still succeeds").
     """
     if obj is None:
         return None

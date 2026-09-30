@@ -138,6 +138,34 @@ def test_open_orders_empty_and_containers():
             P.parse_open_orders_payload(body)
 
 
+def test_position_tpsl_row_does_not_deny_the_page():
+    """P2R1-01: a position TP/SL is placed with quantity "0" ("the engine replaces
+    it at trigger"), so its UNTRIGGERED row may list originalSize "0". The user's
+    own TP/SL on subaccount 0 must not deny the page (and lose the bot row)."""
+    rows = P.parse_open_orders_payload(load_fixture("open_orders_position_tpsl.json"))
+    bot, tpsl = rows
+    assert bot.client_id == "nb7ps_2s-1" and bot.original_size == D("0.0001") and bot.status == "OPEN"
+    assert tpsl.client_id is None and tpsl.status == "UNTRIGGERED" and tpsl.reduce_only is True
+    assert (tpsl.original_size, tpsl.remaining_size, tpsl.price) == (D("0"), D("0"), D("0"))
+    assert schema_error_counts() == {}
+    # Each trigger marker alone is enough; the size may still never be negative.
+    base = load_fixture("open_orders_position_tpsl.json")["orders"][1]
+    for drop, status in ((("isPositionTPSL",), "UNTRIGGERED"), (("tpslType",), "UNTRIGGERED"),
+                         (("tpslType", "isPositionTPSL"), "UNTRIGGERED"), (("tpslType", "isPositionTPSL"), "TPSL_PLACED"),
+                         (("isPositionTPSL",), "CANCELED")):
+        row = {k: v for k, v in base.items() if k not in drop}
+        row["status"] = status
+        assert P.parse_order_row(row).original_size == D("0")
+    _raises("order.originalSize", P.parse_order_row, {**base, "originalSize": "-1"})
+    # type drift on a marker is still an error, never a silent pass
+    _raises("order.isPositionTPSL", P.parse_order_row, {**base, "isPositionTPSL": "true"})
+    _raises("order.tpslType", P.parse_order_row, {**base, "tpslType": 1})
+    # a PLAIN order with originalSize "0" is still schema drift
+    plain = {k: v for k, v in base.items() if k not in ("tpslType", "isPositionTPSL")}
+    plain["status"] = "OPEN"
+    _raises("order.originalSize", P.parse_order_row, plain)
+
+
 def test_order_row_tolerance_and_drift():
     row = load_fixture("order_ok.json")
     row["newField"] = {"anything": 1}
@@ -414,17 +442,39 @@ def test_api_keys_whole_list_fails_on_one_bad_entry():
 def test_parse_compliance():
     geo_only = P.parse_compliance(load_fixture("compliance_geo_only.json"))
     assert geo_only == P.ComplianceView("XX", False, False, None, None)
-    blocked = P.parse_compliance(load_fixture("compliance_blocked.json"))
+    blocked = P.parse_compliance(load_fixture("compliance_blocked.json"), requested_address=ADDR)
     assert blocked.address_status == "BLOCKED" and blocked.reason == "screening"
     body = load_fixture("compliance_blocked.json")
     body["address"]["status"] = "PENDING"
-    _raises("compliance.address.status", P.parse_compliance, body)
+    _raises("compliance.address.status", P.parse_compliance, body, requested_address=ADDR)
     body = load_fixture("compliance_geo_only.json")
     body["geo"]["country"] = ""
     assert P.parse_compliance(body).country == ""
     del body["geo"]["bypassed"]
     _raises("compliance.geo.bypassed", P.parse_compliance, body)
     _raises("compliance.geo", P.parse_compliance, {})
+
+
+def test_compliance_address_echo_is_checked():
+    """P2R1-02: the screening verdict is applied only to the address that was
+    asked for ("echoes the `?address=` param"); a foreign echo or a missing
+    section is drift (DENIED), and an unrequested section is no verdict."""
+    body = load_fixture("compliance_blocked.json")
+    body["address"]["address"] = ADDR_MIXED  # checksum-case echo is the same address
+    assert P.parse_compliance(body, requested_address=ADDR).address_status == "BLOCKED"
+    assert P.parse_compliance(body, requested_address=ADDR_MIXED).address_status == "BLOCKED"
+    body["address"] = {"address": "0x" + "11" * 20, "status": "COMPLIANT"}
+    _raises("compliance.address", P.parse_compliance, body, requested_address=ADDR)
+    for bad in ("", None, "0x1234", 7):
+        body["address"] = {"address": bad, "status": "COMPLIANT"}
+        _raises("compliance.address", P.parse_compliance, body, requested_address=ADDR)
+    _raises("compliance.address", P.parse_compliance, load_fixture("compliance_geo_only.json"), requested_address=ADDR)
+    body = load_fixture("compliance_blocked.json")
+    body["address"] = None
+    _raises("compliance.address", P.parse_compliance, body, requested_address=ADDR)
+    # no ?address= -> no per-user verdict, whatever the body carries
+    unrequested = P.parse_compliance(load_fixture("compliance_blocked.json"))
+    assert unrequested.address_status is None and unrequested.reason is None
 
 
 def test_parse_leverages():

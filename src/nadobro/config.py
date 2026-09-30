@@ -121,29 +121,75 @@ def _arcus_url_ok(url: str, *, secure_scheme: str, local_scheme: str) -> bool:
     return scheme == local_scheme and host.lower() in _ARCUS_LOCAL_HOSTS
 
 
+def _arcus_host_key(url: str) -> str | None:
+    """The host an Arcus URL talks to, for the cross-network check: lowercase,
+    no trailing dot; a loopback fake keys on its port too (two local fakes may
+    stand in for the two networks). None when the URL cannot be parsed."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    host = host.lower().rstrip(".")
+    if host in _ARCUS_LOCAL_HOSTS:
+        if port is None:
+            port = 443 if parts.scheme.lower() in ("https", "wss") else 80
+        return f"loopback:{port}"
+    return host
+
+
+def arcus_url_conflicts(net: str, url: str) -> bool:
+    """True when ``url``'s host is one the OTHER Arcus network uses: its
+    documented REST/WS default host or its configured ``ARCUS_*_URL`` override.
+    One env typo (``ARCUS_TESTNET_REST_URL=https://api.arcus.xyz``) must never
+    point the testnet scope at mainnet, or the reverse (R2-5; build decision 7
+    "mainnet needs ARCUS_MAINNET_ENABLED")."""
+    this = parse_arcus_net(net)
+    key = _arcus_host_key(url)
+    if key is None:
+        return False
+    for table in (_ARCUS_REST_ENV, _ARCUS_WS_ENV):
+        for other, (env_name, default) in table.items():
+            if other == this:
+                continue
+            for candidate in (default, env_str(env_name, default).rstrip("/")):
+                if _arcus_host_key(candidate) == key:
+                    return True
+    return False
+
+
 def arcus_rest_url(net: str) -> str:
     """Arcus REST base URL for ``net`` (``'testnet'``/``'mainnet'`` only).
 
     ``ARCUS_TESTNET_REST_URL`` / ``ARCUS_MAINNET_REST_URL`` override the
     defaults (inline ``# comments`` allowed). The result has no trailing ``/``
     and must be ``https://`` (``http://`` only for 127.0.0.1 / localhost
-    fakes), else ``ValueError``. The URL is never logged.
+    fakes), and its host must not be one the OTHER network uses
+    (:func:`arcus_url_conflicts`), else ``ValueError``. The URL is never logged.
     """
     env_name, default = _ARCUS_REST_ENV[parse_arcus_net(net)]
     url = env_str(env_name, default).rstrip("/")
     if not _arcus_url_ok(url, secure_scheme="https", local_scheme="http"):
         raise ValueError("ARCUS REST URL must be https")
+    if arcus_url_conflicts(net, url):
+        raise ValueError("ARCUS REST URL points at the other Arcus network's host")
     return url
 
 
 def arcus_ws_url(net: str) -> str:
     """Arcus WebSocket URL for ``net``: ``ARCUS_TESTNET_WS_URL`` /
     ``ARCUS_MAINNET_WS_URL`` or the default; must be ``wss://`` (``ws://`` only
-    for 127.0.0.1 / localhost fakes), else ``ValueError``. Used from P4a."""
+    for 127.0.0.1 / localhost fakes) on a host the OTHER network does not use,
+    else ``ValueError``. Used from P4a."""
     env_name, default = _ARCUS_WS_ENV[parse_arcus_net(net)]
     url = env_str(env_name, default).rstrip("/")
     if not _arcus_url_ok(url, secure_scheme="wss", local_scheme="ws"):
         raise ValueError("ARCUS WS URL must be wss")
+    if arcus_url_conflicts(net, url):
+        raise ValueError("ARCUS WS URL points at the other Arcus network's host")
     return url
 
 PRODUCTS = {

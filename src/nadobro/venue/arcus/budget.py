@@ -9,13 +9,25 @@ floor(items / N)``, where ``N`` is ``20`` for most lists — ``60`` for
 ``candles`` and ``50`` for ``openOrders``" — and "a single large page can
 briefly drive your bucket negative". ``l2OrderBook`` costs "``2 +
 floor(nLevels/20)``"; batch writes "incur only a post-flight per-item charge of
-``floor(N/40)``". Order writes are free on the IP layer, but a write while the
-server bucket is empty is rejected with ``reason: ip`` ("Reduce non-write
-traffic from this IP"), so a server 429 blocks every lane, L0 included.
+``floor(N/40)``". Order writes are free on the IP layer ("the write itself is
+free"); a write the bucket cannot cover is rejected with ``reason: ip``
+("Reduce non-write traffic from this IP"), so a WRITE 429 (``ip`` / unknown
+reason) blocks every lane and every write, L0 included
+(:meth:`IpBudget.note_server_429`). A READ 429 ("no ``reason`` field — Per-IP
+weight, on a read endpoint": "When the bucket can't cover a request's weight")
+only says the bucket cannot cover THAT read's weight, so it blocks the weighted
+lanes but never a (weight-0) write: a brake cancel that the venue really
+IP-rejects comes back as its own ``Throttled(ip)`` at no cost
+(:meth:`IpBudget.note_read_429`, R2-3).
 
 Lanes: L0 (brakes) has no floor, so it can always use the last units the other
 lanes may not touch (plan AD-8: "a … reserve for L0 that other lanes cannot
 use"). A lane may only take tokens while the level stays at or above its floor.
+Because the list add-on lands only AFTER the response, an L1-L3 list read
+reserves its WORST-CASE add-on at admission (:func:`list_addon_cap`) and is
+refunded the unused part once the row count is known
+(:meth:`IpBudget.settle_addon`); otherwise concurrent reads that each passed
+the floor check would overdraw the L0 reserve together (R2-1).
 
 Concurrency: the check-and-deduct in :meth:`IpBudget.try_take` is synchronous
 (no ``await`` between the read and the write), so it is atomic on the single
@@ -23,9 +35,12 @@ runtime loop; no lock is needed and this package never imports ``threading``.
 
 Per-subaccount layer: order pool "20,000", cancel pool "40,000", "a slow
 **drip** … **1 action per 10 seconds** per pool" once empty. Write responses
-carry ``rateLimit.remaining`` ("Can be ``0`` or negative while the request
-still succeeds"; "``-1`` is a sentinel meaning the account layer was not
-enforced"); ``GET /v1/rateLimit`` returns ``used``/``cap``/``nextAvailableMs``.
+carry ``rateLimit.remaining`` (``floor(cap - consumed)``: "Can be ``0`` or
+negative while the request still succeeds"; "``-1`` is a sentinel meaning the
+account layer was not enforced"); ``GET /v1/rateLimit`` returns
+``used``/``cap``/``nextAvailableMs``. A write's ``-1`` is therefore AMBIGUOUS
+(the first drip action after the pool empties reads ``-1`` too), so it is
+UNKNOWN, never "unlimited" (R2-2); only ``/v1/rateLimit`` settles it.
 DENIED ≠ EMPTY: no reading, or a stale one, is UNKNOWN (``None``), never "full"
 and never "empty".
 """
@@ -101,6 +116,9 @@ _LIST_DIVISOR: Final[Mapping[str, int]] = MappingProxyType(
         "portfolio": 20,
     }
 )
+# "Page sizes are capped at 1,000 rows for most lists — 1,500 for candles".
+_LIST_PAGE_MAX_ROWS: Final = 1000
+_LIST_PAGE_MAX_ROWS_BY_KEY: Final[Mapping[str, int]] = MappingProxyType({"candles": 1500})
 _L2_MIN_LEVELS: Final = 1
 _L2_MAX_LEVELS: Final = 100  # "default 20, maximum 100"
 _BATCH_DIVISOR: Final = 40
@@ -124,6 +142,18 @@ def list_addon(path_key: str, items: int) -> int:
         raise ValueError("items must be an int >= 0")
     divisor = _LIST_DIVISOR.get(path_key)
     return items // divisor if divisor else 0
+
+
+def list_addon_cap(path_key: str, rows: int | None = None) -> int:
+    """Worst-case post-flight add-on of ONE page of ``path_key``: ``rows`` is the
+    requested ``limit`` / ``countback`` (None -> the documented page cap:
+    1,000 rows, 1,500 for ``candles``; a larger value is capped too). 0 for
+    endpoints without a list add-on. Reserved at admission by L1-L3 reads."""
+    endpoint_weight(path_key)  # validates the key
+    if rows is not None and (not _is_int(rows) or rows < 0):
+        raise ValueError("rows must be an int >= 0")
+    cap = _LIST_PAGE_MAX_ROWS_BY_KEY.get(path_key, _LIST_PAGE_MAX_ROWS)
+    return list_addon(path_key, cap if rows is None else min(rows, cap))
 
 
 def l2_weight(n_levels: int) -> int:
@@ -194,7 +224,8 @@ class IpBudget:
         self._sleep = sleep
         self._level = float(capacity)  # starts FULL
         self._last = clock()
-        self._blocked_until = float("-inf")
+        self._blocked_until = float("-inf")  # write 429: every lane AND every write
+        self._reads_blocked_until = float("-inf")  # read 429: weighted takes only
         self._taken: dict[Lane, int] = {lane: 0 for lane in Lane}
         self._denied: dict[Lane, int] = {lane: 0 for lane in Lane}
         self._impossible_warned: set[tuple[Lane, int]] = set()
@@ -216,14 +247,18 @@ class IpBudget:
         return lane
 
     # -- public --
+    def _read_block_until(self) -> float:
+        return max(self._blocked_until, self._reads_blocked_until)
+
     def try_take(self, weight: int, lane: Lane) -> bool:
-        """Sync check-and-deduct: False while a server 429 block is active, else
-        True (and the level drops) iff ``level - weight >= floor[lane]``."""
+        """Sync check-and-deduct: False while a server 429 block (write or read)
+        is active, else True (and the level drops) iff ``level - weight >=
+        floor[lane]``."""
         lane = self._check_lane(lane)
         if not _is_int(weight) or weight < 0:
             raise ValueError("weight must be an int >= 0")
         now = self._refill_now()
-        if now < self._blocked_until:
+        if now < self._read_block_until():
             return False
         if self._level - weight >= self._floors[lane]:
             self._level -= weight
@@ -243,7 +278,8 @@ class IpBudget:
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or wait < 0:
             raise ValueError("max_wait_s must be a finite number >= 0")
         if weight == 0:
-            # 0-weight calls still respect a server 429 block.
+            # 0-weight calls respect a WRITE 429 block (a read 429 cannot
+            # refuse a weight-0 request: "the write itself is free").
             if self.write_blocked():
                 self._denied[lane] += 1
                 return False
@@ -268,7 +304,7 @@ class IpBudget:
             if self.try_take(weight, lane):
                 return True
             now = self._clock()
-            need = max(self._blocked_until - now, (floor + weight - self._level) / self._refill)
+            need = max(self._read_block_until() - now, (floor + weight - self._level) / self._refill)
             if now + need > deadline:
                 self._denied[lane] += 1
                 return False
@@ -284,9 +320,23 @@ class IpBudget:
         self._refill_now()
         self._level = max(-float(self._capacity), self._level - extra_weight)
 
+    def settle_addon(self, reserved: int, actual: int) -> None:
+        """Settle a post-flight add-on of which ``reserved`` units were taken at
+        admission: charge the excess (like :meth:`charge_after`, may go
+        negative) or refund the unused part (never above capacity)."""
+        for value in (reserved, actual):
+            if not _is_int(value) or value < 0:
+                raise ValueError("add-on units must be ints >= 0")
+        if actual > reserved:
+            self.charge_after(actual - reserved)
+        elif reserved > actual:
+            self._refill_now()
+            self._level = min(float(self._capacity), self._level + (reserved - actual))
+
     def note_server_429(self, retry_after_ms: int) -> None:
-        """The SERVER bucket is empty: block every lane (L0 too) and every
-        write until ``now + retry_after``; the local level drops to <= 0."""
+        """A WRITE 429 (``reason: ip`` / unknown): the server bucket cannot cover
+        even a free write. Block every lane (L0 too) and every write until
+        ``now + retry_after``; the local level drops to <= 0."""
         if not _is_int(retry_after_ms) or retry_after_ms < 0:
             raise ValueError("retry_after_ms must be an int >= 0")
         now = self._refill_now()
@@ -300,8 +350,27 @@ class IpBudget:
                 self._blocked_until - now,
             )
 
+    def note_read_429(self, retry_after_ms: int) -> None:
+        """A READ 429 (no ``reason``): the server bucket cannot cover that read's
+        weight. Block every weighted take (L0 reads too) until ``now +
+        retry_after`` and drop the local level to <= 0, but never writes (R2-3):
+        :meth:`write_blocked` stays False, so brake cancels still go out."""
+        if not _is_int(retry_after_ms) or retry_after_ms < 0:
+            raise ValueError("retry_after_ms must be an int >= 0")
+        now = self._refill_now()
+        self._reads_blocked_until = max(self._reads_blocked_until, now + retry_after_ms / 1000.0)
+        self._level = min(self._level, 0.0)
+        if self._last_429_warn is None or now - self._last_429_warn >= _WARN_429_EVERY_S:
+            self._last_429_warn = now
+            logger.warning(
+                "arcus %s ip budget: reads blocked by a server read 429 for %.1fs (writes still allowed)",
+                self.network,
+                self._reads_blocked_until - now,
+            )
+
     def write_blocked(self) -> bool:
-        """True while a server 429 block is active (writes are refused locally)."""
+        """True while a WRITE 429 block is active (writes are refused locally).
+        A read 429 never sets it."""
         return self._clock() < self._blocked_until
 
     def level(self) -> float:
@@ -316,6 +385,7 @@ class IpBudget:
             "capacity": self._capacity,
             "floors": {lane.name: self._floors[lane] for lane in Lane},
             "blocked_for_s": round(max(0.0, self._blocked_until - now), 3),
+            "reads_blocked_for_s": round(max(0.0, self._read_block_until() - now), 3),
             "taken": {lane.name: self._taken[lane] for lane in Lane},
             "denied": {lane.name: self._denied[lane] for lane in Lane},
         }
@@ -323,7 +393,6 @@ class IpBudget:
 
 # --- per-subaccount pools ------------------------------------------------------------
 
-POOL_NOT_ENFORCED: Final = 1_000_000_000  # headroom sentinel: the account layer is not enforced
 _POOLS: Final = ("order", "cancel")
 
 
@@ -386,7 +455,9 @@ class PoolGovernor:
 
     def update_from_write(self, pool_name: PoolKind, reading: PoolReading) -> None:
         """A write response's ``rateLimit`` reading (``source == "write"``); an
-        older reading than the current one is ignored."""
+        older reading than the current one is ignored. The ``-1`` sentinel
+        (``remaining is None``) is kept as the newest reading and reads as
+        UNKNOWN until a newer reading (e.g. ``GET /v1/rateLimit``) arrives."""
         pool = _check_pool(pool_name)
         if not isinstance(reading, PoolReading) or reading.source != "write":
             raise ValueError("update_from_write needs a write PoolReading")
@@ -410,13 +481,14 @@ class PoolGovernor:
         return reading
 
     def headroom(self, pool: PoolKind) -> int | None:
-        """Units left in ``pool``; None = UNKNOWN (no reading, or stale).
-        Not enforced -> :data:`POOL_NOT_ENFORCED`; on the drip -> ``<= 0``."""
+        """Units left in ``pool``; None = UNKNOWN (no reading, stale, or a
+        write's ambiguous ``-1``: "not enforced" OR the first drip action —
+        never read as unlimited, R2-2); on the drip -> ``<= 0``."""
         reading = self._fresh(_check_pool(pool))
         if reading is None:
             return None
         if reading.source == "write":
-            return POOL_NOT_ENFORCED if reading.remaining is None else reading.remaining
+            return reading.remaining
         if reading.next_available_ms is not None and reading.next_available_ms > 0:
             return 0  # "otherwise the milliseconds until the next drip token frees up"
         if reading.cap is not None and reading.used is not None:
@@ -548,13 +620,13 @@ def session_reserves(
 
 __all__ = [
     "DEFAULT_MAX_WAIT_S",
-    "POOL_NOT_ENFORCED",
     "IpBudget",
     "PoolGovernor",
     "PoolReserves",
     "PoolKind",
     "endpoint_weight",
     "list_addon",
+    "list_addon_cap",
     "l2_weight",
     "batch_addon",
     "session_reserves",

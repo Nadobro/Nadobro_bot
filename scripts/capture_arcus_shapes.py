@@ -194,7 +194,7 @@ def endpoints(ticker: str, address: str | None, net: str, now_us: int) -> list[E
     ref = ArcusAccountRef(net, address, 0)
     acct = {"address": address, "accountIndex": "0"}
     out += [
-        Endpoint("compliance_address", "compliance", "/v1/compliance", {"address": address}, parse_compliance),
+        Endpoint("compliance_address", "compliance", "/v1/compliance", {"address": address}, lambda b: parse_compliance(b, requested_address=address)),
         Endpoint("account", "account", "/v1/account", acct, lambda b: parse_account(b, ref=ref, now_mono=0.0), "account", _itself),
         Endpoint("positions", "positions", "/v1/positions", acct, lambda b: parse_positions_payload(b, ref=ref), "position", _rows("positions")),
         Endpoint("openOrders", "openOrders", "/v1/openOrders", {**acct, "status": "OPEN", "limit": "5"}, parse_open_orders_payload, "order", _rows("orders")),

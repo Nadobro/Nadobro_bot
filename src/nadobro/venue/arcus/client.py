@@ -9,19 +9,22 @@ Reads (all tagged Public in the docs — "No authentication header is required";
 ``probe:probe_log_20260927.txt`` shows keyless testnet reads): every read
 spends IP weight from :class:`~budget.IpBudget` BEFORE it is sent (a local
 denial sends nothing), pays the documented list add-on AFTER the response
-(rows actually returned), and turns every non-2xx, transport error, non-JSON
-body or schema drift into a DENIED outcome — never an empty result
-(DENIED ≠ EMPTY). Account-scoped reads always send ``address`` AND
+(rows actually returned; an L1-L3 read reserves the worst-case add-on at
+admission and is refunded the rest, R2-1), and turns every non-2xx,
+transport error, non-JSON body or schema drift into a DENIED outcome — never
+an empty result (DENIED ≠ EMPTY). Account-scoped reads always send ``address`` AND
 ``accountIndex`` ("An unrecognised parameter name is not an error — it is
 ignored, and the request silently resolves to index 0").
 
 Writes (REST only): ``placeOrder`` / ``cancelOrder`` / ``batchCancelOrders``
 (Scheme 1, signed per payload) and ``setLeverage`` (Scheme 2). A write is
-refused locally while a server 429 block is active (``reason: ip`` "Reduce
-non-write traffic from this IP"). Only an OPENING placement is ever refused on
-clock grounds (no sync within ``ARCUS_CLOCK_MAX_AGE_S``, 02 D2); cancels,
-batch cancels, reduce-only placements and setLeverage never are. A write that
-may have been forwarded is ``Ambiguous`` (never resend; reconcile by clientId).
+refused locally while a WRITE 429 block is active (``reason: ip`` "Reduce
+non-write traffic from this IP"); a READ 429 blocks weighted reads only, never
+a free write such as a brake cancel (R2-3). Only an OPENING placement is ever
+refused on clock grounds (no sync within ``ARCUS_CLOCK_MAX_AGE_S``, 02 D2);
+cancels, batch cancels, reduce-only placements and setLeverage never are. A
+write that may have been forwarded is ``Ambiguous`` (never resend; reconcile by
+clientId).
 
 Cancels: the bot cancels ONLY through :meth:`ArcusClient.batch_cancel` (a batch
 of one when single) — build_decisions "cancel by id via batchCancelOrders
@@ -52,7 +55,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from src.nadobro.config import arcus_rest_url
+from src.nadobro.config import arcus_rest_url, arcus_url_conflicts
 from src.nadobro.core.feature_flags import arcus_clock_max_age_s, arcus_force_ipv4
 from src.nadobro.utils.venue_scope import arcus_scope_for, parse_arcus_net
 from src.nadobro.venue.arcus.budget import (
@@ -61,6 +64,7 @@ from src.nadobro.venue.arcus.budget import (
     endpoint_weight,
     l2_weight,
     list_addon,
+    list_addon_cap,
 )
 from src.nadobro.venue.arcus.clock import GTT_MIN_AHEAD_US, ArcusClock
 from src.nadobro.venue.arcus.errors import (
@@ -173,11 +177,14 @@ _LIST_CONTAINER: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 _KNOWN_429_REASONS: Final = frozenset({"ip", "account_empty", "account_partial", "unknown"})
-_IP_BLOCKING_LAYERS: Final = frozenset({"read_ip", "ip", "unknown"})
+# A write 429 whose reason is `ip` (or unknown/absent) blocks every lane and write;
+# a read 429 (`read_ip`) blocks the weighted reads only (IpBudget.note_read_429).
+_IP_BLOCKING_LAYERS: Final = frozenset({"ip", "unknown"})
 _LOG_429_EVERY_S: Final = 10.0
 _LEVERAGE_WIRE_MAX: Final = 1000  # SetLeverageRequest.leverage "maximum: 1000"
 _LOCAL_HOSTS: Final = frozenset({"127.0.0.1", "localhost"})
 _LOG_TOKEN_RE: Final = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_PAGE_ROWS_RE: Final = re.compile(r"^[0-9]{1,9}$")
 
 
 def build_transport(*, force_ipv4: bool) -> httpx.AsyncHTTPTransport:
@@ -192,9 +199,10 @@ def build_transport(*, force_ipv4: bool) -> httpx.AsyncHTTPTransport:
     )
 
 
-def _check_base_url(url: str) -> str:
+def _check_base_url(url: str, network: str) -> str:
     """An explicit ``base_url`` gets the same rule as ``config.arcus_rest_url``:
-    https, or http only for a loopback fake; no credentials/query/fragment."""
+    https, or http only for a loopback fake; no credentials/query/fragment; and
+    never a host the OTHER network uses (R2-5)."""
     if not isinstance(url, str):
         raise ValueError("ARCUS REST URL must be https")
     url = url.rstrip("/")
@@ -217,6 +225,8 @@ def _check_base_url(url: str) -> str:
     )
     if not ok:
         raise ValueError("ARCUS REST URL must be https")
+    if arcus_url_conflicts(network, url):
+        raise ValueError("ARCUS REST URL points at the other Arcus network's host")
     return url
 
 
@@ -243,6 +253,17 @@ def _raw_items(body: object, container: str | None, count_map: bool) -> int:
         return 0
     rows = body.get(container)
     return len(rows) if isinstance(rows, list) else 0
+
+
+def _page_rows(path_key: str, params: Mapping[str, str] | None) -> int | None:
+    """The requested page size (``limit``; ``countback`` for candles), or None
+    when absent (the worst case is then the documented page cap)."""
+    if not params:
+        return None
+    raw = params.get("countback" if path_key == "candles" else "limit")
+    if isinstance(raw, str) and _PAGE_ROWS_RE.match(raw):
+        return int(raw)
+    return None
 
 
 def _is_int(value: object) -> bool:
@@ -438,7 +459,9 @@ class ArcusClient:
             raise ValueError("ip_budget must be an IpBudget for the same network")
         self._clock = clock
         self._budget = ip_budget
-        self._base = _check_base_url(base_url) if base_url is not None else arcus_rest_url(self._network)
+        self._base = (
+            _check_base_url(base_url, self._network) if base_url is not None else arcus_rest_url(self._network)
+        )
         self._clock_max_age_s = clock_max_age_s or arcus_clock_max_age_s
         self._mono = monotonic
         self._owns_http = http is None
@@ -487,9 +510,12 @@ class ArcusClient:
         self._last_status[path_key] = status
 
     def _on_throttled(self, path_key: str, out: Throttled, body: Mapping[str, object] | None) -> None:
-        """Every SERVER 429: block the IP budget when the IP layer rejected us,
+        """Every SERVER 429: block the IP budget when the IP layer rejected us
+        (a read 429 blocks reads only; an ``ip``/unknown one blocks writes too),
         and log ONE fixed greppable line (rate-limited per (path_key, layer))."""
-        if out.layer in _IP_BLOCKING_LAYERS:
+        if out.layer == "read_ip":
+            self._budget.note_read_429(out.retry_after_ms)
+        elif out.layer in _IP_BLOCKING_LAYERS:
             self._budget.note_server_429(out.retry_after_ms)
         raw = body.get("reason") if body is not None else None
         if raw is None:
@@ -527,8 +553,15 @@ class ArcusClient:
     ) -> ReadResult[T]:
         lane = _check_lane(lane)
         w = endpoint_weight(path_key) if weight is None else weight
+        # R2-1: an L1-L3 list read reserves its WORST-CASE post-flight add-on at
+        # admission (refunded below once the rows are counted), so concurrent
+        # reads can never overdraw the L0 reserve together. L0 has no floor to
+        # protect: its add-on is charged after, as the venue does.
+        hold = 0
+        if lane is not Lane.L0_BRAKE and (container is not None or count_map):
+            hold = list_addon_cap(path_key, _page_rows(path_key, params))
         started = self._mono()
-        if not await self._budget.acquire(w, lane, max_wait_s=max_wait_s):
+        if not await self._budget.acquire(w + hold, lane, max_wait_s=max_wait_s):
             out: ReadResult[T] = LocalDenied(reason=f"ip_budget:{lane.name}")
             self._note(path_key, out, "local")
             logger.debug("arcus %s GET %s -> local-denied w=%d lane=%s", self._network, path_key, w, lane.name)
@@ -542,6 +575,7 @@ class ArcusClient:
                 follow_redirects=False,
             )
         except httpx.HTTPError as exc:
+            self._budget.settle_addon(hold, 0)
             name = type(exc).__name__
             out = Unavailable(http_status=0, message=name)
             self._note(path_key, out, name)
@@ -558,9 +592,9 @@ class ArcusClient:
         )
         if 200 <= status < 300:
             # The venue charges the add-on on the rows it returned, whatever we
-            # make of them, so pay it before parsing.
+            # make of them, so pay it before parsing (less the reservation).
             addon = list_addon(path_key, _raw_items(raw, container, count_map))
-            self._budget.charge_after(addon)
+            self._budget.settle_addon(hold, addon)
             if raw is None:
                 record_schema_error(f"{path_key}.body")
                 out = Unavailable(http_status=status, message="schema")
@@ -571,6 +605,7 @@ class ArcusClient:
                     out = Unavailable(http_status=status, message="schema")
             self._note(path_key, out, status)
             return out
+        self._budget.settle_addon(hold, 0)  # no rows, no add-on (before a 429 zeroes the level)
         body = raw if isinstance(raw, Mapping) else None
         out = _as_read(classify_http(status, body, resp.headers, is_write=False, client_id=None))
         if isinstance(out, Throttled):
@@ -741,10 +776,17 @@ class ArcusClient:
         self, address: str | None, *, lane: Lane, max_wait_s: float | None = None
     ) -> ReadResult[ComplianceView]:
         """``GET /v1/compliance``. ``geo`` describes the CALLER's IP (the bot's
-        egress), not the user; the ``address`` section only with ``?address=``."""
-        params = None if address is None else {"address": normalize_address(address)}
+        egress), not the user; the ``address`` section only with ``?address=``,
+        and then its echo must be that address (a missing section or a foreign
+        echo is ``Unavailable(200, "schema")``, never a verdict)."""
+        wanted = None if address is None else normalize_address(address)
+        params = None if wanted is None else {"address": wanted}
+
+        def parse(obj: object) -> ComplianceView:
+            return parse_compliance(obj, requested_address=wanted)
+
         return await self._get(
-            "compliance", "/v1/compliance", params, lane=lane, max_wait_s=max_wait_s, parse=parse_compliance
+            "compliance", "/v1/compliance", params, lane=lane, max_wait_s=max_wait_s, parse=parse
         )
 
     async def get_account(

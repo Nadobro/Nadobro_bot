@@ -16,8 +16,8 @@ import pytest
 
 from arcus_helpers import REF, FakeMono, FakeSleep, load_fixture
 from src.nadobro.venue.arcus import budget as B
+from src.nadobro.venue.arcus import errors as E
 from src.nadobro.venue.arcus.budget import (
-    POOL_NOT_ENFORCED,
     IpBudget,
     PoolGovernor,
     PoolReserves,
@@ -25,6 +25,7 @@ from src.nadobro.venue.arcus.budget import (
     endpoint_weight,
     l2_weight,
     list_addon,
+    list_addon_cap,
     session_reserves,
 )
 from src.nadobro.venue.arcus.parse import parse_rate_limit
@@ -79,6 +80,38 @@ def test_list_addon_l2_and_batch():
     assert batch_addon(39) == 0 and batch_addon(40) == 1 and batch_addon(100) == 2
     with pytest.raises(ValueError):
         batch_addon(-1)
+
+
+def test_list_addon_cap_is_the_worst_page():
+    """R2-1: the add-on an L1-L3 read reserves at admission — "Page sizes are
+    capped at 1,000 rows for most lists — 1,500 for candles"."""
+    assert list_addon_cap("fills") == 50 and list_addon_cap("fills", 1000) == 50
+    assert list_addon_cap("fills", 200) == 10 and list_addon_cap("fills", 5000) == 50  # capped
+    assert list_addon_cap("openOrders", 1000) == 20 and list_addon_cap("openOrders", 49) == 0
+    assert list_addon_cap("candles") == 25 and list_addon_cap("candles", 300) == 5
+    assert list_addon_cap("markets") == 50 and list_addon_cap("prices") == 50 and list_addon_cap("apiKeys") == 50
+    assert list_addon_cap("account") == 0 and list_addon_cap("time", 1000) == 0
+    for bad in (-1, True, 1.5):
+        with pytest.raises(ValueError):
+            list_addon_cap("fills", bad)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        list_addon_cap("nope")
+
+
+def test_settle_addon_refunds_or_charges_the_difference():
+    budget, _, _ = _budget()
+    assert budget.try_take(20 + 50, Lane.L1_ENGINE)  # base + worst-case add-on
+    budget.settle_addon(50, 2)
+    assert budget.level() == 1500 - 22
+    budget.settle_addon(0, 30)  # L0: nothing reserved, the add-on is charged after
+    assert budget.level() == 1500 - 52
+    budget.settle_addon(5, 12)  # more rows than reserved (drift): the excess is charged
+    assert budget.level() == 1500 - 59
+    budget.settle_addon(1000, 0)  # a refund never lifts the level above capacity
+    assert budget.level() == 1500
+    for bad in ((-1, 0), (0, -1), (True, 0), (0, 1.5)):
+        with pytest.raises(ValueError):
+            budget.settle_addon(*bad)  # type: ignore[arg-type]
 
 
 # --- IP bucket -----------------------------------------------------------------------------
@@ -209,6 +242,35 @@ def test_server_429_blocks_all_lanes_and_writes(caplog):
     asyncio.run(body())
 
 
+def test_read_429_blocks_weighted_takes_but_not_writes(caplog):
+    """R2-3: a read 429 means the bucket cannot cover THAT read's weight; a
+    write is free ("the write itself is free"), so writes are never refused
+    locally on a read 429 — only a write 429 (reason ip) does that."""
+    async def body():
+        budget, mono, _ = _budget()
+        with caplog.at_level(logging.WARNING, logger=B.__name__):
+            budget.note_read_429(2000)
+            budget.note_read_429(500)  # never shortens the block
+        assert not budget.write_blocked()
+        assert budget.level() == 0
+        assert not budget.try_take(1, Lane.L0_BRAKE)
+        assert not await budget.acquire(2, Lane.L0_BRAKE, max_wait_s=0)
+        assert await budget.acquire(0, Lane.L0_BRAKE, max_wait_s=0)  # weight 0 (health) is never refused
+        snap = budget.snapshot()
+        assert snap["blocked_for_s"] == 0.0 and snap["reads_blocked_for_s"] == 2.0
+        assert sum("read 429" in r.getMessage() for r in caplog.records) == 1
+        # a brake read waiting inside its budget gets through once the block lifts
+        assert await budget.acquire(10, Lane.L0_BRAKE, max_wait_s=2.5)
+        assert mono.now >= 1000.0 + 2.0
+        # a write 429 on top still blocks writes
+        budget.note_server_429(1000)
+        assert budget.write_blocked()
+        with pytest.raises(ValueError):
+            budget.note_read_429(-1)
+
+    asyncio.run(body())
+
+
 def test_floor_validation():
     with pytest.raises(ValueError):
         IpBudget("testnet", lane_floors={Lane.L1_ENGINE: 800})  # L1 > L2 (400)
@@ -257,8 +319,8 @@ def test_pool_reading_age():
 def test_pool_write_readings():
     mono = FakeMono(100.0)
     gov = PoolGovernor(REF, clock=mono)
-    gov.update_from_write("order", _write_reading(None, at=100.0))  # -1 sentinel -> not enforced
-    assert gov.headroom("order") == POOL_NOT_ENFORCED
+    gov.update_from_write("order", _write_reading(None, at=100.0))  # -1 sentinel -> UNKNOWN (R2-2)
+    assert gov.headroom("order") is None
     gov.update_from_write("order", _write_reading(-5, at=101.0))  # on the drip
     gov.update_from_write("cancel", _write_reading(40_000, at=101.0))
     assert gov.headroom("order") == -5
@@ -272,6 +334,33 @@ def test_pool_write_readings():
         gov.update_from_write("order", PoolReading(1, 1, 0, 0, "rest", 1.0))
     with pytest.raises(ValueError):
         gov.update_from_write("both", _write_reading(1, at=1.0))  # type: ignore[arg-type]
+
+
+def test_pool_write_sentinel_is_unknown_never_unlimited():
+    """R2-2: a write's remaining -1 is the "not enforced" sentinel AND the
+    documented floor(cap - consumed) of the first drip action, so it can never
+    read as unlimited headroom; a newer /v1/rateLimit reading settles it."""
+    mono = FakeMono(10.0)
+    gov = PoolGovernor(REF, clock=mono)
+    reserves = PoolReserves(order=10, cancel=10)
+    empty = PoolReading(remaining=0, cap=20_000, used=20_000, next_available_ms=8_000, source="rest", as_of_mono=10.0)
+    _, cancel = parse_rate_limit(load_fixture("rate_limit_testnet.json"), ref=REF, now_mono=10.0)
+    gov.update_from_rest(empty, cancel, echoed_account_index=0)
+    assert gov.headroom("order") == 0 and gov.below_reserve(reserves) is True
+    # the first drip action after the pool emptied reports -1
+    pool = E.pool_reading_of({"pool": "order", "remaining": -1}, expect_pool="order", now_mono=11.0)
+    assert pool is not None and pool.remaining is None
+    gov.update_from_write("order", pool)
+    assert gov.headroom("order") is None
+    assert gov.below_reserve(reserves) is None  # unknown: callers hold, exactly like below reserve
+    assert gov.runway_hours("order", 10.0) is None
+    gov.update_from_write("order", _write_reading(-2, at=12.0))  # the next drip action
+    assert gov.headroom("order") == -2 and gov.below_reserve(reserves) is True
+    gov.update_from_write("order", _write_reading(None, at=13.0))
+    order_now = PoolReading(remaining=20_000, cap=20_000, used=0, next_available_ms=0, source="rest", as_of_mono=14.0)
+    gov.update_from_rest(order_now, cancel, echoed_account_index=0)  # the REST read settles it
+    assert gov.headroom("order") == 20_000 and gov.below_reserve(reserves) is False
+    assert not hasattr(B, "POOL_NOT_ENFORCED")
 
 
 def test_pool_rest_readings():
