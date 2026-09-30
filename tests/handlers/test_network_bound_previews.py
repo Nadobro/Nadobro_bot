@@ -23,15 +23,18 @@ from src.nadobro.handlers import (  # noqa: E402
     keyboards,
     orders_view,
     portfolio_deck,
+    positions_view,
     state_reset,
     strategy_handler,
     vault_handler,
 )
 from src.nadobro.handlers.network_guard import (  # noqa: E402
+    NETWORK_UNKNOWN_TEXT,
     STALE_ACTION_TEXT,
     STALE_TRADE_TEXT,
     STALE_UNKNOWN_TEXT,
     bind_cb,
+    network_unknown_text,
     same_network,
     stale_preview_text,
     unbind_cb,
@@ -82,6 +85,12 @@ def test_same_network_is_true_only_for_two_equal_valid_networks(built, current, 
         "strategy:startok:vol:KBTC",
         "vault:deposit:confirm:100.0",
         "vault:withdraw:confirm:1.2345678901234567e-05",
+        "portfolio:close_all_confirm",
+        "portfolio:cancel_all_confirm",
+        "pos:close_all",
+        "trade:close_all",
+        "copy:confirm",
+        "exec_trade:pending",
     ],
 )
 @pytest.mark.parametrize("network", ["testnet", "mainnet"])
@@ -147,11 +156,15 @@ def _est():
         lambda: vault_handler._deposit_confirm_card(100.0),
         lambda: vault_handler._withdraw_confirm_card(1.0, 1.0, 0.1),
         lambda: strategy_handler._vol_fee_quote_key(_est(), 0.0),
+        lambda: keyboards.trade_confirm_kb(),
+        lambda: keyboards.copy_confirm_kb(),
+        lambda: portfolio_deck.portfolio_deck_kb(True, True),
     ],
     ids=[
         "positions_kb", "close_product_kb", "confirm_close_all_kb", "strategy_action_kb",
         "cancel_callback_for", "render_cancel_all_confirm", "render_close_all_confirm",
         "deposit_confirm_card", "withdraw_confirm_card", "vol_fee_quote_key",
+        "trade_confirm_kb", "copy_confirm_kb", "portfolio_deck_kb",
     ],
 )
 def test_every_binding_builder_requires_the_network(build):
@@ -161,11 +174,20 @@ def test_every_binding_builder_requires_the_network(build):
         build()
 
 
+def _callbacks(kb) -> list[str]:
+    return [btn.callback_data for row in kb.inline_keyboard for btn in row]
+
+
 def test_executing_buttons_are_tagged_with_the_network_they_were_rendered_on():
     kb = keyboards.positions_kb([{"product_name": "BTC-PERP"}], network="testnet")
-    callbacks = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    callbacks = _callbacks(kb)
     assert "pos:close:BTC:testnet" in callbacks
-    assert "pos:close_all" in callbacks, "the opener renders a fresh, bound confirm; it stays untagged"
+    # The opener carries the card's network too: the confirm it opens is bound
+    # to it, never to the network current at the second tap.
+    assert "pos:close_all:testnet" in callbacks
+    assert "pos:close_all" not in callbacks
+    assert _callbacks(keyboards.trade_confirm_kb(network="testnet"))[1] == "exec_trade:pending:testnet"
+    assert _callbacks(keyboards.copy_confirm_kb(network="testnet"))[0] == "copy:confirm:testnet"
     assert keyboards.confirm_close_all_kb(network="mainnet").inline_keyboard[0][0].callback_data == (
         "pos:confirm_close_all:mainnet"
     )
@@ -175,10 +197,62 @@ def test_executing_buttons_are_tagged_with_the_network_they_were_rendered_on():
     assert deposit.inline_keyboard[0][0].callback_data == "vault:deposit:confirm:250.0:testnet"
 
 
+def _snapshot(network):
+    snap = {
+        "positions": [{"product_id": 2, "product_name": "BTC-PERP", "symbol": "BTC-PERP", "is_long": True,
+                       "amount": "0.01", "avg_entry_price": "60000", "notional_value": "600", "est_pnl": "1"}],
+        "open_orders": [{"product_id": 2, "product_name": "BTC-PERP", "side": "BUY", "amount": "0.01",
+                         "price": "59000", "digest": "0x" + "ab" * 32}],
+        "stats": {},
+        "equity": {},
+    }
+    if network is not None:
+        snap["network"] = network
+    return snap
+
+
+_BULK_OPENERS = ("portfolio:close_all_confirm", "portfolio:cancel_all_confirm")
+
+
+@pytest.mark.parametrize("network", ["testnet", "mainnet"])
+def test_portfolio_views_bind_their_bulk_openers_to_the_snapshot_network(network):
+    """R1-BULK-OPENER-UNBOUND: every bulk opener carries the network of the
+    view it sits on (the snapshot's), like the per-order cancels next to it."""
+    snap = _snapshot(network)
+    positions = _callbacks(positions_view.render_positions_view(snap)[1])
+    assert f"portfolio:close_all_confirm:{network}" in positions
+    assert f"portfolio:cancel_all_confirm:{network}" in positions
+    assert f"portfolio:cancel_order:d:{'ab' * 8}:{network}" in positions
+    orders = _callbacks(orders_view.render_orders_view(snap)[1])
+    assert f"portfolio:cancel_all_confirm:{network}" in orders
+    deck = _callbacks(portfolio_deck.render_portfolio_deck(snap)[1])
+    assert f"portfolio:close_all_confirm:{network}" in deck
+    for callbacks in (positions, orders, deck):
+        assert not set(callbacks) & set(_BULK_OPENERS), "an untagged bulk opener was rendered"
+
+
+@pytest.mark.parametrize("network", [None, "", "devnet"])
+def test_portfolio_views_render_no_bound_button_for_an_unknown_network(network):
+    """R1-FABRICATED-MAINNET-BINDING: a snapshot that cannot say which network
+    it was read from gets no executing button and no opener, rather than
+    buttons bound to a guessed ``"mainnet"``. The view itself still renders."""
+    snap = _snapshot(network)
+    for text, kb in (
+        positions_view.render_positions_view(snap),
+        orders_view.render_orders_view(snap),
+        portfolio_deck.render_portfolio_deck(snap),
+    ):
+        assert "BTC-PERP" in text
+        bound = [c for c in _callbacks(kb) if unbind_cb(c)[1] is not None or c.startswith(_BULK_OPENERS)]
+        assert bound == [], bound
+        assert not any(c.startswith("portfolio:cancel_order") for c in _callbacks(kb))
+    assert portfolio_deck.portfolio_deck_kb(True, False, network=network).inline_keyboard  # still a deck
+
+
 # --------------------------------------------------------------------------- #
 # i18n of the refusal                                                          #
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("key", [STALE_TRADE_TEXT, STALE_ACTION_TEXT, STALE_UNKNOWN_TEXT])
+@pytest.mark.parametrize("key", [STALE_TRADE_TEXT, STALE_ACTION_TEXT, STALE_UNKNOWN_TEXT, NETWORK_UNKNOWN_TEXT])
 def test_refusal_strings_are_translated_in_every_language(key):
     entry = i18n._TEXTS.get(key)
     assert entry is not None, f"missing from i18n._TEXTS: {key!r}"
@@ -212,9 +286,19 @@ def test_refusal_without_a_known_network_says_out_of_date(lang, built, current):
     assert text == i18n.localize_text(STALE_UNKNOWN_TEXT, lang)
 
 
+@pytest.mark.parametrize("lang", sorted(i18n.SUPPORTED_LANGS))
+def test_unknown_network_notice_is_localized(lang):
+    with i18n.language_context(lang):
+        text = network_unknown_text()
+    assert text == i18n.localize_text(NETWORK_UNKNOWN_TEXT, lang)
+    assert "testnet" in text and "mainnet" in text, text
+    if lang != "en":
+        assert text != NETWORK_UNKNOWN_TEXT, f"{lang} fell back to English"
+
+
 def test_refusal_text_needs_no_parse_mode():
     """Sent without a parse mode: it must carry no Markdown/HTML markup."""
-    for key in (STALE_TRADE_TEXT, STALE_ACTION_TEXT, STALE_UNKNOWN_TEXT):
+    for key in (STALE_TRADE_TEXT, STALE_ACTION_TEXT, STALE_UNKNOWN_TEXT, NETWORK_UNKNOWN_TEXT):
         for text in [key, *i18n._TEXTS[key].values()]:
             assert not any(ch in text for ch in "*_`\\<>"), text
 

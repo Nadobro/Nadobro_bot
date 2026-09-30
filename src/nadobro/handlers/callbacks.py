@@ -39,7 +39,7 @@ from src.nadobro.handlers.home_card import (
 )
 from src.nadobro.handlers.commands import build_status_dashboard_parts
 from src.nadobro.handlers.state_reset import clear_pending_user_state, clear_state_after_network_switch
-from src.nadobro.handlers.network_guard import active_network, refuse_query, same_network, unbind_cb
+from src.nadobro.handlers.network_guard import active_network, network_of, refuse_query, same_network, unbind_cb
 from src.nadobro.users.user_service import (
     get_or_create_user, get_user_nado_client, get_user_readonly_client, get_user_wallet_info,
     get_user, remove_user_private_key, ensure_active_wallet_ready, update_user_language,
@@ -581,6 +581,9 @@ async def _handle_referrals(query, data, telegram_id, context=None):
 
 
 async def _handle_trade(query, data, telegram_id, context):
+    # ``trade:close_all`` must carry the network its menu was rendered on
+    # (PREVIEW-NETWORK-BIND); no other trade:* action is tagged.
+    data, built_network = unbind_cb(data)
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else ""
     needs_wallet = action in ("long", "short", "limit_long", "limit_short")
@@ -622,10 +625,23 @@ async def _handle_trade(query, data, telegram_id, context):
             reply_markup=close_product_kb(network=network),
         )
     elif action == "close_all":
+        # An opener: its confirm is bound to the network the opener carries,
+        # never to the one read here. Nothing renders this button any more
+        # (it only survives on old messages), so an untagged one fails closed.
+        if not same_network(built_network, network_of(user)):
+            await refuse_query(
+                query,
+                kind="close_all_open",
+                built=built_network,
+                current=network_of(user),
+                telegram_id=telegram_id,
+                reply_markup=back_kb(),
+            )
+            return
         await _edit_loc(query, 
             "⚠️ *Close All Positions*\n\nAre you sure you want to close ALL open orders?",
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=confirm_close_all_kb(network=network),
+            reply_markup=confirm_close_all_kb(network=built_network),
         )
 
 
@@ -761,11 +777,13 @@ async def _handle_leverage(query, data, telegram_id, context):
     await _edit_loc(query, 
         preview,
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=trade_confirm_kb(),
+        reply_markup=trade_confirm_kb(network=network),
     )
 
 
 async def _handle_exec_trade(query, data, telegram_id, context):
+    # Confirm carries the network its preview card was priced on.
+    data, card_network = unbind_cb(data)
     pending = context.user_data.get("pending_trade")
     if not pending:
         await _edit_loc(query, 
@@ -775,16 +793,21 @@ async def _handle_exec_trade(query, data, telegram_id, context):
         )
         return
     # PREVIEW-NETWORK-BIND: never confirm a preview on a network it was not
-    # priced on (a missing stamp fails closed).
+    # priced on (a missing stamp fails closed). Both must match the current
+    # network: the slot's own stamp, and the tag on the tapped card. The slot
+    # is single, so a stale card from the other network could otherwise
+    # confirm a newer preview it never showed.
     built_network = pending.get("network")
     current_network = await active_network(telegram_id)
-    if not same_network(built_network, current_network):
-        context.user_data.pop("pending_trade", None)
+    slot_ok = same_network(built_network, current_network)
+    if not (slot_ok and same_network(card_network, current_network)):
+        if not slot_ok:
+            context.user_data.pop("pending_trade", None)
         await refuse_query(
             query,
             kind="exec_trade",
             notice="trade",
-            built=built_network,
+            built=built_network if not slot_ok else card_network,
             current=current_network,
             telegram_id=telegram_id,
             reply_markup=back_kb(),
@@ -863,11 +886,25 @@ async def _handle_positions(query, data, telegram_id, context):
         })
 
     elif action == "close_all":
-        network = await active_network(telegram_id) or "mainnet"
+        # The opener carries the network of the positions card it was on; the
+        # confirm is bound to that network, never re-read here, so a stale card
+        # can't open a close-all on the network the user switched to since. An
+        # untagged (legacy) opener fails closed.
+        current_network = await active_network(telegram_id)
+        if not same_network(built_network, current_network):
+            await refuse_query(
+                query,
+                kind="close_all_open",
+                built=built_network,
+                current=current_network,
+                telegram_id=telegram_id,
+                reply_markup=back_kb(),
+            )
+            return
         await _edit_loc(query, 
             fmt_close_all_confirm(),
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=confirm_close_all_kb(network=network),
+            reply_markup=confirm_close_all_kb(network=built_network),
         )
 
     elif action == "confirm_close_all":

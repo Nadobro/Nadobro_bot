@@ -13,7 +13,13 @@ from src.nadobro.handlers.keyboards import back_kb, copy_hub_kb, copy_trader_pre
 from src.nadobro.i18n import localize_text, get_active_language
 from src.nadobro.users.admin_service import is_admin
 from src.nadobro.core.async_utils import run_blocking
-from src.nadobro.handlers.network_guard import active_network, refuse_query, same_network
+from src.nadobro.handlers.network_guard import (
+    active_network,
+    normalize_network,
+    refuse_query,
+    same_network,
+    unbind_cb,
+)
 from src.nadobro.users.onboarding_service import is_new_onboarding_complete
 from src.nadobro.users.user_service import get_user, ensure_active_wallet_ready
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -424,6 +430,21 @@ async def _handle_copy(query, data, context, telegram_id):
         if not setup:
             await _edit_loc(query, "⚠️ No setup in progress\\.", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=back_kb())
             return
+        # The confirm card is bound to the wizard's network. A wizard with no
+        # valid stamp (its network could not be read when it started) can never
+        # confirm: expire it here rather than render a card bound to a guess.
+        setup_network = normalize_network(setup.get("network"))
+        if setup_network is None:
+            context.user_data.pop("copy_setup", None)
+            await refuse_query(
+                query,
+                kind="copy_setup",
+                built=None,
+                current=None,
+                telegram_id=telegram_id,
+                reply_markup=back_kb("copy:hub"),
+            )
+            return
         ctp_pct = float(parts[2])
         setup["cumulative_take_profit_pct"] = ctp_pct if ctp_pct > 0 else None
         setup["step"] = "confirm"
@@ -440,7 +461,7 @@ async def _handle_copy(query, data, context, telegram_id):
         await _edit_loc(query,
             "✅ *Confirm Copy Setup*\n\nTrader: *{trader}*\nBudget: *${budget}*\nRisk Factor: *{risk}x*\nMax Leverage: *{leverage}x*\nCumulative SL: *{sl}*\nCumulative TP: *{tp}*\n\nReady to start?",
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=copy_confirm_kb(),
+            reply_markup=copy_confirm_kb(network=setup_network),
             trader=escape_md(trader_label),
             budget=f"{setup['budget_usd']:.0f}",
             risk=setup['risk_factor'],
@@ -455,15 +476,21 @@ async def _handle_copy(query, data, context, telegram_id):
             await _edit_loc(query, "⚠️ No setup to confirm\\.", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=back_kb())
             return
         # PREVIEW-NETWORK-BIND: start the copy only on the network the wizard
-        # was run on (a missing stamp fails closed).
+        # was run on (a missing stamp fails closed). Both must match the
+        # current network: the slot's own stamp, and the tag on the tapped
+        # card. The slot is single, so a stale card from the other network
+        # could otherwise confirm a newer wizard it never showed.
+        _untagged, card_network = unbind_cb(data)
         setup_network = setup.get("network")
         current_network = await active_network(telegram_id)
-        if not same_network(setup_network, current_network):
-            context.user_data.pop("copy_setup", None)
+        slot_ok = same_network(setup_network, current_network)
+        if not (slot_ok and same_network(card_network, current_network)):
+            if not slot_ok:
+                context.user_data.pop("copy_setup", None)
             await refuse_query(
                 query,
                 kind="copy_confirm",
-                built=setup_network,
+                built=setup_network if not slot_ok else card_network,
                 current=current_network,
                 telegram_id=telegram_id,
                 reply_markup=back_kb("copy:hub"),

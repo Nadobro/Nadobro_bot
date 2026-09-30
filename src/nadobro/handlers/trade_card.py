@@ -34,6 +34,8 @@ from src.nadobro.handlers.keyboards import (
 from src.nadobro.handlers.home_card import build_home_card_text_async
 from src.nadobro.handlers.network_guard import (
     active_network,
+    network_unknown_message,
+    network_unknown_query,
     normalize_network,
     refuse_query,
     same_network,
@@ -344,7 +346,14 @@ async def open_trade_card_from_message(
     session = _get_trade_card_session(context, touch=True)
     chat_id = update.effective_chat.id
     # A new card is bound to the network it is built on (PREVIEW-NETWORK-BIND).
-    network = await active_network(telegram_id) or "mainnet"
+    # When that cannot be read right now, no card is built: never one bound to
+    # a guessed network.
+    network = await active_network(telegram_id)
+    if network is None:
+        await network_unknown_message(
+            update.message, kind="trade_card_open", telegram_id=telegram_id, reply_markup=home_card_kb(),
+        )
+        return True
 
     if prefer_reply_to_message:
         session = {
@@ -403,7 +412,14 @@ async def open_trade_card_from_callback(query, context: CallbackContext, telegra
     if not is_trade_card_mode_enabled():
         return False
     # A new card is bound to the network it is built on (PREVIEW-NETWORK-BIND).
-    network = await active_network(telegram_id) or "mainnet"
+    # When that cannot be read right now, no card is built: never one bound to
+    # a guessed network.
+    network = await active_network(telegram_id)
+    if network is None:
+        await network_unknown_query(
+            query, kind="trade_card_open", telegram_id=telegram_id, reply_markup=home_card_kb(),
+        )
+        return True
     session = {
         "session_id": _new_session_id(),
         "state": "direction",

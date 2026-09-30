@@ -115,11 +115,11 @@ Each cell is `[label] → callback_data`.
 [❌ Cancel] → copy:hub
 ```
 
-## copy_confirm_kb
+## copy_confirm_kb__mainnet
 `copy_confirm_kb`
 
 ```
-[✅ Confirm & Start] → copy:confirm
+[✅ Confirm & Start] → copy:confirm:mainnet
 [❌ Cancel] → copy:hub
 ```
 
@@ -245,7 +245,7 @@ Each cell is `[label] → callback_data`.
 [📌 Reload positions] → pos:view
 [❌ Close BTC-PERP] → pos:close:BTC:mainnet
 [❌ Close ETH-PERP] → pos:close:ETH:mainnet
-[❌ Close All Positions] → pos:close_all
+[❌ Close All Positions] → pos:close_all:mainnet
 [📁 Back to Portfolio] → portfolio:view  |  [🏠 Home] → nav:main
 ```
 
@@ -412,11 +412,11 @@ Each cell is `[label] → callback_data`.
 [◀ Back] → card:trade:sess-1:back  |  [🏠 Home] → card:trade:sess-1:home
 ```
 
-## trade_confirm_kb
+## trade_confirm_kb__mainnet
 `trade_confirm_kb`
 
 ```
-[❌ Cancel] → cancel_trade  |  [✅ Confirm Trade] → exec_trade:pending
+[❌ Cancel] → cancel_trade  |  [✅ Confirm Trade] → exec_trade:pending:mainnet
 ```
 
 ## trade_confirm_reply_kb

@@ -12,6 +12,8 @@ from src.nadobro.core.async_utils import run_blocking
 from src.nadobro.handlers.network_guard import (
     active_network,
     bind_cb,
+    network_unknown_message,
+    network_unknown_query,
     refuse_query,
     same_network,
     unbind_cb,
@@ -341,12 +343,16 @@ async def handle_vault_callback(query, context: CallbackContext) -> bool:
     if not data.startswith("vault:"):
         return False
     telegram_id = int(query.from_user.id)
+    # None when it cannot be read right now: then nothing network-bound (a
+    # confirm card, the deposit watch) is rendered or armed below, never
+    # anything bound to a guessed network.
     current_network = await active_network(telegram_id)
-    network = current_network or "mainnet"
+    network = current_network
     # Confirm buttons carry the network their card was quoted on.
     data, built_network = unbind_cb(data)
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else "home"
+    back_to_vault = InlineKeyboardMarkup([[InlineKeyboardButton("◀ Back", callback_data="vault:home")]])
 
     # PREVIEW-NETWORK-BIND: a mint/burn confirm only executes on the network its
     # card was quoted on. Checked before the in-flight lock is taken and before
@@ -359,7 +365,7 @@ async def handle_vault_callback(query, context: CallbackContext) -> bool:
                 built=built_network,
                 current=current_network,
                 telegram_id=telegram_id,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ Back", callback_data="vault:home")]]),
+                reply_markup=back_to_vault,
             )
             return True
 
@@ -372,6 +378,9 @@ async def handle_vault_callback(query, context: CallbackContext) -> bool:
         return True
 
     if action == "watch" and len(parts) >= 3:
+        if network is None:
+            await network_unknown_query(query, kind="vault_watch", telegram_id=telegram_id, reply_markup=back_to_vault)
+            return True
         sub = parts[2]
         if sub == "on":
             ok, msg = await run_blocking(enable_deposit_watch, telegram_id, network)
@@ -413,6 +422,11 @@ async def handle_vault_callback(query, context: CallbackContext) -> bool:
             await _edit_markdown_safe(query, text, kb)
             return True
         if sub == "preset" and len(parts) >= 4:
+            if network is None:
+                await network_unknown_query(
+                    query, kind="vault_deposit_card", telegram_id=telegram_id, reply_markup=back_to_vault,
+                )
+                return True
             try:
                 amount = float(parts[3])
             except ValueError:
@@ -462,6 +476,11 @@ async def handle_vault_callback(query, context: CallbackContext) -> bool:
             await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             return True
         if sub == "pct" and len(parts) >= 4:
+            if network is None:
+                await network_unknown_query(
+                    query, kind="vault_withdraw_card", telegram_id=telegram_id, reply_markup=back_to_vault,
+                )
+                return True
             try:
                 pct = max(0, min(100, int(parts[3])))
             except ValueError:
@@ -545,8 +564,17 @@ async def handle_vault_text(update: Update, context: CallbackContext) -> bool:
         return True
     context.user_data.pop(_DEPOSIT_PENDING_KEY, None)
     telegram_id = int(update.effective_user.id)
-    # The confirm card is bound to the network it is quoted on.
-    network = await active_network(telegram_id) or "mainnet"
+    # The confirm card is bound to the network it is quoted on; when that
+    # cannot be read right now, no card (never one bound to a guess).
+    network = await active_network(telegram_id)
+    if network is None:
+        await network_unknown_message(
+            update.message,
+            kind=f"vault_{pending}_card",
+            telegram_id=telegram_id,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ Back", callback_data="vault:home")]]),
+        )
+        return True
     if pending == "deposit":
         snapshot = await run_blocking(get_user_vault_snapshot, telegram_id)
         text, kb = _deposit_confirm_card(amount, snapshot, network=network)

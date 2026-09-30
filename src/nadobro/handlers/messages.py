@@ -49,7 +49,7 @@ from src.nadobro.handlers.home_card import (
 )
 from src.nadobro.handlers.render_utils import plain_text_fallback
 from src.nadobro.handlers.state_reset import clear_pending_user_state
-from src.nadobro.handlers.network_guard import active_network, refuse_message, same_network
+from src.nadobro.handlers.network_guard import active_network, normalize_network, refuse_message, same_network
 from src.nadobro.handlers.wallet_view import build_wallet_view_payload, hydrate_wallet_flow_context
 from src.nadobro.handlers.formatters import fmt_points_dashboard
 from src.nadobro.users.points_service import (
@@ -313,11 +313,19 @@ async def _execute_authorized_action(message, context, telegram_id: int, action_
             MIN_MARGIN_PER_TRADE,
             start_copy,
         )
-        # The copy wizard's own network (PREVIEW-NETWORK-BIND), verified at confirm.
-        network = action_data.get("network")
-        if not network:
-            user = get_user(telegram_id)
-            network = user.network_mode.value if user else "mainnet"
+        # The copy wizard's own network (PREVIEW-NETWORK-BIND), verified at
+        # confirm. Never resolved here: a payload without it fails closed.
+        network = normalize_network(action_data.get("network"))
+        if network is None:
+            await refuse_message(
+                message,
+                kind="start_copy",
+                built=None,
+                current=None,
+                telegram_id=telegram_id,
+                reply_markup=persistent_menu_kb(),
+            )
+            return False, "copy payload carries no network"
         if budget_usd < MIN_MARGIN_PER_TRADE:
             reply = (
                 f"⚠️ Copy trading needs a margin of at least "
@@ -1427,7 +1435,7 @@ async def _handle_pending_trade(update, context, telegram_id, text):
         await _reply_loc(update.message, 
             preview,
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=trade_confirm_kb(),
+            reply_markup=trade_confirm_kb(network=network),
         )
         return True
 
@@ -1470,7 +1478,7 @@ async def _handle_pending_trade(update, context, telegram_id, text):
         await _reply_loc(update.message, 
             preview,
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=trade_confirm_kb(),
+            reply_markup=trade_confirm_kb(network=network),
         )
         return True
 

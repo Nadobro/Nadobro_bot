@@ -588,18 +588,22 @@ def trade_leverage_kb(product, action, size):
     return InlineKeyboardMarkup(rows)
 
 
-def trade_confirm_kb(trade_id="pending"):
+def trade_confirm_kb(trade_id="pending", *, network: str):
+    """``network``: the network the ``pending_trade`` preview was priced on.
+    Confirm carries it (PREVIEW-NETWORK-BIND): the slot is single, so a newer
+    preview on another network may have replaced the one this card showed."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("❌ Cancel", callback_data="cancel_trade"),
-            InlineKeyboardButton("✅ Confirm Trade", callback_data=f"exec_trade:{trade_id}"),
+            InlineKeyboardButton("✅ Confirm Trade", callback_data=bind_cb(f"exec_trade:{trade_id}", network)),
         ],
     ])
 
 
 def positions_kb(positions, *, network: str):
-    """``network``: the network ``positions`` were read from. Each one-tap close
-    is bound to it (PREVIEW-NETWORK-BIND); there is deliberately no default."""
+    """``network``: the network ``positions`` were read from. Each one-tap close,
+    and the "Close All" opener (whose confirm inherits it), is bound to it
+    (PREVIEW-NETWORK-BIND); there is deliberately no default."""
     rows = [
         [InlineKeyboardButton("📌 Reload positions", callback_data="pos:view")],
     ]
@@ -612,7 +616,9 @@ def positions_kb(positions, *, network: str):
                 f"❌ Close {pname}-PERP", callback_data=bind_cb(f"pos:close:{pname}", network),
             )])
     if positions:
-        rows.append([InlineKeyboardButton("❌ Close All Positions", callback_data="pos:close_all")])
+        rows.append([InlineKeyboardButton(
+            "❌ Close All Positions", callback_data=bind_cb("pos:close_all", network),
+        )])
     else:
         # Nothing open yet: point the user at the next move instead of a dead end.
         rows.append([
@@ -1305,9 +1311,12 @@ def copy_cumulative_tp_kb():
     ])
 
 
-def copy_confirm_kb():
+def copy_confirm_kb(*, network: str):
+    """``network``: the network the ``copy_setup`` wizard was run on. Confirm
+    carries it (PREVIEW-NETWORK-BIND): the slot is single, so a newer wizard on
+    another network may have replaced the one this card showed."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirm & Start", callback_data="copy:confirm")],
+        [InlineKeyboardButton("✅ Confirm & Start", callback_data=bind_cb("copy:confirm", network))],
         [InlineKeyboardButton("❌ Cancel", callback_data="copy:hub")],
     ])
 

@@ -24,7 +24,6 @@ import time
 from src.nadobro.handlers.keyboards import back_kb, portfolio_analytics_kb
 from src.nadobro.handlers.network_guard import (
     active_network,
-    network_of,
     refuse_query,
     same_network,
     unbind_cb,
@@ -176,12 +175,27 @@ async def _handle_portfolio(query, data, telegram_id):
     if user:
         mode_label = user.network_mode.value.upper()
 
-    if action == "close_all_confirm":
-        from src.nadobro.handlers.portfolio_deck import render_close_all_confirm
+    if action in ("close_all_confirm", "cancel_all_confirm"):
+        # The opener carries the network of the view it was on (Deck /
+        # Positions & Orders). The confirm is bound to THAT network, never
+        # re-read here: a stale TESTNET view must not open a MAINNET close-all
+        # or cancel-all. An untagged (legacy) opener fails closed.
+        current_network = await active_network(telegram_id)
+        if not same_network(built_network, current_network):
+            await _refuse_stale_portfolio_action(
+                query, telegram_id, kind=f"portfolio_{action}", built=built_network, current=current_network,
+            )
+            return
+        if action == "close_all_confirm":
+            from src.nadobro.handlers.portfolio_deck import render_close_all_confirm
 
+            text, kb = render_close_all_confirm(network=built_network)
+        else:
+            from src.nadobro.handlers.orders_view import render_cancel_all_confirm
+
+            text, kb = render_cancel_all_confirm(network=built_network)
         # Portfolio is the HTML domain: declare it even for plain confirm
         # text so the whole domain is uniform (and statically checkable).
-        text, kb = render_close_all_confirm(network=network_of(user) or "mainnet")
         await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
@@ -250,13 +264,6 @@ async def _handle_portfolio(query, data, telegram_id):
             lambda snap: render_portfolio_deck(snap),
             force=True,
         )
-        return
-
-    if action == "cancel_all_confirm":
-        from src.nadobro.handlers.orders_view import render_cancel_all_confirm
-
-        text, kb = render_cancel_all_confirm(network=network_of(user) or "mainnet")
-        await _edit_loc(query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
     if action == "cancel_all_yes":

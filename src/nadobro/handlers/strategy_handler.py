@@ -1291,7 +1291,14 @@ async def _handle_strategy(query, data, context, telegram_id):
         if strategy_id not in supported:
             return
         current_network = await active_network(telegram_id)
-        if not same_network(card_network, current_network):
+        # The retired Alpha Agent ("bro") has nothing to bind: start_user_bot
+        # refuses "bro" unconditionally, so this branch can never start a run
+        # on any network. Its dashboard (bro_action_kb) still renders an
+        # untagged "strategy:start:bro:MULTI"; answer it as before, on the
+        # current network, rather than with an "out of date" refusal that a
+        # re-tap of the same dashboard could never clear.
+        bro_retired = strategy_id == "bro" and current_network is not None
+        if not bro_retired and not same_network(card_network, current_network):
             await refuse_query(
                 query,
                 kind=f"strategy_{action}",
@@ -1301,7 +1308,7 @@ async def _handle_strategy(query, data, context, telegram_id):
                 reply_markup=back_kb(f"strategy:preview:{strategy_id}"),
             )
             return
-        network = card_network
+        network = current_network if bro_retired else card_network
         vm = _vol_market_pref(context) if strategy_id == "vol" else None
         available_pairs = _strategy_available_products(strategy_id, network, vm)
         allowed_pairs = set(available_pairs)

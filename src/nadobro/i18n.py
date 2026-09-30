@@ -1893,6 +1893,13 @@ _TEXTS = {
         "ru": "⚠️ Это подтверждение устарело. Ничего не отправлено. Начните заново.",
         "ko": "⚠️ 이 확인은 만료되었습니다. 아무것도 전송되지 않았습니다. 다시 시작하세요.",
     },
+    "⚠️ Couldn't check which network you're on (testnet or mainnet). Nothing was sent. Try again.": {
+        "zh": "⚠️ 无法确认您当前所在的网络（testnet 或 mainnet）。未发送任何内容。请重试。",
+        "fr": "⚠️ Impossible de vérifier sur quel réseau vous êtes (testnet ou mainnet). Rien n'a été envoyé. Réessayez.",
+        "ar": "⚠️ تعذّر التحقق من الشبكة التي تستخدمها (testnet أو mainnet). لم يتم إرسال أي شيء. حاول مرة أخرى.",
+        "ru": "⚠️ Не удалось проверить, в какой сети вы находитесь (testnet или mainnet). Ничего не отправлено. Попробуйте ещё раз.",
+        "ko": "⚠️ 현재 네트워크(testnet 또는 mainnet)를 확인할 수 없습니다. 아무것도 전송되지 않았습니다. 다시 시도하세요.",
+    },
     "Setup incomplete. Resume onboarding at ": {
         "zh": "设置未完成。请从以下步骤继续引导：",
         "fr": "Configuration incomplète. Reprenez l'onboarding à l'étape ",

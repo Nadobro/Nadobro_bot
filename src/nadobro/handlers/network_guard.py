@@ -13,10 +13,17 @@ The rule, applied at every confirm site:
   before it executes.
 * A stateless confirm button carries the network it was rendered on as a
   trailing ``callback_data`` segment (``bind_cb`` / ``unbind_cb``), because
-  nothing server-side survives for it to be checked against.
+  nothing server-side survives for it to be checked against. So does a
+  confirm backed by a single ``user_data`` slot (a newer preview may have
+  replaced the one the button was rendered for).
+* An OPENER on a network-labelled view (the bulk "Close All" / "Cancel All"
+  on Portfolio and Positions) carries the view's network too. The confirm it
+  opens is bound to that carried network, never re-read at the second tap:
+  a stale TESTNET view must not open a MAINNET close-all two taps later.
 * The check fails CLOSED: a missing or unknown stamp, or an unknown current
   network, is a mismatch. The preview is discarded and the user is told
-  "Nothing was sent".
+  "Nothing was sent". A preview is never bound to a guessed network: when the
+  current network cannot be read, nothing is rendered (``NETWORK_UNKNOWN_TEXT``).
 
 Clearing previews on a successful switch (``state_reset.
 clear_state_after_network_switch``) is hygiene only. This confirm-time check is
@@ -54,6 +61,13 @@ STALE_ACTION_TEXT = (
     "Nothing was sent. Start again."
 )
 STALE_UNKNOWN_TEXT = "⚠️ This confirmation is out of date. Nothing was sent. Start again."
+# Shown INSTEAD of rendering a preview when the user's network cannot be read
+# right now (``active_network`` returned None): a preview is never bound to a
+# guessed network ("mainnet" as a default is exactly the bug this module fixes).
+NETWORK_UNKNOWN_TEXT = (
+    "⚠️ Couldn't check which network you're on (testnet or mainnet). "
+    "Nothing was sent. Try again."
+)
 
 
 def normalize_network(value) -> str | None:
@@ -135,6 +149,11 @@ def stale_preview_text(built, current, *, notice: str = "action") -> str:
         return template.format(**fmt)
 
 
+def network_unknown_text() -> str:
+    """Localized "couldn't check your network, nothing was sent" (plain text)."""
+    return localize_text(NETWORK_UNKNOWN_TEXT, get_active_language())
+
+
 def _log_refusal(kind: str, built, current, telegram_id) -> None:
     logger.info(
         "network_bound_preview_refused kind=%s built=%s current=%s user=%s",
@@ -153,7 +172,10 @@ async def refuse_query(
     ``kind`` names the preview in the log; ``notice`` picks the wording
     (``"trade"`` for an order preview, ``"action"`` for everything else)."""
     _log_refusal(kind, built, current, telegram_id)
-    text = stale_preview_text(built, current, notice=notice)
+    await _show_on_query(query, stale_preview_text(built, current, notice=notice), reply_markup)
+
+
+async def _show_on_query(query, text: str, reply_markup) -> None:
     markup = localize_markup(reply_markup, get_active_language()) if reply_markup is not None else None
     try:
         await query.edit_message_text(text, reply_markup=markup)
@@ -167,6 +189,20 @@ async def refuse_query(
         if message is None:
             raise
         await message.reply_text(text, reply_markup=markup)
+
+
+async def network_unknown_query(query, *, kind: str, telegram_id, reply_markup=None) -> None:
+    """Show NETWORK_UNKNOWN_TEXT on an inline card instead of rendering a
+    preview that would have to be bound to a guessed network."""
+    _log_refusal(kind, None, None, telegram_id)
+    await _show_on_query(query, network_unknown_text(), reply_markup)
+
+
+async def network_unknown_message(message, *, kind: str, telegram_id, reply_markup=None) -> None:
+    """Answer a typed step with NETWORK_UNKNOWN_TEXT instead of a preview."""
+    _log_refusal(kind, None, None, telegram_id)
+    markup = localize_markup(reply_markup, get_active_language()) if reply_markup is not None else None
+    await message.reply_text(network_unknown_text(), reply_markup=markup)
 
 
 async def refuse_message(

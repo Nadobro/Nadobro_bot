@@ -51,6 +51,9 @@ PARAMETERISED: list[tuple[str, str, tuple, dict]] = [
     ("strategy_action_kb__grid", "strategy_action_kb", ("grid",), {"network": "mainnet"}),
     ("close_product_kb__mainnet", "close_product_kb", (), {"network": "mainnet"}),
     ("confirm_close_all_kb__mainnet", "confirm_close_all_kb", (), {"network": "mainnet"}),
+    # Single-slot confirms: the button carries the network of the preview it showed.
+    ("trade_confirm_kb__mainnet", "trade_confirm_kb", (), {"network": "mainnet"}),
+    ("copy_confirm_kb__mainnet", "copy_confirm_kb", (), {"network": "mainnet"}),
     ("trade_card_direction_kb", "trade_card_direction_kb", ("sess-1",), {}),
     ("trade_card_order_type_kb", "trade_card_order_type_kb", ("sess-1",), {}),
     ("trade_card_leverage_kb", "trade_card_leverage_kb", ("sess-1",), {}),
