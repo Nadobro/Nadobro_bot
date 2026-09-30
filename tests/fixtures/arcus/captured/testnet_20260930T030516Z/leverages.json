@@ -1,0 +1,461 @@
+{
+ "address": "0x000000000000000000000000000000000000dead",
+ "accountIndex": 0,
+ "leverages": [
+  {
+   "marketId": 1,
+   "marketDisplayName": "BTC-USD",
+   "leverage": 40,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 2,
+   "marketDisplayName": "ETH-USD",
+   "leverage": 25,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 3,
+   "marketDisplayName": "SOL-USD",
+   "leverage": 20,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 4,
+   "marketDisplayName": "DOGE-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 6,
+   "marketDisplayName": "HYPE-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 7,
+   "marketDisplayName": "DYDX-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 8,
+   "marketDisplayName": "ZEC-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 9,
+   "marketDisplayName": "AMD-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 10,
+   "marketDisplayName": "INTC-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 11,
+   "marketDisplayName": "F-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 12,
+   "marketDisplayName": "BAC-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 13,
+   "marketDisplayName": "CCL-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 14,
+   "marketDisplayName": "GOOGL-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 15,
+   "marketDisplayName": "META-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 16,
+   "marketDisplayName": "MU-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 17,
+   "marketDisplayName": "BABA-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 18,
+   "marketDisplayName": "HOOD-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 19,
+   "marketDisplayName": "CRCL-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 20,
+   "marketDisplayName": "GLD-USD",
+   "leverage": 25,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 21,
+   "marketDisplayName": "SLV-USD",
+   "leverage": 25,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 22,
+   "marketDisplayName": "USO-USD",
+   "leverage": 20,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 23,
+   "marketDisplayName": "SPY-USD",
+   "leverage": 50,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 24,
+   "marketDisplayName": "QQQ-USD",
+   "leverage": 25,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 25,
+   "marketDisplayName": "VT-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 26,
+   "marketDisplayName": "SGOV-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 27,
+   "marketDisplayName": "RVI-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 28,
+   "marketDisplayName": "NVDA-USD",
+   "leverage": 20,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 29,
+   "marketDisplayName": "TSLA-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 30,
+   "marketDisplayName": "AAPL-USD",
+   "leverage": 20,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 31,
+   "marketDisplayName": "AMZN-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 32,
+   "marketDisplayName": "MSFT-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 33,
+   "marketDisplayName": "SNDK-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 34,
+   "marketDisplayName": "DRAM-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 35,
+   "marketDisplayName": "PLTR-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 36,
+   "marketDisplayName": "CRWV-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 37,
+   "marketDisplayName": "ORCL-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 38,
+   "marketDisplayName": "SPCX-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 39,
+   "marketDisplayName": "BE-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 40,
+   "marketDisplayName": "USAR-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 41,
+   "marketDisplayName": "LIT-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 42,
+   "marketDisplayName": "XRP-USD",
+   "leverage": 20,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 43,
+   "marketDisplayName": "COIN-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 44,
+   "marketDisplayName": "SKHY-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 45,
+   "marketDisplayName": "CASHCAT-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 46,
+   "marketDisplayName": "NBIS-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 47,
+   "marketDisplayName": "MSTR-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 48,
+   "marketDisplayName": "MRVL-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 49,
+   "marketDisplayName": "BOT-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 50,
+   "marketDisplayName": "CPER-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 51,
+   "marketDisplayName": "GME-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 52,
+   "marketDisplayName": "QNT-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 53,
+   "marketDisplayName": "MRNA-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 54,
+   "marketDisplayName": "ENA-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 55,
+   "marketDisplayName": "PUMP-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 56,
+   "marketDisplayName": "NEAR-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 57,
+   "marketDisplayName": "PENGU-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 58,
+   "marketDisplayName": "FARTCOIN-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 59,
+   "marketDisplayName": "SUI-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 60,
+   "marketDisplayName": "WLFI-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 61,
+   "marketDisplayName": "LINK-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 62,
+   "marketDisplayName": "BNB-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 63,
+   "marketDisplayName": "TAO-USD",
+   "leverage": 5,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 64,
+   "marketDisplayName": "AAVE-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 65,
+   "marketDisplayName": "UNI-USD",
+   "leverage": 10,
+   "isolated": false,
+   "marginMode": "CROSS"
+  },
+  {
+   "marketId": 69,
+   "marketDisplayName": "AI-USD",
+   "leverage": 4,
+   "isolated": false,
+   "marginMode": "CROSS"
+  }
+ ]
+}

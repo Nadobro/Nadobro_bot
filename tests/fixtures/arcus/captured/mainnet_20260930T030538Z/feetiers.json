@@ -1,0 +1,53 @@
+{
+ "tiers": [
+  {
+   "level": 0,
+   "name": "Base",
+   "volume_threshold": 0,
+   "maker_fee_ppm": 0,
+   "taker_fee_ppm": 225
+  },
+  {
+   "level": 1,
+   "name": "Bronze",
+   "volume_threshold": 5000000000000000,
+   "maker_fee_ppm": 0,
+   "taker_fee_ppm": 190
+  },
+  {
+   "level": 2,
+   "name": "Silver",
+   "volume_threshold": 20000000000000000,
+   "maker_fee_ppm": 0,
+   "taker_fee_ppm": 160
+  },
+  {
+   "level": 3,
+   "name": "Gold",
+   "volume_threshold": 100000000000000000,
+   "maker_fee_ppm": 0,
+   "taker_fee_ppm": 135
+  },
+  {
+   "level": 4,
+   "name": "Platinum",
+   "volume_threshold": 400000000000000000,
+   "maker_fee_ppm": 0,
+   "taker_fee_ppm": 115
+  },
+  {
+   "level": 5,
+   "name": "VIP",
+   "volume_threshold": 1000000000000000000,
+   "maker_fee_ppm": -20,
+   "taker_fee_ppm": 100
+  },
+  {
+   "level": 6,
+   "name": "Max",
+   "volume_threshold": 3000000000000000000,
+   "maker_fee_ppm": -30,
+   "taker_fee_ppm": 95
+  }
+ ]
+}

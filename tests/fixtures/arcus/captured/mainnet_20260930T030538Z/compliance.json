@@ -1,0 +1,11 @@
+{
+ "geo": {
+  "country": "XX",
+  "region": "XX",
+  "restrictions": {
+   "perpetuals": false,
+   "spot": false
+  },
+  "bypassed": false
+ }
+}

@@ -1,0 +1,90 @@
+{
+ "candles_order": "newest_first",
+ "captured_utc": "2026-09-30T03:05:38.249139+00:00",
+ "endpoints": {
+  "bbo_BTC-USD": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": true,
+   "unknown_fields": []
+  },
+  "candles_BTC-USD_1m": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": true,
+   "unknown_fields": []
+  },
+  "compliance": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": true,
+   "unknown_fields": []
+  },
+  "feetiers": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": null,
+   "unknown_fields": []
+  },
+  "health": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": null,
+   "unknown_fields": []
+  },
+  "l2_BTC-USD": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": true,
+   "unknown_fields": []
+  },
+  "markets": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": true,
+   "unknown_fields": [
+    "lastTradePrice",
+    "openInterestCapNotional"
+   ]
+  },
+  "mids": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": true,
+   "unknown_fields": []
+  },
+  "prices": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": true,
+   "unknown_fields": []
+  },
+  "root": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": null,
+   "unknown_fields": []
+  },
+  "time": {
+   "http": 200,
+   "missing_required": [],
+   "outcome": "Ok",
+   "parse_ok": true,
+   "unknown_fields": []
+  }
+ },
+ "market": "BTC-USD",
+ "network": "mainnet",
+ "schema_error_counts": {},
+ "with_address": false
+}

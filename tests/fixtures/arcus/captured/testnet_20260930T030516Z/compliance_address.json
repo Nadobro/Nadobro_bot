@@ -1,0 +1,15 @@
+{
+ "geo": {
+  "country": "XX",
+  "region": "XX",
+  "restrictions": {
+   "perpetuals": false,
+   "spot": false
+  },
+  "bypassed": false
+ },
+ "address": {
+  "address": "0x000000000000000000000000000000000000dead",
+  "status": "COMPLIANT"
+ }
+}
