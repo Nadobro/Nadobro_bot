@@ -303,6 +303,7 @@ def _nado_like_patterns() -> list[str]:
 
 def _arcus_keys() -> list[str]:
     from src.nadobro.utils.venue_scope import (
+        ARCUS_KEY_NOTICE_PREFIX,
         ARCUS_SCOPES,
         ARCUS_STRATEGY_BOT_PREFIX,
         ARCUS_USER_SETTINGS_PREFIX,
@@ -314,6 +315,8 @@ def _arcus_keys() -> list[str]:
             keys += [
                 f"{ARCUS_STRATEGY_BOT_PREFIX}{uid}:{scope}",
                 f"{ARCUS_USER_SETTINGS_PREFIX}{uid}:{scope}",
+                # P3b key-reminder state (03 D-20): shared bot_state keys carry the scope token.
+                f"{ARCUS_KEY_NOTICE_PREFIX}{uid}:{scope}",
             ]
     return keys
 
@@ -349,7 +352,11 @@ def test_arcus_prefixes_are_disjoint_from_nado_exact_key_prefixes():
     from src.nadobro.strategy import bot_runtime, pending_cleanup
     from src.nadobro.trading import stop_loss_service
     from src.nadobro.users import settings_service
-    from src.nadobro.utils.venue_scope import ARCUS_STRATEGY_BOT_PREFIX, ARCUS_USER_SETTINGS_PREFIX
+    from src.nadobro.utils.venue_scope import (
+        ARCUS_KEY_NOTICE_PREFIX,
+        ARCUS_STRATEGY_BOT_PREFIX,
+        ARCUS_USER_SETTINGS_PREFIX,
+    )
 
     nado = [
         bot_runtime.STATE_PREFIX,
@@ -357,7 +364,7 @@ def test_arcus_prefixes_are_disjoint_from_nado_exact_key_prefixes():
         stop_loss_service._SL_KEY_PREFIX,
         pending_cleanup.PREFIX,
     ]
-    for arcus in (ARCUS_STRATEGY_BOT_PREFIX, ARCUS_USER_SETTINGS_PREFIX):
+    for arcus in (ARCUS_STRATEGY_BOT_PREFIX, ARCUS_USER_SETTINGS_PREFIX, ARCUS_KEY_NOTICE_PREFIX):
         for prefix in nado:
             assert not arcus.startswith(prefix) and not prefix.startswith(arcus), (arcus, prefix)
     # A settings key for a Nado user can never be read as an Arcus one either.

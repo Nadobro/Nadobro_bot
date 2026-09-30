@@ -176,8 +176,18 @@ def test_every_new_label_has_all_five_translations(key):
 
 def test_new_entries_are_appended_at_the_end():
     # Appending keeps every existing label first in _REVERSE_LABEL_MAP.
-    assert list(i18n._LABELS)[-len(vh.I18N_LABEL_KEYS):] == list(vh.I18N_LABEL_KEYS)
-    assert set(list(i18n._TEXTS)[-len(vh.I18N_TEXT_KEYS):]) == set(vh.I18N_TEXT_KEYS)
+    # Updated deliberately for Arcus P3b (03 §20): P1's block stays contiguous and
+    # is immediately followed by the P3b block (users/arcus_link_service.py keys),
+    # which is now the LAST block of each dict.
+    from src.nadobro.users import arcus_link_service as ls
+
+    p1_labels, p3b_labels = list(vh.I18N_LABEL_KEYS), list(ls.I18N_LABEL_KEYS)
+    tail = list(i18n._LABELS)[-(len(p1_labels) + len(p3b_labels)):]
+    assert tail == p1_labels + p3b_labels
+    p1_texts, p3b_texts = set(vh.I18N_TEXT_KEYS), set(ls.I18N_TEXT_KEYS)
+    tail_texts = list(i18n._TEXTS)[-(len(p1_texts) + len(p3b_texts)):]
+    assert set(tail_texts[: len(p1_texts)]) == p1_texts
+    assert set(tail_texts[len(p1_texts):]) == p3b_texts
 
 
 def test_reused_house_labels_exist():

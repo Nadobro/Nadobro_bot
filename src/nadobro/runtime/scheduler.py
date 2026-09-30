@@ -1221,3 +1221,125 @@ def get_scheduler_diagnostics() -> dict:
         "job_count": len(jobs),
         "alert_scan_seconds": int(_ALERT_SCAN_SECONDS),
     }
+
+
+# --- Arcus key lifecycle + egress compliance (Arcus P3b, 03 §12) -----------------------------
+# Registered ONLY when ARCUS_ENABLED or Arcus credentials exist (start_arcus_jobs):
+# with the flag off and no Arcus rows nothing is added and no venue.arcus module is
+# imported (Nado byte-identical). The T-24 h cancel-only stand-down is NOT here — it
+# is P5's ArcusScheduler (run-state aware). Imports stay function-local and never
+# reach handlers/ or strategy/ (the reminder texts live in users.arcus_link_service).
+
+
+def start_arcus_jobs(*, arcus_state_present: bool) -> bool:
+    """Register the Arcus jobs on the (already started) scheduler.
+
+    - key lifecycle (reminders T-14/7/2/1 d + active->expired), every
+      ``ARCUS_KEY_LIFECYCLE_INTERVAL_S``: when ``ARCUS_ENABLED`` OR Arcus
+      credentials exist (expiry notices must reach a stranded user with the flag off);
+    - egress compliance probe (boot + every 6 h): only when ``ARCUS_ENABLED``.
+
+    Returns True iff any job was added. Never resumes or starts anything.
+    """
+    from src.nadobro.core.feature_flags import arcus_enabled, arcus_key_lifecycle_interval_s
+
+    long_tick = {"misfire_grace_time": 120, "coalesce": True, "max_instances": 1}
+    enabled = arcus_enabled()
+    added: list[str] = []
+    if enabled or arcus_state_present:
+        scheduler.add_job(
+            tick_arcus_key_lifecycle, "interval", seconds=arcus_key_lifecycle_interval_s(),
+            id="arcus_key_lifecycle", replace_existing=True, **long_tick,
+        )
+        added.append("arcus_key_lifecycle")
+    if enabled:
+        scheduler.add_job(tick_arcus_egress_compliance, "date", id="arcus_egress_boot", replace_existing=True)
+        scheduler.add_job(
+            tick_arcus_egress_compliance, "interval", hours=6,
+            id="arcus_egress_check", replace_existing=True, **long_tick,
+        )
+        added += ["arcus_egress_boot", "arcus_egress_check"]
+    if added:
+        logger.info(
+            "Arcus jobs registered: %s (flag=%s, credentials=%s)", ", ".join(added), enabled, arcus_state_present
+        )
+    return bool(added)
+
+
+async def tick_arcus_key_lifecycle() -> None:
+    """Send the due Arcus key reminders / expiry notices. The notice state is
+    saved BEFORE sending (at most once). Never raises into APScheduler; a DB
+    error on the list read sends nothing this tick."""
+    if not _bot_app:
+        return
+    try:
+        from src.nadobro.users import arcus_link_service as link_service
+
+        notices = await link_service.collect_key_notices()
+        for notice in notices:
+            await _send_arcus_key_notice(notice)
+    except Exception as exc:
+        logger.warning("arcus key lifecycle tick failed (%s)", type(exc).__name__)
+
+
+async def _send_arcus_key_notice(notice) -> None:
+    """One localized HTML reminder with [🔄 Renew key][🔁 Venue]. Never raises."""
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        from telegram.constants import ParseMode
+        from telegram.error import TelegramError
+
+        from src.nadobro.core.async_utils import run_blocking_db
+        from src.nadobro.core.feature_flags import arcus_key_expiry_stop_hours
+        from src.nadobro.i18n import get_user_language, localize_label, localize_text
+        from src.nadobro.users import arcus_link_service as link_service
+        from src.nadobro.utils.visual import esc
+    except Exception as exc:
+        logger.warning("arcus key notice setup failed (%s)", type(exc).__name__)
+        return
+    try:
+        try:
+            lang = await run_blocking_db(get_user_language, notice.user_id)
+        except Exception as exc:  # the reminder still goes out, in English
+            logger.warning("arcus key notice language read failed uid=%s (%s)", notice.user_id, type(exc).__name__)
+            lang = "en"
+        key, fmt, buttons = link_service.build_key_notice(
+            notice, now_ms=time.time_ns() // 1_000_000, stop_hours=arcus_key_expiry_stop_hours()
+        )
+        values = {name: esc(value) for name, value in fmt.items()}
+        try:
+            text = localize_text(key, lang).format(**values)
+        except (KeyError, IndexError, ValueError):
+            text = key.format(**values)
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(localize_label(label, lang), callback_data=data) for label, data in buttons]]
+        )
+        try:
+            await _bot_app.bot.send_message(
+                chat_id=notice.user_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except TelegramError as exc:  # e.g. the user blocked the bot; the state is already saved
+            logger.info("arcus key notice not delivered uid=%s (%s)", notice.user_id, type(exc).__name__)
+    except Exception as exc:
+        logger.warning("arcus key notice failed uid=%s (%s)", notice.user_id, type(exc).__name__)
+
+
+async def tick_arcus_egress_compliance() -> None:
+    """Keyless ``GET /v1/compliance`` per enabled Arcus network (w1 each): the
+    posture of the BOT's egress (docs: "geo.restrictions is derived from the
+    request origin"). ``users.arcus_link_service.note_egress_posture`` raises the
+    ops alarm on a transition. Never raises."""
+    try:
+        from src.nadobro.core.feature_flags import arcus_mainnet_enabled
+        from src.nadobro.users import arcus_link_service as link_service
+        from src.nadobro.utils.venue_scope import ARCUS_NETWORK_MAINNET, ARCUS_NETWORK_TESTNET
+
+        networks = (ARCUS_NETWORK_TESTNET,) + ((ARCUS_NETWORK_MAINNET,) if arcus_mainnet_enabled() else ())
+        for net in networks:
+            await link_service.refresh_egress_posture(net)
+    except Exception as exc:
+        logger.warning("arcus egress compliance tick failed (%s)", type(exc).__name__)

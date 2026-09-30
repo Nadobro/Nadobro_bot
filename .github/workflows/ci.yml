@@ -64,5 +64,5 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
-      - name: mypy (engine v2 + Arcus venue — see mypy.ini)
-        run: python -m mypy src/nadobro/engine src/nadobro/venue/arcus
+      - name: mypy (engine v2 + Arcus venue + Arcus onboarding — see mypy.ini)
+        run: python -m mypy src/nadobro/engine src/nadobro/venue/arcus src/nadobro/users/arcus_credentials.py src/nadobro/users/arcus_link_service.py src/nadobro/utils/secret_text.py

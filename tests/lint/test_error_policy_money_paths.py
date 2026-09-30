@@ -49,6 +49,9 @@ SERVICES_BASELINE: dict[str, int] = {
     "src/nadobro/venue/arcus/catalog.py": 0,
     "src/nadobro/venue/arcus/client.py": 0,
     "src/nadobro/venue/arcus/hub.py": 0,
+    # Arcus onboarding (P3b, 03 §19.13): born clean — keep at zero.
+    "src/nadobro/users/arcus_credentials.py": 0,
+    "src/nadobro/users/arcus_link_service.py": 0,
 }
 
 DEGRADE_OK_MARKER = "policy: degrade-ok"

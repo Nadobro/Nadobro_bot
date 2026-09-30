@@ -1154,6 +1154,14 @@ _LABELS = {
         "ru": "🧾 Планы Desk Nado",
         "ko": "🧾 Nado Desk 플랜",
     },
+    # --- Arcus P3b: key reminders (users/arcus_link_service.py LABEL_*) ---
+    "🔄 Renew key": {
+        "zh": "🔄 续期密钥",
+        "fr": "🔄 Renouveler la clé",
+        "ar": "🔄 تجديد المفتاح",
+        "ru": "🔄 Обновить ключ",
+        "ko": "🔄 키 갱신",
+    },
 }
 
 
@@ -4060,6 +4068,114 @@ _TEXTS = {
         "ar": "تنطبق اللغة على المنصتين. إعدادات تداول Nado موجودة في عرض Nado.",
         "ru": "Язык применяется к обеим площадкам. Торговые настройки Nado находятся в режиме Nado.",
         "ko": "언어 설정은 두 플랫폼 모두에 적용됩니다. Nado 거래 설정은 Nado 화면에 있습니다.",
+    },
+    # --- Arcus P3b: onboarding vocabulary, 401 diagnosis, key reminders
+    # (users/arcus_link_service.py TEXT_*; the first three are shared vocabulary,
+    # contract §11.5 — later phases REUSE these entries, never re-add them) ---
+    "Arcus is busy, try again in a moment.": {
+        "zh": "Arcus 繁忙，请稍后再试。",
+        "fr": "Arcus est occupé, réessayez dans un instant.",
+        "ar": "Arcus مشغول، حاول مرة أخرى بعد لحظات.",
+        "ru": "Arcus сейчас занят, попробуйте чуть позже.",
+        "ko": "Arcus가 혼잡합니다. 잠시 후 다시 시도하세요.",
+    },
+    "This address isn't eligible for Arcus yet.": {
+        "zh": "该地址暂不符合 Arcus 使用资格。",
+        "fr": "Cette adresse n'est pas encore éligible à Arcus.",
+        "ar": "هذا العنوان غير مؤهل لـ Arcus بعد.",
+        "ru": "Этот адрес пока не допущен к Arcus.",
+        "ko": "이 주소는 아직 Arcus 이용 대상이 아닙니다.",
+    },
+    "That is a WALLET private key. Treat it as exposed and move your funds.": {
+        "zh": "这是钱包私钥。请视其为已泄露，并立即转移您的资金。",
+        "fr": "C'est une clé privée de PORTEFEUILLE. Considérez-la comme compromise et déplacez vos fonds.",
+        "ar": "هذا مفتاح خاص لمحفظة. اعتبره مكشوفاً وانقل أموالك.",
+        "ru": "Это приватный ключ КОШЕЛЬКА. Считайте его скомпрометированным и переведите средства.",
+        "ko": "이것은 지갑 개인 키입니다. 노출된 것으로 간주하고 자금을 옮기세요.",
+    },
+    "✅ Key active on Arcus · valid until {until}.": {
+        "zh": "✅ 密钥在 Arcus 上有效 · 有效期至 {until}。",
+        "fr": "✅ Clé active sur Arcus · valable jusqu'au {until}.",
+        "ar": "✅ المفتاح نشط على Arcus · صالح حتى {until}.",
+        "ru": "✅ Ключ активен на Arcus · действует до {until}.",
+        "ko": "✅ Arcus에서 키가 활성 상태입니다 · {until}까지 유효.",
+    },
+    "✅ Key active on Arcus · no expiry.": {
+        "zh": "✅ 密钥在 Arcus 上有效 · 无到期时间。",
+        "fr": "✅ Clé active sur Arcus · sans expiration.",
+        "ar": "✅ المفتاح نشط على Arcus · بلا تاريخ انتهاء.",
+        "ru": "✅ Ключ активен на Arcus · без срока действия.",
+        "ko": "✅ Arcus에서 키가 활성 상태입니다 · 만료 없음.",
+    },
+    "Your key is active. Nadobro's clock was off by {seconds}s; it has re-synced with Arcus and retries. The team has been alerted.": {
+        "zh": "您的密钥有效。Nadobro 的时钟偏差了 {seconds} 秒，已与 Arcus 重新同步并将重试。团队已收到提醒。",
+        "fr": "Votre clé est active. L'horloge de Nadobro était décalée de {seconds} s ; elle s'est resynchronisée avec Arcus et réessaie. L'équipe a été alertée.",
+        "ar": "مفتاحك نشط. كانت ساعة Nadobro منحرفة بمقدار {seconds} ث؛ وقد أعادت المزامنة مع Arcus وستعيد المحاولة. تم تنبيه الفريق.",
+        "ru": "Ваш ключ активен. Часы Nadobro расходились на {seconds} с; они заново синхронизированы с Arcus, запрос будет повторён. Команда уведомлена.",
+        "ko": "키는 활성 상태입니다. Nadobro의 시계가 {seconds}초 어긋나 있었으며, Arcus와 다시 동기화한 뒤 재시도합니다. 팀에 알림이 전달되었습니다.",
+    },
+    "Your Arcus key expired on {until}. Paste a new key to trade again.": {
+        "zh": "您的 Arcus 密钥已于 {until} 过期。请粘贴新密钥以继续交易。",
+        "fr": "Votre clé Arcus a expiré le {until}. Collez une nouvelle clé pour trader à nouveau.",
+        "ar": "انتهت صلاحية مفتاح Arcus الخاص بك في {until}. الصق مفتاحاً جديداً للتداول مجدداً.",
+        "ru": "Срок действия вашего ключа Arcus истёк {until}. Вставьте новый ключ, чтобы снова торговать.",
+        "ko": "Arcus 키가 {until}에 만료되었습니다. 다시 거래하려면 새 키를 붙여 넣으세요.",
+    },
+    "This key is no longer active on Arcus (revoked). Link a new key.": {
+        "zh": "此密钥在 Arcus 上已失效（已撤销）。请关联新密钥。",
+        "fr": "Cette clé n'est plus active sur Arcus (révoquée). Associez une nouvelle clé.",
+        "ar": "لم يعد هذا المفتاح نشطاً على Arcus (تم إلغاؤه). اربط مفتاحاً جديداً.",
+        "ru": "Этот ключ больше не активен на Arcus (отозван). Привяжите новый ключ.",
+        "ko": "이 키는 더 이상 Arcus에서 활성 상태가 아닙니다(취소됨). 새 키를 연결하세요.",
+    },
+    "This key was replaced: a newer key was created with the same name, <code>{key_name}</code>. Link a new key with a new name.": {
+        "zh": "此密钥已被替换：有一个同名的新密钥 <code>{key_name}</code> 被创建。请使用新名称关联新密钥。",
+        "fr": "Cette clé a été remplacée : une clé plus récente a été créée avec le même nom, <code>{key_name}</code>. Associez une nouvelle clé avec un nouveau nom.",
+        "ar": "تم استبدال هذا المفتاح: أُنشئ مفتاح أحدث بالاسم نفسه <code>{key_name}</code>. اربط مفتاحاً جديداً باسم جديد.",
+        "ru": "Этот ключ заменён: создан более новый ключ с тем же именем <code>{key_name}</code>. Привяжите новый ключ с новым именем.",
+        "ko": "이 키는 교체되었습니다: 같은 이름 <code>{key_name}</code>(으)로 더 새로운 키가 생성되었습니다. 새 이름으로 새 키를 연결하세요.",
+    },
+    "This key no longer covers subaccount 0. Link a new key.": {
+        "zh": "此密钥已不再覆盖子账户 0。请关联新密钥。",
+        "fr": "Cette clé ne couvre plus le sous-compte 0. Associez une nouvelle clé.",
+        "ar": "لم يعد هذا المفتاح يغطي الحساب الفرعي 0. اربط مفتاحاً جديداً.",
+        "ru": "Этот ключ больше не охватывает субаккаунт 0. Привяжите новый ключ.",
+        "ko": "이 키는 더 이상 하위 계정 0을 포함하지 않습니다. 새 키를 연결하세요.",
+    },
+    "Arcus refused a signed request, but your key looks fine. Nadobro holds new Arcus orders and retries. If this keeps happening, contact support.": {
+        "zh": "Arcus 拒绝了一个签名请求，但您的密钥看起来正常。Nadobro 会暂停新的 Arcus 订单并重试。如果问题持续出现，请联系支持。",
+        "fr": "Arcus a refusé une requête signée, mais votre clé semble correcte. Nadobro suspend les nouveaux ordres Arcus et réessaie. Si cela se reproduit, contactez le support.",
+        "ar": "رفض Arcus طلباً موقّعاً، لكن مفتاحك يبدو سليماً. يوقف Nadobro أوامر Arcus الجديدة مؤقتاً ويعيد المحاولة. إذا تكرر ذلك، تواصل مع الدعم.",
+        "ru": "Arcus отклонил подписанный запрос, но ваш ключ выглядит исправным. Nadobro приостанавливает новые ордера Arcus и повторяет попытку. Если это повторяется, обратитесь в поддержку.",
+        "ko": "Arcus가 서명된 요청을 거부했지만 키는 정상으로 보입니다. Nadobro는 새 Arcus 주문을 보류하고 재시도합니다. 계속 발생하면 지원팀에 문의하세요.",
+    },
+    "No Arcus key is linked on {network}. Link one in 👛 Arcus wallet.": {
+        "zh": "{network} 上未关联 Arcus 密钥。请在 👛 Arcus 钱包 中关联。",
+        "fr": "Aucune clé Arcus n'est associée sur {network}. Associez-en une dans 👛 Portefeuille Arcus.",
+        "ar": "لا يوجد مفتاح Arcus مرتبط على {network}. اربط مفتاحاً من 👛 محفظة Arcus.",
+        "ru": "На {network} не привязан ключ Arcus. Привяжите его в разделе 👛 Кошелёк Arcus.",
+        "ko": "{network}에 연결된 Arcus 키가 없습니다. 👛 Arcus 지갑에서 연결하세요.",
+    },
+    "⏳ Your Arcus {network} key <code>{key_name}</code> expires in {days} days ({until}). Create a new key in the Arcus app with a new name and paste it in 👛 Arcus wallet to renew. Arcus strategies stop {stop_hours} hours before a key expires and never restart on their own.": {
+        "zh": "⏳ 您的 Arcus {network} 密钥 <code>{key_name}</code> 将在 {days} 天后过期（{until}）。请在 Arcus 应用中以新名称创建新密钥，并粘贴到 👛 Arcus 钱包 中完成续期。Arcus 策略会在密钥过期前 {stop_hours} 小时停止，且不会自动重新启动。",
+        "fr": "⏳ Votre clé Arcus {network} <code>{key_name}</code> expire dans {days} jours ({until}). Créez une nouvelle clé dans l'application Arcus avec un nouveau nom et collez-la dans 👛 Portefeuille Arcus pour la renouveler. Les stratégies Arcus s'arrêtent {stop_hours} heures avant l'expiration d'une clé et ne redémarrent jamais d'elles-mêmes.",
+        "ar": "⏳ ينتهي مفتاح Arcus {network} الخاص بك <code>{key_name}</code> خلال {days} يوم ({until}). أنشئ مفتاحاً جديداً في تطبيق Arcus باسم جديد والصقه في 👛 محفظة Arcus لتجديده. تتوقف استراتيجيات Arcus قبل {stop_hours} ساعة من انتهاء صلاحية المفتاح ولا يُعاد تشغيلها تلقائياً أبداً.",
+        "ru": "⏳ Ваш ключ Arcus {network} <code>{key_name}</code> истекает через {days} дн. ({until}). Создайте новый ключ в приложении Arcus с новым именем и вставьте его в разделе 👛 Кошелёк Arcus, чтобы продлить. Стратегии Arcus останавливаются за {stop_hours} ч до истечения ключа и никогда не перезапускаются сами.",
+        "ko": "⏳ Arcus {network} 키 <code>{key_name}</code>이(가) {days}일 후({until}) 만료됩니다. Arcus 앱에서 새 이름으로 새 키를 만든 뒤 👛 Arcus 지갑에 붙여 넣어 갱신하세요. Arcus 전략은 키 만료 {stop_hours}시간 전에 중지되며 절대 자동으로 다시 시작되지 않습니다.",
+    },
+    "⏳ Your Arcus {network} key <code>{key_name}</code> expires in {hours} hours ({until}). Arcus strategies stop {stop_hours} hours before a key expires and never restart on their own. Renew the key in 👛 Arcus wallet.": {
+        "zh": "⏳ 您的 Arcus {network} 密钥 <code>{key_name}</code> 将在 {hours} 小时后过期（{until}）。Arcus 策略会在密钥过期前 {stop_hours} 小时停止，且不会自动重新启动。请在 👛 Arcus 钱包 中续期密钥。",
+        "fr": "⏳ Votre clé Arcus {network} <code>{key_name}</code> expire dans {hours} heures ({until}). Les stratégies Arcus s'arrêtent {stop_hours} heures avant l'expiration d'une clé et ne redémarrent jamais d'elles-mêmes. Renouvelez la clé dans 👛 Portefeuille Arcus.",
+        "ar": "⏳ ينتهي مفتاح Arcus {network} الخاص بك <code>{key_name}</code> خلال {hours} ساعة ({until}). تتوقف استراتيجيات Arcus قبل {stop_hours} ساعة من انتهاء صلاحية المفتاح ولا يُعاد تشغيلها تلقائياً أبداً. جدّد المفتاح في 👛 محفظة Arcus.",
+        "ru": "⏳ Ваш ключ Arcus {network} <code>{key_name}</code> истекает через {hours} ч ({until}). Стратегии Arcus останавливаются за {stop_hours} ч до истечения ключа и никогда не перезапускаются сами. Продлите ключ в разделе 👛 Кошелёк Arcus.",
+        "ko": "⏳ Arcus {network} 키 <code>{key_name}</code>이(가) {hours}시간 후({until}) 만료됩니다. Arcus 전략은 키 만료 {stop_hours}시간 전에 중지되며 절대 자동으로 다시 시작되지 않습니다. 👛 Arcus 지갑에서 키를 갱신하세요.",
+    },
+    "⚠️ Your Arcus {network} key <code>{key_name}</code> has expired. Paste a new key in 👛 Arcus wallet to trade on Arcus again.": {
+        "zh": "⚠️ 您的 Arcus {network} 密钥 <code>{key_name}</code> 已过期。请在 👛 Arcus 钱包 中粘贴新密钥，以便再次在 Arcus 上交易。",
+        "fr": "⚠️ Votre clé Arcus {network} <code>{key_name}</code> a expiré. Collez une nouvelle clé dans 👛 Portefeuille Arcus pour trader à nouveau sur Arcus.",
+        "ar": "⚠️ انتهت صلاحية مفتاح Arcus {network} الخاص بك <code>{key_name}</code>. الصق مفتاحاً جديداً في 👛 محفظة Arcus للتداول على Arcus مجدداً.",
+        "ru": "⚠️ Срок действия вашего ключа Arcus {network} <code>{key_name}</code> истёк. Вставьте новый ключ в разделе 👛 Кошелёк Arcus, чтобы снова торговать на Arcus.",
+        "ko": "⚠️ Arcus {network} 키 <code>{key_name}</code>이(가) 만료되었습니다. Arcus에서 다시 거래하려면 👛 Arcus 지갑에 새 키를 붙여 넣으세요.",
     },
 }
 

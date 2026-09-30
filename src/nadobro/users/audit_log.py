@@ -12,6 +12,10 @@ Sensitive events currently recorded:
   - howl_suggestion_rejected               (blocked unsafe auto-tuning)
   - agent_enabled / agent_disabled         (autonomous execution toggles)
   - venue_switched                         (/venue view selection; details "nado->arcus")
+  - arcus_linked / arcus_unlinked          (Arcus API key link lifecycle; network + short address only)
+  - arcus_wallet_key_pasted                (a WALLET private key was pasted and refused; never the key)
+  - arcus_key_invalidated                  (a linked Arcus key is no longer listed ACTIVE)
+  - arcus_mode_switched                    (Arcus network view; details "testnet->mainnet")
 """
 from __future__ import annotations
 

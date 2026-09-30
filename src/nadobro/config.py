@@ -192,6 +192,71 @@ def arcus_ws_url(net: str) -> str:
         raise ValueError("ARCUS WS URL points at the other Arcus network's host")
     return url
 
+
+# Arcus web app (API key creation) + Terms of Use (Arcus P3b onboarding). Docs:
+# guides__rest-trading "Open the API Keys page — [testnet](https://testnet.arcus.xyz/api-keys),
+# or [mainnet](https://app.arcus.xyz/api-keys)"; concepts__disclaimer "Use of the
+# protocol is subject to the [Terms of Use](https://arcus.xyz/legal/terms)".
+# Read at CALL time; the URLs become Telegram URL buttons, so https only.
+ARCUS_TESTNET_APP_DEFAULT = "https://testnet.arcus.xyz"
+ARCUS_MAINNET_APP_DEFAULT = "https://app.arcus.xyz"
+ARCUS_TERMS_DEFAULT = "https://arcus.xyz/legal/terms"
+_ARCUS_APP_ENV = {
+    ARCUS_NETWORK_TESTNET: ("ARCUS_TESTNET_APP_URL", ARCUS_TESTNET_APP_DEFAULT),
+    ARCUS_NETWORK_MAINNET: ("ARCUS_MAINNET_APP_URL", ARCUS_MAINNET_APP_DEFAULT),
+}
+
+
+def _https_host(url: str) -> str | None:
+    """The lowercase host of an ``https://`` URL without credentials, query or
+    fragment; None for anything else (never prefix-matched)."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        _ = parts.port  # raises ValueError on a malformed port
+    except ValueError:
+        return None
+    if parts.scheme.lower() != "https" or not host:
+        return None
+    if parts.username is not None or parts.password is not None or parts.query or parts.fragment:
+        return None
+    return host.lower().rstrip(".")
+
+
+def arcus_app_url(net: str) -> str:
+    """The Arcus web app for ``net`` (no trailing ``/``): ``ARCUS_TESTNET_APP_URL``
+    / ``ARCUS_MAINNET_APP_URL`` or the documented default. Must be ``https://``
+    and must not be the OTHER network's app host (default or override), else
+    ``ValueError`` — a key created on the wrong network could never be found."""
+    this = parse_arcus_net(net)
+    env_name, default = _ARCUS_APP_ENV[this]
+    url = env_str(env_name, default).rstrip("/")
+    host = _https_host(url)
+    if host is None:
+        raise ValueError("ARCUS app URL must be https")
+    for other, (other_env, other_default) in _ARCUS_APP_ENV.items():
+        if other == this:
+            continue
+        for candidate in (other_default, env_str(other_env, other_default).rstrip("/")):
+            if _https_host(candidate) == host:
+                raise ValueError("ARCUS app URL points at the other Arcus network's app")
+    return url
+
+
+def arcus_api_keys_url(net: str) -> str:
+    """The API Keys page of the Arcus web app for ``net`` (``ValueError`` as
+    :func:`arcus_app_url`)."""
+    return arcus_app_url(net) + "/api-keys"
+
+
+def arcus_terms_url() -> str:
+    """The Arcus Terms of Use (``ARCUS_TERMS_URL`` or the documented default);
+    must be ``https://``, else ``ValueError``."""
+    url = env_str("ARCUS_TERMS_URL", ARCUS_TERMS_DEFAULT)
+    if _https_host(url) is None:
+        raise ValueError("ARCUS terms URL must be https")
+    return url
+
 PRODUCTS = {
     "USDT0": {"id": 0, "type": "spot"},
     "BTC": {"id": 2, "type": "perp", "symbol": "BTC-PERP"},

@@ -15,11 +15,21 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from src.nadobro.core.feature_flags import arcus_enabled_for
+from src.nadobro.core.feature_flags import arcus_enabled_for, arcus_mainnet_enabled
 from src.nadobro.db import execute_returning, query_count
 from src.nadobro.users.audit_log import record_audit_event
 from src.nadobro.users.user_service import _get_cached_user, get_user, invalidate_user_cache
-from src.nadobro.utils.venue_scope import VENUE_ARCUS, VENUE_NADO, VENUES
+from src.nadobro.utils.venue_scope import (
+    ARCUS_MAINNET_SCOPE,
+    ARCUS_NETWORK_MAINNET,
+    ARCUS_NETWORK_TESTNET,
+    VENUE_ARCUS,
+    VENUE_NADO,
+    VENUES,
+    arcus_network_from_db,
+    arcus_scope_for,
+    parse_arcus_net,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,3 +150,72 @@ def count_users_on_venue(venue: str) -> int:
     picks the policy."""
     venue = _require_venue(venue)
     return query_count("SELECT COUNT(*) FROM users WHERE active_venue = %s", (venue,))
+
+
+# --- Arcus network mode (``users.arcus_network_mode``; Arcus P3b) ------------------------
+# A DIFFERENT domain from Nado's ``network_mode``: switching it never touches Nado
+# caches, clients or ``network_mode``, and never starts, stops or resumes anything.
+
+
+def get_arcus_network_mode(telegram_id: int) -> str:
+    """The Arcus network the user sees: 'mainnet' only on an EXACT stored match,
+    otherwise 'testnet' (including a user with no row yet). A DB error
+    PROPAGATES (DENIED != EMPTY)."""
+    user = get_user(int(telegram_id))
+    if user is None:
+        return ARCUS_NETWORK_TESTNET
+    return arcus_network_from_db(getattr(user, "arcus_network_mode", None))
+
+
+def set_arcus_network_mode(telegram_id: int, mode: str) -> SwitchOutcome:
+    """Compare-and-set ``users.arcus_network_mode``. It has no other side effects.
+
+    - ``mode`` must be exactly 'testnet' or 'mainnet' (``parse_arcus_net``) and
+      the id positive, else ValueError before any DB access.
+    - Switching TO mainnet needs the Arcus cohort AND ``ARCUS_MAINNET_ENABLED``
+      (build_decisions #7), else 'not_allowed' without writing. Switching to
+      testnet is never gated, so nobody is stranded on mainnet.
+    - 'switched' = this call flipped the row; 'unchanged' = already there, a
+      concurrent switch won, or no row. The user cache is invalidated ALWAYS
+      once the UPDATE is attempted (as ``set_active_venue`` does).
+    - Callers must refuse while Arcus automation runs ("Stop, then switch").
+    """
+    target = parse_arcus_net(mode)
+    uid = int(telegram_id)
+    if uid <= 0:
+        # A falsy id would also make invalidate_user_cache clear EVERY user.
+        raise ValueError(f"invalid telegram_id: {telegram_id!r}")
+    if arcus_scope_for(target) == ARCUS_MAINNET_SCOPE and not (
+        arcus_enabled_for(uid) and arcus_mainnet_enabled()
+    ):
+        return "not_allowed"
+    previous = {ARCUS_NETWORK_TESTNET: ARCUS_NETWORK_MAINNET, ARCUS_NETWORK_MAINNET: ARCUS_NETWORK_TESTNET}[target]
+    try:
+        row = execute_returning(
+            "UPDATE users SET arcus_network_mode = %s "
+            "WHERE telegram_id = %s AND arcus_network_mode = %s "
+            "RETURNING arcus_network_mode",
+            (target, uid, previous),
+        )
+    finally:
+        invalidate_user_cache(uid)
+    if not row:
+        return "unchanged"
+    record_audit_event(uid, "arcus_mode_switched", f"{previous}->{target}")  # never raises
+    logger.info("arcus_mode_switch telegram_id=%s %s->%s", uid, previous, target)
+    return "switched"
+
+
+def has_live_arcus_credentials() -> bool:
+    """Boot check for ``main.py``: is there any ``active``/``expired`` Arcus
+    credential? Raises on a DB error, including a missing table (P1's fail-soft
+    DDL); the caller picks the policy. Lives here — not in
+    ``users/arcus_credentials.py`` — so the boot path never imports
+    ``venue.arcus``."""
+    return (
+        query_count(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM arcus_credentials "
+            "WHERE status IN ('active', 'expired') LIMIT 1) t"
+        )
+        > 0
+    )

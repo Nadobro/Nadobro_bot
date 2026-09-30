@@ -66,6 +66,9 @@ ARCUS_SCOPES = (ARCUS_TESTNET_SCOPE, ARCUS_MAINNET_SCOPE)
 # (pinned by tests/lint/test_venue_scope_hygiene.py).
 ARCUS_STRATEGY_BOT_PREFIX = "arcus_strategy_bot:"
 ARCUS_USER_SETTINGS_PREFIX = "arcus_user_settings:"
+# Arcus API-key reminder state (P3b): ``f"{prefix}{uid}:{arcus_scope_for(net)}"``,
+# e.g. ``arcus_key_notice:42:arcus_testnet`` (shared keys carry the scope token).
+ARCUS_KEY_NOTICE_PREFIX = "arcus_key_notice:"
 
 # --- Arcus network modes (``users.arcus_network_mode``) --------------------
 # The same two words as Nado's networks but a DIFFERENT domain: always a plain
@@ -329,6 +332,7 @@ __all__ = [
     "ARCUS_SCOPES",
     "ARCUS_STRATEGY_BOT_PREFIX",
     "ARCUS_USER_SETTINGS_PREFIX",
+    "ARCUS_KEY_NOTICE_PREFIX",
     "ARCUS_NETWORK_TESTNET",
     "ARCUS_NETWORK_MAINNET",
     "ARCUS_NETWORK_MODES",

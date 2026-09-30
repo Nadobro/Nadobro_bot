@@ -16,7 +16,8 @@
 5. Outside the package, only ``ARCUS_IMPORTERS_ALLOWED`` may import
    ``venue.arcus`` in ANY form (absolute, ``from src.nadobro.venue import
    arcus``, relative, ``importlib``). P2 value: empty — the library is unwired
-   and no Nado module can reach it (Nado byte-identity).
+   and no Nado module can reach it (Nado byte-identity). P3b: exactly
+   ``users/arcus_credentials.py`` and ``users/arcus_link_service.py``.
 6. Detector self-checks on synthetic sources.
 """
 from __future__ import annotations
@@ -99,7 +100,12 @@ EXTRA_ALLOWED: dict[str, tuple[str, ...]] = {
 ALWAYS_ALLOWED: tuple[str, ...] = ("src.nadobro.utils", PKG)
 
 # Rule 5: modules outside the package that may import it. P2: none (unwired).
-ARCUS_IMPORTERS_ALLOWED: set[str] = set()
+# P3b (03 §4, V-13): exactly the credential store and the link service. Handlers,
+# runtime/scheduler.py and main.py reach the library only through these two.
+ARCUS_IMPORTERS_ALLOWED: set[str] = {
+    "src/nadobro/users/arcus_credentials.py",
+    "src/nadobro/users/arcus_link_service.py",
+}
 
 SYNC_HTTPX_ATTRS = frozenset(
     {"Client", "HTTPTransport", "get", "post", "put", "patch", "delete", "head", "options", "request", "stream"}
@@ -304,7 +310,7 @@ def test_only_allowed_modules_import_venue_arcus():
             offenders.append(rel)
     assert not offenders, (
         "modules outside src/nadobro/venue/arcus import it but are not in ARCUS_IMPORTERS_ALLOWED "
-        "(P2: the library is unwired):\n  " + "\n  ".join(offenders)
+        "(P3b: only the two users/arcus_* modules may; handlers/runtime/main.py go through them):\n  " + "\n  ".join(offenders)
     )
 
 

@@ -420,7 +420,10 @@ def test_venue_service_never_reaches_a_stop_or_start_path():
         parts = mod.split(".")
         pkg = parts[2] if len(parts) >= 3 and mod.startswith("src.nadobro.") else None
         assert pkg not in _FORBIDDEN_PACKAGES, f"venue_service imports {mod}"
-    # And it writes exactly one thing: users.active_venue (plus the audit row).
+    # And it writes exactly two things, each a compare-and-set of ONE users column
+    # (plus the audit row): users.active_venue (P1 /venue) and users.arcus_network_mode
+    # (P3b, 03 §11.4 set_arcus_network_mode — updated deliberately; it never touches
+    # Nado's network_mode, caches or clients).
     sql = [
         n.value for n in ast.walk(tree)
         if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.lstrip().upper().startswith(
@@ -429,7 +432,9 @@ def test_venue_service_never_reaches_a_stop_or_start_path():
     ]
     assert sql == [
         "UPDATE users SET active_venue = %s WHERE telegram_id = %s AND active_venue = %s "
-        "RETURNING active_venue"
+        "RETURNING active_venue",
+        "UPDATE users SET arcus_network_mode = %s WHERE telegram_id = %s AND arcus_network_mode = %s "
+        "RETURNING arcus_network_mode",
     ], sql
 
 

@@ -262,3 +262,63 @@ def arcus_clock_max_age_s() -> float:
     """Max age of the /v1/time offset before an OPENING placement re-syncs.
     Default 900, range [120, 3600]."""
     return _arcus_float_in_range("ARCUS_CLOCK_MAX_AGE_S", 900.0, 120.0, 3600.0)
+
+
+# --- Arcus onboarding / key lifecycle readers (P3b) ---------------------------
+
+ARCUS_KEY_EXPIRY_STOP_HOURS_DEFAULT = 24.0
+ARCUS_KEY_REMINDER_DAYS_DEFAULT: tuple[int, ...] = (14, 7, 2, 1)
+
+
+def arcus_key_expiry_stop_hours() -> float:
+    """Hours before an Arcus API key expires at which Arcus automation stands
+    down (cancel-only). Default 24 (build_decisions #5: "T-24h cancel-only
+    stand-down"); a value <= 0, > 168 or non-finite falls back to 24 (one
+    WARNING).
+
+    THE single reader of ``ARCUS_KEY_EXPIRY_STOP_HOURS``: the key reminders
+    (P3b) print this value and P5's stand-down scan must call this function
+    too, so the text and the actual stand-down window can never disagree.
+    """
+    name = "ARCUS_KEY_EXPIRY_STOP_HOURS"
+    value = env_float(name, ARCUS_KEY_EXPIRY_STOP_HOURS_DEFAULT)
+    if not math.isfinite(value) or value <= 0 or value > 168:
+        _arcus_warn_once(name, value, ARCUS_KEY_EXPIRY_STOP_HOURS_DEFAULT)
+        return ARCUS_KEY_EXPIRY_STOP_HOURS_DEFAULT
+    return value
+
+
+def arcus_key_reminder_days() -> tuple[int, ...]:
+    """Days before expiry at which a key reminder is sent (``ARCUS_KEY_REMINDER_DAYS``,
+    comma list of ints in 1..180). Deduplicated and sorted descending. Default
+    (14, 7, 2, 1) (build_decisions #5). An empty list or ANY unusable token falls
+    back to the whole default (one WARNING): more reminders, never fewer."""
+    name = "ARCUS_KEY_REMINDER_DAYS"
+    raw = env_str(name, "")
+    if not raw:
+        return ARCUS_KEY_REMINDER_DAYS_DEFAULT
+    days: set[int] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        try:
+            value = int(token)
+        except ValueError:
+            _arcus_warn_once(name, raw, ARCUS_KEY_REMINDER_DAYS_DEFAULT)
+            return ARCUS_KEY_REMINDER_DAYS_DEFAULT
+        if not 1 <= value <= 180:
+            _arcus_warn_once(name, raw, ARCUS_KEY_REMINDER_DAYS_DEFAULT)
+            return ARCUS_KEY_REMINDER_DAYS_DEFAULT
+        days.add(value)
+    return tuple(sorted(days, reverse=True))
+
+
+def arcus_link_pending_ttl_s() -> float:
+    """Seconds an in-memory Arcus link flow (``arcus_link_pending``) stays
+    valid. Default 1800, range [300, 7200]."""
+    return _arcus_float_in_range("ARCUS_LINK_PENDING_TTL_S", 1800.0, 300.0, 7200.0)
+
+
+def arcus_key_lifecycle_interval_s() -> int:
+    """Seconds between Arcus key-lifecycle ticks (reminders + the
+    active->expired transition). Default 600, range [60, 3600]."""
+    return _arcus_int_in_range("ARCUS_KEY_LIFECYCLE_INTERVAL_S", 600, 60, 3600)
