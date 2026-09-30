@@ -81,6 +81,24 @@ _PRIVATE_KEY_FIELD_RE = re.compile(
 # AUDIT-FIX-LR-1: catch Telegram bot tokens even when not in /bot<token>/
 # URL form. Token shape is <digits>:<35+ chars from URL-safe alphabet>.
 _TG_BOT_TOKEN_BARE_RE = re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b")
+# E6 (Arcus P2): PEM blocks (a pasted Ed25519 key in PKCS#8 form), including a
+# block truncated by a log-line cut, and labelled secrets whose label carries a
+# prefix. ``_PRIVATE_KEY_FIELD_RE`` above anchors on ``\b``, and ``_`` is a word
+# character, so ``api_secret=…`` / ``wallet_private_key=…`` /
+# ``ARCUS_PROBE_SIGNING_KEY=…`` slip past it, and its value class has no ``=``
+# (base64 padding). Bare 64-hex seeds / 128-hex signatures are already masked by
+# ``_LONG_HEX_RE``. Plain ``signature`` is deliberately NOT a label here.
+_E6_PEM_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]{3,64}-----.*?-----END [A-Z0-9 ]{3,64}-----", re.DOTALL
+)
+_E6_PEM_OPEN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]{3,64}-----.*\Z", re.DOTALL)
+_E6_LABELLED_SECRET_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])"
+    r"((?:[A-Za-z0-9]+[_-]){0,6}(?:api[_-]?secret|secret|signing[_-]?(?:key|seed)|private[_-]?key|seed[_-]?hex|x-signature))"
+    r"(?![A-Za-z0-9])"
+    r"(\s*[\"']?\s*[:=]\s*[\"']?)"
+    r"([A-Za-z0-9_\-./+=]{8,})"
+)
 
 
 def redact_sensitive_text(value: Any) -> Any:
@@ -89,7 +107,9 @@ def redact_sensitive_text(value: Any) -> Any:
     if not isinstance(value, str):
         return value
 
-    text = _URL_CREDENTIALS_RE.sub(r"\1<REDACTED>:<REDACTED>@", value)
+    text = _E6_PEM_RE.sub("<REDACTED_PEM>", value)
+    text = _E6_PEM_OPEN_RE.sub("<REDACTED_PEM>", text)
+    text = _URL_CREDENTIALS_RE.sub(r"\1<REDACTED>:<REDACTED>@", text)
     text = _PINECONE_URL_RE.sub("<REDACTED_PINECONE_URL>", text)
     text = _BOT_TOKEN_RE.sub("/bot<REDACTED>", text)
     text = _TG_BOT_TOKEN_BARE_RE.sub("<REDACTED_BOT_TOKEN>", text)
@@ -102,6 +122,7 @@ def redact_sensitive_text(value: Any) -> Any:
         lambda m: f"{m.group(1)}{m.group(2)}<REDACTED_ID>", text
     )
     text = _PRIVATE_KEY_FIELD_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<REDACTED>", text)
+    text = _E6_LABELLED_SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<REDACTED>", text)
     text = _SUPABASE_HOST_RE.sub("<REDACTED_DB_HOST>", text)
     text = _FLY_INTERNAL_RE.sub("<REDACTED_IPV6>", text)
     text = _IPV4_RE.sub("<REDACTED_IP>", text)

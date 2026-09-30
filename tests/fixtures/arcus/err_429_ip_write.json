@@ -1,0 +1,5 @@
+{
+ "error": "rate limited",
+ "reason": "ip",
+ "retryAfterMs": 2000
+}

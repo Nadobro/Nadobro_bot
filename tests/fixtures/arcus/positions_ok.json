@@ -1,0 +1,43 @@
+{
+ "positions": {
+  "1": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 1,
+   "marketDisplayName": "BTC-USD",
+   "side": "LONG",
+   "size": "0.0001",
+   "averageEntryPrice": "84500",
+   "leverage": "40",
+   "marginMode": "CROSS",
+   "borrowedCapital": "-8.45",
+   "marginUsed": "0.21",
+   "positionValueNotional": "8.45",
+   "unrealizedPnl": "0.01",
+   "markPx": "84510.2",
+   "cumulativeFunding": {
+    "allTime": "0",
+    "sinceOpen": "0",
+    "sinceChange": "0"
+   },
+   "sequenceNumber": 40
+  },
+  "3": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 3,
+   "marketDisplayName": "SOL-USD",
+   "side": "SHORT",
+   "size": "-0.5",
+   "averageEntryPrice": "122.5",
+   "leverage": "20",
+   "marginMode": "CROSS",
+   "borrowedCapital": "61.25",
+   "marginUsed": "3.06",
+   "positionValueNotional": "-61.25",
+   "unrealizedPnl": "0",
+   "markPx": "0"
+  }
+ },
+ "total": 2
+}

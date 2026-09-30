@@ -1,0 +1,59 @@
+{
+ "fills": [
+  {
+   "tradeId": "t-0000000000000002",
+   "orderId": "0000000000000abc",
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 3,
+   "marketDisplayName": "SOL-USD",
+   "side": "SELL",
+   "originalSize": "1",
+   "size": "0.4",
+   "price": "130.25",
+   "fee": "0.0038",
+   "closedPnl": "0.12",
+   "role": "TAKER",
+   "positionEffect": "CLOSE_LONG",
+   "createdAt": 1790000000160000
+  },
+  {
+   "tradeId": "t-0000000000000001",
+   "orderId": "liq:00000000000000aa",
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 2,
+   "marketDisplayName": "ETH-USD",
+   "side": "SELL",
+   "originalSize": "0.01",
+   "size": "0.01",
+   "price": "2600.5",
+   "fee": "0.26",
+   "closedPnl": "0",
+   "role": "TAKER",
+   "positionEffect": "CLOSE_LONG",
+   "createdAt": 1790000000100000,
+   "liquidation": {
+    "method": "LIQUIDATION",
+    "liquidatedUser": "q83vEjRWeJCrze8SNFZ4kKvN7xIA"
+   }
+  },
+  {
+   "tradeId": "t-0000000000000003",
+   "orderId": "a1b2c3d4e5f67890",
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 1,
+   "marketDisplayName": "BTC-USD",
+   "side": "BUY",
+   "originalSize": "0.0001",
+   "size": "0.0001",
+   "price": "84517.3",
+   "fee": "-0.0001",
+   "role": "MAKER",
+   "positionEffect": "OPEN_LONG",
+   "createdAt": 1790000000170000
+  }
+ ],
+ "total": 3
+}

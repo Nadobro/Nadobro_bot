@@ -1,0 +1,5 @@
+{
+ "error": "could not deliver order to the matching engine",
+ "errorSource": "Order",
+ "errorType": "Transmission"
+}

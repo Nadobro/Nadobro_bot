@@ -1,0 +1,34 @@
+{
+ "accountIndex": 0,
+ "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+ "netQuoteBalance": "990.5",
+ "equity": "1000.1",
+ "freeCollateral": "950",
+ "netDeposits": "1000",
+ "pendingDeposits": "0",
+ "pendingWithdrawals": "0",
+ "positions": {
+  "1": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 1,
+   "marketDisplayName": "BTC-USD",
+   "side": "LONG",
+   "size": "0.0001",
+   "averageEntryPrice": "84500",
+   "leverage": "40",
+   "marginMode": "CROSS",
+   "borrowedCapital": "-8.45",
+   "marginUsed": "0.21",
+   "positionValueNotional": "8.45",
+   "unrealizedPnl": "0.01",
+   "markPx": "84510.2",
+   "cumulativeFunding": {
+    "allTime": "0",
+    "sinceOpen": "0",
+    "sinceChange": "0"
+   }
+  }
+ },
+ "sequenceNumber": 42
+}

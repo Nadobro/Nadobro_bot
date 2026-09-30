@@ -1,0 +1,5 @@
+{
+ "error": "order notional below minimum",
+ "errorSource": "Order",
+ "errorType": "InvalidRequest"
+}

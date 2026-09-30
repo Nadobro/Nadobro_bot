@@ -1,0 +1,36 @@
+{
+ "apiKeys": [
+  {
+   "apiKey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "allSubaccounts": false,
+   "accountIndex": 0,
+   "apiWalletName": "nadobro-ab12",
+   "status": "ACTIVE",
+   "validUntil": 1798640000000,
+   "createdAt": 1790000000000000
+  },
+  {
+   "apiKey": "1111111111111111111111111111111111111111111111111111111111111111",
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "allSubaccounts": true,
+   "apiWalletName": "",
+   "status": "ACTIVE",
+   "validUntil": 0,
+   "createdAt": 1789000000000000
+  },
+  {
+   "apiKey": "2222222222222222222222222222222222222222222222222222222222222222",
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "allSubaccounts": false,
+   "accountIndex": 1,
+   "apiWalletName": "old",
+   "status": "DELETED",
+   "permissions": [
+    "withdraw"
+   ],
+   "validUntil": 1780000000000,
+   "createdAt": 1770000000000000
+  }
+ ]
+}

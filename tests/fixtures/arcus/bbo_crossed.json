@@ -1,0 +1,13 @@
+{
+ "bestBid": {
+  "price": "84600.0",
+  "size": "0.5"
+ },
+ "bestAsk": {
+  "price": "84594.5",
+  "size": "0.4"
+ },
+ "lastSequenceId": 1,
+ "globalSequenceId": 1,
+ "timestamp": 1790000000000000
+}

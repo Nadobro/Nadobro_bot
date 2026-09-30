@@ -272,3 +272,54 @@ def test_module_is_a_stdlib_only_leaf():
         if isinstance(node, ast.Import):
             for a in node.names:
                 assert not a.name.startswith(("src", "nadobro")), a.name
+
+
+# --- Arcus network helpers (Arcus P2, 02 §3.1): appended -----------------------
+
+
+class _StrSub(str):
+    pass
+
+
+def test_parse_arcus_net_exact_tokens_only():
+    assert vs.parse_arcus_net("testnet") == "testnet"
+    assert vs.parse_arcus_net("mainnet") == "mainnet"
+    for bad in ("Testnet", " testnet", "testnet ", "MAINNET", "arcus_testnet", "", None,
+                b"testnet", _StrSub("testnet"), 1, _Mode.TESTNET):
+        with pytest.raises(ValueError) as exc:
+            vs.parse_arcus_net(bad)
+        assert str(exc.value) == "not an Arcus network token"  # fixed text: never echoes the input
+
+
+def test_arcus_scope_for():
+    assert vs.arcus_scope_for("testnet") == "arcus_testnet" == vs.ARCUS_TESTNET_SCOPE
+    assert vs.arcus_scope_for("mainnet") == "arcus_mainnet" == vs.ARCUS_MAINNET_SCOPE
+    for bad in ("arcus_testnet", "Mainnet", "", None):
+        with pytest.raises(ValueError):
+            vs.arcus_scope_for(bad)
+
+
+def test_arcus_net_from_scope():
+    assert vs.arcus_net_from_scope("arcus_mainnet") == "mainnet"
+    assert vs.arcus_net_from_scope("arcus_testnet") == "testnet"
+    for bad in ("mainnet", "ARCUS_MAINNET", " arcus_mainnet", "arcus_", None, _StrSub("arcus_mainnet")):
+        with pytest.raises(ValueError) as exc:
+            vs.arcus_net_from_scope(bad)
+        assert str(exc.value) == "not an Arcus scope token"
+
+
+def test_arcus_scope_round_trip():
+    for net in vs.ARCUS_NETWORK_MODES:
+        assert vs.arcus_net_from_scope(vs.arcus_scope_for(net)) == net
+    for scope in vs.ARCUS_SCOPES:
+        assert vs.arcus_scope_for(vs.arcus_net_from_scope(scope)) == scope
+
+
+def test_arcus_helpers_are_exported_and_silent(caplog):
+    for name in ("parse_arcus_net", "arcus_scope_for", "arcus_net_from_scope"):
+        assert name in vs.__all__
+    caplog.set_level(logging.DEBUG, logger=vs.__name__)
+    with pytest.raises(ValueError):
+        vs.parse_arcus_net("garbage")
+    vs.arcus_scope_for("testnet")
+    assert _scope_warnings(caplog) == [] and not caplog.records

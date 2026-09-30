@@ -1,0 +1,5 @@
+{
+ "error": "price is not a multiple of tick size",
+ "errorSource": "Order",
+ "errorType": "Tick"
+}

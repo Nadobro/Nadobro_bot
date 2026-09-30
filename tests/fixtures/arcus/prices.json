@@ -1,0 +1,14 @@
+{
+ "1": {
+  "marketDisplayName": "BTC-USD",
+  "oraclePrice": "84532.4",
+  "markPrice": "84321.1",
+  "sequencer": 42
+ },
+ "2": {
+  "marketDisplayName": "ETH-USD",
+  "oraclePrice": "0",
+  "markPrice": "0",
+  "sequencer": 0
+ }
+}

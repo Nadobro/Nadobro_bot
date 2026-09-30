@@ -1,0 +1,6 @@
+{
+ "error": "rate limited",
+ "reason": "account_empty",
+ "retryAfterMs": 850,
+ "clientId": "my-order-42"
+}

@@ -1,0 +1,14 @@
+{
+ "responses": [
+  {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "clientId": "nb7ps_2s-2",
+   "marketId": 1,
+   "marketDisplayName": "BTC-USD",
+   "status": "ERROR",
+   "error": "x",
+   "updateTime": 1
+  }
+ ]
+}

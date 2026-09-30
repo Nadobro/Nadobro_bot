@@ -1,12 +1,16 @@
 import logging
 import os
 from typing import Optional
+from urllib.parse import urlsplit
 
-from src.nadobro.utils.env import clean_env_value, env_bool
+from src.nadobro.utils.env import clean_env_value, env_bool, env_str
 from src.nadobro.utils.venue_scope import (
+    ARCUS_NETWORK_MAINNET,
+    ARCUS_NETWORK_TESTNET,
     STR_STRIP_LOWER_ELSE_MAINNET,
     coerce_nado_network,
     guard_nado_scope,
+    parse_arcus_net,
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -74,6 +78,73 @@ NADO_MAINNET_ARCHIVE = "https://archive.prod.nado.xyz/v1"
 # and https://docs.nado.xyz/developer-resources/api/rewards/ink-airdrop
 NADO_TESTNET_ARCHIVE_REWARDS = "https://archive.test.nado.xyz/rewards/v1"
 NADO_MAINNET_ARCHIVE_REWARDS = "https://archive.prod.nado.xyz/rewards/v1"
+
+# --- Arcus (second venue; perps only) --------------------------------------
+# REST base has NO "/v1" (client paths carry it). Sources: Arcus docs
+# place-order servers "https://api.arcus.xyz Mainnet … https://api.testnet.arcus.xyz
+# Testnet"; websocket "Connect to wss://api.testnet.arcus.xyz/v1/ws (mainnet:
+# wss://api.arcus.xyz/v1/ws)". Env overrides are read at CALL time only
+# (nothing here reads an ARCUS_* variable at import).
+ARCUS_TESTNET_REST_DEFAULT = "https://api.testnet.arcus.xyz"
+ARCUS_MAINNET_REST_DEFAULT = "https://api.arcus.xyz"
+ARCUS_TESTNET_WS_DEFAULT = "wss://api.testnet.arcus.xyz/v1/ws"
+ARCUS_MAINNET_WS_DEFAULT = "wss://api.arcus.xyz/v1/ws"
+
+_ARCUS_REST_ENV = {
+    ARCUS_NETWORK_TESTNET: ("ARCUS_TESTNET_REST_URL", ARCUS_TESTNET_REST_DEFAULT),
+    ARCUS_NETWORK_MAINNET: ("ARCUS_MAINNET_REST_URL", ARCUS_MAINNET_REST_DEFAULT),
+}
+_ARCUS_WS_ENV = {
+    ARCUS_NETWORK_TESTNET: ("ARCUS_TESTNET_WS_URL", ARCUS_TESTNET_WS_DEFAULT),
+    ARCUS_NETWORK_MAINNET: ("ARCUS_MAINNET_WS_URL", ARCUS_MAINNET_WS_DEFAULT),
+}
+# Plain-text schemes are allowed ONLY for a local fake on the loopback host.
+_ARCUS_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
+
+
+def _arcus_url_ok(url: str, *, secure_scheme: str, local_scheme: str) -> bool:
+    """A parsed (never prefix-matched) check: ``http://127.0.0.1.evil.example``
+    must not pass as local. No credentials, query or fragment in a base URL."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        _ = parts.port  # raises ValueError on a malformed / out-of-range port
+    except ValueError:
+        return False
+    if not host or parts.username is not None or parts.password is not None:
+        return False
+    if parts.query or parts.fragment:
+        return False
+    scheme = parts.scheme.lower()
+    if scheme == secure_scheme:
+        return True
+    return scheme == local_scheme and host.lower() in _ARCUS_LOCAL_HOSTS
+
+
+def arcus_rest_url(net: str) -> str:
+    """Arcus REST base URL for ``net`` (``'testnet'``/``'mainnet'`` only).
+
+    ``ARCUS_TESTNET_REST_URL`` / ``ARCUS_MAINNET_REST_URL`` override the
+    defaults (inline ``# comments`` allowed). The result has no trailing ``/``
+    and must be ``https://`` (``http://`` only for 127.0.0.1 / localhost
+    fakes), else ``ValueError``. The URL is never logged.
+    """
+    env_name, default = _ARCUS_REST_ENV[parse_arcus_net(net)]
+    url = env_str(env_name, default).rstrip("/")
+    if not _arcus_url_ok(url, secure_scheme="https", local_scheme="http"):
+        raise ValueError("ARCUS REST URL must be https")
+    return url
+
+
+def arcus_ws_url(net: str) -> str:
+    """Arcus WebSocket URL for ``net``: ``ARCUS_TESTNET_WS_URL`` /
+    ``ARCUS_MAINNET_WS_URL`` or the default; must be ``wss://`` (``ws://`` only
+    for 127.0.0.1 / localhost fakes), else ``ValueError``. Used from P4a."""
+    env_name, default = _ARCUS_WS_ENV[parse_arcus_net(net)]
+    url = env_str(env_name, default).rstrip("/")
+    if not _arcus_url_ok(url, secure_scheme="wss", local_scheme="ws"):
+        raise ValueError("ARCUS WS URL must be wss")
+    return url
 
 PRODUCTS = {
     "USDT0": {"id": 0, "type": "spot"},

@@ -1,0 +1,74 @@
+{
+ "markets": [
+  {
+   "marketDisplayName": "KBONK-USD",
+   "fullAssetName": "1000 BONK",
+   "marketId": 67,
+   "status": "OFFLINE",
+   "baseAsset": "KBONK",
+   "quoteAsset": "USD",
+   "tickSize": "0.00001",
+   "stepSize": "0.0001",
+   "tickTiers": [
+    {
+     "upToPrice": "0.0005",
+     "tick": "0.00001"
+    },
+    {
+     "upToPrice": "0.001",
+     "tick": "0.00002"
+    },
+    {
+     "upToPrice": "0.002",
+     "tick": "0.00005"
+    },
+    {
+     "upToPrice": "0.005",
+     "tick": "0.0001"
+    },
+    {
+     "upToPrice": "0.01",
+     "tick": "0.0002"
+    },
+    {
+     "tick": "0.0005"
+    }
+   ],
+   "minOrderNotional": "5",
+   "minOrderSize": "0.01",
+   "maxOrderSize": "10000000",
+   "oraclePrice": "0.00371",
+   "markPrice": "0.00371",
+   "fundingRate": "0",
+   "nextFundingRate": "0.0000125",
+   "nextFundingAt": 1790542800,
+   "priceChange24h": "0.0306",
+   "volume24h": "0",
+   "volume24hNotional": "0",
+   "trades24h": 0,
+   "openInterest": "0",
+   "openInterestCapNotional": null,
+   "initialMarginFraction": "0.2",
+   "maintenanceMarginFraction": "0.133334",
+   "offHoursInitialMarginFraction": "0.2",
+   "regularTradingHours": null,
+   "isOutsideRth": false,
+   "currentSettlementPrice": null,
+   "upperTradingBound": null,
+   "lowerTradingBound": null,
+   "nextUpperTradingBound": null,
+   "nextLowerTradingBound": null,
+   "isUpperInExpansionZone": null,
+   "isLowerInExpansionZone": null,
+   "upperZoneEnteredAt": null,
+   "upperExpectedExpansionAt": null,
+   "lowerZoneEnteredAt": null,
+   "lowerExpectedExpansionAt": null,
+   "type": "PERPETUAL",
+   "category": "CRYPTO",
+   "addedTimestamp": 1790285850,
+   "assetResolution": "10000000000",
+   "pythId": "1782"
+  }
+ ]
+}

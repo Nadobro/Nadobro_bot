@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 
-from src.nadobro.utils.env import env_bool, env_int_set
+from src.nadobro.utils.env import env_bool, env_float, env_int, env_int_set, env_str
+
+logger = logging.getLogger(__name__)
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -167,3 +171,94 @@ def arcus_enabled_for(telegram_id: int | None) -> bool:
     except (TypeError, ValueError):
         return False
     return uid in arcus_allowed_user_ids()
+
+
+# --- Arcus venue library readers (P2) ---------------------------------------
+# Every reader re-reads the env on each call (no caching). An out-of-range or
+# non-finite numeric value is clamped (or defaulted) with ONE WARNING per
+# reader per process — visible, never a silent override.
+
+ARCUS_V1_MARKET_ALLOWLIST_DEFAULT = "BTC-USD,ETH-USD,SOL-USD"
+
+_ARCUS_CLAMP_WARNED: set[str] = set()
+
+
+def _arcus_warn_once(name: str, raw: object, used: object) -> None:
+    if name in _ARCUS_CLAMP_WARNED:
+        return
+    _ARCUS_CLAMP_WARNED.add(name)
+    logger.warning("env %s=%r is out of range; using %r", name, raw, used)
+
+
+def _arcus_int_in_range(name: str, default: int, lo: int, hi: int) -> int:
+    value = env_int(name, default)
+    clamped = max(lo, min(hi, value))
+    if clamped != value:
+        _arcus_warn_once(name, value, clamped)
+    return clamped
+
+
+def _arcus_float_in_range(name: str, default: float, lo: float, hi: float) -> float:
+    value = env_float(name, default)
+    if not math.isfinite(value):
+        _arcus_warn_once(name, value, default)
+        return default
+    clamped = max(lo, min(hi, value))
+    if clamped != value:
+        _arcus_warn_once(name, value, clamped)
+    return clamped
+
+
+def _reset_arcus_flag_warnings_for_tests() -> None:
+    _ARCUS_CLAMP_WARNED.clear()
+
+
+def arcus_mainnet_enabled() -> bool:
+    """Arcus MAINNET switch. Default OFF.
+
+    Requires the master switch too: ``ARCUS_MAINNET_ENABLED`` alone (with
+    ``ARCUS_ENABLED`` off) is False, so the mainnet flag can never open Arcus
+    mainnet traffic, linking or starts by itself. Arcus network mode defaults
+    to testnet; brakes never read this flag.
+    """
+    return arcus_enabled() and env_flag("ARCUS_MAINNET_ENABLED", False)
+
+
+def arcus_force_ipv4() -> bool:
+    """Pin Arcus REST/WS connections to IPv4 (a whitelisted static egress). Default OFF."""
+    return env_flag("ARCUS_FORCE_IPV4", False)
+
+
+def arcus_market_allowlist() -> frozenset[str]:
+    """Upper-cased tickers from ``ARCUS_MARKET_ALLOWLIST`` (comma list; blanks
+    dropped). Default BTC-USD, ETH-USD, SOL-USD. The catalog intersects this
+    with the v1 market set, so the env can only SHRINK what is tradable."""
+    raw = env_str("ARCUS_MARKET_ALLOWLIST", ARCUS_V1_MARKET_ALLOWLIST_DEFAULT)
+    return frozenset(t.strip().upper() for t in raw.split(",") if t.strip())
+
+
+def arcus_ip_l0_reserve() -> int:
+    """IP-weight units reserved for the L0 brake lane. Default 300, range [0, 1000]."""
+    return _arcus_int_in_range("ARCUS_IP_L0_RESERVE", 300, 0, 1000)
+
+
+def arcus_catalog_refresh_s() -> float:
+    """Seconds between Arcus market-catalog refreshes. Default 60, range [15, 3600]."""
+    return _arcus_float_in_range("ARCUS_CATALOG_REFRESH_S", 60.0, 15.0, 3600.0)
+
+
+def arcus_catalog_max_age_s() -> float:
+    """Catalog snapshot age after which callers refuse (stale). Default 300, range [60, 3600]."""
+    return _arcus_float_in_range("ARCUS_CATALOG_MAX_AGE_S", 300.0, 60.0, 3600.0)
+
+
+def arcus_gtt_days() -> int:
+    """goodTilTime horizon in days for every Arcus order. Default 40, range [32, 180]
+    (the venue rejects a GTT less than one month ahead)."""
+    return _arcus_int_in_range("ARCUS_GTT_DAYS", 40, 32, 180)
+
+
+def arcus_clock_max_age_s() -> float:
+    """Max age of the /v1/time offset before an OPENING placement re-syncs.
+    Default 900, range [120, 3600]."""
+    return _arcus_float_in_range("ARCUS_CLOCK_MAX_AGE_S", 900.0, 120.0, 3600.0)

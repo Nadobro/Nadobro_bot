@@ -1,0 +1,4 @@
+{
+ "error": "perpetuals are not available in your region",
+ "code": "GEO_RESTRICTED"
+}

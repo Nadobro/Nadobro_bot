@@ -271,6 +271,47 @@ def arcus_network_from_db(raw: object) -> str:
     return ARCUS_NETWORK_TESTNET
 
 
+_ARCUS_SCOPE_BY_NET = {
+    ARCUS_NETWORK_TESTNET: ARCUS_TESTNET_SCOPE,
+    ARCUS_NETWORK_MAINNET: ARCUS_MAINNET_SCOPE,
+}
+_ARCUS_NET_BY_SCOPE = {scope: net for net, scope in _ARCUS_SCOPE_BY_NET.items()}
+
+
+def parse_arcus_net(value: object) -> str:
+    """Exact Arcus network token: ``'testnet'`` or ``'mainnet'``.
+
+    Only a plain ``str`` (``type(value) is str`` — no subclass, no bytes) that
+    is EXACTLY one of :data:`ARCUS_NETWORK_MODES` is accepted: no strip, no case
+    fold, no scope tokens. Anything else raises ``ValueError`` whose message
+    never echoes the value. This is the one place Arcus code compares a network
+    token (the hygiene lint flags every other compare). Pure: no logging.
+    """
+    if type(value) is str and value in ARCUS_NETWORK_MODES:
+        return value
+    raise ValueError("not an Arcus network token")
+
+
+def arcus_scope_for(net: object) -> str:
+    """``'testnet'`` -> ``'arcus_testnet'``, ``'mainnet'`` -> ``'arcus_mainnet'``.
+
+    Validated through :func:`parse_arcus_net` and looked up by dict SUBSCRIPT
+    (never a ``.get`` default), so anything else raises ``ValueError``.
+    """
+    return _ARCUS_SCOPE_BY_NET[parse_arcus_net(net)]
+
+
+def arcus_net_from_scope(scope: object) -> str:
+    """``'arcus_testnet'`` -> ``'testnet'``, ``'arcus_mainnet'`` -> ``'mainnet'``.
+
+    Exact ``str`` tokens only (no strip, no case fold); anything else raises
+    ``ValueError`` without echoing the value. Inverse of :func:`arcus_scope_for`.
+    """
+    if type(scope) is str and scope in _ARCUS_NET_BY_SCOPE:
+        return _ARCUS_NET_BY_SCOPE[scope]
+    raise ValueError("not an Arcus scope token")
+
+
 def _reset_warnings_for_tests() -> None:
     _warned.clear()
 
@@ -306,4 +347,7 @@ __all__ = [
     "coerce_nado_network",
     "active_venue_from_db",
     "arcus_network_from_db",
+    "parse_arcus_net",
+    "arcus_scope_for",
+    "arcus_net_from_scope",
 ]

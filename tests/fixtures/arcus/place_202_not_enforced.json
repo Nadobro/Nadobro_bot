@@ -1,0 +1,21 @@
+{
+ "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+ "accountIndex": 0,
+ "orderId": "a1b2c3d4e5f67890",
+ "clientId": "nb7ps_2s-1",
+ "marketId": 1,
+ "marketDisplayName": "BTC-USD",
+ "side": "BUY",
+ "type": "LIMIT",
+ "timeInForce": "ALO",
+ "goodTilTime": "1793456000000000",
+ "quantity": "0.0001",
+ "price": "84517.3",
+ "reduceOnly": false,
+ "status": "ACK",
+ "createdAt": 1790000000123456,
+ "rateLimit": {
+  "pool": "order",
+  "remaining": -1
+ }
+}

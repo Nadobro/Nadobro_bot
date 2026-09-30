@@ -1,0 +1,356 @@
+{
+ "58": {
+  "marketDisplayName": "FARTCOIN-USD",
+  "oraclePrice": "0.1806",
+  "markPrice": "0.1824",
+  "sequencer": 2264965607
+ },
+ "64": {
+  "marketDisplayName": "AAVE-USD",
+  "oraclePrice": "162.65",
+  "markPrice": "164.27",
+  "sequencer": 2264965607
+ },
+ "46": {
+  "marketDisplayName": "NBIS-USD",
+  "oraclePrice": "264.36",
+  "markPrice": "264.64",
+  "sequencer": 2264965607
+ },
+ "60": {
+  "marketDisplayName": "WLFI-USD",
+  "oraclePrice": "0.05702",
+  "markPrice": "0.05757",
+  "sequencer": 2264965541
+ },
+ "40": {
+  "marketDisplayName": "USAR-USD",
+  "oraclePrice": "14.9",
+  "markPrice": "14.84",
+  "sequencer": 2264965607
+ },
+ "42": {
+  "marketDisplayName": "XRP-USD",
+  "oraclePrice": "1.4962",
+  "markPrice": "1.5036",
+  "sequencer": 2264965607
+ },
+ "37": {
+  "marketDisplayName": "ORCL-USD",
+  "oraclePrice": "146.51",
+  "markPrice": "146.87",
+  "sequencer": 2264965607
+ },
+ "33": {
+  "marketDisplayName": "SNDK-USD",
+  "oraclePrice": "1818.96",
+  "markPrice": "1824.05",
+  "sequencer": 2264965653
+ },
+ "1": {
+  "marketDisplayName": "BTC-USD",
+  "oraclePrice": "83420.6",
+  "markPrice": "83629.1",
+  "sequencer": 2264965249
+ },
+ "54": {
+  "marketDisplayName": "ENA-USD",
+  "oraclePrice": "0.2487",
+  "markPrice": "0.251",
+  "sequencer": 2264965607
+ },
+ "34": {
+  "marketDisplayName": "DRAM-USD",
+  "oraclePrice": "64.58",
+  "markPrice": "64.74",
+  "sequencer": 2264965607
+ },
+ "53": {
+  "marketDisplayName": "MRNA-USD",
+  "oraclePrice": "214.32",
+  "markPrice": "214.89",
+  "sequencer": 2264965245
+ },
+ "10": {
+  "marketDisplayName": "INTC-USD",
+  "oraclePrice": "123.36",
+  "markPrice": "123.41",
+  "sequencer": 2264965607
+ },
+ "48": {
+  "marketDisplayName": "MRVL-USD",
+  "oraclePrice": "293.08",
+  "markPrice": "293.75",
+  "sequencer": 2264965607
+ },
+ "45": {
+  "marketDisplayName": "CASHCAT-USD",
+  "oraclePrice": "0.175031",
+  "markPrice": "0.176781",
+  "sequencer": 2264964385
+ },
+ "24": {
+  "marketDisplayName": "QQQ-USD",
+  "oraclePrice": "755.33",
+  "markPrice": "755.66",
+  "sequencer": 2264965607
+ },
+ "57": {
+  "marketDisplayName": "PENGU-USD",
+  "oraclePrice": "0.01016",
+  "markPrice": "0.01026",
+  "sequencer": 2264965607
+ },
+ "23": {
+  "marketDisplayName": "SPY-USD",
+  "oraclePrice": "773.3",
+  "markPrice": "774.08",
+  "sequencer": 2264965607
+ },
+ "38": {
+  "marketDisplayName": "SPCX-USD",
+  "oraclePrice": "165.42",
+  "markPrice": "163.86",
+  "sequencer": 2264965607
+ },
+ "31": {
+  "marketDisplayName": "AMZN-USD",
+  "oraclePrice": "260.44",
+  "markPrice": "260.82",
+  "sequencer": 2264965653
+ },
+ "20": {
+  "marketDisplayName": "GLD-USD",
+  "oraclePrice": "391.1",
+  "markPrice": "391.22",
+  "sequencer": 2264965607
+ },
+ "6": {
+  "marketDisplayName": "HYPE-USD",
+  "oraclePrice": "86.357",
+  "markPrice": "87.142",
+  "sequencer": 2264965541
+ },
+ "35": {
+  "marketDisplayName": "PLTR-USD",
+  "oraclePrice": "198.2",
+  "markPrice": "198.55",
+  "sequencer": 2264965653
+ },
+ "49": {
+  "marketDisplayName": "BOT-USD",
+  "oraclePrice": "29.17",
+  "markPrice": "29.14",
+  "sequencer": 2264963961
+ },
+ "29": {
+  "marketDisplayName": "TSLA-USD",
+  "oraclePrice": "374.23",
+  "markPrice": "374.71",
+  "sequencer": 2264965607
+ },
+ "63": {
+  "marketDisplayName": "TAO-USD",
+  "oraclePrice": "303.31",
+  "markPrice": "306.34",
+  "sequencer": 2264965607
+ },
+ "61": {
+  "marketDisplayName": "LINK-USD",
+  "oraclePrice": "14.501",
+  "markPrice": "14.637",
+  "sequencer": 2264965415
+ },
+ "16": {
+  "marketDisplayName": "MU-USD",
+  "oraclePrice": "1130.29",
+  "markPrice": "1133.19",
+  "sequencer": 2264965652
+ },
+ "15": {
+  "marketDisplayName": "META-USD",
+  "oraclePrice": "785.2",
+  "markPrice": "784.56",
+  "sequencer": 2264965607
+ },
+ "51": {
+  "marketDisplayName": "GME-USD",
+  "oraclePrice": "25.53",
+  "markPrice": "25.61",
+  "sequencer": 2264965607
+ },
+ "28": {
+  "marketDisplayName": "NVDA-USD",
+  "oraclePrice": "234.55",
+  "markPrice": "234.26",
+  "sequencer": 2264965653
+ },
+ "56": {
+  "marketDisplayName": "NEAR-USD",
+  "oraclePrice": "5.06",
+  "markPrice": "5.11",
+  "sequencer": 2264965607
+ },
+ "9": {
+  "marketDisplayName": "AMD-USD",
+  "oraclePrice": "643.03",
+  "markPrice": "643.97",
+  "sequencer": 2264965607
+ },
+ "3": {
+  "marketDisplayName": "SOL-USD",
+  "oraclePrice": "119.118",
+  "markPrice": "119.713",
+  "sequencer": 2264965541
+ },
+ "19": {
+  "marketDisplayName": "CRCL-USD",
+  "oraclePrice": "88.5",
+  "markPrice": "88.59",
+  "sequencer": 2264965607
+ },
+ "50": {
+  "marketDisplayName": "CPER-USD",
+  "oraclePrice": "42.23",
+  "markPrice": "42.16",
+  "sequencer": 2264965607
+ },
+ "21": {
+  "marketDisplayName": "SLV-USD",
+  "oraclePrice": "56.77",
+  "markPrice": "56.77",
+  "sequencer": 2264965607
+ },
+ "36": {
+  "marketDisplayName": "CRWV-USD",
+  "oraclePrice": "91.2",
+  "markPrice": "91.32",
+  "sequencer": 2264965607
+ },
+ "55": {
+  "marketDisplayName": "PUMP-USD",
+  "oraclePrice": "0.005937",
+  "markPrice": "0.005994",
+  "sequencer": 2264965606
+ },
+ "32": {
+  "marketDisplayName": "MSFT-USD",
+  "oraclePrice": "538.05",
+  "markPrice": "538.67",
+  "sequencer": 2264965607
+ },
+ "69": {
+  "marketDisplayName": "AI-USD",
+  "oraclePrice": "0.0008",
+  "markPrice": "0.0008",
+  "sequencer": 2264880856
+ },
+ "39": {
+  "marketDisplayName": "BE-USD",
+  "oraclePrice": "310.01",
+  "markPrice": "310.92",
+  "sequencer": 2264965607
+ },
+ "52": {
+  "marketDisplayName": "QNT-USD",
+  "oraclePrice": "51.7",
+  "markPrice": "51.59",
+  "sequencer": 2264965674
+ },
+ "14": {
+  "marketDisplayName": "GOOGL-USD",
+  "oraclePrice": "360.09",
+  "markPrice": "358.57",
+  "sequencer": 2264965607
+ },
+ "65": {
+  "marketDisplayName": "UNI-USD",
+  "oraclePrice": "8.88",
+  "markPrice": "8.963",
+  "sequencer": 2264965607
+ },
+ "7": {
+  "marketDisplayName": "DYDX-USD",
+  "oraclePrice": "0.1413",
+  "markPrice": "0.1427",
+  "sequencer": 2264965607
+ },
+ "4": {
+  "marketDisplayName": "DOGE-USD",
+  "oraclePrice": "0.09392",
+  "markPrice": "0.09471",
+  "sequencer": 2264965249
+ },
+ "43": {
+  "marketDisplayName": "COIN-USD",
+  "oraclePrice": "209.46",
+  "markPrice": "208.92",
+  "sequencer": 2264965607
+ },
+ "44": {
+  "marketDisplayName": "SKHY-USD",
+  "oraclePrice": "196.98",
+  "markPrice": "197.23",
+  "sequencer": 2264965607
+ },
+ "22": {
+  "marketDisplayName": "USO-USD",
+  "oraclePrice": "147.06",
+  "markPrice": "147.15",
+  "sequencer": 2264965607
+ },
+ "18": {
+  "marketDisplayName": "HOOD-USD",
+  "oraclePrice": "124.13",
+  "markPrice": "124.46",
+  "sequencer": 2264965607
+ },
+ "59": {
+  "marketDisplayName": "SUI-USD",
+  "oraclePrice": "1.163",
+  "markPrice": "1.174",
+  "sequencer": 2264965541
+ },
+ "47": {
+  "marketDisplayName": "MSTR-USD",
+  "oraclePrice": "164.43",
+  "markPrice": "163.79",
+  "sequencer": 2264965607
+ },
+ "41": {
+  "marketDisplayName": "LIT-USD",
+  "oraclePrice": "3.8616",
+  "markPrice": "3.8944",
+  "sequencer": 2264965607
+ },
+ "17": {
+  "marketDisplayName": "BABA-USD",
+  "oraclePrice": "113.93",
+  "markPrice": "114.23",
+  "sequencer": 2264965607
+ },
+ "2": {
+  "marketDisplayName": "ETH-USD",
+  "oraclePrice": "2673.19",
+  "markPrice": "2683.88",
+  "sequencer": 2264965249
+ },
+ "30": {
+  "marketDisplayName": "AAPL-USD",
+  "oraclePrice": "338.76",
+  "markPrice": "337.77",
+  "sequencer": 2264965653
+ },
+ "8": {
+  "marketDisplayName": "ZEC-USD",
+  "oraclePrice": "1423.696",
+  "markPrice": "1437.932",
+  "sequencer": 2264965415
+ },
+ "62": {
+  "marketDisplayName": "BNB-USD",
+  "oraclePrice": "761.1",
+  "markPrice": "768.7",
+  "sequencer": 2264965607
+ }
+}

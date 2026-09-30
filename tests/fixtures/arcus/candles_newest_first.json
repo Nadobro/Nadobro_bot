@@ -1,0 +1,69 @@
+{
+ "candles": [
+  {
+   "marketDisplayName": "BTC-USD",
+   "marketId": 1,
+   "timeframe": "1m",
+   "openTime": 1790000180000000,
+   "open": "84500.0",
+   "high": "84620.0",
+   "low": "84480.0",
+   "close": "84610.0",
+   "volume": "0.012",
+   "takerBuyVolume": "0.006",
+   "notionalVolume": "1014.2",
+   "takerBuyNotionalVolume": "507.1",
+   "tradeCount": 7,
+   "isFinal": false
+  },
+  {
+   "marketDisplayName": "BTC-USD",
+   "marketId": 1,
+   "timeframe": "1m",
+   "openTime": 1790000120000000,
+   "open": "84500.0",
+   "high": "84620.0",
+   "low": "84480.0",
+   "close": "84590.0",
+   "volume": "0.012",
+   "takerBuyVolume": "0.006",
+   "notionalVolume": "1014.2",
+   "takerBuyNotionalVolume": "507.1",
+   "tradeCount": 7,
+   "isFinal": true
+  },
+  {
+   "marketDisplayName": "BTC-USD",
+   "marketId": 1,
+   "timeframe": "1m",
+   "openTime": 1790000060000000,
+   "open": "84500.0",
+   "high": "84620.0",
+   "low": "84480.0",
+   "close": "84550.0",
+   "volume": "0.012",
+   "takerBuyVolume": "0.006",
+   "notionalVolume": "1014.2",
+   "takerBuyNotionalVolume": "507.1",
+   "tradeCount": 7,
+   "isFinal": true
+  },
+  {
+   "marketDisplayName": "BTC-USD",
+   "marketId": 1,
+   "timeframe": "1m",
+   "openTime": 1790000000000000,
+   "open": "84500.0",
+   "high": "84620.0",
+   "low": "84480.0",
+   "close": "84510.0",
+   "volume": "0.012",
+   "takerBuyVolume": "0.006",
+   "notionalVolume": "1014.2",
+   "takerBuyNotionalVolume": "507.1",
+   "tradeCount": 7,
+   "isFinal": true
+  }
+ ],
+ "total": 4
+}

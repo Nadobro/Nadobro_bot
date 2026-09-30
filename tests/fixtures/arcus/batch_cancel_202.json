@@ -1,0 +1,26 @@
+{
+ "responses": [
+  {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "clientId": "nb7ps_2s-2",
+   "marketId": 1,
+   "marketDisplayName": "BTC-USD",
+   "status": "CANCEL_ACKNOWLEDGED",
+   "updateTime": 1
+  },
+  {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "orderId": "00000000000000ff",
+   "marketId": 3,
+   "marketDisplayName": "SOL-USD",
+   "status": "CANCEL_ACKNOWLEDGED",
+   "updateTime": 1
+  }
+ ],
+ "rateLimit": {
+  "pool": "cancel",
+  "remaining": 39997
+ }
+}

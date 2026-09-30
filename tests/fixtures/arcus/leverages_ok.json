@@ -1,0 +1,13 @@
+{
+ "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+ "accountIndex": 0,
+ "leverages": [
+  {
+   "marketId": 1,
+   "marketDisplayName": "BTC-USD",
+   "leverage": 40,
+   "isolated": false,
+   "marginMode": "CROSS"
+  }
+ ]
+}

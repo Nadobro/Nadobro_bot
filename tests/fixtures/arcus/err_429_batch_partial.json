@@ -1,0 +1,9 @@
+{
+ "error": "rate limited",
+ "reason": "account_partial",
+ "retryAfterMs": 1200,
+ "clientIds": [
+  "nb7ps_2s-2",
+  ""
+ ]
+}

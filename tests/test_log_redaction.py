@@ -153,6 +153,55 @@ class LogRedactionTests(unittest.TestCase):
         self.assertFalse(filt.filter(skip))
         self.assertTrue(filt.filter(keep))
 
+    # --- E6 (Arcus P2): PEM blocks and prefixed/labelled secrets -------------
+
+    def test_e6_pem_block(self):
+        text = (
+            "key=-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8Q\n"
+            "-----END PRIVATE KEY----- tail"
+        )
+        redacted = redact_sensitive_text(text)
+        self.assertIn("<REDACTED_PEM>", redacted)
+        self.assertIn("tail", redacted)
+        self.assertNotIn("MC4CAQAwBQYDK2VwBCIE", redacted)
+
+    def test_e6_truncated_pem(self):
+        redacted = redact_sensitive_text("-----BEGIN PRIVATE KEY-----\nMC4CAQAw")
+        self.assertIn("<REDACTED_PEM>", redacted)
+        self.assertNotIn("MC4CAQAw", redacted)
+
+    def test_e6_labelled_secrets(self):
+        cases = (
+            ("api_secret=QUJDREVGR0hJSktMTU5PUA==", "api_secret", "QUJDREVGR0hJSktMTU5PUA"),
+            ('"signing_key": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"', "signing_key", "0f1e2d3c4b5a69788796a5b4c3d2e1f0"),
+            ("wallet_private_key: abcdefgh12345678", "wallet_private_key", "abcdefgh12345678"),
+            ("ARCUS_PROBE_SIGNING_KEY=zz11yy22xx33ww44", "ARCUS_PROBE_SIGNING_KEY", "zz11yy22xx33ww44"),
+            ("arcus_signing_seed=AbCdEfGh12", "arcus_signing_seed", "AbCdEfGh12"),
+            ("X-Signature: sig_abcdefgh12", "X-Signature", "sig_abcdefgh12"),
+        )
+        for text, label, value in cases:
+            redacted = redact_sensitive_text(text)
+            self.assertNotIn(value, redacted, text)
+            self.assertIn(label, redacted, text)
+            self.assertIn("<REDACTED>", redacted, text)
+
+    def test_e6_does_not_eat_neighbours(self):
+        for text in (
+            "secretary=bob12345678",
+            "signature_ok=True",
+            "user count=3 active=2",
+            "key_fingerprint=ab12cd34",
+            "signing_key_fingerprint=ab12cd34",
+        ):
+            self.assertEqual(redact_sensitive_text(text), text)
+
+    def test_e6_seed_and_pubkey_hex(self):
+        seed = bytes(range(32)).hex()
+        pub = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"
+        redacted = redact_sensitive_text(f"seed {seed} and api_key={pub}")
+        self.assertNotIn(seed, redacted)
+        self.assertNotIn(pub, redacted)
+
 
 if __name__ == "__main__":
     unittest.main()

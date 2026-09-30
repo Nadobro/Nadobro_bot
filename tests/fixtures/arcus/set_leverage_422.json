@@ -1,0 +1,9 @@
+{
+ "requestId": "7f1f6d1e-0000-4000-8000-000000000001",
+ "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+ "accountIndex": 0,
+ "marketId": 1,
+ "leverage": 10,
+ "status": "REJECTED",
+ "rejectReason": "HAS_OPEN_POSITION"
+}
