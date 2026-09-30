@@ -160,9 +160,19 @@ NATURAL_LANGUAGE_STRATEGY_PHRASES: tuple[StrategyPhrase, ...] = (
 )
 
 
+# Grid-family default session stop-loss, % of margin on live PnL net of fees
+# (the session SL/TP rail). Owner decision 2026-09-27: 5%. The old defaults
+# (grid 0.5%, dgrid/rgrid 0.8%) were smaller than one default level's normal
+# move — $0.50 against a $2,000 level at $100 x 40 — so the rail fired on noise
+# and its taker flatten was the largest single cost in the real-tape baselines
+# (grid 100x40: $600 of −$1,113 over 30 days). A default only reaches users who
+# never saved a value; an explicit user SL is never overridden.
+GRID_FAMILY_DEFAULT_SL_PCT = 5.0
+
 SETTINGS_STRATEGY_DEFAULTS: Mapping[str, dict] = {
     "grid": {
-        "notional_usd": 75.0, "spread_bp": 4.0, "interval_seconds": 45, "tp_pct": 0.6, "sl_pct": 0.5,
+        "notional_usd": 75.0, "spread_bp": 4.0, "interval_seconds": 45, "tp_pct": 0.6,
+        "sl_pct": GRID_FAMILY_DEFAULT_SL_PCT,
         "levels": 2, "threshold_bp": 0.0, "close_offset_bp": 24.0,
         "reference_mode": "ema_fast",
         "ema_fast_alpha": 0.45,
@@ -181,7 +191,8 @@ SETTINGS_STRATEGY_DEFAULTS: Mapping[str, dict] = {
     },
     "rgrid": {
         "notional_usd": 100.0, "spread_bp": 10.0, "rgrid_spread_bp": 10.0, "interval_seconds": 60,
-        "tp_pct": 1.2, "sl_pct": 0.8, "rgrid_stop_loss_pct": 0.8, "rgrid_take_profit_pct": 1.2,
+        "tp_pct": 1.2, "sl_pct": GRID_FAMILY_DEFAULT_SL_PCT,
+        "rgrid_stop_loss_pct": GRID_FAMILY_DEFAULT_SL_PCT, "rgrid_take_profit_pct": 1.2,
         "levels": 4, "rgrid_discretion": 0.06,
         "rgrid_reset_threshold_pct": 0.2, "rgrid_reset_timeout_seconds": 120,
         # Legacy keys kept for one migration cycle.
@@ -189,7 +200,7 @@ SETTINGS_STRATEGY_DEFAULTS: Mapping[str, dict] = {
     },
     "dgrid": {
         "notional_usd": 100.0, "cycle_notional_usd": 100.0, "spread_bp": 8.0,
-        "interval_seconds": 30, "tp_pct": 1.2, "sl_pct": 0.8, "levels": 4,
+        "interval_seconds": 30, "tp_pct": 1.2, "sl_pct": GRID_FAMILY_DEFAULT_SL_PCT, "levels": 4,
         "dgrid_trend_on_variance_ratio": 1.25,
         "dgrid_range_on_variance_ratio": 1.15,
         "dgrid_spread_bp": 8.0,
@@ -197,7 +208,7 @@ SETTINGS_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "dgrid_max_spread_bp": 50.0,
         "dgrid_short_window_points": 4,
         "dgrid_long_window_points": 12,
-        "rgrid_stop_loss_pct": 0.8,
+        "rgrid_stop_loss_pct": GRID_FAMILY_DEFAULT_SL_PCT,
         "rgrid_take_profit_pct": 1.2,
         "rgrid_discretion": 0.06,
         "grid_reset_threshold_pct": 0.2,
@@ -305,6 +316,9 @@ RUNTIME_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "cycle_notional_usd": 400.0,
         "spread_bp": 4.0,
         "interval_seconds": 45,
+        # Without this the session state fell back to bot_runtime._default_state's
+        # generic 0.5% whenever a path skipped the settings merge.
+        "sl_pct": GRID_FAMILY_DEFAULT_SL_PCT,
         "threshold_bp": 12.0,
         "close_offset_bp": 24.0,
     },
@@ -314,7 +328,7 @@ RUNTIME_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "rgrid_spread_bp": 10.0,
         "interval_seconds": 60,
         "levels": 4,
-        "rgrid_stop_loss_pct": 0.8,
+        "rgrid_stop_loss_pct": GRID_FAMILY_DEFAULT_SL_PCT,
         "rgrid_take_profit_pct": 1.2,
         "rgrid_discretion": 0.06,
         "rgrid_reset_threshold_pct": 0.2,
@@ -330,7 +344,7 @@ RUNTIME_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "interval_seconds": 30,
         "levels": 4,
         "tp_pct": 1.2,
-        "sl_pct": 0.8,
+        "sl_pct": GRID_FAMILY_DEFAULT_SL_PCT,
         "dgrid_trend_on_variance_ratio": 1.25,
         "dgrid_range_on_variance_ratio": 1.15,
         "dgrid_spread_bp": 8.0,
@@ -338,7 +352,7 @@ RUNTIME_STRATEGY_DEFAULTS: Mapping[str, dict] = {
         "dgrid_max_spread_bp": 50.0,
         "dgrid_short_window_points": 4,
         "dgrid_long_window_points": 12,
-        "rgrid_stop_loss_pct": 0.8,
+        "rgrid_stop_loss_pct": GRID_FAMILY_DEFAULT_SL_PCT,
         "rgrid_take_profit_pct": 1.2,
         "rgrid_discretion": 0.06,
         "grid_reset_threshold_pct": 0.2,

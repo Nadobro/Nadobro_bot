@@ -1531,6 +1531,18 @@ def _mm_cycle_budget_preflight(
     return ok, collateral_budget, required_min, min_order_notional, max_q, margin_per
 
 
+def _default_sl_pct(strategy: str) -> float:
+    """The strategy's own registry default session SL (% of margin) — the card's
+    fallback when a conf lacks the key, so a card never shows a different default
+    than the engine starts with (grid family 5%, Mid 0.5%)."""
+    from src.nadobro.strategy.strategy_registry import SETTINGS_STRATEGY_DEFAULTS
+
+    try:
+        return float(SETTINGS_STRATEGY_DEFAULTS.get(str(strategy or "").lower(), {}).get("sl_pct", 0.5))
+    except (TypeError, ValueError):
+        return 0.5
+
+
 def _fmt_strategy_config_text(strategy: str, conf: dict, network: str) -> str:
     if strategy == "vol":
         tp_pct = float(conf.get("tp_pct", 1.0))
@@ -1552,7 +1564,7 @@ def _fmt_strategy_config_text(strategy: str, conf: dict, network: str) -> str:
         spread_bp = float(conf.get("rgrid_spread_bp", conf.get("grid_spread_bp", spread_bp)))
     interval_seconds = int(conf.get("interval_seconds", 60))
     tp_pct = float(conf.get("tp_pct", 1.0))
-    sl_pct = float(conf.get("sl_pct", 0.5))
+    sl_pct = float(conf.get("sl_pct", _default_sl_pct(strategy)))
     base = (
         f"⚙️ *{escape_md(strategy.upper())}*\n\n"
         f"Mode: *{escape_md(network.upper())}*\n"
@@ -2189,7 +2201,7 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
     spread_bp = float(conf.get("spread_bp", 5.0))
     interval_seconds = int(conf.get("interval_seconds", 60))
     tp_pct = float(conf.get("tp_pct", 1.0))
-    sl_pct = float(conf.get("sl_pct", 0.5))
+    sl_pct = float(conf.get("sl_pct", _default_sl_pct(strategy)))
 
     if strategy == "grid":
         # Fill-anchored Grid reads NONE of threshold_bp / close_offset_bp /
@@ -2285,9 +2297,12 @@ def _strategy_config_section_text(strategy: str, conf: dict, network: str, secti
                 "to exit, so the size per rung is capped so a full pyramid reaching its "
                 "own stop, fees included, fits inside that budget"
                 + (
-                    "\\. " if _room.get("pyramid_fits", True) else
+                    # The caveat is only true when the rung really is floored at
+                    # the venue minimum; otherwise the cap does fit the budget.
                     " — except when the rung is already at the venue minimum \\(see "
                     "below\\)\\. "
+                    if (not _room.get("pyramid_fits", True) and _room.get("floored"))
+                    else "\\. "
                 )
                 + "The per\\-position stop and trail live on the Exits tab\\."
                 f"{_rgrid_step_cap_note(conf, _sl_val)}"
@@ -3289,7 +3304,7 @@ def _build_strategy_preview_text(
         spread_bp = float(conf.get("rgrid_spread_bp", conf.get("grid_spread_bp", spread_bp)))
     interval_seconds = int(conf.get("interval_seconds", 60))
     tp_pct = float(conf.get("tp_pct", 1.0))
-    sl_pct = float(conf.get("sl_pct", 0.5))
+    sl_pct = float(conf.get("sl_pct", _default_sl_pct(strategy_id)))
     available_margin = 0.0
     mid = 0.0
     funding_rate = 0.0
@@ -3517,7 +3532,7 @@ def _build_strategy_preview_text(
         range_on = float(conf.get("dgrid_range_on_variance_ratio", 1.15))
         min_spread = float(conf.get("dgrid_min_spread_bp", 2.0))
         max_spread = float(conf.get("dgrid_max_spread_bp", 50.0))
-        _dg_sl = float(conf.get("rgrid_stop_loss_pct", conf.get("sl_pct", 0.8)) or 0.0)
+        _dg_sl = float(conf.get("rgrid_stop_loss_pct", conf.get("sl_pct", _default_sl_pct("dgrid"))) or 0.0)
         _dg_spread_key = "rgrid_spread_bp" if float(conf.get("rgrid_spread_bp", 0) or 0) > 0 else "dgrid_spread_bp"
         _dg_plan = rgrid_trigger_plan(conf, _dg_sl, spread_key=_dg_spread_key)
         _dg_trend_lbl = (

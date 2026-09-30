@@ -134,15 +134,47 @@ def test_liq_guard_blocks_loose_and_disarmed_high_lev_but_not_tight():
 
 
 def test_liq_guard_leaves_default_configs_untouched():
-    """Regression: default grid/rgrid/dgrid/mid ship an armed session stop
-    (0.5–0.8% of margin). At pair-max leverage that must stay safe, or enabling
-    per-asset leverage would block every default strategy start."""
+    """Regression: default grid/rgrid/dgrid ship an armed 5% session stop
+    (GRID_FAMILY_DEFAULT_SL_PCT) and Mid 0.5%. At pair-max leverage that must stay
+    safe, or enabling per-asset leverage would block every default strategy start."""
     from src.nadobro.quant.liquidation import fallback_mmf, liquidation_safety
+    from src.nadobro.strategy.strategy_registry import (
+        GRID_FAMILY_DEFAULT_SL_PCT,
+        SETTINGS_STRATEGY_DEFAULTS,
+    )
 
-    for max_lev, default_sl in ((50, 0.5), (40, 0.8), (20, 0.8)):
-        mmf = fallback_mmf(1 / max_lev)
-        v = liquidation_safety(leverage=max_lev, mmf=mmf, sl_pct=default_sl, sl_armed=True)
-        assert v.ok, (max_lev, default_sl, v.reason)
+    defaults = {GRID_FAMILY_DEFAULT_SL_PCT, float(SETTINGS_STRATEGY_DEFAULTS["mid"]["sl_pct"])}
+    for max_lev in (50, 40, 20):
+        for default_sl in sorted(defaults):
+            mmf = fallback_mmf(1 / max_lev)
+            v = liquidation_safety(leverage=max_lev, mmf=mmf, sl_pct=default_sl, sl_armed=True)
+            assert v.ok, (max_lev, default_sl, v.reason)
+
+
+def test_grid_family_default_session_sl_is_five_percent():
+    """GRIDFAM-2026-09-27-DEFAULT-SL-5: a user who never set an SL gets exactly
+    GRID_FAMILY_DEFAULT_SL_PCT (5%) on grid, rgrid and dgrid through the same
+    composition start_user_bot uses (_default_state ∪ runtime ∪ settings defaults);
+    Mid keeps its own 0.5%."""
+    from src.nadobro.strategy.bot_runtime import _default_state
+    from src.nadobro.strategy.strategy_registry import (
+        GRID_FAMILY_DEFAULT_SL_PCT,
+        RUNTIME_STRATEGY_DEFAULTS,
+        SETTINGS_STRATEGY_DEFAULTS,
+        effective_sl_tp_pct,
+    )
+
+    assert GRID_FAMILY_DEFAULT_SL_PCT == 5.0
+    for sid in ("grid", "rgrid", "dgrid"):
+        state = _default_state()
+        state.update(RUNTIME_STRATEGY_DEFAULTS.get(sid, {}))
+        state.update(SETTINGS_STRATEGY_DEFAULTS[sid])
+        sl, _tp = effective_sl_tp_pct(sid, state)
+        assert sl == GRID_FAMILY_DEFAULT_SL_PCT, (sid, sl)
+    mid = _default_state()
+    mid.update(RUNTIME_STRATEGY_DEFAULTS.get("mid", {}))
+    mid.update(SETTINGS_STRATEGY_DEFAULTS["mid"])
+    assert effective_sl_tp_pct("mid", mid)[0] == 0.5
 
 
 def test_grid_does_not_set_fill_blind_limit_price_stop():
