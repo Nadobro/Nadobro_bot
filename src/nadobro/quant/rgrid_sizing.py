@@ -396,7 +396,10 @@ class TriggerLadderPlan:
         """A full pyramid stopped out at the ladder's own stop stays inside the
         session stop budget (always True when the stop is disarmed)."""
         budget = self.sizing.stop_budget_usd
-        return budget <= 0 or self.pyramid_stop_cost <= budget
+        # Tolerance: a rung sized exactly to the budget lands a few 1e-27 over it
+        # after Decimal rounding (5.000...002 vs 5.00 at the 5% default) and
+        # would read "does not fit".
+        return budget <= 0 or self.pyramid_stop_cost <= budget + Decimal("0.000001")
 
     @property
     def levels_capped(self) -> bool:

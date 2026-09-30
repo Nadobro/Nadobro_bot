@@ -3,6 +3,7 @@ from datetime import datetime
 
 from src.nadobro.models.database import get_bot_state_raw, set_bot_state
 from src.nadobro.strategy.strategy_registry import (
+    GRID_FAMILY_DEFAULT_SL_PCT,
     MARKET_MAKING_STRATEGIES,
     normalize_strategy_id,
     settings_strategy_defaults,
@@ -10,6 +11,42 @@ from src.nadobro.strategy.strategy_registry import (
 from src.nadobro.users.user_service import get_user
 
 SETTINGS_PREFIX = "user_settings:"
+
+# One-time, owner-approved (2026-09-27) migration of the grid-family default
+# session stop-loss to GRID_FAMILY_DEFAULT_SL_PCT. Saved settings are persisted
+# WITH the merged defaults, so a user who ever edited any setting carries the OLD
+# default (grid 0.5%, rgrid/dgrid 0.8%) and it is indistinguishable from a
+# choice; the owner decided those values move to the new default. Any other
+# value (a custom SL) is kept. The marker makes it apply exactly once per
+# settings key: a user who picks 0.5% again after the migration keeps it.
+GRID_FAMILY_SL_MIGRATION = "grid_family_sl_5pct_2026_09"
+_OLD_GRID_FAMILY_SL_DEFAULTS: dict[str, dict[str, float]] = {
+    "grid": {"sl_pct": 0.5},
+    "rgrid": {"sl_pct": 0.8, "rgrid_stop_loss_pct": 0.8},
+    "dgrid": {"sl_pct": 0.8, "rgrid_stop_loss_pct": 0.8},
+}
+
+
+def _migrate_grid_family_sl_default(strategies: dict) -> bool:
+    """Replace a stored grid-family SL that exactly equals its OLD default with
+    GRID_FAMILY_DEFAULT_SL_PCT, key by key. Returns True if anything changed.
+    Pure (in-memory); the caller records the marker and the next save persists."""
+    changed = False
+    if not isinstance(strategies, dict):
+        return False
+    for sid, old_keys in _OLD_GRID_FAMILY_SL_DEFAULTS.items():
+        cfg = strategies.get(sid)
+        if not isinstance(cfg, dict):
+            continue
+        for key, old_val in old_keys.items():
+            try:
+                current = float(cfg.get(key))
+            except (TypeError, ValueError):
+                continue
+            if abs(current - old_val) < 1e-9:
+                cfg[key] = GRID_FAMILY_DEFAULT_SL_PCT
+                changed = True
+    return changed
 
 
 def _settings_key(telegram_id: int, network: str) -> str:
@@ -26,6 +63,9 @@ def _default_settings() -> dict:
         "slippage": 1.0,
         "risk_profile": "balanced",
         "strategies": _default_strategy_settings(),
+        # A brand-new blob already carries the new defaults, so it is born
+        # migrated — otherwise a later explicit 0.5% would be "migrated" away.
+        "migrations": [GRID_FAMILY_SL_MIGRATION],
     }
 
 
@@ -89,6 +129,17 @@ def get_user_settings(telegram_id: int) -> tuple[str, dict]:
                         if sid in loaded_strats and isinstance(loaded_strats[sid], dict):
                             base.update(loaded_strats[sid])
                     settings["strategies"] = default_strats
+                # Judge the marker from the LOADED blob (the defaults dict above
+                # carries it for new users and would otherwise mask an old blob).
+                # Until the user's next save persists the marker, every load
+                # re-applies the same in-memory upgrade — idempotent, and no
+                # post-migration explicit choice can exist without that save.
+                loaded_migrations = loaded.get("migrations")
+                loaded_migrations = list(loaded_migrations) if isinstance(loaded_migrations, list) else []
+                if GRID_FAMILY_SL_MIGRATION not in loaded_migrations:
+                    _migrate_grid_family_sl_default(settings.get("strategies"))
+                    loaded_migrations.append(GRID_FAMILY_SL_MIGRATION)
+                settings["migrations"] = loaded_migrations
         except Exception:
             pass
     return network, settings
