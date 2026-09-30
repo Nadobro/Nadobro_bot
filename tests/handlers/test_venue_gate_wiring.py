@@ -4,6 +4,9 @@ tests: it exits without ENCRYPTION_KEY), plus the new i18n strings.
 * group order: private-chat (-3) < language (-2) < venue gate (-1) < handlers (0);
 * ``register_venue_handlers`` runs after every Nado CommandHandler and BEFORE
   the catch-all CallbackQueryHandler (PTB runs the first match per group);
+* every Nado group-0 handler is wrapped by ``serialized = serialized_for(
+  venue_gate)`` — the venue re-check inside the per-user lock when the gate is
+  registered, plain ``with_user_serialized`` when it is not;
 * the decision is made once at boot, off the loop, after init_db, and the
   default is "not registered" (production byte-identical);
 * the command menu is unchanged in Phase 1 (no /venue entry);
@@ -77,13 +80,47 @@ def test_venue_handlers_register_before_the_catch_all_and_after_the_commands():
     adds = _add_handler_calls(setup)
     catch_all = [c for c in adds if ast.unparse(c.args[0]).startswith("CallbackQueryHandler(")]
     assert len(catch_all) == 1
-    # The catch-all itself is unchanged.
+    # The catch-all: ack outside the lock, the venue re-check inside it.
     assert ast.unparse(catch_all[0].args[0]) == (
-        "CallbackQueryHandler(with_callback_ack(with_user_serialized(handle_callback)))"
+        "CallbackQueryHandler(with_callback_ack(serialized(handle_callback)))"
     )
     commands = [c for c in adds if ast.unparse(c.args[0]).startswith("CommandHandler(")]
     assert commands and all(c.lineno < reg[0].lineno for c in commands)
     assert reg[0].lineno < catch_all[0].lineno
+
+
+def test_every_nado_group0_handler_gets_the_in_lock_venue_recheck():
+    # BC1-TOCTOU: an update the gate passed at arrival can queue behind a venue
+    # switch; every Nado handler re-checks under the lock. None may bypass it.
+    setup = _fn("setup_bot")
+    src = ast.unparse(setup)
+    assert "with_user_serialized" not in src  # only through serialized_for
+    assign = [n for n in ast.walk(setup) if isinstance(n, ast.Assign)
+              and ast.unparse(n) == "serialized = serialized_for(venue_gate)"]
+    assert len(assign) == 1
+    group0 = [c for c in _add_handler_calls(setup) if _group(c) == 0]
+    assert group0 and all(c.lineno > assign[0].lineno for c in group0)
+    wrapped = {}
+    for call in group0:
+        handler = call.args[0]
+        assert isinstance(handler, ast.Call) and handler.func.id in (
+            "CommandHandler", "CallbackQueryHandler", "MessageHandler"), ast.unparse(handler)
+        callback = handler.args[-1]
+        if handler.func.id == "CallbackQueryHandler":
+            assert ast.unparse(callback.func) == "with_callback_ack"
+            callback = callback.args[0]
+        assert ast.unparse(callback.func) == "serialized", ast.unparse(handler)
+        wrapped[ast.unparse(callback.args[0])] = handler.func.id
+    assert wrapped["handle_callback"] == "CallbackQueryHandler"
+    assert wrapped["handle_message"] == "MessageHandler"
+    assert sum(kind == "CommandHandler" for kind in wrapped.values()) == 16
+
+
+def test_serialized_for_matches_the_gate_registration():
+    from src.nadobro.handlers import update_serialization as us
+
+    assert vg.serialized_for(False) is us.with_user_serialized  # flag off: byte-identical
+    assert vg.serialized_for(True) is not us.with_user_serialized
 
 
 def test_setup_bot_defaults_to_no_gate():

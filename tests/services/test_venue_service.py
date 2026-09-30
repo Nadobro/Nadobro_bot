@@ -274,6 +274,86 @@ def test_set_active_venue_accepts_str_id(monkeypatch, rec):
 
 
 # ---------------------------------------------------------------------------
+# get_active_venue_fresh (the switch paths) + last_known_venue (the gate's
+# unreadable-venue fallback)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def seen(monkeypatch):
+    s: set[int] = set()
+    monkeypatch.setattr(vs, "_last_seen_arcus", s)
+    return s
+
+
+def test_get_active_venue_fresh_drops_the_cached_row_before_reading(monkeypatch):
+    order = []
+    monkeypatch.setattr(vs, "invalidate_user_cache", lambda uid=None: order.append(("invalidate", uid)))
+    monkeypatch.setattr(vs, "get_user", lambda uid: order.append(("read", uid)) or SimpleNamespace(active_venue="arcus"))
+    assert vs.get_active_venue_fresh(str(_UID)) == "arcus"
+    assert order == [("invalidate", _UID), ("read", _UID)]
+
+
+@pytest.mark.parametrize("bad_uid", [0, -5, "0"])
+def test_get_active_venue_fresh_rejects_non_positive_ids(monkeypatch, bad_uid):
+    # invalidate_user_cache(0) would wipe EVERY user's cache entry.
+    monkeypatch.setattr(vs, "invalidate_user_cache", lambda uid=None: pytest.fail("no invalidate"))
+    with pytest.raises(ValueError, match="invalid telegram_id"):
+        vs.get_active_venue_fresh(bad_uid)
+
+
+def test_get_active_venue_fresh_db_error_propagates(monkeypatch):
+    monkeypatch.setattr(vs, "invalidate_user_cache", lambda uid=None: None)
+    _patch_user(monkeypatch, RuntimeError("db down"))
+    with pytest.raises(RuntimeError, match="db down"):
+        vs.get_active_venue_fresh(_UID)
+
+
+def test_last_known_venue_is_nado_for_a_user_never_seen(seen, monkeypatch):
+    monkeypatch.setattr(vs, "get_user", lambda *a: pytest.fail("last_known_venue does no IO"))
+    monkeypatch.setattr(vs, "_get_cached_user", lambda *a: pytest.fail("last_known_venue does no IO"))
+    assert vs.last_known_venue(_UID) == "nado"
+
+
+def test_last_known_venue_follows_every_successful_read(seen, monkeypatch):
+    _patch_user(monkeypatch, SimpleNamespace(active_venue="arcus"))
+    vs.get_active_venue(_UID)
+    assert vs.last_known_venue(str(_UID)) == "arcus"
+    _patch_user(monkeypatch, SimpleNamespace(active_venue="nado"))
+    vs.get_active_venue(_UID)
+    assert vs.last_known_venue(_UID) == "nado"
+    monkeypatch.setattr(vs, "_get_cached_user", lambda uid: SimpleNamespace(active_venue="arcus"))
+    vs.peek_active_venue(_UID)
+    assert vs.last_known_venue(_UID) == "arcus"
+    monkeypatch.setattr(vs, "_get_cached_user", lambda uid: None)
+    assert vs.peek_active_venue(_UID) is None  # a miss teaches nothing
+    assert vs.last_known_venue(_UID) == "arcus"
+    _patch_user(monkeypatch, None)  # no row -> nado
+    vs.get_active_venue(_UID)
+    assert vs.last_known_venue(_UID) == "nado"
+
+
+def test_a_failed_read_keeps_the_last_known_venue(seen, monkeypatch):
+    seen.add(_UID)
+    _patch_user(monkeypatch, RuntimeError("db down"))
+    with pytest.raises(RuntimeError):
+        vs.get_active_venue(_UID)
+    assert vs.last_known_venue(_UID) == "arcus"
+
+
+def test_last_known_venue_follows_a_switch_but_not_a_cas_miss(seen, monkeypatch, rec):
+    _allow(monkeypatch)
+    rec.returning = {"active_venue": "arcus"}
+    assert vs.set_active_venue(_UID, "arcus") == "switched"
+    assert vs.last_known_venue(_UID) == "arcus"
+    rec.returning = None
+    assert vs.set_active_venue(_UID, "nado") == "unchanged"
+    assert vs.last_known_venue(_UID) == "arcus"  # a miss proves nothing
+    rec.returning = {"active_venue": "nado"}
+    assert vs.set_active_venue(_UID, "nado") == "switched"
+    assert vs.last_known_venue(_UID) == "nado"
+
+
+# ---------------------------------------------------------------------------
 # count_users_on_venue
 # ---------------------------------------------------------------------------
 

@@ -7,7 +7,8 @@ starts or resumes anything on either venue. It also touches no Nado cache
 on its own whatever the selection.
 
 Every function is SYNC and may hit Postgres. Call it from a coroutine through
-``core.async_utils.run_blocking_db``.
+``core.async_utils.run_blocking_db`` — except ``peek_active_venue`` and
+``last_known_venue``, which never do IO.
 """
 from __future__ import annotations
 
@@ -24,6 +25,28 @@ logger = logging.getLogger(__name__)
 
 SwitchOutcome = Literal["switched", "unchanged", "not_allowed"]
 
+# The users this PROCESS last saw on the Arcus view (a successful venue read or
+# a switch). Consulted ONLY when the venue cannot be read, so a DB blip fails
+# closed for a user known to be on Arcus and changes nothing for anyone else.
+# Bounded by the Arcus cohort; set.add / discard / ``in`` are atomic under the
+# GIL, so the loop and the DB worker threads may share it without a lock.
+_last_seen_arcus: set[int] = set()
+
+
+def _note_venue(uid: int, venue: str) -> None:
+    if venue == VENUE_ARCUS:
+        _last_seen_arcus.add(uid)
+    else:
+        _last_seen_arcus.discard(uid)
+
+
+def last_known_venue(telegram_id: int) -> str:
+    """The venue this process last saw for the user: 'arcus' only when it was
+    last seen on the Arcus view, else 'nado' (including a user never seen since
+    boot). No IO. For the unreadable-venue fallback only — never a substitute
+    for a real read."""
+    return VENUE_ARCUS if int(telegram_id) in _last_seen_arcus else VENUE_NADO
+
 
 def _require_venue(venue: object) -> str:
     """Exact match only: 'ARCUS', 'arcus_mainnet', '' and None are all refused."""
@@ -37,10 +60,23 @@ def get_active_venue(telegram_id: int) -> str:
     including a user with no row yet. Served from get_user's 10 s cache, which
     the language middleware has already warmed for the current update. A DB
     error PROPAGATES: an unreadable venue is not 'nado' (DENIED != EMPTY)."""
-    user = get_user(int(telegram_id))
-    if user is None:
-        return VENUE_NADO
-    return VENUE_ARCUS if getattr(user, "active_venue", None) == VENUE_ARCUS else VENUE_NADO
+    uid = int(telegram_id)
+    user = get_user(uid)
+    venue = VENUE_ARCUS if user is not None and getattr(user, "active_venue", None) == VENUE_ARCUS else VENUE_NADO
+    _note_venue(uid, venue)
+    return venue
+
+
+def get_active_venue_fresh(telegram_id: int) -> str:
+    """``get_active_venue`` from Postgres, never from the cache: the switch
+    paths decide on this (a cached row may predate a switch). Raises on a DB
+    error."""
+    uid = int(telegram_id)
+    if uid <= 0:
+        # invalidate_user_cache(0) would clear EVERY user's entry.
+        raise ValueError(f"invalid telegram_id: {telegram_id!r}")
+    invalidate_user_cache(uid)
+    return get_active_venue(uid)
 
 
 def peek_active_venue(telegram_id: int) -> str | None:
@@ -50,10 +86,13 @@ def peek_active_venue(telegram_id: int) -> str | None:
     runs on every update, right after the language middleware warmed this
     cache for the same update). A miss means "unknown", never 'nado': the
     caller falls back to ``get_active_venue`` through ``run_blocking_db``."""
-    user = _get_cached_user(int(telegram_id))
+    uid = int(telegram_id)
+    user = _get_cached_user(uid)
     if user is None:
         return None
-    return VENUE_ARCUS if getattr(user, "active_venue", None) == VENUE_ARCUS else VENUE_NADO
+    venue = VENUE_ARCUS if getattr(user, "active_venue", None) == VENUE_ARCUS else VENUE_NADO
+    _note_venue(uid, venue)
+    return venue
 
 
 def set_active_venue(telegram_id: int, venue: str) -> SwitchOutcome:
@@ -89,6 +128,7 @@ def set_active_venue(telegram_id: int, venue: str) -> SwitchOutcome:
         invalidate_user_cache(uid)
     if not row:
         return "unchanged"
+    _note_venue(uid, venue)
     record_audit_event(uid, "venue_switched", f"{previous}->{venue}")  # never raises
     logger.info("venue_switch telegram_id=%s %s->%s", uid, previous, venue)
     return "switched"

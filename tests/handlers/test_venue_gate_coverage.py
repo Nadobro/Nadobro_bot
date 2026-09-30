@@ -164,17 +164,65 @@ def test_venue_handler_keyboards_are_classified():
         "venue:view": NEUTRAL, "venue:set:nado": NEUTRAL, "venue:set:arcus": NEUTRAL,
         "ax:home": ARCUS_ONLY, "ax:help": ARCUS_ONLY,
         "nav:main": DISPATCH, "settings:language_menu": NEUTRAL,
+        # the Nado stop entries on the Arcus home
+        "portfolio:close_all_confirm": NEVER_GATE, "portfolio:cancel_all_confirm": NEVER_GATE,
+        "desk:view": NEVER_GATE,
     }
     seen = set()
     for kb in (
-        vh.venue_card_kb("nado"), vh.venue_card_kb("arcus"), vh.arcus_home_kb(), vh.arcus_help_kb(),
-        vh.arcus_settings_kb(), vh.arcus_unavailable_kb(), vh.arcus_free_text_kb(),
+        vh.venue_card_kb("nado"), vh.venue_card_kb("arcus"), vh.arcus_home_kb(), vh.arcus_home_kb([], True),
+        vh.arcus_help_kb(), vh.arcus_settings_kb(), vh.arcus_unavailable_kb(), vh.arcus_free_text_kb(),
     ):
         for row in kb.inline_keyboard:
             for btn in row:
                 seen.add(btn.callback_data)
                 assert _cls(btn.callback_data) == expected[btn.callback_data], btn.callback_data
     assert seen == set(expected)
+
+
+def _buttons(kb):
+    return [b.callback_data for row in kb.inline_keyboard for b in row]
+
+
+def test_every_live_nado_automation_on_the_arcus_banner_has_a_stop_entry_from_the_arcus_view():
+    """BC1-STOP-ENTRY-UNREACHABLE: NEVER_GATE only helps if the Arcus view can
+    REACH the stop. Each automation the Arcus home lists maps to a NEVER_GATE
+    command, or to a NEVER_GATE button the home shows while it is listed."""
+    from src.nadobro.handlers import venue_handler as vh
+
+    by_command = {
+        vh.TEXT_ITEM_STRATEGY: "stop_all",   # stop_all_automation_for_user: strategy loops...
+        vh.TEXT_ITEM_COPY: "stop_all",       # ...and copy mirrors
+        vh.TEXT_ITEM_MANAGED_AI: "agent_off",
+    }
+    by_button = {vh.TEXT_ITEM_DESK: "desk:view"}  # /stop_all does NOT stop desk plans
+    for key, name in by_command.items():
+        assert classify_command(name) == (NEVER_GATE, None), name
+    for key, data in by_button.items():
+        assert data in _buttons(vh.arcus_home_kb([(key, {"n": "1"})])), key
+        assert _cls(data) == NEVER_GATE
+    assert classify_command("desk") == (NEVER_GATE, None)
+    # Close / cancel: shown whenever the banner is, each a confirm screen first.
+    for items, failed in (([(vh.TEXT_ITEM_COPY, {"n": "1"})], False), ([], True)):
+        buttons = _buttons(vh.arcus_home_kb(items, failed))
+        assert {"portfolio:close_all_confirm", "portfolio:cancel_all_confirm"} <= set(buttons)
+    # Nothing listed: the placeholder home stays [Venue] [Help].
+    assert _buttons(vh.arcus_home_kb()) == ["venue:view", "ax:help"]
+
+
+def test_the_stop_entry_screens_only_lead_to_stops_or_views():
+    """The desk list's only actions are Stop + Refresh (so it can be NEVER_GATE);
+    each confirm screen's Yes is NEVER_GATE and its way back is a DISPATCH view."""
+    from src.nadobro.handlers.desk_handler import _desk_view_kb
+    from src.nadobro.handlers.orders_view import render_cancel_all_confirm
+    from src.nadobro.handlers.portfolio_deck import render_close_all_confirm
+
+    plan = type("Plan", (), {"plan_id": "0123456789abcdef", "product": "BTC", "algo": "twap"})()
+    for data in _buttons(_desk_view_kb([{"plan": plan}])):
+        assert _cls(data) == NEVER_GATE, data
+    for render in (render_close_all_confirm, render_cancel_all_confirm):
+        classes = sorted(_cls(d) for d in _buttons(render()[1]))
+        assert classes == sorted([NEVER_GATE, DISPATCH]), (render.__name__, classes)
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +347,7 @@ ACTIONS = {
         "stop": {"copy:stop:3": NEVER_GATE},
     },
     ("desk_handler.py", "handle_desk_callback"): {
-        "view": {"desk:view": NADO_ONLY},
+        "view": {"desk:view": NEVER_GATE},  # the read-only list: the only entry to desk:stop
         "confirm": {"desk:confirm:0123456789abcdef": NADO_ONLY},
         "discard": {"desk:discard:0123456789abcdef": NEVER_GATE},
         "stop": {"desk:stop:0123456789abcdef": NEVER_GATE},
@@ -400,7 +448,7 @@ def test_registered_commands_match_the_table():
 
 
 def test_command_classes_are_pinned():
-    assert {n for n, (c, _) in vc.COMMANDS.items() if c == NEVER_GATE} == {"stop_all", "revoke", "agent_off"}
+    assert {n for n, (c, _) in vc.COMMANDS.items() if c == NEVER_GATE} == {"stop_all", "revoke", "agent_off", "desk"}
     assert {n for n, (c, _) in vc.COMMANDS.items() if c == NEUTRAL} == {"help", "ops", "venue"}
     assert {n: t for n, (c, t) in vc.COMMANDS.items() if c == DISPATCH} == {
         "start": AX_HOME, "status": AX_HOME, "mm_status": AX_UNAVAILABLE, "mm_fills": AX_UNAVAILABLE,
@@ -440,7 +488,7 @@ def test_never_gate_set_is_pinned():
         "portfolio:close_all_confirm", "portfolio:close_all_yes", "portfolio:cancel_all_confirm",
         "portfolio:cancel_all_yes", "wallet:revoke_steps", "wallet:revoke_confirm",
         "wallet:remove_active", "cancel_trade", "points:cancel", "vault:watch:off", "howl:dismiss",
-        "trade:close", "trade:close_all",
+        "trade:close", "trade:close_all", "desk:view",
     })
     assert [p.pattern for p in vc.NEVER_GATE_PATTERNS] == [
         r"^copy:stop:\d+$",

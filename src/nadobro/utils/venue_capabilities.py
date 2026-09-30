@@ -5,8 +5,10 @@ screens a user SEES. The venue gate (``handlers/venue_gate.py``) uses this table
 to decide, per update, what a user on the Arcus view may reach:
 
 * ``NEVER_GATE`` — reduces/cancels Nado exposure or state (stop, close, cancel,
-  remove). Always passes, whatever the venue: the owner rule is that every Nado
-  stop path stays reachable from the Arcus view.
+  remove), plus the read-only desk list (``desk:view`` / ``/desk``), the only
+  entry to ``desk:stop`` (/stop_all does not stop desk plans). Always passes,
+  whatever the venue: the owner rule is that every Nado stop path stays
+  reachable from the Arcus view.
 * ``NEUTRAL`` — venue-agnostic (``/venue``, help, language, onboarding language
   and terms). Always passes.
 * ``DISPATCH`` — a view. Nado users get today's Nado screen; Arcus users get the
@@ -94,6 +96,8 @@ NEVER_GATE_EXACT: frozenset[str] = frozenset({
     "howl:dismiss",                  # callbacks._handle_howl: drop pending HOWL suggestions
     "trade:close",                   # callbacks._handle_trade: close picker (no emitter today)
     "trade:close_all",               # callbacks._handle_trade: close-all confirm (no emitter today)
+    "desk:view",                     # desk_handler: the read-only desk list — its ONLY actions are
+                                     # desk:stop:<id> and this refresh (desk:confirm stays NADO_ONLY)
 })
 NEVER_GATE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(re.compile(p) for p in (
     r"^copy:stop:\d+$",                               # copy_handler: stop a mirror
@@ -199,7 +203,7 @@ COMMANDS: dict[str, tuple[str, str | None]] = {
     "airdrop": (NADO_ONLY, None),
     "mm_status": (DISPATCH, AX_UNAVAILABLE),
     "mm_fills": (DISPATCH, AX_UNAVAILABLE),
-    "desk": (NADO_ONLY, None),
+    "desk": (NEVER_GATE, None),              # the read-only desk list (entry to desk:stop), as desk:view
     "venue": (NEUTRAL, None),
 }
 

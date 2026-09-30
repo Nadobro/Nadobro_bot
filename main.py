@@ -220,10 +220,8 @@ def setup_bot(venue_gate: bool = False):
     from src.nadobro.handlers.brief_commands import cmd_market_news, cmd_morning_brief, cmd_night_howl
     from src.nadobro.handlers.messages import handle_message
     from src.nadobro.handlers.callbacks import handle_callback
-    from src.nadobro.handlers.update_serialization import (
-        with_callback_ack,
-        with_user_serialized,
-    )
+    from src.nadobro.handlers.update_serialization import with_callback_ack
+    from src.nadobro.handlers.venue_gate import register_venue_handlers, serialized_for
 
     async def _private_chat_only(update: Update, context):
         chat = update.effective_chat
@@ -318,41 +316,45 @@ def setup_bot(venue_gate: bool = False):
     app.add_handler(TypeHandler(Update, _private_chat_only), group=-3)
     app.add_handler(TypeHandler(Update, _language_middleware), group=-2)
 
-    app.add_handler(CommandHandler("start", with_user_serialized(cmd_start)))
-    app.add_handler(CommandHandler("help", with_user_serialized(cmd_help)))
-    app.add_handler(CommandHandler("status", with_user_serialized(cmd_status)))
-    app.add_handler(CommandHandler("ops", with_user_serialized(cmd_ops)))
-    app.add_handler(CommandHandler("stop_all", with_user_serialized(cmd_stop_all)))
-    app.add_handler(CommandHandler("revoke", with_user_serialized(cmd_revoke)))
-    app.add_handler(CommandHandler("agent_on", with_user_serialized(cmd_agent_on)))
-    app.add_handler(CommandHandler("agent_off", with_user_serialized(cmd_agent_off)))
-    app.add_handler(CommandHandler("agent_status", with_user_serialized(cmd_agent_status)))
-    app.add_handler(CommandHandler("brief", with_user_serialized(cmd_morning_brief)))
-    app.add_handler(CommandHandler("howl", with_user_serialized(cmd_night_howl)))
-    app.add_handler(CommandHandler("news", with_user_serialized(cmd_market_news)))
-    app.add_handler(CommandHandler("airdrop", with_user_serialized(cmd_airdrop)))
+    # Every group-0 handler runs under the per-user lock. With the Arcus venue
+    # gate registered, ``serialized`` also re-checks the venue INSIDE that lock
+    # (an update the gate passed can queue behind a venue switch); without it,
+    # ``serialized`` IS ``with_user_serialized`` — routing exactly as before.
+    serialized = serialized_for(venue_gate)
+
+    app.add_handler(CommandHandler("start", serialized(cmd_start)))
+    app.add_handler(CommandHandler("help", serialized(cmd_help)))
+    app.add_handler(CommandHandler("status", serialized(cmd_status)))
+    app.add_handler(CommandHandler("ops", serialized(cmd_ops)))
+    app.add_handler(CommandHandler("stop_all", serialized(cmd_stop_all)))
+    app.add_handler(CommandHandler("revoke", serialized(cmd_revoke)))
+    app.add_handler(CommandHandler("agent_on", serialized(cmd_agent_on)))
+    app.add_handler(CommandHandler("agent_off", serialized(cmd_agent_off)))
+    app.add_handler(CommandHandler("agent_status", serialized(cmd_agent_status)))
+    app.add_handler(CommandHandler("brief", serialized(cmd_morning_brief)))
+    app.add_handler(CommandHandler("howl", serialized(cmd_night_howl)))
+    app.add_handler(CommandHandler("news", serialized(cmd_market_news)))
+    app.add_handler(CommandHandler("airdrop", serialized(cmd_airdrop)))
     # Phase 3: Tread-style live MM dashboard.
-    app.add_handler(CommandHandler("mm_status", with_user_serialized(cmd_mm_status)))
-    app.add_handler(CommandHandler("mm_fills", with_user_serialized(cmd_mm_fills)))
+    app.add_handler(CommandHandler("mm_status", serialized(cmd_mm_status)))
+    app.add_handler(CommandHandler("mm_fills", serialized(cmd_mm_fills)))
     # Desk text-to-trade plan list (TWAP / triggers / exits / spot).
     from src.nadobro.handlers.desk_handler import cmd_desk
 
-    app.add_handler(CommandHandler("desk", with_user_serialized(cmd_desk)))
+    app.add_handler(CommandHandler("desk", serialized(cmd_desk)))
 
     # Arcus P1 (flag off by default): the per-venue gate (its own group, -1),
     # /venue and the venue:/ax: callbacks. Added ONLY when ARCUS_ENABLED is on or
     # a user is already on the Arcus view; otherwise nothing is registered and
     # every update routes exactly as before. Must come BEFORE the catch-all
     # CallbackQueryHandler below: PTB runs the first matching handler per group.
-    from src.nadobro.handlers.venue_gate import register_venue_handlers
-
     register_venue_handlers(app, enabled=venue_gate)
 
     # ``with_callback_ack`` sits OUTSIDE the serialization wrapper on purpose: the
     # button spinner is cleared before we queue behind this user's previous
     # action, so a tap feels instant even when the prior handler is still working.
-    app.add_handler(CallbackQueryHandler(with_callback_ack(with_user_serialized(handle_callback))))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, with_user_serialized(handle_message)))
+    app.add_handler(CallbackQueryHandler(with_callback_ack(serialized(handle_callback))))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, serialized(handle_message)))
     app.add_error_handler(_error_handler)
 
     logger.info("Bot handlers registered (pure bot mode, language middleware active)")

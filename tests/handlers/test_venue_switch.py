@@ -80,6 +80,8 @@ class Row:
         self.cleared: list[str] = []
         self.fail_cas = False
         self.fail_read = False
+        # A cached row that predates a switch (served until invalidated).
+        self.stale: str | None = None
         us._user_locks.clear()
 
         def user(_uid):
@@ -87,8 +89,12 @@ class Row:
                 raise RuntimeError("db down")
             if not self.exists:
                 return None
-            return SimpleNamespace(active_venue=self.venue, network_mode=NetworkMode(self.network),
+            venue_ = self.stale if self.stale is not None else self.venue
+            return SimpleNamespace(active_venue=venue_, network_mode=NetworkMode(self.network),
                                    arcus_network_mode="testnet", language="en")
+
+        def invalidate(_uid=None):
+            self.stale = None
 
         def cas(sql, params):
             self.cas_calls.append(params)
@@ -107,7 +113,7 @@ class Row:
         monkeypatch.setattr(venue_service, "get_user", user)
         monkeypatch.setattr(venue_service, "_get_cached_user", lambda _uid: None)
         monkeypatch.setattr(venue_service, "execute_returning", cas)
-        monkeypatch.setattr(venue_service, "invalidate_user_cache", lambda _uid=None: None)
+        monkeypatch.setattr(venue_service, "invalidate_user_cache", invalidate)
         monkeypatch.setattr(venue_service, "record_audit_event", lambda *a, **k: None)
         monkeypatch.setattr(vh, "get_user", user)
         monkeypatch.setattr(vh, "run_blocking_db", rb)
@@ -288,7 +294,8 @@ def test_switch_back_to_nado_renders_exactly_todays_nado_home(monkeypatch, nado_
 def test_nado_to_nado_just_renders_the_nado_home(monkeypatch, nado_home):
     row = Row(monkeypatch, venue="nado")
     q = tap("venue:set:nado")
-    assert row.cas_calls == []
+    assert row.cas_calls == [("nado", UID, "arcus")]  # always attempted; a no-op here
+    assert row.venue == "nado" and row.cleared == []
     assert q.answers == [(None, False)]
     direct = FakeQuery("nav:main")
     run(callbacks._show_dashboard(direct, UID))
@@ -319,6 +326,47 @@ def test_failed_switch_back_refuses_and_keeps_the_arcus_view(monkeypatch, nado_h
     q = tap("venue:set:nado")
     assert q.answers == [(vh.TEXT_SWITCH_FAILED, True)]
     assert row.venue == "arcus" and q.edits == []
+
+
+def test_switch_back_with_an_unreadable_venue_after_a_cas_miss_refuses(monkeypatch, nado_home):
+    row = Row(monkeypatch, venue="nado")
+    row.fail_read = True
+    q = tap("venue:set:nado")
+    assert q.answers == [(vh.TEXT_SWITCH_FAILED, True)] and q.edits == []
+
+
+# ---------------------------------------------------------------------------
+# a cached row that predates a switch never decides one (BC1-STALE-CACHE / BC2-1)
+# ---------------------------------------------------------------------------
+
+def test_switch_to_nado_writes_even_when_the_cached_venue_says_nado(monkeypatch, nado_home):
+    row = Row(monkeypatch, venue="arcus")
+    row.stale = "nado"  # the row says arcus; a pre-switch read re-cached 'nado'
+    context = ctx(pending_trade={"x": 1})
+    q = tap("venue:set:nado", context)
+    assert row.venue == "nado"
+    assert row.cas_calls == [("nado", UID, "arcus")]
+    assert q.answers == [(vh.TEXT_SWITCHED_TO_NADO, False)]
+    assert context.user_data == {} and row.cleared  # a real switch: pending flows dropped
+
+
+def test_switch_to_arcus_reads_fresh_when_the_cached_venue_says_arcus(monkeypatch):
+    row = Row(monkeypatch, venue="nado")
+    row.stale = "arcus"
+    _allow(monkeypatch)
+    q = tap("venue:set:arcus")
+    assert row.venue == "arcus"
+    assert row.cas_calls == [("arcus", UID, "nado")]
+    assert q.answers == [(vh.TEXT_SWITCHED_TO_ARCUS, False)]
+
+
+def test_switch_back_when_the_cache_says_arcus_but_the_row_is_nado(monkeypatch, nado_home):
+    row = Row(monkeypatch, venue="nado")
+    row.stale = "arcus"
+    q = tap("venue:set:nado")
+    assert row.venue == "nado" and row.cleared == []
+    assert q.answers == [(None, False)]  # nothing flipped: no toast, still the Nado home
+    assert len(q.edits) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +626,34 @@ def test_an_unreadable_source_is_never_reported_as_nothing_running(banner_source
 def test_banner_escapes_dynamic_values():
     text = vh.arcus_home_text("testnet", [(vh.TEXT_ITEM_STRATEGY, {"strategy": "<b>X&Y</b>", "network": "M"})], False)
     assert "&lt;b&gt;X&amp;Y&lt;/b&gt;" in text and "<b>X&Y</b>" not in text
+
+
+def _home_buttons(monkeypatch, snapshot):
+    Row(monkeypatch, venue="arcus")
+    monkeypatch.setattr(vh, "nado_automation_snapshot", lambda _uid: snapshot)
+    q = tap("ax:home")
+    [(_text, kw)] = q.edits
+    return [b.callback_data for r in kw["reply_markup"].inline_keyboard for b in r]
+
+
+_STOP_ENTRIES = ["portfolio:close_all_confirm", "portfolio:cancel_all_confirm"]
+
+
+@pytest.mark.parametrize("snapshot,expected", [
+    (("testnet", [], False), []),
+    (("testnet", [(vh.TEXT_ITEM_COPY, {"n": "1"})], False), _STOP_ENTRIES),
+    (("testnet", [(vh.TEXT_ITEM_DESK, {"n": "2"})], False), _STOP_ENTRIES + ["desk:view"]),
+    (("testnet", [], True), _STOP_ENTRIES + ["desk:view"]),  # could not check: offer them all
+])
+def test_arcus_home_offers_the_nado_stop_entries_while_the_banner_shows(monkeypatch, snapshot, expected):
+    # BC1-STOP-ENTRY-UNREACHABLE: /stop_all does not stop desk plans, close
+    # positions or cancel orders — the home carries those entries, all NEVER_GATE.
+    from src.nadobro.utils.venue_capabilities import NEVER_GATE, classify_callback
+
+    buttons = _home_buttons(monkeypatch, snapshot)
+    assert buttons == ["venue:view", "ax:help"] + expected
+    for data in expected:
+        assert classify_callback(data)[0] == NEVER_GATE, data
 
 
 def test_home_render_failure_degrades_to_could_not_check(monkeypatch):

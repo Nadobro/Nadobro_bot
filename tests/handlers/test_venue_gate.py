@@ -93,10 +93,12 @@ def edited(text):
 
 
 class World:
-    """Patched gate collaborators: the venue, the renderer, last_active."""
+    """Patched gate collaborators: the venue, the renderer, last_active, and the
+    venue this process last saw for the user (the unreadable-venue fallback)."""
 
-    def __init__(self, monkeypatch, venue):
+    def __init__(self, monkeypatch, venue, last_known=NADO):
         self.venue = venue
+        self.last_known = last_known
         self.venue_reads = 0
         self.rendered: list[tuple[str, str]] = []  # (target, "query"|"message")
         self.touched = 0
@@ -121,6 +123,7 @@ class World:
             return fn(*a, **k)
 
         monkeypatch.setattr(vg, "read_active_venue", read)
+        monkeypatch.setattr(vg, "last_known_venue", lambda uid: self.last_known)
         monkeypatch.setattr(vg, "render_arcus_target", render)
         monkeypatch.setattr(vg, "get_or_create_user", touch)
         monkeypatch.setattr(vg, "run_blocking_db", rb)
@@ -224,7 +227,8 @@ def test_nado_user_messages_pass(monkeypatch, factory):
 
 @pytest.mark.parametrize("factory", [lambda d=d: cb(d) for d in NEVER_GATE_SAMPLES + NEUTRAL_SAMPLES]
                          + [lambda: cmd("/stop_all"), lambda: cmd("/agent_off"), lambda: cmd("/revoke"),
-                            lambda: cmd("/venue"), lambda: cmd("/help"), lambda: cmd("/ops")])
+                            lambda: cmd("/desk"), lambda: cmd("/venue"), lambda: cmd("/help"),
+                            lambda: cmd("/ops")])
 def test_never_gate_and_neutral_pass_without_reading_the_venue(monkeypatch, factory):
     world = World(monkeypatch, AssertionError("venue must not be read"))
     update = factory()
@@ -307,7 +311,7 @@ def test_arcus_user_dispatch_commands_reply_with_the_arcus_screen(monkeypatch, t
     assert world.touched == 1  # last_active still refreshed, as /start would
 
 
-@pytest.mark.parametrize("text", ["/desk", "/brief", "/howl", "/news", "/airdrop", "/agent_on",
+@pytest.mark.parametrize("text", ["/brief", "/howl", "/news", "/airdrop", "/agent_on",
                                   "/agent_status", "/nonexistent"])
 def test_arcus_user_nado_only_commands_are_denied(monkeypatch, text):
     world = World(monkeypatch, ARCUS)
@@ -317,7 +321,7 @@ def test_arcus_user_nado_only_commands_are_denied(monkeypatch, text):
     assert world.rendered == []
 
 
-@pytest.mark.parametrize("text", ["/stop_all", "/agent_off", "/revoke", "/venue", "/help", "/ops"])
+@pytest.mark.parametrize("text", ["/stop_all", "/agent_off", "/revoke", "/desk", "/venue", "/help", "/ops"])
 def test_arcus_user_stop_and_neutral_commands_pass(monkeypatch, text):
     world = World(monkeypatch, ARCUS)
     update = cmd(text)
@@ -396,6 +400,8 @@ def test_arcus_non_text_and_edited_messages_stop_silently(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_unreadable_venue_is_treated_as_nado(monkeypatch, caplog):
+    # Never seen on the Arcus view by this process -> Nado view (a DB blip must
+    # not take the bot down for every Nado user).
     World(monkeypatch, RuntimeError("db down"))
     with caplog.at_level(logging.WARNING):
         assert run(cb("strategy:start:grid:BTC")) is True
@@ -404,6 +410,26 @@ def test_unreadable_venue_is_treated_as_nado(monkeypatch, caplog):
         assert run(denied) is False  # ax:* stays denied
     assert denied.callback_query.answers == [(vh.TEXT_ARCUS_BUTTON_ON_NADO, True)]
     assert "treating as nado" in caplog.text
+
+
+def test_unreadable_venue_keeps_a_known_arcus_user_gated(monkeypatch, caplog):
+    # BC1-UNREADABLE-FAILOPEN: last seen on Arcus + an unreadable venue = still
+    # the Arcus view (fail-closed), never a pass into the Nado handlers.
+    world = World(monkeypatch, RuntimeError("db down"), last_known=ARCUS)
+    with caplog.at_level(logging.WARNING):
+        denied = cb("strategy:start:grid:BTC")
+        assert run(denied) is False
+        text = txt("long BTC 10x")
+        assert run(text) is False  # never reaches handle_message (trade parser / relay / LLM)
+        assert run(cmd("/brief")) is False
+        assert run(edited("long BTC 10x")) is False
+        view = cb("nav:main")
+        assert run(view) is False
+        assert run(cb("strategy:stop")) is True  # stop paths still pass
+    assert denied.callback_query.answers == [(vh.TEXT_DENIED_ON_ARCUS, True)]
+    assert text.message.replies[0][0] == vh.TEXT_ARCUS_FREE_TEXT_HINT
+    assert world.rendered == [(vc.AX_HOME, "query")]
+    assert "treating as arcus (last known)" in caplog.text
 
 
 async def _render_fails(*_a, **_k):
@@ -544,3 +570,169 @@ def test_register_adds_gate_venue_command_and_callbacks(monkeypatch):
     assert command.command == "venue"
     assert callback.pattern == r"^(?:venue|ax):"
     assert vg.VENUE_GATE_GROUP == -1
+
+
+# ---------------------------------------------------------------------------
+# the re-check INSIDE the per-user lock (BC1-TOCTOU)
+# ---------------------------------------------------------------------------
+
+async def _deliver(update, group0):
+    """One update through PTB's groups: the gate at -1 (it checks at ARRIVAL),
+    then — if it passed — the group-0 handler, which waits for the user's lock."""
+    try:
+        await vg.venue_gate(update, SimpleNamespace(user_data={}))
+    except ApplicationHandlerStop:
+        return
+    await group0(update, SimpleNamespace(user_data={}))
+
+
+def _behind_a_switch(monkeypatch, update, *, start=NADO, to=ARCUS, wrap=None):
+    """A slow handler holds the user's lock, a venue switch queues next, then
+    ``update`` arrives: the gate reads ``start`` and passes it, and it waits for
+    the lock BEHIND the switch. ``wrap`` is how main.setup_bot wraps the Nado
+    handler. Returns (world, [updates the Nado handler ran for])."""
+    world = World(monkeypatch, start)
+    # A double-take of the (non re-entrant) lock would fail fast, not hang.
+    monkeypatch.setattr(us, "_LOCK_WAIT_SECONDS", 2.0)
+    wrap = wrap or vg.serialized_for(True)
+    nado_ran = []
+
+    async def slow(update, context):
+        await asyncio.sleep(0.05)
+
+    async def switch(update, context):  # the venue:set:* handler's CAS
+        world.venue = to
+
+    async def nado(update, context):
+        nado_ran.append(update)
+
+    async def body():
+        tasks = [asyncio.create_task(_deliver(cb("status:refresh"), us.with_user_serialized(slow)))]
+        await asyncio.sleep(0.01)
+        tasks.append(asyncio.create_task(_deliver(cb("venue:set:" + to), us.with_user_serialized(switch))))
+        await asyncio.sleep(0.01)
+        tasks.append(asyncio.create_task(_deliver(update, wrap(nado))))
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(0)
+
+    asyncio.run(body())
+    return world, nado_ran
+
+
+def test_serialized_for_is_exactly_with_user_serialized_when_the_gate_is_off():
+    # Flag off: main.setup_bot wraps every handler exactly as before.
+    assert vg.serialized_for(False) is us.with_user_serialized
+
+
+@pytest.mark.parametrize("data", ["strategy:start:grid:BTC", "copy:resume:3", "howl:approve:0",
+                                  "vault:deposit", "garbage"])
+def test_a_nado_tap_queued_behind_a_switch_to_arcus_never_runs(monkeypatch, data):
+    update = cb(data)
+    world, nado_ran = _behind_a_switch(monkeypatch, update)
+    assert world.venue == ARCUS
+    assert nado_ran == []  # the Nado handler never ran for an Arcus-view user
+    assert update.callback_query.answers == [(vh.TEXT_DENIED_ON_ARCUS, True)]
+
+
+def test_free_text_queued_behind_a_switch_to_arcus_never_reaches_handle_message(monkeypatch):
+    update = txt("long BTC 10x")
+    _world, nado_ran = _behind_a_switch(monkeypatch, update)
+    assert nado_ran == []  # no trade parser, LOWIQPTS relay or LLM chat
+    assert update.message.replies[0][0] == vh.TEXT_ARCUS_FREE_TEXT_HINT
+
+
+def test_a_nado_command_queued_behind_a_switch_to_arcus_is_denied(monkeypatch):
+    update = cmd("/brief")
+    _world, nado_ran = _behind_a_switch(monkeypatch, update)
+    assert nado_ran == []
+    assert update.message.replies == [(vh.TEXT_DENIED_ON_ARCUS, {})]
+
+
+def test_an_edited_message_queued_behind_a_switch_stops_silently(monkeypatch):
+    update = edited("long BTC 10x")
+    _world, nado_ran = _behind_a_switch(monkeypatch, update)
+    assert nado_ran == [] and update.edited_message.replies == []
+
+
+@pytest.mark.parametrize("factory,target,kind", [
+    (lambda: cb("nav:main"), vc.AX_HOME, "query"),
+    (lambda: cb("portfolio:view"), vc.AX_UNAVAILABLE, "query"),
+    (lambda: cmd("/start"), vc.AX_HOME, "message"),
+])
+def test_a_view_queued_behind_a_switch_renders_the_arcus_screen(monkeypatch, factory, target, kind):
+    update = factory()
+    world, nado_ran = _behind_a_switch(monkeypatch, update)
+    assert nado_ran == []
+    assert world.rendered == [(target, kind)]
+
+
+@pytest.mark.parametrize("factory", [lambda: cb("strategy:stop"), lambda: cb("desk:stop:ab12"),
+                                     lambda: cmd("/stop_all"), lambda: cmd("/desk")])
+def test_a_stop_queued_behind_a_switch_to_arcus_still_runs(monkeypatch, factory):
+    update = factory()
+    _world, nado_ran = _behind_a_switch(monkeypatch, update)
+    assert nado_ran == [update]
+
+
+def test_the_recheck_passes_a_nado_user_through(monkeypatch):
+    update = cb("strategy:start:grid:BTC")
+    world, nado_ran = _behind_a_switch(monkeypatch, update, to=NADO)  # no venue change
+    assert nado_ran == [update] and world.rendered == []
+    assert update.callback_query.answers == []
+
+
+def test_the_recheck_behind_with_callback_ack_still_drops_the_tap(monkeypatch):
+    # Exactly main.setup_bot's catch-all: with_callback_ack(serialized(handle_callback)).
+    serialized = vg.serialized_for(True)
+    update = cb("strategy:start:grid:BTC")
+    _world, nado_ran = _behind_a_switch(monkeypatch, update, wrap=lambda h: us.with_callback_ack(serialized(h)))
+    assert nado_ran == []
+
+
+def test_the_recheck_reads_nothing_for_stop_and_neutral_updates(monkeypatch):
+    world = World(monkeypatch, AssertionError("venue must not be read"))
+    ran = []
+
+    async def nado(update, context):
+        ran.append(update)
+
+    for update in (cb("strategy:stop"), cb("points:cancel"), cmd("/stop_all"), cmd("/help")):
+        asyncio.run(vg.venue_recheck(nado)(update, SimpleNamespace(user_data={})))
+    assert len(ran) == 4 and world.venue_reads == 0
+
+
+def test_a_recheck_crash_after_reading_arcus_drops_the_update(monkeypatch):
+    World(monkeypatch, ARCUS)
+    monkeypatch.setattr(vg, "render_arcus_target", _render_fails)
+    ran = []
+
+    async def nado(update, context):
+        ran.append(update)
+
+    asyncio.run(vg.venue_recheck(nado)(cb("nav:main"), SimpleNamespace(user_data={})))
+    assert ran == []
+
+
+def test_a_recheck_crash_for_a_nado_user_runs_the_handler(monkeypatch):
+    World(monkeypatch, NADO)
+    monkeypatch.setattr(vg, "classify_callback", lambda _d: (_ for _ in ()).throw(RuntimeError("bug")))
+    ran = []
+
+    async def nado(update, context):
+        ran.append(update)
+
+    asyncio.run(vg.venue_recheck(nado)(cb("strategy:start:grid:BTC"), SimpleNamespace(user_data={})))
+    assert len(ran) == 1
+
+
+def test_the_recheck_uses_the_last_known_venue_when_unreadable(monkeypatch):
+    World(monkeypatch, RuntimeError("db down"), last_known=ARCUS)
+    ran = []
+
+    async def nado(update, context):
+        ran.append(update)
+
+    update = txt("long BTC 10x")
+    asyncio.run(vg.venue_recheck(nado)(update, SimpleNamespace(user_data={})))
+    assert ran == []
+    assert update.message.replies[0][0] == vh.TEXT_ARCUS_FREE_TEXT_HINT

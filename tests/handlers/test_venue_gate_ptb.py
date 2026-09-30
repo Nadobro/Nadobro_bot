@@ -13,6 +13,9 @@ What it proves, on the real dispatcher:
   Nado command handler, while a passed one does;
 * ``venue:`` / ``ax:`` callbacks are claimed by the venue handler, not the
   catch-all;
+* an update the gate passed at arrival that then queues behind a venue switch
+  (per-user lock) never runs its Nado handler — main.py's ``serialized_for``
+  re-check, on the real dispatcher;
 * with the gate NOT registered (flag off, nobody on Arcus) the groups are just
   -3/-2/0, the venue is never read and routing is exactly today's.
 """
@@ -77,11 +80,22 @@ async def venue_view(query, uid):
     events.append(["venue_view"])
 
 
+async def switch_to_arcus(query, context, uid):
+    STATE["venue"] = "arcus"
+    events.append(["switched"])
+
+
+async def slow(update, context):
+    await asyncio.sleep(0.2)
+    events.append(["slow"])
+
+
 venue_gate.read_active_venue = read
 venue_handler.read_active_venue = read
 venue_gate.render_arcus_target = render
 venue_handler.render_arcus_target = render
 venue_handler._venue_view = venue_view
+venue_handler._switch_to_arcus = switch_to_arcus
 venue_gate.get_or_create_user = lambda *a, **k: None
 
 
@@ -92,14 +106,17 @@ def rec(name):
 
 
 def build(enabled):
+    # main.setup_bot's layout, wrappers included (serialized_for).
+    serialized = venue_gate.serialized_for(enabled)
     app = Application.builder().token("424242:TEST-TOKEN").concurrent_updates(True).build()
     app.add_handler(TypeHandler(Update, rec("private")), group=-3)
     app.add_handler(TypeHandler(Update, rec("language")), group=-2)
-    for name in ("start", "stop_all", "desk"):
-        app.add_handler(CommandHandler(name, rec("cmd_" + name)))
+    for name in ("start", "stop_all", "desk", "brief"):
+        app.add_handler(CommandHandler(name, serialized(rec("cmd_" + name))))
+    app.add_handler(CommandHandler("slow", serialized(slow)))
     venue_gate.register_venue_handlers(app, enabled=enabled)
-    app.add_handler(CallbackQueryHandler(rec("handle_callback")))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, rec("handle_message")))
+    app.add_handler(CallbackQueryHandler(serialized(rec("handle_callback"))))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, serialized(rec("handle_message"))))
     return app
 
 
@@ -144,6 +161,7 @@ CASES = [
     ["arcus", "msg", "/start"],
     ["arcus", "msg", "/stop_all"],
     ["arcus", "msg", "/desk"],
+    ["arcus", "msg", "/brief"],
     ["arcus", "edited", "long BTC 10x"],
 ]
 
@@ -168,11 +186,34 @@ async def run(enabled):
     return out
 
 
+async def race():
+    # A slow Nado handler holds the user's lock; venue:set:arcus queues next;
+    # then a Nado tap and free text arrive while the row still says 'nado'.
+    app = build(True)
+    await app.initialize()
+    STATE["venue"] = "nado"
+    events.clear()
+    tasks = [asyncio.create_task(app.process_update(msg_update(900, "/slow", app.bot)))]
+    await asyncio.sleep(0.03)
+    tasks.append(asyncio.create_task(app.process_update(cb_update(901, "venue:set:arcus", app.bot))))
+    await asyncio.sleep(0.03)
+    tasks.append(asyncio.create_task(app.process_update(cb_update(902, "strategy:start:grid:BTC", app.bot))))
+    tasks.append(asyncio.create_task(app.process_update(msg_update(903, "long BTC 10x", app.bot))))
+    tasks.append(asyncio.create_task(app.process_update(cb_update(904, "strategy:stop", app.bot))))
+    await asyncio.gather(*tasks)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    out = [e[:] for e in events]
+    await app.shutdown()
+    return out
+
+
 async def main():
     enabled = await run(True)
     STATE["reads"] = 0
     disabled = await run(False)
-    print("RESULT " + json.dumps({"enabled": enabled, "disabled": disabled}))
+    raced = await race()
+    print("RESULT " + json.dumps({"enabled": enabled, "disabled": disabled, "race": raced}))
 
 
 asyncio.run(main())
@@ -240,7 +281,8 @@ def test_real_ptb_routing_with_the_gate_registered():
     events = c["arcus|msg|/start"]
     assert ["render", "ax:home", "message"] in events and "cmd_start" not in _names(events)
     assert _names(c["arcus|msg|/stop_all"]) == pre + ["cmd_stop_all"]
-    assert c["arcus|msg|/desk"] == [["private"], ["language"], ["reply", TEXT_DENIED_ON_ARCUS]]
+    assert _names(c["arcus|msg|/desk"]) == pre + ["cmd_desk"]  # the desk list: entry to desk:stop
+    assert c["arcus|msg|/brief"] == [["private"], ["language"], ["reply", TEXT_DENIED_ON_ARCUS]]
     assert c["arcus|edited|long BTC 10x"] == [["private"], ["language"]]
 
 
@@ -255,4 +297,22 @@ def test_real_ptb_routing_without_the_gate_is_todays():
     assert _names(c["arcus|cb|venue:view"]) == pre + ["handle_callback"]
     assert _names(c["arcus|msg|long BTC 10x"]) == pre + ["handle_message"]
     assert _names(c["arcus|msg|/desk"]) == pre + ["cmd_desk"]
+    assert _names(c["arcus|msg|/brief"]) == pre + ["cmd_brief"]
     assert _names(c["arcus|msg|/start"]) == pre + ["cmd_start"]
+
+
+def test_real_ptb_update_queued_behind_a_switch_never_runs_a_nado_handler():
+    from src.nadobro.handlers.venue_handler import TEXT_ARCUS_FREE_TEXT_HINT, TEXT_DENIED_ON_ARCUS
+
+    events = _result()["race"]
+    names = _names(events)
+    assert "slow" in names and "switched" in names
+    assert names.index("slow") < names.index("switched")
+    after = events[names.index("switched") + 1:]
+    # Passed by the gate at arrival (row still 'nado'), then re-checked under the
+    # lock after the switch: no Nado handler runs, the user gets the Arcus replies.
+    assert "handle_message" not in _names(after)
+    assert ["answer", TEXT_DENIED_ON_ARCUS, True] in after
+    assert ["reply", TEXT_ARCUS_FREE_TEXT_HINT] in after
+    # The only Nado handler that ran after the switch is the queued STOP.
+    assert _names(after).count("handle_callback") == 1

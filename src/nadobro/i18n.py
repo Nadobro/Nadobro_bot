@@ -1132,6 +1132,28 @@ _LABELS = {
         "ru": "Arcus (бета)",
         "ko": "Arcus (베타)",
     },
+    # Nado stop entries on the Arcus home (each opens a Nado confirm screen / list).
+    "❌ Close Nado positions": {
+        "zh": "❌ 平掉 Nado 持仓",
+        "fr": "❌ Fermer les positions Nado",
+        "ar": "❌ إغلاق مراكز Nado",
+        "ru": "❌ Закрыть позиции Nado",
+        "ko": "❌ Nado 포지션 종료",
+    },
+    "🗑 Cancel Nado orders": {
+        "zh": "🗑 撤销 Nado 挂单",
+        "fr": "🗑 Annuler les ordres Nado",
+        "ar": "🗑 إلغاء أوامر Nado",
+        "ru": "🗑 Отменить ордера Nado",
+        "ko": "🗑 Nado 주문 취소",
+    },
+    "🧾 Nado desk plans": {
+        "zh": "🧾 Nado Desk 计划",
+        "fr": "🧾 Plans Desk Nado",
+        "ar": "🧾 خطط Desk في Nado",
+        "ru": "🧾 Планы Desk Nado",
+        "ko": "🧾 Nado Desk 플랜",
+    },
 }
 
 

@@ -10,7 +10,10 @@ Nado testnet <-> mainnet is a different thing ("stop, then switch") and lives in
 
 Phase 1 is plumbing only: no Arcus client, no Arcus trading. The Arcus view is a
 placeholder home plus a banner listing what is still live on Nado — read from
-Postgres only, never a Nado client, because it sits on the tap path.
+Postgres only, never a Nado client, because it sits on the tap path. While that
+banner shows, the home also carries the Nado stop entries /stop_all and
+/agent_off do not cover (desk plans, positions, open orders); every one is
+NEVER_GATE, so it works from the Arcus view.
 
 A switch drops the pending Nado conversational flows (in-memory AND their
 persisted ``bot_state`` twins — a text-trade preview reloads from Postgres, so an
@@ -48,7 +51,12 @@ from src.nadobro.trading.text_trade_pending import (
 )
 from src.nadobro.users.onboarding_service import is_new_onboarding_complete
 from src.nadobro.users.user_service import get_user
-from src.nadobro.users.venue_service import get_active_venue, peek_active_venue, set_active_venue
+from src.nadobro.users.venue_service import (
+    get_active_venue,
+    get_active_venue_fresh,
+    peek_active_venue,
+    set_active_venue,
+)
 from src.nadobro.users.wallet_pending_flow import clear_wallet_pending_flow
 from src.nadobro.utils.venue_capabilities import AX_HELP, AX_HOME, AX_SETTINGS, AX_UNAVAILABLE
 from src.nadobro.utils.venue_scope import ARCUS_NETWORK_TESTNET, NADO_NETWORKS, VENUE_ARCUS, VENUE_NADO
@@ -63,6 +71,13 @@ CB_SET_ARCUS = "venue:set:arcus"
 VENUE_CALLBACK_PATTERN = r"^(?:venue|ax):"
 # ax:* screens reachable by callback (ax:unavailable is render-only).
 AX_CALLBACK_SCREENS = frozenset({AX_HOME, AX_HELP, AX_SETTINGS})
+# Nado stop entries on the Arcus home — all NEVER_GATE (they pass the gate on the
+# Arcus view). They cover what /stop_all (strategies + copy trades) and
+# /agent_off do not: the desk list (its only actions are Stop and Refresh) and
+# the close-all / cancel-all CONFIRM screens (nothing happens without a Yes).
+CB_NADO_DESK = "desk:view"
+CB_NADO_CLOSE_ALL = "portfolio:close_all_confirm"
+CB_NADO_CANCEL_ALL = "portfolio:cancel_all_confirm"
 
 # --- i18n keys (English source; every one has zh/fr/ar/ru/ko in i18n.py) ------
 # Callback alerts / toasts and plain-text replies (each <= 200 chars, every language).
@@ -126,6 +141,9 @@ LABEL_HELP = "❓ Help"
 LABEL_NADO = "Nado"
 LABEL_ARCUS = "Arcus (beta)"
 LABEL_LANGUAGE = "🌐 Language"
+LABEL_NADO_CLOSE = "❌ Close Nado positions"
+LABEL_NADO_CANCEL = "🗑 Cancel Nado orders"
+LABEL_NADO_DESK = "🧾 Nado desk plans"
 
 CALLBACK_ANSWER_TEXT_KEYS = (
     TEXT_DENIED_ON_ARCUS, TEXT_ARCUS_BUTTON_ON_NADO, TEXT_ARCUS_NOT_ALLOWED,
@@ -142,7 +160,9 @@ I18N_TEXT_KEYS = CALLBACK_ANSWER_TEXT_KEYS + (
     TEXT_HELP_TITLE, TEXT_HELP_BETA, TEXT_HELP_VENUE, TEXT_HELP_AUTOMATION,
     TEXT_SETTINGS_TITLE, TEXT_SETTINGS_BODY,
 )
-I18N_LABEL_KEYS = (LABEL_VENUE, LABEL_HELP, LABEL_NADO, LABEL_ARCUS)
+I18N_LABEL_KEYS = (
+    LABEL_VENUE, LABEL_HELP, LABEL_NADO, LABEL_ARCUS, LABEL_NADO_CLOSE, LABEL_NADO_CANCEL, LABEL_NADO_DESK,
+)
 
 
 # --- small helpers ------------------------------------------------------------
@@ -183,8 +203,18 @@ def venue_card_kb(current_venue: str) -> InlineKeyboardMarkup:
     ])
 
 
-def arcus_home_kb() -> InlineKeyboardMarkup:
-    return _markup([[(LABEL_VENUE, CB_VENUE_VIEW), (LABEL_HELP, AX_HELP)]])
+def arcus_home_kb(
+    items: list[tuple[str, dict[str, str]]] | None = None, failed: bool = False,
+) -> InlineKeyboardMarkup:
+    """[Venue] [Help]; while the banner shows (something live on Nado, or it
+    could not be checked) also the Nado stop entries — the desk list only when
+    desk plans were counted or the check failed."""
+    rows = [[(LABEL_VENUE, CB_VENUE_VIEW), (LABEL_HELP, AX_HELP)]]
+    if items or failed:
+        rows.append([(LABEL_NADO_CLOSE, CB_NADO_CLOSE_ALL), (LABEL_NADO_CANCEL, CB_NADO_CANCEL_ALL)])
+        if failed or any(key == TEXT_ITEM_DESK for key, _ in (items or ())):
+            rows.append([(LABEL_NADO_DESK, CB_NADO_DESK)])
+    return _markup(rows)
 
 
 def arcus_help_kb() -> InlineKeyboardMarkup:
@@ -386,7 +416,7 @@ async def build_arcus_screen(target: str, telegram_id: int) -> tuple[str, Inline
         except Exception:  # policy: degrade-ok(banner says it could not check — never "nothing running")
             logger.warning("arcus home: automation snapshot failed uid=%s", telegram_id)
             arcus_network, items, failed = ARCUS_NETWORK_TESTNET, [], True
-        return arcus_home_text(arcus_network, items, failed), arcus_home_kb()
+        return arcus_home_text(arcus_network, items, failed), arcus_home_kb(items, failed)
     if target == AX_HELP:
         return arcus_help_text(), arcus_help_kb()
     if target == AX_SETTINGS:
@@ -575,9 +605,10 @@ async def _refuse(query: Any, key: str) -> None:
 async def _switch_to_arcus(query: Any, context: CallbackContext, uid: int) -> None:
     """Nado -> Arcus view. Order: read, eligibility, onboarding, compare-and-set,
     clear pending Nado flows, toast, render ax:home. A refusal or a DB error
-    changes nothing and never renders the Arcus home (DENIED != EMPTY)."""
+    changes nothing and never renders the Arcus home (DENIED != EMPTY). The read
+    is FRESH: a cached row may predate a switch."""
     try:
-        current = await run_blocking_db(get_active_venue, uid)
+        current = await run_blocking_db(get_active_venue_fresh, uid)
     except Exception as exc:
         logger.warning("venue switch to arcus: venue unreadable uid=%s (%s)", uid, type(exc).__name__)
         await _refuse(query, TEXT_SWITCH_FAILED)
@@ -618,26 +649,25 @@ async def _switch_to_arcus(query: Any, context: CallbackContext, uid: int) -> No
 
 async def _switch_to_nado(query: Any, context: CallbackContext, uid: int) -> None:
     """Arcus -> Nado view. Never gated by the flag or the allowlist, so nobody
-    can be stranded on Arcus. Renders exactly today's Nado home."""
+    can be stranded on Arcus. Renders exactly today's Nado home.
+
+    The compare-and-set is ALWAYS attempted (a no-op on a row already on Nado):
+    deciding off a read first could skip it on a stale 'nado' while the row
+    still says Arcus. Only a flip clears the pending flows and toasts."""
     try:
-        current = await run_blocking_db(get_active_venue, uid)
+        outcome = await run_blocking_db(set_active_venue, uid, VENUE_NADO)
     except Exception as exc:
-        logger.warning("venue switch to nado: venue unreadable uid=%s (%s)", uid, type(exc).__name__)
+        logger.warning("venue switch to nado failed uid=%s (%s)", uid, type(exc).__name__)
         await _refuse(query, TEXT_SWITCH_FAILED)
         return
     toast = None
-    if current == VENUE_ARCUS:
-        try:
-            outcome = await run_blocking_db(set_active_venue, uid, VENUE_NADO)
-        except Exception as exc:
-            logger.warning("venue switch to nado failed uid=%s (%s)", uid, type(exc).__name__)
-            await _refuse(query, TEXT_SWITCH_FAILED)
-            return
-        if outcome != "switched" and await _venue_is(uid, VENUE_ARCUS, unreadable=True):
-            await _refuse(query, TEXT_SWITCH_FAILED)
-            return
+    if outcome == "switched":
         await clear_nado_pending_flows(context, uid)
         toast = tr(TEXT_SWITCHED_TO_NADO)
+    elif await _venue_is(uid, VENUE_ARCUS, unreadable=True):
+        # CAS miss with the row still on Arcus (or unreadable): nothing changed.
+        await _refuse(query, TEXT_SWITCH_FAILED)
+        return
     await _answer_self(query, toast)
     from src.nadobro.handlers.callbacks import _show_dashboard
 
@@ -646,10 +676,9 @@ async def _switch_to_nado(query: Any, context: CallbackContext, uid: int) -> Non
 
 
 async def _venue_is(uid: int, venue: str, *, unreadable: bool = False) -> bool:
-    """Fresh read after a CAS miss (the cache was just invalidated). An
-    unreadable venue answers ``unreadable``."""
+    """Fresh read after a CAS miss. An unreadable venue answers ``unreadable``."""
     try:
-        return (await run_blocking_db(get_active_venue, uid)) == venue
+        return (await run_blocking_db(get_active_venue_fresh, uid)) == venue
     except Exception as exc:
         logger.warning("venue re-read failed uid=%s (%s)", uid, type(exc).__name__)
         return unreadable

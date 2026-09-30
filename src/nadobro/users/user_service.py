@@ -36,6 +36,26 @@ _USER_CACHE_MAX_ENTRIES = 512
 # worker may be reading or writing — without a lock this races. (Audit
 # 2026-05.)
 _user_cache_lock = threading.RLock()
+# Invalidation epoch. ``get_user`` reads Postgres and THEN caches: without this,
+# a read whose SELECT ran before a write committed could store its pre-write row
+# AFTER that write's ``invalidate_user_cache`` and mask the write (a venue
+# switch, a language or wallet change) for up to _USER_CACHE_TTL. Every
+# invalidate bumps the epoch; a read captures it before its SELECT and skips
+# the cache write when it moved. Global, not per user: invalidations are rare
+# user actions, so the cost is at most an extra cache miss, and nothing grows.
+_user_cache_epoch = 0
+
+
+def _cache_epoch() -> int:
+    with _user_cache_lock:
+        return _user_cache_epoch
+
+
+def _cache_user_if_current(user: UserRow, epoch: int) -> None:
+    with _user_cache_lock:
+        if epoch != _user_cache_epoch:
+            return  # invalidated while this row was being read: it may predate that write
+        _cache_user(user)
 
 
 def _cache_user(user: UserRow):
@@ -62,7 +82,9 @@ def _get_cached_user(telegram_id: int) -> Optional[UserRow]:
 
 
 def invalidate_user_cache(telegram_id: Optional[int] = None):
+    global _user_cache_epoch
     with _user_cache_lock:
+        _user_cache_epoch += 1
         if telegram_id:
             _user_cache.pop(telegram_id, None)
         else:
@@ -72,6 +94,7 @@ def invalidate_user_cache(telegram_id: Optional[int] = None):
 def get_or_create_user(
     telegram_id: int, username: str = None, language_code: str | None = None
 ) -> tuple[UserRow, bool, Optional[str]]:
+    epoch = _cache_epoch()
     row = query_one("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
     if row:
         if username:
@@ -85,7 +108,7 @@ def get_or_create_user(
                 (datetime.now(timezone.utc).isoformat(), telegram_id),
             )
         user = UserRow(row)
-        _cache_user(user)
+        _cache_user_if_current(user, epoch)
         return user, False, None
 
     # Seed language from the Telegram client locale so a Korean device starts
@@ -99,7 +122,7 @@ def get_or_create_user(
     )
     row = query_one("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
     user = UserRow(row) if row else UserRow({"telegram_id": telegram_id, "network_mode": "mainnet"})
-    _cache_user(user)
+    _cache_user_if_current(user, epoch)
     return user, True, None
 
 
@@ -107,11 +130,12 @@ def get_user(telegram_id: int) -> Optional[UserRow]:
     cached = _get_cached_user(telegram_id)
     if cached:
         return cached
+    epoch = _cache_epoch()
     row = query_one("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
     if not row:
         return None
     user = UserRow(row)
-    _cache_user(user)
+    _cache_user_if_current(user, epoch)
     return user
 
 

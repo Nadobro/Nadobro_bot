@@ -2,15 +2,19 @@
 
 Nado and Arcus run IN PARALLEL; ``users.active_venue`` only picks which venue's
 screens the user sees, and this gate enforces that choice on every update
-BEFORE any group-0 handler runs. It never stops, cancels or resumes anything.
+BEFORE any group-0 handler runs — and again INSIDE the per-user lock, just
+before the group-0 handler itself (``venue_recheck``): an update passed at
+arrival can queue behind a venue switch. It never stops, cancels or resumes
+anything.
 
 Classification lives in ``utils/venue_capabilities.py``. Per update:
 
-* Nado-view users (and a venue that cannot be read — see below): everything
-  passes exactly as today, except ``ax:*`` buttons (denied with a hint).
+* Nado-view users: everything passes exactly as today, except ``ax:*``
+  buttons (denied with a hint).
 * Arcus-view users:
   - NEVER_GATE (every Nado stop / close / cancel / remove path, /stop_all,
-    /agent_off, /revoke) and NEUTRAL (/venue, help, language, terms) pass;
+    /agent_off, /revoke, the /desk list) and NEUTRAL (/venue, help, language,
+    terms) pass;
   - DISPATCH views render the Arcus target instead (ax:home, ax:settings or
     the "Not on Arcus yet" card), inside the per-user lock, then stop;
   - NADO_ONLY and UNKNOWN are denied with a localized hint (fail-closed);
@@ -25,20 +29,23 @@ never answers a callback query it lets through (group 0's ``with_callback_ack``
 and ``points:cancel``'s own alert are unchanged).
 
 Venue read: the in-process user cache (the language middleware warmed it for
-this very update), else Postgres off the loop. If it cannot be read the user is
-treated as Nado-view: in Phase 1 the gate only separates VIEWS and every Nado
-action is legitimate on the user's own account, so failing closed on a DB blip
-would take the whole bot down for everyone (revisit when Arcus trading lands).
-A crash AFTER the venue read as Arcus denies and stops — PTB hands a handler
-exception to the error handler and then carries on to the next group, so an
-unguarded crash would let the update through.
+this very update), else Postgres off the loop. If it cannot be read, the venue
+this process last saw for the user decides (``venue_service.last_known_venue``):
+a user known to be on the Arcus view stays gated (fail-closed), and only a user
+never seen there since boot is treated as Nado-view — failing closed for
+EVERYONE on a DB blip would take the whole bot down. A crash AFTER the venue
+read as Arcus denies and stops — PTB hands a handler exception to the error
+handler and then carries on to the next group, so an unguarded crash would let
+the update through.
 
 Wiring (``register_venue_handlers``, called from main.setup_bot): a TypeHandler
 in its OWN group, -1 — after the private-chat filter (-3) and the language
 middleware (-2), ahead of group 0 — plus ``/venue`` and the ``venue:``/``ax:``
-callbacks in group 0 ahead of the catch-all. Registered ONLY when ARCUS_ENABLED
-is on or a user is already on the Arcus view; otherwise nothing is added and
-every update routes byte-identically to before.
+callbacks in group 0 ahead of the catch-all; and ``serialized_for`` wraps every
+Nado group-0 handler with the in-lock re-check. Registered ONLY when
+ARCUS_ENABLED is on or a user is already on the Arcus view; otherwise nothing is
+added, ``serialized_for`` is plain ``with_user_serialized``, and every update
+routes byte-identically to before.
 """
 from __future__ import annotations
 
@@ -69,7 +76,7 @@ from src.nadobro.handlers.venue_handler import (
 )
 from src.nadobro.i18n import get_active_language, localize_markup, resolve_reply_button_text
 from src.nadobro.users.user_service import get_or_create_user
-from src.nadobro.users.venue_service import count_users_on_venue
+from src.nadobro.users.venue_service import count_users_on_venue, last_known_venue
 from src.nadobro.utils.venue_capabilities import (
     ARCUS_ONLY,
     COMMANDS,
@@ -117,13 +124,17 @@ def command_name(message: Any) -> str | None:
     return text[1:length].split("@", 1)[0].lower()
 
 
-async def _venue_or_nado(telegram_id: int, probe: _Probe) -> str:
+async def _venue_or_last_known(telegram_id: int, probe: _Probe | None = None) -> str:
     try:
         venue = await read_active_venue(telegram_id)
-    except Exception as exc:  # policy: degrade-ok(unreadable venue = Nado view; see module docstring)
-        logger.warning("venue gate: venue unreadable uid=%s (%s); treating as nado", telegram_id, type(exc).__name__)
-        venue = VENUE_NADO
-    probe.venue = venue
+    except Exception as exc:  # policy: degrade-ok(unreadable = last venue seen; never seen = Nado view; module docstring)
+        venue = last_known_venue(telegram_id)
+        logger.warning(
+            "venue gate: venue unreadable uid=%s (%s); treating as %s (last known)",
+            telegram_id, type(exc).__name__, venue,
+        )
+    if probe is not None:
+        probe.venue = venue
     return venue
 
 
@@ -142,7 +153,7 @@ def _render_callback(target: str) -> Handler:
         uid = int(update.effective_user.id)
         # Re-checked under the per-user lock: a tap queued behind a switch back
         # to Nado renders nothing instead of an Arcus screen.
-        if await read_active_venue(uid) != VENUE_ARCUS:
+        if await _venue_or_last_known(uid) != VENUE_ARCUS:
             return
         await render_arcus_target(target, uid, query=update.callback_query)
 
@@ -153,7 +164,7 @@ def _render_reply(target: str) -> Handler:
     async def _render(update: Update, context: CallbackContext) -> None:
         uid = int(update.effective_user.id)
         await _touch_user(update)
-        if await read_active_venue(uid) != VENUE_ARCUS:
+        if await _venue_or_last_known(uid) != VENUE_ARCUS:
             return
         await render_arcus_target(target, uid, message=update.message)
 
@@ -167,7 +178,7 @@ async def _arcus_free_text(update: Update, context: CallbackContext) -> None:
     uid = int(update.effective_user.id)
     message = update.message
     await _touch_user(update)
-    if await read_active_venue(uid) != VENUE_ARCUS:
+    if await _venue_or_last_known(uid) != VENUE_ARCUS:
         return
     resolved = resolve_reply_button_text((message.text or "").strip(), prefer=REPLY_BUTTON_MAP.__contains__)
     button_target = REPLY_BUTTON_MAP.get(resolved)
@@ -182,7 +193,21 @@ async def _arcus_free_text(update: Update, context: CallbackContext) -> None:
     )
 
 
-async def _gate(update: Update, context: CallbackContext, uid: int, probe: _Probe) -> None:
+async def _serialized(handler: Handler, update: Update, context: CallbackContext, locked: bool) -> None:
+    if locked:
+        # venue_recheck already holds this user's lock (asyncio.Lock is not
+        # re-entrant: taking it again would wait out the timeout and drop).
+        await handler(update, context)
+    else:
+        await with_user_serialized(handler)(update, context)
+
+
+async def _gate(
+    update: Update, context: CallbackContext, uid: int, probe: _Probe, *, locked: bool = False,
+) -> None:
+    """Pass (return) or stop (ApplicationHandlerStop) one update. ``locked``: run
+    by ``venue_recheck`` with the per-user lock already held, after
+    ``with_callback_ack`` has acked the tap."""
     from telegram.ext import ApplicationHandlerStop
 
     query = getattr(update, "callback_query", None)
@@ -192,7 +217,7 @@ async def _gate(update: Update, context: CallbackContext, uid: int, probe: _Prob
         cls, target = classify_callback(data)
         if cls in _ALWAYS_PASS:
             return
-        venue = await _venue_or_nado(uid, probe)
+        venue = await _venue_or_last_known(uid, probe)
         if venue != VENUE_ARCUS:
             if cls == ARCUS_ONLY:
                 await answer_query(query, tr(TEXT_ARCUS_BUTTON_ON_NADO), show_alert=True)
@@ -203,10 +228,13 @@ async def _gate(update: Update, context: CallbackContext, uid: int, probe: _Prob
         if cls == DISPATCH and target:
             # A bare ack (a "Loading portfolio…" toast would lie here), then the
             # Arcus screen in place of the Nado one.
-            fire_and_forget(answer_query(query), name="venue-gate-ack")
-            await with_user_serialized(_render_callback(target))(update, context)
+            if not locked:
+                fire_and_forget(answer_query(query), name="venue-gate-ack")
+            await _serialized(_render_callback(target), update, context, locked)
             raise ApplicationHandlerStop()
-        logger.info("venue gate: denied on arcus uid=%s %s", uid, probe.tag)
+        logger.info("venue gate: denied on arcus uid=%s %s%s", uid, probe.tag, " (re-check)" if locked else "")
+        # Under the lock the tap was already acked, so this alert usually cannot
+        # show — the queued Nado action is still dropped.
         await answer_query(query, tr(TEXT_DENIED_ON_ARCUS), show_alert=True)
         raise ApplicationHandlerStop()
 
@@ -220,25 +248,25 @@ async def _gate(update: Update, context: CallbackContext, uid: int, probe: _Prob
             cls, target = classify_command(name)
             if cls in _ALWAYS_PASS:
                 return
-            if await _venue_or_nado(uid, probe) != VENUE_ARCUS:
+            if await _venue_or_last_known(uid, probe) != VENUE_ARCUS:
                 return
             if cls == DISPATCH and target:
-                await with_user_serialized(_render_reply(target))(update, context)
+                await _serialized(_render_reply(target), update, context, locked)
                 raise ApplicationHandlerStop()
-            logger.info("venue gate: denied on arcus uid=%s %s", uid, probe.tag)
+            logger.info("venue gate: denied on arcus uid=%s %s%s", uid, probe.tag, " (re-check)" if locked else "")
             await message.reply_text(tr(TEXT_DENIED_ON_ARCUS))
             raise ApplicationHandlerStop()
         probe.tag = "text" if getattr(message, "text", None) else "message"
-        if await _venue_or_nado(uid, probe) != VENUE_ARCUS:
+        if await _venue_or_last_known(uid, probe) != VENUE_ARCUS:
             return
         if getattr(message, "text", None):
-            await with_user_serialized(_arcus_free_text)(update, context)
+            await _serialized(_arcus_free_text, update, context, locked)
         raise ApplicationHandlerStop()
 
     # Edited messages — and any other update type, should allowed_updates ever
     # widen: Nado passes, Arcus stops silently (fail-closed).
     probe.tag = "other"
-    if await _venue_or_nado(uid, probe) == VENUE_ARCUS:
+    if await _venue_or_last_known(uid, probe) == VENUE_ARCUS:
         raise ApplicationHandlerStop()
 
 
@@ -262,6 +290,50 @@ async def venue_gate(update: Update, context: CallbackContext) -> None:
         )
         if probe.venue == VENUE_ARCUS:
             raise ApplicationHandlerStop() from None
+
+
+def venue_recheck(handler: Handler) -> Handler:
+    """The gate again, INSIDE the per-user lock, right before a Nado group-0
+    handler. The group -1 gate decides at ARRIVAL; an update it passed can then
+    wait for the lock behind a venue switch (up to the lock timeout), and must
+    not run a Nado handler for a user who is now on the Arcus view. Same rules
+    and replies as the gate; a stop here means ``handler`` never runs. Wrap it
+    INSIDE ``with_user_serialized`` — ``serialized_for`` does."""
+    from telegram.ext import ApplicationHandlerStop
+
+    async def _wrapped(update: Update, context: CallbackContext) -> Any:
+        user = getattr(update, "effective_user", None)
+        if user is None:
+            return await handler(update, context)
+        uid = int(user.id)
+        probe = _Probe()
+        try:
+            await _gate(update, context, uid, probe, locked=True)
+        except ApplicationHandlerStop:
+            return None
+        except Exception as exc:
+            logger.warning(
+                "venue re-check error uid=%s %s venue=%s (%s)", uid, probe.tag, probe.venue, type(exc).__name__,
+            )
+            if probe.venue == VENUE_ARCUS:
+                return None
+        return await handler(update, context)
+
+    return _wrapped
+
+
+def serialized_for(enabled: bool) -> Callable[[Handler], Handler]:
+    """How main.setup_bot wraps every Nado group-0 handler. Gate registered:
+    ``with_user_serialized(venue_recheck(handler))``. Gate NOT registered (flag
+    off, nobody on Arcus): exactly ``with_user_serialized`` — the very same
+    function, so production routing stays byte-identical."""
+    if not enabled:
+        return with_user_serialized
+
+    def _serialize(handler: Handler) -> Handler:
+        return with_user_serialized(venue_recheck(handler))
+
+    return _serialize
 
 
 def should_register_venue_gate() -> bool:
