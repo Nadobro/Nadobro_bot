@@ -39,6 +39,16 @@ Fix applied (search for AUDIT-FIX):
                   patterns as an oracle, differential-fuzzes against them,
                   and times every pattern in this module (10k/100k chars)
                   and the whole chain (up to 1M chars).
+                  The rewritten patterns only redact correctly through their
+                  ``_redact_*`` helpers (extra groups, a callable replacement,
+                  pre-checks), so they deliberately do NOT keep the old names
+                  ``_URL_CREDENTIALS_RE`` / ``_PINECONE_URL_RE`` /
+                  ``_SUPABASE_HOST_RE``: code written against the old module
+                  (e.g. a ``_base_chain`` on an unmerged branch) that calls
+                  ``OLD_NAME.sub(old_replacement, text)`` fails with NameError
+                  instead of silently mis-redacting. When merging such code,
+                  call ``_redact_url_credentials`` / ``_redact_pinecone_urls``
+                  / ``_redact_supabase_hosts`` in place of those three subs.
 """
 import logging
 import re
@@ -87,7 +97,7 @@ _IPV6_RE = re.compile(
 # after a previous match, the one place re.sub resumes inside a run
 # (``...supabase.com`` then ``-``) -- and let group 1 consume, and the
 # replacement write back, the run's chars before its first boundary.
-_SUPABASE_HOST_RE = re.compile(
+_SUPABASE_HOST_SCAN_RE = re.compile(
     r"(?:(?<![a-z0-9-])|(?<=\.pooler\.supabase\.com))"
     r"((?:(?!\b)[a-z0-9-])*+)"
     r"\b[a-z0-9-]++\.pooler\.supabase\.com\b",
@@ -104,7 +114,7 @@ _FLY_INTERNAL_RE = re.compile(r"\bfdaa:[a-fA-F0-9:]+\b")
 # occurrences the first one saw: if the first fails, every later one fails.
 # The second alternative consumes such a run (group 1 unset) and
 # ``_pinecone_repl`` writes it back unchanged.
-_PINECONE_URL_RE = re.compile(
+_PINECONE_RUN_RE = re.compile(
     r'https?://(?:([^\s"\'<>]+pinecone\.io[^\s"\'<>]*)|[^\s"\'<>]*+)',
     re.IGNORECASE,
 )
@@ -118,7 +128,7 @@ _PINECONE_URL_RE = re.compile(
 # non-letter lead-in. The possessive quantifiers only drop backtracking that
 # can never succeed (a shorter run is always followed by a char of the same
 # class, never by the literal that must come next).
-_URL_CREDENTIALS_RE = re.compile(
+_URL_CREDENTIALS_SCAN_RE = re.compile(
     r"(?<![a-z0-9+.-])([0-9+.-]*+)([a-z][a-z0-9+.-]*+://)([^/\s:@]++):([^@\s/]++)@",
     re.IGNORECASE,
 )
@@ -136,7 +146,7 @@ def _redact_url_credentials(text: str) -> str:
     # Exact pre-check: every match contains "://" and "@" (caseless chars).
     if "://" not in text or "@" not in text:
         return text
-    return _URL_CREDENTIALS_RE.sub(r"\1\2<REDACTED>:<REDACTED>@", text)
+    return _URL_CREDENTIALS_SCAN_RE.sub(r"\1\2<REDACTED>:<REDACTED>@", text)
 
 
 def _pinecone_repl(match: "re.Match[str]") -> str:
@@ -146,13 +156,13 @@ def _pinecone_repl(match: "re.Match[str]") -> str:
 
 
 def _redact_pinecone_urls(text: str) -> str:
-    return _PINECONE_URL_RE.sub(_pinecone_repl, text)
+    return _PINECONE_RUN_RE.sub(_pinecone_repl, text)
 
 
 def _redact_supabase_hosts(text: str) -> str:
     if _SUPABASE_LITERAL_RE.search(text) is None:
         return text
-    return _SUPABASE_HOST_RE.sub(r"\1<REDACTED_DB_HOST>", text)
+    return _SUPABASE_HOST_SCAN_RE.sub(r"\1<REDACTED_DB_HOST>", text)
 
 
 def redact_sensitive_text(value: Any) -> Any:

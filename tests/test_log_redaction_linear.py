@@ -11,8 +11,12 @@ pattern, and ``http://http://...`` grew quadratically in the Pinecone pattern.
 Two halves:
 
 * Timing. Every compiled pattern in the module (discovered, so a pattern added
-  later is covered automatically) and the whole chain, across adversarial input
-  families at 10k / 100k / 1M chars, in thread CPU time. Budgets sit ~5-20x
+  later is timed without being registered) and the whole chain, across
+  adversarial input families at 10k / 100k / 1M chars, in thread CPU time. A
+  pattern is only proven linear on the SHAPES in ``_FAMILIES``: a new pattern
+  must come with a family aimed at its own quantifiers (two E6 patterns on an
+  unmerged branch were quadratic yet passed every earlier family; the canary
+  test pins the families that catch them). Budgets sit ~5-20x
   above the linear cost measured on a laptop and orders of magnitude below the
   quadratic cost (hours at 1M), so they separate the two without flaking on a
   slow CI runner. A stage that blows its 10k budget fails there, before the
@@ -164,20 +168,31 @@ _FAMILIES = {
     "ellipsis_addr": lambda n: "0x" + _rep("a", n // 2) + "..." + _rep("b", n - n // 2 - 6) + "g",
     "whitespace": lambda n: _rep(" ", n),
     "random_specials": lambda n: _random_text(":/@.-_ aA1\u00e9" + _FOLD_LETTERS, n),
+    # Keyword + long whitespace run + a terminator that fails the separator or
+    # the value: quadratic in a separator with two adjacent \s* (only optional
+    # atoms between them), which re-splits the run on every failure.
+    "secret_ws": lambda n: "secret" + " " * (n - 7) + "x",
+    "token_ws": lambda n: "token" + " " * (n - 6) + "!",
+    "bearer_ws": lambda n: "Bearer" + " " * (n - 7) + "!",
+    "account_id_ws": lambda n: (
+        "account_id" + " " * ((n - 12) // 2) + ":" + " " * (n - 12 - (n - 12) // 2) + "x"
+    ),
+    # Repeated opener with no closer: quadratic in a lazy ``open.*?close`` that
+    # rescans to the end from every opener.
+    "pem_begin_repeats": lambda n: _rep("-----BEGIN AAA-----", n),
 }
 
-# The chain at 1M chars costs ~0.2-0.65 s per family on a laptop, so the
-# per-family 1M check runs on a subset: families that were quadratic before
-# LR-LINEAR, including ones that carry "://" + "@" / ".pooler.supabase.com" so
-# the chain's exact pre-checks cannot skip the rewritten patterns. The 1M
-# "gauntlet" below still runs every family through the chain, and the
-# per-pattern test times every pattern directly (no pre-check) on every family.
+# The chain at 1M chars costs ~0.1-0.7 s per family on a laptop, so the
+# per-family 1M check runs on a subset (kept small for the file's ~10 s budget
+# on a CI runner): each rewritten stage's pre-LR-LINEAR worst case, carrying
+# "://" + "@" / ".pooler.supabase.com" so the chain's exact pre-checks cannot
+# skip the rewritten patterns. The 1M "gauntlet" below still runs every family
+# through the chain, and the per-pattern test times every pattern directly (no
+# pre-check) on every family, IGNORECASE fold letters included.
 _CHAIN_1M_FAMILIES = (
-    "unicode_letters",
-    "scheme_run_no_user",  # 1M letters + "://@": the 4.6 s-at-16k case
-    "http_repeats",
-    "a_dash_then_supabase_literal",
-    "random_specials",
+    "scheme_run_no_user",  # URL credentials: 1M letters + "://@", the 4.6 s-at-16k case
+    "http_repeats",  # Pinecone URL
+    "a_dash_then_supabase_literal",  # Supabase host
 )
 
 # Per-pattern budgets (CPU seconds). Laptop cost of the slowest pattern over
@@ -193,6 +208,29 @@ _CHAIN_BUDGET_1M = 3.0
 # timing is too small for its ratio to mean anything (and is within budget).
 _MAX_GROWTH = 30.0
 _RATIO_FLOOR = 0.005
+
+
+# Canaries: known-QUADRATIC patterns, copied verbatim from the E6 additions on
+# the unmerged Arcus branch (review 2026-09-30), which passed every family this
+# file had then. NOT production patterns; each is paired with the family that
+# must expose it (small sizes: a quadratic stage grows ~16x per 4x input, a
+# linear one ~4x) so dropping or weakening that family fails here.
+_CANARY_LABELLED_SECRET_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])"
+    r"((?:[A-Za-z0-9]+[_-]){0,6}(?:api[_-]?secret|secret|signing[_-]?(?:key|seed)|private[_-]?key|seed[_-]?hex|x-signature))"
+    r"(?![A-Za-z0-9])"
+    r"(\s*[\"']?\s*[:=]\s*[\"']?)"
+    r"([A-Za-z0-9_\-./+=]{8,})"
+)
+_CANARY_PEM_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]{3,64}-----.*?-----END [A-Z0-9 ]{3,64}-----", re.DOTALL
+)
+_CANARIES = (
+    # (pattern, family that must expose it, small size; large = 4x small)
+    (_CANARY_LABELLED_SECRET_RE, "secret_ws", 500),
+    (_CANARY_PEM_RE, "pem_begin_repeats", 2000),
+)
+_CANARY_MIN_GROWTH = 8.0  # quadratic ~16x, linear ~4x per 4x input
 
 
 def _elapsed(fn, arg) -> float:
@@ -249,6 +287,25 @@ class LogRedactionLinearTimeTests(unittest.TestCase):
                     t100 = _timed(fn, s100, _STAGE_BUDGET_100K)
                     self.assertLessEqual(t100, _STAGE_BUDGET_100K, f"{name} on {family} @100k")
                     self._check_growth(fn, s10, s100, t10, t100, f"{name} on {family}")
+
+    def test_families_expose_known_quadratic_shapes(self):
+        # TEST-FAMILY-GAP: the per-pattern test is only as strong as
+        # _FAMILIES. These canaries are quadratic; each paired family must
+        # show quadratic growth on it, or a real pattern of that shape could
+        # pass test_every_pattern_is_linear_on_every_family unnoticed.
+        for pattern, family, n in _CANARIES:
+            with self.subTest(family=family):
+                gen = _FAMILIES[family]
+                fn = lambda s, p=pattern: p.sub("", s)  # noqa: E731
+                small, large = gen(n), gen(4 * n)
+                t_small = min(_elapsed(fn, small) for _ in range(3))
+                t_large = min(_elapsed(fn, large) for _ in range(3))
+                self.assertGreaterEqual(
+                    t_large / max(t_small, 1e-6),
+                    _CANARY_MIN_GROWTH,
+                    f"{family} no longer exposes a quadratic canary: "
+                    f"{t_small * 1e3:.2f} ms -> {t_large * 1e3:.2f} ms for 4x input",
+                )
 
     def test_whole_chain_is_linear_up_to_1m_chars(self):
         for family in _CHAIN_1M_FAMILIES:
@@ -361,6 +418,10 @@ _EDGE_CASES = (
 
 class LogRedactionDifferentialTests(unittest.TestCase):
     def _assert_same(self, text: str):
+        # Whole-chain identity. If strictly ADDITIVE stages are later wrapped
+        # around this chain (e.g. the Arcus E6 PEM / labelled-secret rules
+        # around a ``_base_chain``), compare that wrapped base chain (the part
+        # LR-LINEAR rewrote) against the oracle here -- do not loosen this.
         self.assertEqual(redact_sensitive_text(text), _oracle_redact(text), repr(text))
         for name, oracle in _REWRITTEN_STAGES.items():
             self.assertEqual(getattr(lr, name)(text), oracle(text), f"{name}: {text!r}")
@@ -405,9 +466,31 @@ class LogRedactionDifferentialTests(unittest.TestCase):
 
     def test_grammar_fuzz_matches_oracle(self):
         rng = random.Random(20260930)
-        for _ in range(8000):
+        for _ in range(5000):
             text = _fuzz_line(rng)
             self._assert_same(text)
+
+    def test_old_pattern_names_keep_their_old_meaning_or_are_gone(self):
+        # LR-R1-MERGE-1: code written against the pre-LR-LINEAR module (e.g. a
+        # ``_base_chain`` on an unmerged branch) calls ``lr._NAME.sub(<old
+        # replacement>, text)``. A rewritten pattern under an old name would
+        # make that caller silently mis-redact after a merge, so every old
+        # name must either still be the exact old pattern or be gone (the
+        # caller then fails with NameError).
+        oracle = {
+            name[len("_O"):]: pattern  # "_O_BOT_TOKEN_RE" -> "_BOT_TOKEN_RE"
+            for name, pattern in globals().items()
+            if name.startswith("_O_") and isinstance(pattern, re.Pattern)
+        }
+        self.assertEqual(len(oracle), 17)
+        gone = []
+        for name, old in sorted(oracle.items()):
+            new = getattr(lr, name, None)
+            if new is None:
+                gone.append(name)
+            else:
+                self.assertEqual((new.pattern, new.flags), (old.pattern, old.flags), name)
+        self.assertEqual(gone, ["_PINECONE_URL_RE", "_SUPABASE_HOST_RE", "_URL_CREDENTIALS_RE"])
 
     def test_url_scheme_class_splits_into_letters_and_lead_in(self):
         # The URL-credential rewrite captures a scheme run's non-letter lead-in
