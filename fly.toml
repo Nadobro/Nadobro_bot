@@ -1,18 +1,12 @@
-# fly.toml app configuration file generated for nadobro-bot on 2026-05-18T07:01:13Z
+# fly.toml app configuration file generated for nadobro-bot on 2026-10-02T08:42:45Z
 #
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
 #
 
-# Region MUST stay in Europe: Postgres (Supabase, EU) and the @lowiqpts relay
-# (nadobro-relay, primary_region='ams') both live there. A 'nrt' (Tokyo) machine
-# put every DB round-trip and every relay poll ~230ms across the planet — that
-# is what pinned button taps at multi-second latency and made the 1.5s relay
-# poll time out every 2s (2026-08-14). 'fra' and 'ams' are both ~10ms from the
-# relay+DB; keep it here unless the DB and relay move too.
 app = 'nadobro-bot'
 primary_region = 'fra'
 kill_signal = 'SIGTERM'
-kill_timeout = 60
+kill_timeout = '1m0s'
 
 [build]
   dockerfile = 'Dockerfile'
@@ -89,6 +83,8 @@ kill_timeout = 60
 # gives the event loop its own core during placement bursts (2 dedicated CPUs,
 # 4 GB). Note: applying this restarts the machine, which stands every running
 # strategy down (redeploy = no auto-resume) — resume is user-initiated.
+  checks = [{ grace_period = '10s', interval = '15s', method = 'GET', path = '/health', timeout = '2s' }]
+
 [[vm]]
   memory = '4gb'
   cpu_kind = 'performance'
@@ -96,9 +92,10 @@ kill_timeout = 60
   memory_mb = 4096
   size = 'performance-2x'
 
-[[http_service.checks]]
-  interval = "15s"
-  timeout = "2s"
-  grace_period = "10s"
-  method = "GET"
-  path = "/health"
+[[vm]]
+  memory = '4gb'
+  cpu_kind = 'performance'
+  cpus = 1
+  memory_mb = 4096
+  size = 'performance-cpu-1x'
+  processes = ['app']
